@@ -1,93 +1,90 @@
 # DoomSRL build script.
-# Runs make via MSYS2 (SRL toolchain), then generates ISO + CUE.
+# Runs SRL's make build via MSYS2 MINGW64.
 #
 # Usage:
-#   powershell -ExecutionPolicy Bypass -File build.ps1          # incremental
-#   powershell -ExecutionPolicy Bypass -File build.ps1 -Clean   # full rebuild
-#   powershell -ExecutionPolicy Bypass -File build.ps1 -Cdda    # force CDDA
+#   powershell -ExecutionPolicy Bypass -File build.ps1           # incremental
+#   powershell -ExecutionPolicy Bypass -File build.ps1 -Clean    # full rebuild
 #
-# SRL's shared.mk handles: compile, link, ISO (xorrisofs), audio (sox).
-# We generate the CUE here because absolute paths are needed for Kronos.
+# SRL's shared.mk handles: compile, link, ISO (xorrisofs), CUE generation.
+# CDDA music: place WAV/FLAC/OGG/MP3 files in cd/music/ and create a
+# cd/music/tracklist file listing them in order (one per line, track 02+).
+# SRL will convert them with sox and append them to the disc image.
 
-param(
-    [switch]$Clean,
-    [switch]$Cdda    # force CDDA even if music/ is absent (for testing)
-)
+param([switch]$Clean)
 
 $ErrorActionPreference = "Stop"
-$root   = Split-Path -Parent $MyInvocation.MyCommand.Path
-$msys2  = "C:\msys64"
-$bash   = "$msys2\usr\bin\bash.exe"
-$srlDir = Join-Path $root "SaturnRingLib"
+$root  = Split-Path -Parent $MyInvocation.MyCommand.Path
+$msys2 = "C:\msys64"
+$bash  = "$msys2\usr\bin\bash.exe"
 
 if (-not (Test-Path $bash)) {
     throw "MSYS2 not found at $msys2. Run SaturnRingLib\setup_compiler.bat first."
 }
 
-# Convert Windows path to MSYS2 /c/... format
-function To-Msys2Path([string]$p) {
+function ConvertTo-Msys2Path([string]$p) {
     $p = $p.Replace('\','/')
-    if ($p -match '^([A-Za-z]):(.*)') {
-        return '/' + $Matches[1].ToLower() + $Matches[2]
-    }
+    if ($p -match '^([A-Za-z]):(.*)') { return '/' + $Matches[1].ToLower() + $Matches[2] }
     return $p
 }
 
 function Invoke-Msys2([string]$cmd) {
-    & $bash --login -c "export MSYSTEM=MINGW64; source /etc/profile 2>/dev/null; $cmd"
+    # sh2eb-elf-gcc lives in SaturnRingLib/Compiler/sh2eb-elf/bin (extracted by setup_compiler.bat)
+    $compilerBin = ConvertTo-Msys2Path (Join-Path $root "SaturnRingLib\Compiler\sh2eb-elf\bin")
+    & $bash --login -c "export MSYSTEM=MINGW64; source /etc/profile 2>/dev/null; export PATH='$compilerBin':`$PATH; $cmd"
     if ($LASTEXITCODE -ne 0) { throw "MSYS2 command failed (exit $LASTEXITCODE)" }
 }
 
+# Detect CDDA music files
+$musicDir  = Join-Path $root "cd\music"
+$trackList = Join-Path $musicDir "tracklist"
+$cdda      = (Test-Path $trackList) -or
+             ((Test-Path $musicDir) -and (Get-ChildItem $musicDir -Include "*.wav","*.mp3","*.flac","*.ogg" -Recurse -ErrorAction SilentlyContinue).Count -gt 0)
+
+# Handle optional external music/ directory (compatibility with SaturnDoom layout)
+$extMusic = Join-Path $root "music"
+if (-not $cdda -and (Test-Path $extMusic)) {
+    $wavs = Get-ChildItem -Path $extMusic -Filter "track_*.wav" |
+            Where-Object { $_.BaseName -match '^track_\d+$' } |
+            Sort-Object { [int]($_.BaseName -replace 'track_','') }
+    if ($wavs.Count -gt 0) {
+        Write-Host "Copying $($wavs.Count) WAV tracks to cd/music/..."
+        New-Item -ItemType Directory -Path $musicDir -Force | Out-Null
+        $lines = @()
+        foreach ($w in $wavs) {
+            Copy-Item $w.FullName (Join-Path $musicDir $w.Name) -Force
+            $lines += $w.Name
+        }
+        $lines | Out-File -FilePath $trackList -Encoding ascii -NoNewline
+        Add-Content $trackList ""
+        $cdda = $true
+    }
+}
+
+$rootMsys = ConvertTo-Msys2Path $root
+
 Push-Location $root
 try {
-    # Detect CDDA WAV files
-    $musicDir = Join-Path $root "music"
-    $wavFiles = @()
-    if (Test-Path $musicDir) {
-        $wavFiles = Get-ChildItem -Path $musicDir -Filter "track_*.wav" |
-                    Where-Object { $_.BaseName -match '^track_\d+$' } |
-                    Sort-Object { [int]($_.BaseName -replace 'track_','') }
-    }
-    $cdda = ($wavFiles.Count -gt 0) -or $Cdda
-
-    $rootMsys = To-Msys2Path $root
-
     if ($Clean) {
         Write-Host "Cleaning..."
         Invoke-Msys2 "cd '$rootMsys' && make clean"
     }
 
-    $makeArgs = "make all"
-    if ($cdda) { $makeArgs += " CDDA_MUSIC=1" }
+    $makeTarget = "build"
+    $makeArgs   = ""
+    if ($cdda) { $makeArgs = "CDDA_MUSIC=1" }
 
-    Write-Host "Building DoomSRL..."
-    Invoke-Msys2 "cd '$rootMsys' && $makeArgs"
+    Write-Host "Building DoomSRL$(if ($cdda) {' (CDDA)'})..."
+    Invoke-Msys2 "cd '$rootMsys' && make $makeTarget $makeArgs"
 
-    # SRL's shared.mk produces game.iso (and copies audio tracks into it if sox found).
-    # Generate a CUE with absolute paths so Kronos can find everything.
-    $isoPath = Join-Path $root "game.iso"
-    if (-not (Test-Path $isoPath)) { throw "game.iso not produced by make" }
-
-    $isoAbs = (Resolve-Path $isoPath).Path
-    $cue    = [System.Text.StringBuilder]::new()
-    [void]$cue.AppendLine("FILE `"$isoAbs`" BINARY")
-    [void]$cue.AppendLine('  TRACK 01 MODE1/2048')
-    [void]$cue.AppendLine('    INDEX 01 00:00:00')
-    [void]$cue.AppendLine('    POSTGAP 00:02:00')
-
-    foreach ($wav in $wavFiles) {
-        $tno = [int]($wav.BaseName -replace 'track_','')
-        [void]$cue.AppendLine("FILE `"$($wav.FullName)`" WAVE")
-        [void]$cue.AppendLine("  TRACK $($tno.ToString('D2')) AUDIO")
-        [void]$cue.AppendLine('    INDEX 01 00:00:00')
+    # SRL outputs to build/DoomSRL.bin + build/DoomSRL.cue
+    $binPath = Join-Path $root "build\DoomSRL.bin"
+    $cuePath = Join-Path $root "build\DoomSRL.cue"
+    if (Test-Path $binPath) {
+        $bin = Get-Item $binPath
+        Write-Output "OK  bin=$([string]::Format('{0:N0}', $bin.Length)) bytes"
+        if (Test-Path $cuePath) { Write-Output "CUE: $cuePath" }
+    } else {
+        Write-Warning "build/DoomSRL.bin not found -- check make output above"
     }
-
-    $cue.ToString().TrimEnd() | Out-File -FilePath game.cue -Encoding ascii -NoNewline
-    Add-Content -Path game.cue -Value ""
-
-    $iso = Get-Item game.iso
-    $msg = "OK  iso={0:N0} bytes" -f $iso.Length
-    if ($cdda) { $msg += "  cdda=$($wavFiles.Count) tracks" }
-    Write-Output $msg
 }
 finally { Pop-Location }

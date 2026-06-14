@@ -33,6 +33,6 @@ static void __attribute__((noreturn, noinline)) run_on_doom_stack(void)
 
 int main(void)
 {
-    SRL::Core::Initialize(SRL::Types::Colors::Black);
+    SRL::Core::Initialize(SRL::Types::HighColor::Colors::Black);
     run_on_doom_stack();
 }

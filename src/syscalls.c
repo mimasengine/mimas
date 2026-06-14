@@ -115,6 +115,9 @@ void _exit(int status)
     for (;;) ;
 }
 
+void exit(int status)   { _exit(status); }
+void abort(void)        { _exit(1); }
+
 int rename(const char *old, const char *newp)
 {
     (void)old; (void)newp;
@@ -133,5 +136,3 @@ int mkdir(const char *path, mode_t mode)
 }
 
 double fabs(double x)                   { return x < 0.0 ? -x : x; }
-
-void __call_exitprocs(int code, void *d) { (void)code; (void)d; }

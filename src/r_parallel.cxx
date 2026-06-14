@@ -220,6 +220,11 @@ static void rp_exec_fuzz(const rp_cmd_t *cm)
 {
     int   yl=cm->b, yh=cm->c, count;
     byte *dest;
+    /* SATURN: bounds check — rp_exec_col/trans/span have this check; fuzz
+       was the only executor missing it. A corrupted cm->a reads columnofs[]
+       out of bounds, producing a garbage dest that writes into vbl_count /
+       gametic and causes the observed freeze. */
+    if ((unsigned short)cm->a >= SCREENWIDTH) return;
     if (!yl) yl=1;
     if (yh==viewheight-1) yh=viewheight-2;
     count=yh-yl;
@@ -280,12 +285,13 @@ static void rp_slave_body(void)
     SYNC->slave_masked_done=1;
 }
 
-/* SRL::Slave::ITask wrapper around rp_slave_body */
-class RpSlaveTask : public SRL::Slave::ITask
+/* SRL::Types::ITask wrapper around rp_slave_body */
+class RpSlaveTask : public SRL::Types::ITask
 {
 public:
-    void Start() override { rp_slave_body(); }
     bool IsDone() override { return SYNC->slave_masked_done != 0; }
+protected:
+    void Do() override { rp_slave_body(); }
 };
 
 static RpSlaveTask slave_task;

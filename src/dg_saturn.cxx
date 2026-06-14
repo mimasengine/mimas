@@ -60,10 +60,16 @@ extern "C" int   r_visplane_peak;
 #define SCU_DSTA            (*(volatile unsigned int *)0x25FE007C)
 #define DMA_END_FLAG        0x80000000u
 
-extern "C" unsigned char  *sat_wad_base;
-extern "C" unsigned int    sat_wad_size;
-extern "C" int             sat_streaming_mode;
+extern "C" unsigned char  *sat_wad_base    = nullptr;
+extern "C" unsigned int    sat_wad_size     = 0;
+extern "C" int             sat_streaming_mode = 0;
 extern "C" int W_SaturnCDInit(void);
+
+/* Jo Engine compat shim: d_main.c calls jo_print(x, y, str) for debug overlay */
+extern "C" void jo_print(int x, int y, char *str)
+{
+    SRL::Debug::Print((uint8_t)x, (uint8_t)y, str);
+}
 
 static char irq_result[41];
 
@@ -472,7 +478,17 @@ extern "C" void DG_DrawFrame(void)
 
 extern "C" uint32_t DG_GetTicksMs(void)
 {
-    static uint32_t prev_ms = 0;
+    /* safe_ms: last known-good ms value.
+       last_fv:  frt_at_vbl snapshot at last safe call — used as a real-vblank
+                 discriminator when us_acc looks corrupted.  frt_at_vbl is set
+                 by the ISR once per vblank; it changes at most once per real
+                 frame regardless of how many times DG_GetTicksMs is called.
+                 When us_acc is stomped by a rogue slave write, safe_ms advances
+                 by exactly A = us_per_frame/1000 ms per real vblank detected
+                 via frt_at_vbl change — preventing both the prev_ms+17-per-call
+                 runaway and the single-spike-then-reset failure mode. */
+    static uint32_t       safe_ms  = 0;
+    static unsigned short last_fv  = 0;
     unsigned long long us_snap;
     unsigned short fv, f;
     unsigned int sr, sr_masked;
@@ -489,10 +505,22 @@ extern "C" uint32_t DG_GetTicksMs(void)
     result = (uint32_t)((us_snap + ((unsigned short)(f - fv) * ns_per_frt) / 1000) / 1000);
 
     if (result > 7200000U ||
-        (prev_ms > 0U && result > prev_ms + 5000U))
-        result = prev_ms + 17U;
+        (safe_ms > 0U && result > safe_ms + 5000U))
+    {
+        /* Corruption detected: advance safe_ms by A ms only if a real vblank
+           occurred (frt_at_vbl changed).  All calls within the same vblank
+           see the same fv → same safe_ms, unlike prev_ms+17 per call. */
+        uint32_t A = us_per_frame / 1000U;
+        if (fv != last_fv)
+        {
+            safe_ms += A;
+            last_fv  = fv;
+        }
+        return safe_ms;
+    }
 
-    prev_ms = result;
+    safe_ms = result;
+    last_fv = fv;
     return result;
 }
 

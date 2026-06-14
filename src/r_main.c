@@ -866,7 +866,7 @@ void R_SetupFrame (player_t* player)
 // SATURN: the frame is recorded as draw commands and executed on both
 // SH-2 CPUs (see ../r_parallel.c). The hooks are no-ops if the slave
 // CPU is unavailable or low-detail mode is active.
-#include "../r_parallel.h"
+#include "r_parallel.h"
 
 /* SATURN: FRT probe — measure pre-RP time displayed as 'p' on RP_DEBUG row 2 */
 extern unsigned short sat_frt(void);

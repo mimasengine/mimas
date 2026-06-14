@@ -1,0 +1,18 @@
+# Build artifacts
+*.o
+*.d
+game.elf
+game.raw
+game.iso
+game.cue
+game.map
+
+# CD content: generated binary + copyrighted WAD
+cd/0.bin
+cd/DOOM1.WAD
+
+# CDDA audio tracks (generated, copyrighted)
+music/
+
+# Claude Code local memory
+.claude/

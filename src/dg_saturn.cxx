@@ -1,4 +1,4 @@
-/*
+﻿/*
 ** DoomSRL -- doomgeneric platform layer for the Sega Saturn (SRL build).
 **
 ** Hardware usage:
@@ -27,6 +27,19 @@ extern "C" {
 }
 
 #define SHOW_FPS 1
+
+/* SATURN DEBUG: set to 1 to ignore the RAM cart and always stream the WAD
+   from CD (lets us reproduce the no-cart / 1M-cart path on a 4MB emulator or
+   hardware to confirm the cart-size hypothesis for the black screen). */
+#define FORCE_CD_STREAM 0
+
+/* SATURN DEBUG: framebuffer->VDP2 blit method.  1 = SCU DMA (fast, but hangs
+   the SH-2 bus on real hardware -- the observed first-frame freeze at the
+   "DF:kick" checkpoint).  0 = plain CPU copy (slow but cannot lock the bus):
+   if hardware survives past DF:end with this set to 0, the SCU DMA config is
+   confirmed as the hardware hang and we fix it properly (uncached indirect
+   table + cache write-back, or slDMACopy). */
+#define USE_SCU_DMA 0
 
 extern "C" byte *I_VideoBuffer;
 extern "C" int   gametic;
@@ -103,8 +116,15 @@ static void console_redraw(void)
 {
     if (!console_enabled)
         return;
+    static char padded[CONSOLE_COLS + 1];
     for (int y = 0; y < CONSOLE_ROWS; ++y)
-        SRL::Debug::Print(0, y + 1, "%-40s", console_lines[y]);
+    {
+        int len = (int)strlen(console_lines[y]);
+        memcpy(padded, console_lines[y], len);
+        memset(padded + len, ' ', CONSOLE_COLS - len);
+        padded[CONSOLE_COLS] = '\0';
+        SRL::Debug::Print(0, y + 2, padded);
+    }
 }
 
 static void console_scroll(void)
@@ -139,19 +159,23 @@ extern "C" void sat_console_clear(void)
     memset(console_lines, 0, sizeof(console_lines));
     console_row = 0;
     console_col = 0;
-    for (int y = 0; y < 30; ++y)
-        SRL::Debug::Print(0, y, "%-40s", "");
+    SRL::Debug::PrintClearScreen();
+}
+
+extern "C" void sat_debug_row0(const char *s)
+{
+    SRL::Debug::Print(0, 1, s);
 }
 
 extern "C" void DG_Fatal(const char *msg)
 {
-    /* SATURN: row 1 (row 0 is loop counter); truncate to 27 chars */
+    /* Row 0: full message (44 chars max, no format args so % is literal) */
     {
-        char tmp[28];
+        static char tmp[45];
         int i;
-        for (i = 0; i < 27 && msg[i]; i++) tmp[i] = msg[i];
+        for (i = 0; i < 44 && msg[i]; i++) tmp[i] = msg[i];
         tmp[i] = '\0';
-        SRL::Debug::Print(0, 1, "***FATAL*** %s", tmp);
+        SRL::Debug::Print(0, 1, tmp);
     }
     console_enabled = 1;
     sat_console_putc('\n');
@@ -159,11 +183,13 @@ extern "C" void DG_Fatal(const char *msg)
         sat_console_putc(*msg++);
     sat_console_putc('\n');
     console_redraw();
+    /* 5s pause so user can read the error before the counter starts (300 vblanks) */
+    for (int _w = 0; _w < 300; _w++) SRL::Core::Synchronize();
     {
         unsigned int n = 0;
         for (;;)
         {
-            SRL::Debug::Print(0, 0, "FATAL loop n=%u", n++);
+            SRL::Debug::Print(0, 1, "FATAL loop n=%u", n++);
             SRL::Core::Synchronize();
         }
     }
@@ -190,25 +216,41 @@ static void cart_enable(void)
     *(volatile unsigned short *)0x257EFFFE = 1;
 }
 
-static int cart_check(void)
+/* SATURN: probe the *usable* cart size in bytes (0x400000 / 0x200000 /
+   0x100000), or 0 if absent/broken.  An Action Replay stuck in 1M mode (or
+   any sub-4MB cart) mirrors its banks: writing four distinct sentinels one
+   per MB and reading bank 0 back tells us the real size from the aliasing
+   pattern.  The 3.94MB IWAD needs the full 4MB; a smaller cart must fall
+   back to CD streaming, otherwise the truncated/aliased WAD is the black
+   screen seen on real hardware. */
+static unsigned int cart_probe_size(void)
 {
-    volatile unsigned int *base = (volatile unsigned int *)CART_RAM_UNCACHED;
+    volatile unsigned int *b = (volatile unsigned int *)CART_RAM_UNCACHED;
     unsigned char id = *CART_ID_ADDR;
+    const unsigned int MBW = 0x100000u / 4u;   /* 32-bit words per MB */
 
     printf("cart id: 0x%02x\n", id);
     if (id != CART_ID_4MB && id != CART_ID_1MB)
         return 0;
-    base[0]                      = 0x12345678;
-    base[(CART_RAM_SIZE / 4) - 2] = 0xCAFEBABE;
-    base[CART_RAM_SIZE / 8]      = 0x600DBEEF;
-    if (base[0]                      != 0x12345678 ||
-        base[(CART_RAM_SIZE / 4) - 2] != 0xCAFEBABE ||
-        base[CART_RAM_SIZE / 8]      != 0x600DBEEF)
+
+    b[0]       = 0xA5A50000u;
+    b[1 * MBW] = 0xA5A50001u;
+    b[2 * MBW] = 0xA5A50002u;
+    b[3 * MBW] = 0xA5A50003u;
+
+    /* liveness: bank 0 must read back one of the values we wrote */
+    if (b[0] != 0xA5A50000u && b[0] != 0xA5A50001u &&
+        b[0] != 0xA5A50002u && b[0] != 0xA5A50003u)
     {
-        printf("cart probe failed!\n");
+        printf("cart probe: no writable RAM\n");
         return 0;
     }
-    return 1;
+    if (b[0] == 0xA5A50000u && b[1 * MBW] == 0xA5A50001u &&
+        b[2 * MBW] == 0xA5A50002u && b[3 * MBW] == 0xA5A50003u)
+        return 0x400000u;                      /* 4 independent MB banks */
+    if (b[0] == 0xA5A50002u && b[1 * MBW] == 0xA5A50003u)
+        return 0x200000u;                      /* mirrors every 2 MB     */
+    return 0x100000u;                          /* mirrors every 1 MB     */
 }
 
 static void cache_purge(void)
@@ -252,11 +294,36 @@ static int load_wad(void)
 #define FRT_FRCH (*(volatile unsigned char *)0xFFFFFE12)
 #define FRT_FRCL (*(volatile unsigned char *)0xFFFFFE13)
 
-static volatile unsigned int       vbl_count    = 0;
-static volatile unsigned long long us_acc        = 0;
-static volatile unsigned short     frt_at_vbl   = 0;
-static unsigned int                us_per_frame  = 16683;
-static unsigned int                ns_per_frt    = 4469;
+/* SATURN DEBUG: the clock state lives in a guarded block.  A stray write
+   that overruns an adjacent buffer trips guard0/guard1 instead of silently
+   corrupting the clock; clk_check() (once per frame) also cross-checks
+   us_acc against vbl_count*us_per_frame.  The ISR advances both in lockstep,
+   so any large divergence means us_acc (or us_per_frame) was stomped -- this
+   distinguishes real memory corruption from a clock-math bug and tags the
+   game_phase in which it happens.  See sat_clk_corrupt_count on overlay row 0. */
+#define CLK_GUARD0  0xC0DEFACEu
+#define CLK_GUARD1  0xFACEC0DEu
+static struct clk_block_t {
+    unsigned int                guard0;
+    volatile unsigned int       vbl_count;
+    volatile unsigned long long us_acc;
+    volatile unsigned short     frt_at_vbl;
+    unsigned int                us_per_frame;
+    unsigned int                ns_per_frt;
+    unsigned int                guard1;
+} clk = { CLK_GUARD0, 0, 0, 0, 16683, 4469, CLK_GUARD1 };
+
+#define vbl_count    clk.vbl_count
+#define us_acc       clk.us_acc
+#define frt_at_vbl   clk.frt_at_vbl
+#define us_per_frame clk.us_per_frame
+#define ns_per_frt   clk.ns_per_frt
+
+extern "C" int sat_clk_corrupt_count;   /* # frames a clock anomaly was seen */
+int sat_clk_corrupt_count = 0;
+extern "C" int sat_clk_guard_hits;      /* # times a guard word was clobbered */
+int sat_clk_guard_hits = 0;
+int sat_getticks_guard = 0;             /* # times DG_GetTicksMs clamp tripped */
 
 static unsigned short frt_read(void)
 {
@@ -296,6 +363,94 @@ static void vblank_handler(void)
 extern "C" volatile int game_phase;
 volatile int game_phase = 0;
 
+/* SATURN DEBUG: per-frame clock-integrity check.  If the guard words or the
+   us_acc/vbl_count relationship are broken, log it (overlay row 0 + printf)
+   and self-heal by rebuilding us_acc from the vblank counter -- this is the
+   proven SaturnDoom fix (vbl_count as the source of truth) but here it is
+   only triggered ON corruption, and counted, so the overlay tells us how
+   often it happens and in which phase.  If sat_clk_corrupt_count stays 0 but
+   the game still freezes, the freeze is NOT the clock -- look at RPBAD. */
+extern "C" void sat_clk_check(const char *where)
+{
+    /* NB: vbl_count / us_acc / us_per_frame are macros that expand to clk.*,
+       so use the bare names here (clk.vbl_count would become clk.clk.*). */
+    unsigned int       vc     = vbl_count;
+    unsigned int       upf    = us_per_frame;
+    unsigned long long acc    = us_acc;
+    unsigned long long expect = (unsigned long long)vc * (unsigned long long)upf;
+    long long          diff   = (long long)acc - (long long)expect;
+    int                bad    = 0;
+
+    if (clk.guard0 != CLK_GUARD0 || clk.guard1 != CLK_GUARD1)
+    {
+        sat_clk_guard_hits++;
+        bad = 1;
+    }
+    if (upf != 16683u && upf != 20000u)  bad = 1;          /* period stomped   */
+    if (diff < -2000000LL || diff > 2000000LL) bad = 1;    /* >2s divergence   */
+
+    if (bad)
+    {
+        sat_clk_corrupt_count++;
+        {
+            static char r0[45];
+            sprintf(r0, "CLKCOR n%d g%d ph%d ms%u",
+                    sat_clk_corrupt_count, sat_clk_guard_hits, game_phase,
+                    (unsigned int)(acc / 1000ULL));
+            SRL::Debug::Print(0, 0, r0);
+        }
+        printf("CLKCOR #%d @%s ph%d acc=%ums vbl=%u upf=%u g0=%08x g1=%08x\n",
+               sat_clk_corrupt_count, where ? where : "?", game_phase,
+               (unsigned int)(acc / 1000ULL), vc, upf,
+               (unsigned int)clk.guard0, (unsigned int)clk.guard1);
+
+        /* self-heal: clock = vblank counter (cannot drift, cannot accumulate
+           a stomped value), restore period + guards. */
+        us_per_frame = (TVSTAT & 1) ? 20000u : 16683u;
+        us_acc       = (unsigned long long)vc * (unsigned long long)us_per_frame;
+        clk.guard0   = CLK_GUARD0;
+        clk.guard1   = CLK_GUARD1;
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* Tick counter: updated every doomgeneric_Tick() call, visible on    */
+/* row 6 of the debug overlay without needing DG_DrawFrame.           */
+/* ------------------------------------------------------------------ */
+static volatile unsigned int tick_count = 0;
+
+extern "C" void sat_tick_show(void)
+{
+    tick_count++;
+    static char tc[45];
+    sprintf(tc, "TC%05u ph%d ms%u",
+            (unsigned int)(tick_count % 100000),
+            game_phase,
+            (unsigned int)DG_GetTicksMs());
+    SRL::Debug::Print(0, 6, tc);
+}
+
+/* SATURN DEBUG: persistent "last checkpoint reached" marker on overlay row 9.
+   Unlike row 6 (rewritten only at tick start, so wiped by the first frame's
+   PrintClearScreen and never refreshed when tick 1 hangs), this is updated
+   continuously through the frame, so whatever it shows when the game freezes
+   is the last code point that executed.  Used to localise the hardware
+   first-frame hang (black screen at ph3/F1). */
+extern "C" void sat_stage(const char *s)
+{
+    SRL::Debug::Print(0, 9, (char *)s);
+}
+
+/* End-of-tick heartbeat on row 10: only advances if a whole doomgeneric_Tick
+   completed.  If this never appears, tick 1 never finished (hang inside the
+   first D_Display); if it sticks at a value, that tick's successor hung. */
+extern "C" void sat_tick_end(void)
+{
+    static char te[45];
+    sprintf(te, "TKEND%05u", (unsigned int)(tick_count % 100000));
+    SRL::Debug::Print(0, 10, te);
+}
+
 #if SHOW_FPS
 extern "C" int rp_timeout_count;
 static unsigned int dg_frame_count = 0;
@@ -307,16 +462,25 @@ static void fps_update(void)
     unsigned int now = vbl_count;
     unsigned int hz  = (us_per_frame == 20000) ? 50 : 60;
 
-    SRL::Debug::Print(0, 0, "F%05u ph%d to%d                    ",
-                      dg_frame_count % 100000, game_phase, rp_timeout_count);
+    /* row 1: per-frame live counter; row 0 reserved for boot/fatal */
+    {
+        static char r1[45];
+        sprintf(r1, "F%05u ph%d to%d vbl%u",
+                dg_frame_count % 100000, game_phase,
+                rp_timeout_count, (unsigned int)(vbl_count & 0xFFFF));
+        SRL::Debug::Print(0, 1, r1);
+    }
     frames++;
     if (now - t0 >= hz)
     {
         unsigned int elapsed = now - t0;
         unsigned int fps = (frames * hz + elapsed / 2) / elapsed;
-        SRL::Debug::Print(0, 1, "%2ufps gt%5d vp%3d ph%d dma%4u",
-                          fps, gametic, r_visplane_peak,
-                          game_phase, (unsigned int)last_dma_ticks);
+        static char r2[45];
+        sprintf(r2, "%2ufps gt%5d vp%3d dma%4u dsta%04x",
+                fps, gametic, r_visplane_peak,
+                (unsigned int)last_dma_ticks,
+                (unsigned int)(SCU_DSTA & 0xFFFF));
+        SRL::Debug::Print(0, 2, r2);
         t0     = now;
         frames = 0;
     }
@@ -366,22 +530,63 @@ extern "C" void DG_Init(void)
     printf("DoomSRL platform init\n");
     printf("video: %s\n", (TVSTAT & 1) ? "PAL" : "NTSC");
 
+    SRL::Debug::Print(0, 1, "INIT CD...");
+
     /* CD filesystem init (SRL wraps GFS) */
     SRL::Cd::Initialize();
 
+    SRL::Debug::Print(0, 1, "INIT CART...");
     cart_enable();
-    if (cart_check())
+    unsigned int cart_sz = cart_probe_size();
     {
+        static char cid[45];
+        unsigned char id = *CART_ID_ADDR;
+        sprintf(cid, "CART id=0x%02x usable=%uKB", (unsigned int)id,
+                cart_sz / 1024u);
+        SRL::Debug::Print(0, 1, cid);
+        printf("cart usable size: %u bytes (%u KB)\n", cart_sz, cart_sz / 1024u);
+        unsigned int t = vbl_count;
+        while (vbl_count - t < 180) ;   /* 3s pause so the size is readable */
+    }
+#if FORCE_CD_STREAM
+    cart_sz = 0;   /* test override: ignore the cart, force CD streaming */
+#endif
+    /* The 3.94MB IWAD only fits a full 4MB cart.  A 1M/2M (or 1M-mode AR)
+       cart cannot hold it -- stream from CD instead of loading a truncated,
+       aliased WAD that renders as a black screen on hardware. */
+    if (cart_sz >= 0x400000u)
+    {
+        SRL::Debug::Print(0, 1, "INIT WAD(cart 4MB)...");
         if (!load_wad())
             DG_Fatal("DOOM1.WAD load failed");
+        {
+            static char ws[45];
+            sprintf(ws, "WAD OK sz=%u", sat_wad_size);
+            SRL::Debug::Print(0, 1, ws);
+            unsigned int t = vbl_count; while (vbl_count - t < 120) ;
+        }
     }
     else
     {
-        printf("No RAM cart -- CD streaming mode\n");
+        if (cart_sz)
+            printf("cart only %uKB (<4MB) -- IWAD too big, CD streaming\n",
+                   cart_sz / 1024u);
+        else
+            printf("No usable RAM cart -- CD streaming mode\n");
         sat_streaming_mode = 1;
+        SRL::Debug::Print(0, 1, cart_sz ? "CART<4MB -> CD STREAM..."
+                                        : "NO CART -> CD STREAM...");
         if (!W_SaturnCDInit())
             DG_Fatal("DOOM1.WAD not found on CD");
+        {
+            static char ws[45];
+            sprintf(ws, "WAD CD sz=%u", sat_wad_size);
+            SRL::Debug::Print(0, 1, ws);
+            unsigned int t = vbl_count; while (vbl_count - t < 120) ;
+        }
     }
+
+    SRL::Debug::Print(0, 1, "INIT VDP2...");
 
     /* VDP2: NBG1 as 512x256 8bpp bitmap, palette bank 1, below console.
        These are direct SGL calls -- still valid under SRL (SGL is linked). */
@@ -391,9 +596,12 @@ extern "C" void DG_Init(void)
     slBitMapNbg1(COL_TYPE_256, BM_512x256, (void *)DOOM_VRAM);
     slBMPaletteNbg1(1);
     slPriorityNbg1(6);
-    slPriorityNbg0(7);
-    slScrPosNbg1(toFIXED(0.0), toFIXED(-12.0));
-    slScrAutoDisp(NBG0ON | NBG1ON);
+    /* NBG3 = SRL debug text (priority 7, set by SRL::Core::Initialize).
+       NBG0 is unused. Enable NBG1 (game) + NBG3 (overlay). */
+    slScrPosNbg1(toFIXED(0.0), toFIXED(0.0));
+    slScrAutoDisp(NBG1ON | NBG3ON);
+
+    SRL::Debug::Print(0, 1, "INIT DOOM...");
 }
 
 static void dma_table_build(void)
@@ -424,7 +632,10 @@ extern "C" void DG_DrawFrame(void)
         console_enabled  = 0;
         sat_console_clear();
         dma_table_build();
+        SRL::Debug::Print(0, 1, "FRAME1 OK               ");
     }
+
+    sat_stage("DF:start");   /* survives the first-frame clear above */
 
     if (palette_changed)
     {
@@ -443,7 +654,24 @@ extern "C" void DG_DrawFrame(void)
     fps_update();
 #endif
 
-    /* Async SCU DMA blit: fires without a trailing wait. */
+    sat_clk_check("draw");
+
+#if !USE_SCU_DMA
+    /* SATURN DEBUG: CPU blit fallback (no SCU DMA).  Purge so the master sees
+       the slave's write-through framebuffer pixels, then copy row by row to
+       VDP2 VRAM (uncached).  Used to prove whether the SCU DMA is the
+       hardware first-frame hang. */
+    sat_stage("DF:cpu");
+    cache_purge();
+    for (int y = 0; y < 200; ++y)
+        memcpy(DOOM_VRAM + y * DOOM_VRAM_STRIDE, framebuffer + y * 320, 320);
+    sat_stage("DF:end");
+    return;
+#endif
+
+    /* SCU DMA blit -- synchronous: wait for previous, kick, wait for this one.
+       Made synchronous to prevent an async DMA from bus-starving the SH-2
+       and freezing the game loop on real hardware. */
 #if SHOW_FPS
     {
         unsigned short t0, t1;
@@ -453,18 +681,22 @@ extern "C" void DG_DrawFrame(void)
         l  = *(volatile unsigned char *)0xFFFFFE13;
         t0 = (unsigned short)((h << 8) | l);
 
+        sat_stage("DF:dma0");
         dma_wait_idle();
 
-        h  = *(volatile unsigned char *)0xFFFFFE12;
-        l  = *(volatile unsigned char *)0xFFFFFE13;
-        t1 = (unsigned short)((h << 8) | l);
-        last_dma_ticks = (unsigned short)(t1 - t0);
-
+        sat_stage("DF:kick");
         cache_purge();
         SCU_D0W  = (unsigned int)dma_table;
         SCU_D0AD = 0x101;
         SCU_D0MD = 0x01000007;
         SCU_D0EN = 0x101;
+        dma_wait_idle();
+        sat_stage("DF:dma1");
+
+        h  = *(volatile unsigned char *)0xFFFFFE12;
+        l  = *(volatile unsigned char *)0xFFFFFE13;
+        t1 = (unsigned short)((h << 8) | l);
+        last_dma_ticks = (unsigned short)(t1 - t0);
     }
 #else
     dma_wait_idle();
@@ -473,19 +705,21 @@ extern "C" void DG_DrawFrame(void)
     SCU_D0AD = 0x101;
     SCU_D0MD = 0x01000007;
     SCU_D0EN = 0x101;
+    dma_wait_idle();
 #endif
+    sat_stage("DF:end");
 }
 
 extern "C" uint32_t DG_GetTicksMs(void)
 {
     /* safe_ms: last known-good ms value.
-       last_fv:  frt_at_vbl snapshot at last safe call — used as a real-vblank
+       last_fv:  frt_at_vbl snapshot at last safe call â€” used as a real-vblank
                  discriminator when us_acc looks corrupted.  frt_at_vbl is set
                  by the ISR once per vblank; it changes at most once per real
                  frame regardless of how many times DG_GetTicksMs is called.
                  When us_acc is stomped by a rogue slave write, safe_ms advances
                  by exactly A = us_per_frame/1000 ms per real vblank detected
-                 via frt_at_vbl change — preventing both the prev_ms+17-per-call
+                 via frt_at_vbl change â€” preventing both the prev_ms+17-per-call
                  runaway and the single-spike-then-reset failure mode. */
     static uint32_t       safe_ms  = 0;
     static unsigned short last_fv  = 0;
@@ -509,7 +743,9 @@ extern "C" uint32_t DG_GetTicksMs(void)
     {
         /* Corruption detected: advance safe_ms by A ms only if a real vblank
            occurred (frt_at_vbl changed).  All calls within the same vblank
-           see the same fv → same safe_ms, unlike prev_ms+17 per call. */
+           see the same fv â†’ same safe_ms, unlike prev_ms+17 per call. */
+        extern int sat_getticks_guard;   /* SATURN DEBUG: how often this trips */
+        sat_getticks_guard++;
         uint32_t A = us_per_frame / 1000U;
         if (fv != last_fv)
         {
@@ -644,7 +880,9 @@ extern "C" void doomgeneric_Tick(void);
 extern "C" void doom_start(void)
 {
     static char *argv[] = { (char *)"doom", 0 };
+    sat_stage("DS:create");        /* entering doomgeneric_Create (D_DoomMain) */
     doomgeneric_Create(1, argv);
+    sat_stage("DS:loop");          /* WAD + level setup OK, entering main loop */
     for (;;)
         doomgeneric_Tick();
 }

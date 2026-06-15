@@ -878,16 +878,28 @@ extern unsigned short rp_frt_entry;   /* written here, read in r_parallel.c */
    the r_plane.o BSS boundary (BSS map: viewangleoffset @ 0x060cadf8,
    cachedystep[0] @ 0x060cadfc). */
 #include "i_system.h"
+extern volatile int game_phase;            /* SATURN: defined in dg_saturn.cxx */
+extern void jo_print(int x, int y, char *str);  /* -> SRL::Debug::Print overlay */
+int sat_vao_corrupt_count = 0;             /* SATURN DEBUG: viewangleoffset hits */
 void V_Canary (const char* where)
 {
     if (viewangleoffset != 0)
     {
-        static int canary_count = 0;
-        if (canary_count < 8)
-        {
-            printf("CANARY: vao=%08x @%s cnt=%d\n",
-                   (unsigned int)viewangleoffset, where, ++canary_count);
-        }
+        /* SATURN DEBUG: viewangleoffset sits just below r_plane.o's
+           cached*[] arrays; a negative-index / overrun write lands here.
+           Show on overlay row 8 (visible on real hardware, unlike printf
+           which only reaches the disabled in-game console) with the value,
+           the call site, and the game_phase to localise the writer. */
+        static char vbuf[45];
+        ++sat_vao_corrupt_count;
+        snprintf(vbuf, sizeof(vbuf), "VAOCOR n%d vao%08x @%.6s ph%d",
+                 sat_vao_corrupt_count, (unsigned int)viewangleoffset,
+                 where ? where : "?", game_phase);
+        jo_print(0, 8, vbuf);
+        if (sat_vao_corrupt_count <= 8)
+            printf("CANARY: vao=%08x @%s cnt=%d ph%d\n",
+                   (unsigned int)viewangleoffset, where,
+                   sat_vao_corrupt_count, game_phase);
         viewangleoffset = 0;   /* reset so the view does not rotate away */
     }
 }

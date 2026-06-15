@@ -27,6 +27,7 @@ extern "C" {
 
 extern "C" unsigned char *sat_wad_base;
 extern "C" unsigned int   sat_wad_size;
+extern "C" void sat_debug_row0(const char *s);
 
 /* ------------------------------------------------------------------ */
 /* CD-streaming state                                                  */
@@ -44,29 +45,60 @@ extern "C" int W_SaturnCDInit(void)
     static SRL::Cd::File wad_static("DOOM1.WAD");
     wad_cd_file = &wad_static;
 
+    sat_debug_row0("CD:exists?");
     if (!wad_cd_file->Exists())
     {
         printf("CD: DOOM1.WAD not found\n");
+        sat_debug_row0("CD:NOT FOUND");
         wad_cd_file = nullptr;
         return 0;
     }
+    sat_debug_row0("CD:open...");
     wad_cd_file->Open();
 
-    /* Determine size: read in 2048-byte chunks until EOF to count bytes. */
-    static unsigned char probe[2048];
-    unsigned int total = 0;
-    while (!wad_cd_file->IsEOF())
+    /*
+    ** Determine WAD size from the header instead of a sequential probe.
+    ** Sequential read via IsEOF()+Read() stops early (wrong sector count),
+    ** giving sat_wad_size < actual file size; reads at the lump directory
+    ** (which sits at the END of the WAD) are then blocked by the bounds
+    ** check in Saturn_Read, causing W_GetNumForName to find nothing.
+    **
+    ** The WAD header (12 bytes at offset 0) gives us:
+    **   [4..7]  numlumps      (little-endian int32)
+    **   [8..11] infotableofs  (little-endian int32, offset of lump directory)
+    ** So sat_wad_size = infotableofs + numlumps * 16.
+    */
+    sat_debug_row0("CD:hdr...");
+    static unsigned char hdr[12];
+    int hgot = wad_cd_file->LoadBytes(0, 12, hdr);
     {
-        int n = wad_cd_file->Read(2048, probe);
-        if (n <= 0) break;
-        total += (unsigned int)n;
+        static char hdbg[45];
+        sprintf(hdbg, "CD:hdr got=%d [%c%c%c%c]", hgot,
+                hgot>=4?hdr[0]:'?', hgot>=4?hdr[1]:'?',
+                hgot>=4?hdr[2]:'?', hgot>=4?hdr[3]:'?');
+        sat_debug_row0(hdbg);
     }
-    /* Seek back to beginning for subsequent random-access reads */
-    wad_cd_file->Seek(0);
+    if (hgot < 12 || (hdr[0] != 'I' && hdr[0] != 'P') ||
+        hdr[1] != 'W' || hdr[2] != 'A' || hdr[3] != 'D')
+    {
+        printf("CD: bad WAD header (got=%d)\n", hgot);
+        sat_debug_row0("CD:BAD HDR");
+        wad_cd_file = nullptr;
+        return 0;
+    }
 
-    sat_wad_size = total;
+    int32_t numlumps     = (int32_t)(hdr[4]  | (hdr[5]<<8)  | (hdr[6]<<16)  | (hdr[7]<<24));
+    int32_t infotableofs = (int32_t)(hdr[8]  | (hdr[9]<<8)  | (hdr[10]<<16) | (hdr[11]<<24));
+    sat_wad_size = (unsigned int)(infotableofs + numlumps * 16);
     sat_wad_base = NULL;   /* signals CD mode to Saturn_Read */
-    printf("CD: WAD %u bytes\n", sat_wad_size);
+
+    printf("CD: WAD %u bytes, %d lumps, dir@%d\n",
+           sat_wad_size, (int)numlumps, (int)infotableofs);
+    {
+        static char msg[45];
+        sprintf(msg, "CD:WAD=%u nl=%d", sat_wad_size, (int)numlumps);
+        sat_debug_row0(msg);
+    }
     return sat_wad_size > 12 ? 1 : 0;
 }
 
@@ -116,8 +148,38 @@ static size_t Saturn_Read(wad_file_t *file, unsigned int offset,
         return n;
     }
 
-    /* CD mode: SRL::Cd::File::LoadBytes for byte-offset random access */
-    if (!wad_cd_file) return 0;
-    int got = wad_cd_file->LoadBytes((size_t)offset, (int32_t)n, buffer);
-    return (got > 0) ? (size_t)got : 0;
+    /* CD mode: LoadBytes(sectorOffset, size, dest) where sectorOffset is the
+    ** number of 2048-byte sectors to skip at the start of the file -- NOT a
+    ** byte offset.  We must convert the byte offset ourselves:
+    **   sector = offset / 2048
+    **   sub    = offset % 2048   (bytes into that sector where the data starts)
+    ** For the non-aligned case read the first partial sector into a static
+    ** lead buffer, copy the tail of it, then issue a second call for the rest.
+    */
+    if (!wad_cd_file || n == 0) return 0;
+
+    size_t sector = (size_t)(offset >> 11);   /* offset / 2048 */
+    size_t sub    = (size_t)(offset & 2047);  /* offset % 2048 */
+
+    if (sub == 0)
+    {
+        /* Perfectly sector-aligned: one LoadBytes call */
+        int got = wad_cd_file->LoadBytes(sector, (int32_t)n, buffer);
+        return (got > 0) ? (size_t)got : 0;
+    }
+
+    /* Non-aligned: read first (partial) sector into a lead buffer */
+    static unsigned char lead_buf[2048];
+    int lgot = wad_cd_file->LoadBytes(sector, 2048, lead_buf);
+    if (lgot <= (int)sub) return 0;
+
+    size_t first = (size_t)(2048 - sub);  /* bytes available after the skip */
+    if (first > n) first = n;
+    memcpy(buffer, lead_buf + sub, first);
+    if (first >= n) return n;
+
+    /* Read the remaining bytes, now sector-aligned */
+    int rgot = wad_cd_file->LoadBytes(sector + 1, (int32_t)(n - first),
+                                      (unsigned char *)buffer + first);
+    return first + (size_t)(rgot > 0 ? (size_t)rgot : 0);
 }

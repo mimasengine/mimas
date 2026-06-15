@@ -54,6 +54,8 @@ planefunction_t		ceilingfunc;
 static visplane_t	*visplanes;
 /* SATURN: peak visplane count per frame, exposed for the debug overlay. */
 int r_visplane_peak = 0;
+/* SATURN DEBUG: # of out-of-range R_MapPlane calls skipped (was I_Error halt). */
+int sat_mapplane_oob = 0;
 visplane_t*		lastvisplane;
 visplane_t*		floorplane;
 visplane_t*		ceilingplane;
@@ -134,6 +136,26 @@ R_MapPlane
     fixed_t	length;
     unsigned	index;
 	
+    /* SATURN: guard OOB BEFORE the RANGECHECK below.  RANGECHECK is defined
+       (doomdef.h), so its I_Error("R_MapPlane: ...") used to fire first and
+       HALT the game (-> DG_Fatal freeze) -- the observed "freeze at level
+       load, R_MapPlane: 202,202 at 255".  255 = 0xFF = an uninitialised
+       visplane top[]/bottom[] sentinel leaking in as y.  Skip the bad span
+       (and log it) instead of halting; also protects cachedheight[y] etc.
+       from an OOB index.  See sat_mapplane_oob on overlay row 11. */
+    extern int sat_mapplane_oob;
+    extern void jo_print(int x, int y, char *str);
+    if (x2 < x1 || x1 < 0 || x2 >= viewwidth ||
+        y > viewheight || (unsigned int)y >= (unsigned int)SCREENHEIGHT)
+    {
+        static char ob[45];
+        ++sat_mapplane_oob;
+        snprintf(ob, sizeof(ob), "MPOOB n%d x1%d x2%d y%d vw%d vh%d",
+                 sat_mapplane_oob, x1, x2, y, viewwidth, viewheight);
+        jo_print(0, 11, ob);
+        return;
+    }
+
 #ifdef RANGECHECK
     if (x2 < x1
      || x1 < 0
@@ -143,12 +165,6 @@ R_MapPlane
 	I_Error ("R_MapPlane: %i, %i at %i",x1,x2,y);
     }
 #endif
-
-    /* SATURN: guard OOB — visplane clips can reach SCREENHEIGHT in vanilla Doom;
-       cachedystep[SCREENHEIGHT] would stomp the adjacent BSS (viewangleoffset),
-       triggering V_Canary and freezing the game via DG_Fatal. */
-    if ((unsigned int)y >= (unsigned int)SCREENHEIGHT)
-        return;
 
     if (planeheight != cachedheight[y])
     {

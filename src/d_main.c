@@ -511,6 +511,11 @@ void doomgeneric_Tick()
     // frame syncronous IO operations
     I_StartFrame ();
 
+    /* SATURN: tick counter overlay (row 6); updated every doomgeneric_Tick
+       call, independently of DG_DrawFrame, to show the loop is alive. */
+    extern void sat_tick_show(void);
+    sat_tick_show();
+
     V_Canary ("tick start");
 
 #if SATURN_TICK_DEBUG
@@ -582,6 +587,13 @@ void doomgeneric_Tick()
         }
     }
 #endif
+
+    /* SATURN DEBUG: end-of-tick heartbeat (overlay row 10).  If this never
+       advances past 0, tick 1 hung inside the first D_Display. */
+    {
+        extern void sat_tick_end(void);
+        sat_tick_end();
+    }
 }
 
 //

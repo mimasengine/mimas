@@ -32,11 +32,11 @@ extern "C" {
    run on a 4MB emulator the same way a no-cart / 1M-cart system would). */
 #define FORCE_CD_STREAM 0
 
-/* Framebuffer->VDP2 blit method.  1 = SCU DMA (fast, but currently hangs the
-   SH-2 bus on real hardware -- TODO: fix with an uncached indirect table +
-   cache write-back, or slDMACopy).  0 = plain CPU copy (slower but safe on
-   hardware).  Keep 0 until the SCU DMA path is fixed. */
-#define USE_SCU_DMA 0
+/* Framebuffer->VDP2 blit method.  1 = SCU DMA (fast; validated on real hardware
+   once the indirect descriptor table is built through the cache-through mirror
+   so the cacheless SCU bus master reads valid descriptors -- see dma_table_build).
+   0 = plain CPU copy (slower, kept as a safe fallback). */
+#define USE_SCU_DMA 1
 
 extern "C" byte *I_VideoBuffer;
 extern "C" int   gametic;

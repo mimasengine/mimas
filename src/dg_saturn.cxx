@@ -106,6 +106,11 @@ extern "C" int            gamestate;        /* gamestate_t: GS_LEVEL == 0 */
 extern "C" int            menuactive;       /* boolean: menu overlay up */
 extern "C" int            automapactive;    /* boolean: automap up */
 extern "C" int            sat_vdp2_sky;     /* core: skip software sky (=> VDP2) */
+extern "C" int            sat_potato_floors;/* core: solid-colour floors/ceilings */
+/* Potato floors (solid-colour, flat-shaded) -- big EX/fillrate win, visible
+   quality drop.  POTATO_FLOORS = the value at boot; toggle live in-game with the
+   pad Z button.  Default off so the game starts textured. */
+#define POTATO_FLOORS 0
 #define GS_LEVEL 0
 #define SAT_CMAP_BYTES (34 * 256)           /* COLORMAP: 34 maps of 256 (r_data.c) */
 
@@ -400,7 +405,7 @@ static void fps_update(void)
         /* Trimmed: fps duplicated row 17's inst, and dma/dsta were dead with the
            SCU DMA blit disabled (USE_SCU_DMA=0).  Kept gt (heartbeat) + vp
            (visplane peak) -- vp is the number sky->VDP2 should pull down. */
-        sprintf(r2, "gt%5d vp%3d", gametic, r_visplane_peak);
+        sprintf(r2, "gt%5d vp%3d pot%d", gametic, r_visplane_peak, sat_potato_floors);
         SRL::Debug::Print(0, 2, r2);
         {
             static char rA[45];
@@ -526,6 +531,7 @@ extern "C" void DG_Init(void)
     /* Enable the core sky-skip: R_DrawPlanes leaves the sky region as index 0
        (transparent) so the VDP2 NBG0 sky shows through. */
     sat_vdp2_sky = 1;
+    sat_potato_floors = POTATO_FLOORS;   /* boot default; pad Z toggles it live */
 
     SRL::Debug::Print(0, 1, "INIT DOOM...");
 }
@@ -866,6 +872,11 @@ static void poll_pad(void)
     unsigned short cur     = Smpc_Peripheral[0].data;
     unsigned short changed = cur ^ prev;
     prev = cur;
+
+    /* Pad Z (unmapped in pad_map) = live Potato-floors toggle, for A/B testing
+       the solid-colour-floor quality vs fps without rebuilding. */
+    if ((changed & PER_DGT_TZ) && !(cur & PER_DGT_TZ))
+        sat_potato_floors = !sat_potato_floors;
 
     for (unsigned int i = 0; i < PAD_MAP_LEN; ++i)
     {

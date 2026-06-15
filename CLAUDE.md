@@ -23,14 +23,8 @@ by ReyeMe). Contact the author before any public/commercial release.
 
 | Path | Role |
 |------|------|
-| `src/` | Doom game sources (doomgeneric / Chocolate-Doom, lightly patched) |
-| `dg_saturn.cpp` | Platform layer: SRL VDP2 framebuffer, SMPC pad, CD WAD loader |
-| `i_sound_saturn.cpp` | SRL SCSP sound (PCM SFX + CDDA music) |
-| `main.cpp` | Entry point: SRL init, then launches Doom on dedicated stack |
-| `sat_gfx.cpp/.hpp` | Text overlay (SRL Debug::Print or raw VDP2 NBG0 writes) |
-| `r_parallel.cpp` | Slave SH-2 column renderer (SRL::Slave::ExecuteOnSlave) |
-| `syscalls.c` | newlib stubs (sbrk heap, no filesystem) |
-| `w_file_saturn.cpp` | WAD backend: DOOM1.WAD read via SRL::Cd::File |
+| `core/` | **git submodule [doom-saturn-core](https://github.com/N0rt0N85/doom-saturn-core)**: the Doom game sources (doomgeneric / Chocolate-Doom, lightly patched) + `r_parallel.c` (dual-SH2 column renderer). **Shared verbatim with DoomJo.** |
+| `src/` | **SRL platform layer only** (C++): `dg_saturn.cxx` (VDP2 framebuffer, SMPC pad, CD WAD loader), `i_sound_saturn.cxx` (SCSP sound), `main.cxx` (SRL init + Doom stack), `w_file_saturn.cxx` (WAD backend), `syscalls.c` (newlib stubs) |
 | `cd/` | CD image content: DOOM1.WAD + text metadata |
 | `docs/` | SRL API reference and notes |
 | `SaturnRingLib/` | git submodule: ReyeMe/SaturnRingLib (SDK + toolchain setup) |
@@ -38,22 +32,41 @@ by ReyeMe). Contact the author before any public/commercial release.
 ## Setup after a fresh clone
 
 ```powershell
-git submodule update --init   # pulls SaturnRingLib submodule
+git submodule update --init --recursive   # core + SaturnRingLib
 cd SaturnRingLib
 setup_compiler.bat            # downloads sh2eb-elf-gcc 14.2 toolchain
 ```
 
 Obtain `doom1.wad` (shareware v1.9) and generate the stripped WAD:
 ```powershell
-python tools/strip_wad.py doom1.wad cd/DOOM1.WAD
+python tools/strip_wad.py doom1.wad cd/data/DOOM1.WAD
 ```
+
+## Shared core (doom-saturn-core) — workflow
+
+The Doom sources + the `r_parallel` renderer live in the `core/` submodule and
+are compiled **verbatim** by both this port and **DoomJo** (the Jo Engine port,
+`../DoomJo`). Edit shared code **once**, in `core/`:
+
+```powershell
+# 1. edit + commit + push the shared change in the submodule
+cd core; git add -A; git commit -m "..."; git push; cd ..
+# 2. record the new core revision in this port
+git add core && git commit -m "bump core"
+# 3. pull it into DoomJo the same way: cd ../DoomJo/core; git pull; cd ..; git add core; git commit
+```
+
+`core/r_parallel.c` must stay **pure C** (no C++): DoomJo compiles it with
+GCC 9.3 which errors on C++isms (e.g. unnamed parameters) that DoomSRL's GCC 14
+would only warn about. Its only platform hooks are `slSlaveFunc` (SGL, both
+ports) and an `extern jo_print` debug shim (each port implements it).
 
 ## Architecture: C Doom + C++ SRL
 
-Doom sources (`src/`) are C. Platform files (`dg_saturn.cpp`, `main.cpp`, etc.)
-are C++ that wrap SRL's C++ API. Bridge rules:
-- Platform .cpp files compile as C++23, Doom .c files compile as C2x
-- SRL types used ONLY in platform files, never in `src/`
+Doom sources (`core/`) are C. Platform files in `src/` (`dg_saturn.cxx`,
+`main.cxx`, etc.) are C++ that wrap SRL's C++ API. Bridge rules:
+- Platform `.cxx` files compile as C++23; `core/*.c` compile as C (gnu11)
+- SRL types used ONLY in `src/` platform files, never in `core/`
 - `extern "C"` exports: `DG_Init`, `DG_DrawFrame`, `DG_SleepMs`, `DG_GetKey`,
   `DG_SetWindowTitle`, `doom_start`
 

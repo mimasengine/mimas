@@ -91,7 +91,7 @@ static unsigned short pending_cram[256];
 static volatile int   palette_dirty = 0;
 
 static unsigned char framebuffer[320 * 200] __attribute__((aligned(4)));
-static unsigned int  dma_table[200][3] __attribute__((aligned(4)));
+static unsigned int  dma_table[200][3] __attribute__((aligned(16)));
 
 extern "C" unsigned char *DG_FrameBuffer(void)
 {
@@ -490,13 +490,23 @@ extern "C" void DG_Init(void)
 
 static void dma_table_build(void)
 {
+    /* SATURN: build the SCU indirect descriptor list through the cache-through
+       mirror (| 0x20000000) so the descriptors are guaranteed to be in
+       physical RAM.  The SCU is a bus master with no cache: if the table were
+       written copy-back and not flushed, the SCU would read stale/garbage
+       descriptors and DMA to wild addresses -- a classic cause of the bus
+       hang seen on real hardware (works on emulators, which model the cache
+       leniently).  SCU_D0W still gets the normal 0x06 address; the SCU reads
+       the same physical RAM we just wrote uncached. */
+    unsigned int (*t)[3] =
+        (unsigned int (*)[3])((unsigned int)dma_table | 0x20000000u);
     for (int y = 0; y < 200; ++y)
     {
-        dma_table[y][0] = 320;
-        dma_table[y][1] = (unsigned int)DOOM_VRAM + y * DOOM_VRAM_STRIDE;
-        dma_table[y][2] = (unsigned int)framebuffer + y * 320;
+        t[y][0] = 320;
+        t[y][1] = (unsigned int)DOOM_VRAM + y * DOOM_VRAM_STRIDE;
+        t[y][2] = (unsigned int)framebuffer + y * 320;
     }
-    dma_table[199][2] |= DMA_END_FLAG;
+    t[199][2] |= DMA_END_FLAG;
 }
 
 static void dma_wait_idle(void)

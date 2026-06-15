@@ -112,6 +112,27 @@ static void sat_ss_report(void)
     }
 }
 
+/* SATURN DEBUG: R_RenderBSPNode integrity.  Vanilla never bounds-checks
+   bspnum before nodes[bspnum], and never limits recursion depth -- a corrupt
+   node child index (or stomped nodes[]) sends it into OOB reads / cyclic
+   recursion = infinite loop = the R:bsp freeze (vbl ticks, ms frozen).
+   These guards turn that into a logged, survivable skip (overlay row 13). */
+int sat_bsp_badnode = 0;   /* bspnum >= numnodes (corrupt child index) */
+int sat_bsp_deep    = 0;   /* recursion depth exceeded                 */
+static void sat_bsp_report(void)
+{
+    static int last = -1;
+    int n = sat_bsp_badnode + sat_bsp_deep;
+    if (n != last)
+    {
+        static char b[45];
+        last = n;
+        snprintf(b, sizeof(b), "BSPN bad%d deep%d", sat_bsp_badnode,
+                 sat_bsp_deep);
+        jo_print(0, 13, b);
+    }
+}
+
 
 
 

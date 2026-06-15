@@ -333,8 +333,36 @@ static int rp_wait(volatile int *flag)
     return guard!=0;
 }
 
+/* SATURN: THE ~1-2min freeze fix.  slSlaveFunc bump-allocates a 12-byte record
+   {0x30, func, arg} from the SGL transient work buffer at GBR+72 and advances
+   the pointer every call, but NEVER resets it -- SGL normally resets it once
+   per frame inside slSynch(), which DoomSRL replaced with its own vblank sync.
+   Because rp_restart() calls slSlaveFunc every frame, GBR+72 crept forward 12
+   bytes/frame into the SGL system area and after ~1-2 min overran the VBlank
+   user-callback pointer at GBR+20 (0x060FFC14); _BlankIn then jsr'd to garbage
+   -> CPU illegal-instruction exception -> SGL halt-loop = the freeze.  We
+   restore GBR+72 to its post-init base before each slSlaveFunc, exactly as
+   slSynch would, so the single per-frame record always reuses the same slot. */
+static void rp_sgl_workptr_reset(void)
+{
+    static volatile unsigned int *wp   = 0;
+    static unsigned int           base = 0;
+    if (!wp)
+    {
+        unsigned int gbr;
+        __asm__ volatile ("stc gbr,%0" : "=r"(gbr));
+        wp   = (volatile unsigned int *)(gbr + 72);
+        base = *wp;                 /* capture clean base on the first frame */
+    }
+    else
+    {
+        *wp = base;                 /* undo the per-frame leak */
+    }
+}
+
 static void rp_restart(void)
 {
+    rp_sgl_workptr_reset();
     SYNC->ready=0;
     SYNC->masked_at=in_masked?0:-1;
     SYNC->total=0;

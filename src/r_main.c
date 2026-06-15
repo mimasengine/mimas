@@ -906,6 +906,10 @@ void V_Canary (const char* where)
 
 /* SATURN: phase indicator (defined in dg_saturn.c). */
 extern volatile int game_phase;
+/* SATURN DEBUG: persistent checkpoint on overlay row 9 (defined dg_saturn.cxx).
+   The ~1-2min freeze is inside this function (ph4); these sub-markers reveal
+   which step loops -- read row 9 when it freezes. */
+extern void sat_stage(const char *s);
 
 void R_RenderPlayerView (player_t* player)
 {
@@ -915,6 +919,7 @@ void R_RenderPlayerView (player_t* player)
 
     game_phase = 4; /* R_RenderPlayerView (BSP + execute) */
 
+    sat_stage("R:setup");
     R_SetupFrame (player);
 
     // Clear buffers.
@@ -929,6 +934,7 @@ void R_RenderPlayerView (player_t* player)
     RP_BeginFrame ();
 
     // The head node is the last node output.
+    sat_stage("R:bsp");
     R_RenderBSPNode (numnodes-1);
 
     V_Canary ("bsp");
@@ -936,6 +942,7 @@ void R_RenderPlayerView (player_t* player)
     // Check for new console commands.
     NetUpdate ();
 
+    sat_stage("R:planes");
     R_DrawPlanes ();
 
     V_Canary ("planes");
@@ -946,15 +953,18 @@ void R_RenderPlayerView (player_t* player)
     RP_BeginMasked ();
 
     game_phase = 5; /* R_DrawMasked */
+    sat_stage("R:masked");
     R_DrawMasked ();
 
     V_Canary ("masked");
 
     game_phase = 4; /* back to render (RP_EndFrame) */
+    sat_stage("R:endf");
     RP_EndFrame ();
 
     V_Canary ("endframe");
 
     // Check for new console commands.
     NetUpdate ();
+    sat_stage("R:done");
 }

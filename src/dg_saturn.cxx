@@ -3,7 +3,8 @@
 **
 ** Hardware usage:
 **   VDP2 NBG1   : 512x256 8bpp bitmap in VRAM bank B0 = Doom framebuffer
-**   VDP2 NBG0   : SRL debug text overlay (SRL::Debug::Print)
+**   VDP2 NBG0   : 512x256 8bpp sky scroll layer in VRAM bank A0 (behind NBG1)
+**   VDP2 NBG3   : SRL debug text overlay (SRL::Debug::Print)
 **   CRAM bank 1 : Doom PLAYPAL (256 colours, RGB555)
 **   4MB DRAM cart at 0x22400000: entire IWAD memory-mapped for zero-copy lumps
 **   Low work RAM (0x00200000, 1MB): Doom zone heap
@@ -74,6 +75,39 @@ extern "C" unsigned char  *sat_wad_base    = nullptr;
 extern "C" unsigned int    sat_wad_size     = 0;
 extern "C" int             sat_streaming_mode = 0;
 extern "C" int W_SaturnCDInit(void);
+
+/* ------------------------------------------------------------------ */
+/* Sky -> VDP2 NBG0 scroll layer (SATURN sky offload)                   */
+/* ------------------------------------------------------------------ */
+/* Doom sky is 256x128, full-bright (palette indices are direct).  We blit it
+   into VDP2 VRAM bank A0 as a 512x256 8bpp NBG0 bitmap (tiled 2x horizontally so
+   the scroll wraps seamlessly) and scroll it by viewangle.  NBG1 (the game
+   framebuffer) is at bank B0. */
+#define SKY_VRAM         ((unsigned char *)0x25E00000)  /* VDP2 VRAM A0 */
+#define SKY_VRAM_STRIDE  512
+#define SKY_ANGLESHIFT   22   /* r_sky.h ANGLETOSKYSHIFT: 90deg (0x40000000)->256px */
+
+/* SKY_FIXED 1 = the sky does NOT scroll with the view angle (Romain's choice:
+   a static backdrop).  0 = scroll with viewangle, slowed by SKY_PARALLAX_SHIFT
+   (0 = Doom-faithful 256px/90deg, 1 = half, 2 = quarter). */
+#define SKY_FIXED          0
+#define SKY_PARALLAX_SHIFT 0
+
+/* SKY_DEBUG_SHOW: 1 = draw NBG0 ON TOP of the game (opaque) so we can verify the
+   sky uploads/orients/scrolls before transparency is wired (Stage A).  0 = NBG0
+   below NBG1, revealed only through index-0 transparency (Stage B/C). */
+#define SKY_DEBUG_SHOW   0
+
+extern "C" int            skytexture;
+extern "C" unsigned int   viewangle;        /* angle_t (unsigned int) */
+extern "C" unsigned char *R_GetColumn(int tex, int col);
+extern "C" unsigned char *colormaps;        /* lighttable_t* (byte*), saturn_cmap */
+extern "C" int            gamestate;        /* gamestate_t: GS_LEVEL == 0 */
+extern "C" int            menuactive;       /* boolean: menu overlay up */
+extern "C" int            automapactive;    /* boolean: automap up */
+extern "C" int            sat_vdp2_sky;     /* core: skip software sky (=> VDP2) */
+#define GS_LEVEL 0
+#define SAT_CMAP_BYTES (34 * 256)           /* COLORMAP: 34 maps of 256 (r_data.c) */
 
 /* Jo Engine compat shim: d_main.c calls jo_print(x, y, str) for debug overlay */
 extern "C" void jo_print(int x, int y, char *str)
@@ -472,11 +506,26 @@ extern "C" void DG_Init(void)
 
     slBitMapNbg1(COL_TYPE_256, BM_512x256, (void *)DOOM_VRAM);
     slBMPaletteNbg1(1);
-    slPriorityNbg1(6);
-    /* NBG3 = SRL debug text (priority 7, set by SRL::Core::Initialize).
-       NBG0 is unused. Enable NBG1 (game) + NBG3 (overlay). */
     slScrPosNbg1(toFIXED(0.0), toFIXED(0.0));
-    slScrAutoDisp(NBG1ON | NBG3ON);
+
+    /* SATURN sky: NBG0 = 512x256 8bpp bitmap (VRAM A0, palette bank 1, shared
+       with NBG1).  Bitmap content is uploaded per-level by sky_upload() once
+       skytexture is known.  NBG3 = SRL debug text (priority 7). */
+    for (int y = 0; y < 256; ++y)
+        memset(SKY_VRAM + y * SKY_VRAM_STRIDE, 0, SKY_VRAM_STRIDE);
+    slBitMapNbg0(COL_TYPE_256, BM_512x256, (void *)SKY_VRAM);
+    slBMPaletteNbg0(1);
+    slScrPosNbg0(toFIXED(0.0), toFIXED(0.0));
+#if SKY_DEBUG_SHOW
+    slPriorityNbg0(6); slPriorityNbg1(5);   /* sky ON TOP to verify Stage A */
+#else
+    slPriorityNbg0(5); slPriorityNbg1(6);   /* sky below game; shown via transparency */
+#endif
+    slScrAutoDisp(NBG0ON | NBG1ON | NBG3ON);
+
+    /* Enable the core sky-skip: R_DrawPlanes leaves the sky region as index 0
+       (transparent) so the VDP2 NBG0 sky shows through. */
+    sat_vdp2_sky = 1;
 
     SRL::Debug::Print(0, 1, "INIT DOOM...");
 }
@@ -509,6 +558,48 @@ static void dma_wait_idle(void)
         ;
 }
 
+/* SATURN sky: upload the current sky texture (256x128, full-bright) into the NBG0
+   bitmap, tiled 2x across the 512-wide plane so horizontal scroll wraps cleanly.
+   Called when skytexture changes (per level/episode).  VDP2 VRAM is uncached I/O
+   space, so direct writes are fine. */
+/* Darkest non-zero palette index (cached).  Index 0 is the VDP2 transparent code,
+   so we must keep it out of any layer that should be opaque -- both the sky here
+   and (Stage B) the scene colormap.  colors[] is the live PLAYPAL. */
+static int sat_near_black(void)
+{
+    static int idx = -1;
+    if (idx < 0)
+    {
+        int best = 0x7fffffff;
+        idx = 1;
+        for (int i = 1; i < 256; ++i)
+        {
+            int lum = (int)colors[i].r + colors[i].g + colors[i].b;
+            if (lum < best) { best = lum; idx = i; }
+        }
+    }
+    return idx;
+}
+
+static int sky_loaded_tex = -1;
+static void sky_upload(void)
+{
+    unsigned char *vram = SKY_VRAM;
+    unsigned char  nb   = (unsigned char)sat_near_black();
+    for (int col = 0; col < 256; ++col)
+    {
+        const unsigned char *src = R_GetColumn(skytexture, col);  /* 128-tall */
+        for (int y = 0; y < 128; ++y)
+        {
+            unsigned char p = src[y];
+            if (!p) p = nb;     /* keep the sky OPAQUE: 0 is the transparent code */
+            vram[y * SKY_VRAM_STRIDE + col]       = p;
+            vram[y * SKY_VRAM_STRIDE + col + 256] = p;   /* 2nd tile */
+        }
+    }
+    sky_loaded_tex = skytexture;
+}
+
 extern "C" void DG_DrawFrame(void)
 {
     static int first_frame = 1;
@@ -520,6 +611,55 @@ extern "C" void DG_DrawFrame(void)
         sat_console_clear();
         dma_table_build();
         SRL::Debug::Print(0, 1, "FRAME1 OK               ");
+    }
+
+    /* SATURN sky -> VDP2: (re)upload on level/episode change; position the layer.
+       SKY_FIXED keeps it static; otherwise scroll by viewangle (90deg = 256 sky
+       px via SKY_ANGLESHIFT, slowed by SKY_PARALLAX_SHIFT; VDP2 wraps the plane). */
+    if (skytexture > 0 && skytexture != sky_loaded_tex)
+        sky_upload();
+#if SKY_FIXED
+    slScrPosNbg0(toFIXED(0.0), toFIXED(0.0));
+#else
+    {
+        /* Negated: invert the scroll direction (Romain -- the un-negated way felt
+           wrong-way round; this was the real issue, not the speed). */
+        int sx = -(int)(viewangle >> (SKY_ANGLESHIFT + SKY_PARALLAX_SHIFT));
+        slScrPosNbg0((FIXED)(sx << 16), toFIXED(0.0));
+    }
+#endif
+
+    /* SATURN sky index-0 reservation (index 0 = VDP2 transparent code; where NBG1
+       has 0 the NBG0 sky behind shows through):
+       (1) remap the scene colormap ONCE so the 3D view (walls/floors/sprites/fuzz,
+           all via colormaps[]) and the software sky never emit 0;
+       (2) gate the sky by NBG0's DISPLAY (slScrAutoDisp), NOT slScrTransparent --
+           slScrTransparent rewrites the whole transparent-mask and clobbered SRL's
+           text/back setup (black screen).  When an overlay owns the screen (menu/
+           automap) or we're out of a level, drop NBG0 so UI index-0 shows the
+           black back-screen instead of sky.  NBG1 keeps SRL's default transparency.
+       (3) scrub the status-bar rows' 0 -> near-black (direct-palette UI that
+           bypasses the colormap) while the sky is shown. */
+    {
+        static int cmap_done = 0;
+        unsigned char nb = (unsigned char)sat_near_black();
+        if (!cmap_done && colormaps && skytexture > 0)
+        {
+            for (int i = 0; i < SAT_CMAP_BYTES; ++i)
+                if (colormaps[i] == 0) colormaps[i] = nb;
+            cmap_done = 1;
+        }
+        /* Keep the sky shown while the pause menu is up (menuactive): the menu
+           draws opaque patches over the frozen game frame, so the sky belongs
+           behind it.  Drop the sky only for the automap (its index-0 background
+           would otherwise show sky) and outside a level. */
+        (void)menuactive;
+        int show_sky = (gamestate == GS_LEVEL) && !automapactive;
+        slScrAutoDisp((uint16_t)(show_sky ? (NBG0ON | NBG1ON | NBG3ON)
+                                          : (NBG1ON | NBG3ON)));
+        if (show_sky)
+            for (int i = 168 * 320; i < 200 * 320; ++i)
+                if (framebuffer[i] == 0) framebuffer[i] = nb;
     }
 
     if (palette_changed)

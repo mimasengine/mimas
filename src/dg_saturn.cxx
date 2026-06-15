@@ -81,8 +81,6 @@ extern "C" void jo_print(int x, int y, char *str)
     SRL::Debug::Print((uint8_t)x, (uint8_t)y, str);
 }
 
-static char irq_result[41];
-
 #if SHOW_FPS
 static unsigned short last_dma_ticks;
 #endif
@@ -372,11 +370,15 @@ static void fps_update(void)
         SRL::Debug::Print(0, 2, r2);
         {
             static char rA[45];
-            sprintf(rA, "AVG %u.%u fps  inst %u.%u    ",
+            /* row 17: stable build-comparison number, with the build-identity
+               stamp (b:__TIME__) folded in -- build.ps1 touches dg_saturn.cxx so
+               __TIME__ refreshes every build, letting you confirm on hardware you
+               flashed the latest.  (Was row 18; the boot IRQ probe it shared the
+               row with answered 1.1 and was removed.) */
+            sprintf(rA, "AVG %u.%u inst %u.%u b:" __TIME__,
                     avg10 / 10, avg10 % 10, inst10 / 10, inst10 % 10);
             SRL::Debug::Print(0, 17, rA);
         }
-        SRL::Debug::Print(0, 18, irq_result);   /* boot IRQ-cost probe (1.1) */
         t0     = now;
         frames = 0;
     }
@@ -396,31 +398,10 @@ extern "C" void DG_Init(void)
     /* Register our VBlank handler via SRL event system */
     SRL::Core::OnVblank += vblank_handler;
 
-    /* One-shot IRQ profile: how much CPU do interrupts steal? */
-    {
-        unsigned int gaps = 0, gap_ticks = 0, biggest = 0;
-        unsigned int start_vbl = vbl_count;
-        unsigned short prev = frt_read();
-
-        while (vbl_count - start_vbl < 60)
-        {
-            unsigned short now = frt_read();
-            unsigned short d   = (unsigned short)(now - prev);
-            if (d > 18)
-            {
-                gaps++;
-                gap_ticks += d;
-                if (d > biggest)
-                    biggest = d;
-            }
-            prev = now;
-        }
-        sprintf(irq_result, "irq %u %ums mx%uus b:" __TIME__,
-                gaps,
-                (unsigned int)(((unsigned long long)gap_ticks * ns_per_frt) / 1000000),
-                (biggest * ns_per_frt) / 1000);
-        printf("%s\n", irq_result);
-    }
+    /* IRQ-cost probe removed: it answered perf question 1.1 (IRQ steals ~2.4% CPU
+       -- not a bottleneck, crossed off) and was a one-shot boot reading that never
+       updated.  Its build-identity stamp (b:__TIME__) now lives on the live row-17
+       fps line.  Removing the 60-vblank busy-loop also shaves ~1s off boot. */
 
     printf("build: " __DATE__ " " __TIME__ "\n");
     printf("DoomSRL platform init\n");

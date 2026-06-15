@@ -1,3 +1,6 @@
 [submodule "SaturnRingLib"]
 	path = SaturnRingLib
 	url = https://github.com/ReyeMe/SaturnRingLib.git
+[submodule "core"]
+	path = core
+	url = https://github.com/N0rt0N85/doom-saturn-core.git

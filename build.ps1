@@ -74,7 +74,11 @@ try {
     if ($cdda) { $makeArgs = "CDDA_MUSIC=1" }
 
     Write-Host "Building DoomSRL$(if ($cdda) {' (CDDA)'})..."
-    Invoke-Msys2 "cd '$rootMsys' && make $makeTarget $makeArgs"
+    # Touch the file carrying the on-screen build stamp (dg_saturn.cxx -> row 18
+    # "b:<__TIME__>") so every build recompiles it with a fresh timestamp -- lets
+    # you confirm on hardware that you flashed THIS build even when only core/
+    # files changed (which otherwise leaves dg_saturn.o, and its __TIME__, stale).
+    Invoke-Msys2 "cd '$rootMsys' && touch src/dg_saturn.cxx && make $makeTarget $makeArgs"
 
     # SRL outputs to build/DoomSRL.bin + build/DoomSRL.cue
     $binPath = Join-Path $root "build\DoomSRL.bin"

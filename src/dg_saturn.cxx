@@ -36,7 +36,7 @@ extern "C" {
    once the indirect descriptor table is built through the cache-through mirror
    so the cacheless SCU bus master reads valid descriptors -- see dma_table_build).
    0 = plain CPU copy (slower, kept as a safe fallback). */
-#define USE_SCU_DMA 1
+#define USE_SCU_DMA 0
 
 extern "C" byte *I_VideoBuffer;
 extern "C" int   gametic;
@@ -359,12 +359,24 @@ static void fps_update(void)
     {
         unsigned int elapsed = now - t0;
         unsigned int fps = (frames * hz + elapsed / 2) / elapsed;
+        /* tenths of an fps, for resolution at 5-10 fps; EMA (~4s) for a stable
+           average to compare builds with. */
+        unsigned int inst10 = (frames * 10u * hz + elapsed / 2) / elapsed;
+        static unsigned int avg10 = 0;
+        avg10 = avg10 ? (avg10 * 3 + inst10) / 4 : inst10;
         static char r2[45];
         sprintf(r2, "%2ufps gt%5d vp%3d dma%4u dsta%04x",
                 fps, gametic, r_visplane_peak,
                 (unsigned int)last_dma_ticks,
                 (unsigned int)(SCU_DSTA & 0xFFFF));
         SRL::Debug::Print(0, 2, r2);
+        {
+            static char rA[45];
+            sprintf(rA, "AVG %u.%u fps  inst %u.%u    ",
+                    avg10 / 10, avg10 % 10, inst10 / 10, inst10 % 10);
+            SRL::Debug::Print(0, 17, rA);
+        }
+        SRL::Debug::Print(0, 18, irq_result);   /* boot IRQ-cost probe (1.1) */
         t0     = now;
         frames = 0;
     }
@@ -545,6 +557,12 @@ extern "C" void DG_DrawFrame(void)
     dg_frame_count++;
     fps_update();
 #endif
+
+    /* SATURN: no per-frame slSynch / SRL::Core::Synchronize here -- the freeze is
+       handled by rp_sgl_workptr_reset() (core/r_parallel.c) resetting BOTH the
+       slave write (GBR+72) and read (GBR+68) pointers each frame.  That avoids
+       slSynch's vblank-cap (~7-12fps) and its SCSP-sound conflict (silent SFX),
+       so we keep the full parallel speed and working sound. */
 
 #if !USE_SCU_DMA
     /* CPU blit fallback (no SCU DMA).  The raw SCU DMA blit below hangs the

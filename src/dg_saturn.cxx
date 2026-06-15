@@ -363,10 +363,10 @@ static void fps_update(void)
         static unsigned int avg10 = 0;
         avg10 = avg10 ? (avg10 * 3 + inst10) / 4 : inst10;
         static char r2[45];
-        sprintf(r2, "%2ufps gt%5d vp%3d dma%4u dsta%04x",
-                fps, gametic, r_visplane_peak,
-                (unsigned int)last_dma_ticks,
-                (unsigned int)(SCU_DSTA & 0xFFFF));
+        /* Trimmed: fps duplicated row 17's inst, and dma/dsta were dead with the
+           SCU DMA blit disabled (USE_SCU_DMA=0).  Kept gt (heartbeat) + vp
+           (visplane peak) -- vp is the number sky->VDP2 should pull down. */
+        sprintf(r2, "gt%5d vp%3d", gametic, r_visplane_peak);
         SRL::Debug::Print(0, 2, r2);
         {
             static char rA[45];

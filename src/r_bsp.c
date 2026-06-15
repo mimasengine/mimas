@@ -87,6 +87,31 @@ typedef	struct
 cliprange_t*	newend;
 cliprange_t	solidsegs[MAXSEGS];
 
+/* SATURN DEBUG: solidsegs[] is the prime suspect for the R_RenderBSPNode
+   (R:bsp) infinite-loop freeze.  R_ClipSolidWallSegment does newend++ with no
+   MAXSEGS bound (vanilla relies on the count staying < 32); an overrun -- or a
+   stray write that corrupts the high 0x7fffffff sentinel or newend itself --
+   makes the "while (start->last < first-1) start++;" walks run off the array
+   forever (CPU stuck, vblank ISR still ticking = the exact symptom).  We now
+   bound newend and the walks, and count both so the freeze becomes a
+   survivable, logged glitch (overlay row 12 SSOF). */
+int sat_ss_overflow = 0;   /* newend reached MAXSEGS (internal overflow)     */
+int sat_ss_walkoff  = 0;   /* a clip walk hit the array end (sentinel gone)  */
+extern void jo_print(int x, int y, char *str);
+static void sat_ss_report(void)
+{
+    static int last = -1;
+    int n = sat_ss_overflow + sat_ss_walkoff;
+    if (n != last)
+    {
+        static char b[45];
+        last = n;
+        snprintf(b, sizeof(b), "SSOF of%d wo%d ne%d", sat_ss_overflow,
+                 sat_ss_walkoff, (int)(newend - solidsegs));
+        jo_print(0, 12, b);
+    }
+}
+
 
 
 
@@ -104,11 +129,27 @@ R_ClipSolidWallSegment
     cliprange_t*	next;
     cliprange_t*	start;
 
+    /* SATURN: bound newend so a full solidsegs[] (or a stray-write-inflated
+       newend) cannot overrun the array and destroy the sentinel.  Drop the
+       segment instead -- minor glitch, no freeze. */
+    if (newend >= &solidsegs[MAXSEGS-1])
+    {
+        sat_ss_overflow++;
+        sat_ss_report();
+        return;
+    }
+
     // Find the first range that touches the range
     //  (adjacent pixels are touching).
     start = solidsegs;
-    while (start->last < first-1)
+    while (start->last < first-1 && start < &solidsegs[MAXSEGS-1])
 	start++;
+    if (start->last < first-1)   /* SATURN: sentinel gone -> bail, don't loop */
+    {
+        sat_ss_walkoff++;
+        sat_ss_report();
+        return;
+    }
 
     if (first < start->first)
     {
@@ -199,8 +240,14 @@ R_ClipPassWallSegment
     // Find the first range that touches the range
     //  (adjacent pixels are touching).
     start = solidsegs;
-    while (start->last < first-1)
+    while (start->last < first-1 && start < &solidsegs[MAXSEGS-1])
 	start++;
+    if (start->last < first-1)   /* SATURN: sentinel gone -> bail, don't loop */
+    {
+        sat_ss_walkoff++;
+        sat_ss_report();
+        return;
+    }
 
     if (first < start->first)
     {
@@ -469,9 +516,15 @@ boolean R_CheckBBox (fixed_t*	bspcoord)
     sx2--;
 	
     start = solidsegs;
-    while (start->last < sx2)
+    while (start->last < sx2 && start < &solidsegs[MAXSEGS-1])
 	start++;
-    
+    if (start->last < sx2)       /* SATURN: sentinel gone -> treat as visible */
+    {
+        sat_ss_walkoff++;
+        sat_ss_report();
+        return true;
+    }
+
     if (sx1 >= start->first
 	&& sx2 <= start->last)
     {

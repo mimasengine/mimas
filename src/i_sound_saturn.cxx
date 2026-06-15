@@ -32,6 +32,15 @@ static int cdda_track = 0;
 /* Hardware                                                             */
 /* ------------------------------------------------------------------ */
 
+/* SFX debug overlay (off by default; jo_print shim lives in dg_saturn.cxx):
+ *   row 6  SFX#<n> ch<c> ns<samples> r<rate> o<sram_off>  (last sound, or CACHE-FAIL)
+ *   row 7  PLAY <8-ch live map>  r<sram high-water>  f<cache failures>
+ * Used to localise the silent-SFX bug to MVOL=0 and the rapid-retrigger drop. */
+#define SFX_DIAG 0
+#if SFX_DIAG
+extern "C" void jo_print(int x, int y, char *str);
+#endif
+
 #define SOUND_RAM       0x25A00000u
 #define SOUND_RAM_SIZE  0x80000u
 #define SCSP_SLOT(n)    ((volatile unsigned short *)(0x25B00000u + ((n) << 5)))
@@ -79,6 +88,13 @@ static int           sfx_cache_used = 0;
 static unsigned int  sram_alloc     = 0x100;
 static uint32_t      chan_end_ms[NUM_CHANNELS];
 static boolean       sound_ready    = false;
+
+#if SFX_DIAG
+/* "Missing sounds" hunt: I_UpdateSound shows which channels are live + the
+ * sound-RAM high-water mark + the running cache-failure count, to see whether
+ * sounds actually spread across channels and whether the SFX RAM/cache runs dry. */
+static unsigned int   dbg_cachefail = 0;
+#endif
 
 extern "C" int   snd_sfxdevice       = SNDDEVICE_SB;
 extern "C" int   snd_musicdevice     = SNDDEVICE_SB;
@@ -422,8 +438,14 @@ extern "C" void I_InitSound(boolean use_sfx_prefix)
         for (int r = 0; r < 16; ++r) slot[r] = 0;
         slot[R_EG2] = 0x001Fu;
     }
+    /* SRL/SGL leaves the SCSP master volume at 0 in CDDA mode (CD-DA is mixed
+     * on a separate path, so music is audible while every slot stays muted --
+     * that's the SFX bug). Force MVOL=15, preserving MEM4MB/DAC18B as set by
+     * the SGL driver. */
+    SCSP_CONTROL = (unsigned short)((SCSP_CONTROL & 0xFFF0u) | 0x000Fu);
     sound_ready = true;
-    printf("I_InitSound: CDDA (SRL), SFX sram @ 0x%x\n", (unsigned)sram_alloc);
+    printf("I_InitSound: CDDA (SRL), SFX sram @ 0x%x, ctl=0x%x\n",
+           (unsigned)sram_alloc, (unsigned)SCSP_CONTROL);
     return;
 #endif
 
@@ -457,9 +479,24 @@ extern "C" void I_UpdateSound(void)
 #ifndef SATURN_CDDA_MUSIC
     if (mus.playing && !mus.paused)
         mus_step(DG_GetTicksMs());
-#else
-    /* CDDA: SRL::Sound::Cdda handles playback automatically; nothing to poll. */
-    (void)0;
+#endif
+#if SFX_DIAG
+    /* Row 7: per-channel live map. For each channel 0-7 show its index while it
+     * is still inside its playback window (our chan_end_ms bookkeeping = Doom
+     * thinks it's playing), else '.'. Then sound-RAM high-water (r) and the
+     * running cache-failure count (f). Lets us see whether sounds actually
+     * spread across channels and whether the SFX RAM/cache is running dry. */
+    {
+        uint32_t now = DG_GetTicksMs();
+        char map[NUM_CHANNELS + 1];
+        for (int ch = 0; ch < NUM_CHANNELS; ++ch)
+            map[ch] = (now < chan_end_ms[ch]) ? (char)('0' + ch) : '.';
+        map[NUM_CHANNELS] = 0;
+        static char ln7[45];
+        snprintf(ln7, sizeof ln7, "PLAY %s  r%05x f%u   ", map,
+                 (unsigned)sram_alloc, dbg_cachefail);
+        jo_print(0, 7, ln7);
+    }
 #endif
 }
 
@@ -476,10 +513,34 @@ extern "C" int I_StartSound(sfxinfo_t *sfxinfo, int channel, int vol, int sep)
     if (!sound_ready || channel < 0 || channel >= NUM_CHANNELS) return -1;
     if (sfxinfo->link != NULL) sfxinfo = sfxinfo->link;
     cached_sfx_t *c = cache_sfx(sfxinfo);
+#if SFX_DIAG
+    { static unsigned int n = 0; static char sb[45];
+      if (c) snprintf(sb, sizeof sb, "SFX#%u ch%d ns%u r%u o%05x  ",
+                      ++n, channel, c->nsamples, c->rate, c->sram_off);
+      else { ++dbg_cachefail;
+             snprintf(sb, sizeof sb, "SFX#%u ch%d CACHE-FAIL       ", ++n, channel); }
+      jo_print(0, 6, sb); }
+#endif
     if (!c) return -1;
 
+#ifdef SATURN_CDDA_MUSIC
+    /* Defensive: keep the SCSP master volume up in case the SGL driver zeroed
+     * it after I_InitSound (see the MVOL note there). */
+    SCSP_CONTROL = (unsigned short)((SCSP_CONTROL & 0xFFF0u) | 0x000Fu);
+#endif
     volatile unsigned short *slot = SCSP_SLOT(channel);
+
+    /* Restart cleanly on a slot that may already be playing (rapid same-channel
+     * retrigger, e.g. continuous pistol fire on ch0): key the slot OFF and let
+     * the SCSP COMMIT that key-off (KYONEX clears on its internal scan) BEFORE
+     * we reprogram and key ON. Without the wait the off+on KYONEX commits land
+     * in the same scan window, coalesce into "stay/go off", and the shot is
+     * silently dropped. Poll KYONEX-clear with a minimum settle floor (in case
+     * the bit isn't read-backable) and a hard cap. */
     slot[R_KYON] = (unsigned short)((slot[R_KYON] & ~(KYONB | KYONX)) | KYONX);
+    for (int g = 0; g < 600; ++g)
+        if (!(slot[R_KYON] & KYONX) && g >= 64) break;
+
     slot[R_SA]    = (unsigned short)(c->sram_off & 0xFFFFu);
     slot[R_LSA]   = 0;
     slot[R_LEA]   = (unsigned short)(c->nsamples - 1u);

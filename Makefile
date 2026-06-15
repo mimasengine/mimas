@@ -72,7 +72,11 @@ SOURCES += $(DOOM_CXXSRCS)
 # -----------------------------------------------------------------------
 # Doom-specific compile flags
 # -----------------------------------------------------------------------
-CDDA_MUSIC ?= 0
+# Default ON: keeps the 68K running + the CDDA sound path active even with no
+# music tracks present, so the SFX bug (correlated with 68K-alive) reproduces.
+# build.ps1 still passes CDDA_MUSIC=1 explicitly when cd/music has tracks; an
+# empty cd/music means the sox audio-append step finds nothing and is a no-op.
+CDDA_MUSIC ?= 1
 ifeq ($(CDDA_MUSIC),1)
   CDDA_FLAG = -DSATURN_CDDA_MUSIC
 endif

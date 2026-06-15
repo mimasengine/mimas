@@ -160,10 +160,11 @@ void D_ProcessEvents (void)
 //  draw current display, possibly wiping it from the previous
 //
 
-// SATURN: debug timing for D_Display sub-phases (row 5) and doomgeneric_Tick (rows 3-4).
-// Both D_Display and doomgeneric_Tick use d_ms; defines must precede both.
-#define DISPLAY_DEBUG     1
-#define SATURN_TICK_DEBUG 1
+// SATURN: per-frame timing overlays (D_Display sub-phases row 5, doomgeneric_Tick
+// rows 3-4).  Off by default -- they sprintf every frame (SH-2 perf).  Set to 1
+// to re-enable.
+#define DISPLAY_DEBUG     0
+#define SATURN_TICK_DEBUG 0
 extern void jo_print(int x, int y, char *str);
 extern uint32_t DG_GetTicksMs(void);
 #define d_ms DG_GetTicksMs
@@ -483,7 +484,7 @@ boolean D_GrabMouseCallback(void)
 }
 
 // SATURN: per-phase timing; defines moved before D_Display (see above).
-#define SATURN_TICK_DEBUG 1
+#define SATURN_TICK_DEBUG 0
 
 // SATURN: memory-corruption canary, defined in r_main.c
 void V_Canary (const char* where);
@@ -510,11 +511,6 @@ void doomgeneric_Tick()
 
     // frame syncronous IO operations
     I_StartFrame ();
-
-    /* SATURN: tick counter overlay (row 6); updated every doomgeneric_Tick
-       call, independently of DG_DrawFrame, to show the loop is alive. */
-    extern void sat_tick_show(void);
-    sat_tick_show();
 
     V_Canary ("tick start");
 
@@ -587,13 +583,6 @@ void doomgeneric_Tick()
         }
     }
 #endif
-
-    /* SATURN DEBUG: end-of-tick heartbeat (overlay row 10).  If this never
-       advances past 0, tick 1 hung inside the first D_Display. */
-    {
-        extern void sat_tick_end(void);
-        sat_tick_end();
-    }
 }
 
 //

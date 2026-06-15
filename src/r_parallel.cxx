@@ -24,7 +24,8 @@ extern "C" {
 #include "r_parallel.h"
 }
 
-#define RP_DEBUG 1
+/* Per-frame slave-timing overlay (row 2).  Off by default (sprintf/frame). */
+#define RP_DEBUG 0
 
 #if RP_DEBUG
 extern "C" unsigned short sat_frt(void);
@@ -85,35 +86,6 @@ static int  rp_disabled;
 extern "C" int rp_timeout_count;
 int rp_timeout_count = 0;
 
-/* ------------------------------------------------------------------ */
-/* SATURN DEBUG: out-of-bounds draw-command telemetry.                 */
-/* Either CPU records the latest bad command into this uncached block; */
-/* the master prints a summary after the frame (overlay row 7 + emu    */
-/* console).  A non-zero count means a draw command reached an         */
-/* executor with coordinates outside the screen -- i.e. the command    */
-/* data was corrupted (stray write, or master/slave cache incoherency).*/
-/* This is the prime freeze suspect: a bad cm->a/b/c turns             */
-/* ylookup[]/columnofs[] into a wild pointer -> stomps BSS globals.    */
-/* ------------------------------------------------------------------ */
-extern "C" volatile int game_phase;
-
-typedef struct {
-    int count;
-    int type, a, b, c, phase;
-} rp_diag_t;
-static rp_diag_t rp_diag_store __attribute__((aligned(16)));
-#define DIAG ((volatile rp_diag_t *)((unsigned int)&rp_diag_store | 0x20000000u))
-
-static void rp_badcmd(const rp_cmd_t *cm)
-{
-    DIAG->count++;
-    DIAG->type  = cm->type;
-    DIAG->a     = cm->a;
-    DIAG->b     = cm->b;
-    DIAG->c     = cm->c;
-    DIAG->phase = game_phase;
-}
-
 static void (*saved_col)(void);
 static void (*saved_base)(void);
 static void (*saved_fuzz)(void);
@@ -135,7 +107,7 @@ static void rp_exec_col(const rp_cmd_t *cm, const int *colofs)
 
     if ((unsigned short)cm->a >= SCREENWIDTH  ||
         (unsigned short)cm->b >= SCREENHEIGHT ||
-        (unsigned short)cm->c >= SCREENHEIGHT) { rp_badcmd(cm); return; }
+        (unsigned short)cm->c >= SCREENHEIGHT) return;
     if (count <= 0) return;
 
     memcpy(col_cache, src, 128);
@@ -194,7 +166,7 @@ static void rp_exec_trans(const rp_cmd_t *cm, const int *colofs)
     if (count < 0) return;
     if ((unsigned short)cm->a >= SCREENWIDTH  ||
         (unsigned short)cm->b >= SCREENHEIGHT ||
-        (unsigned short)cm->c >= SCREENHEIGHT) { rp_badcmd(cm); return; }
+        (unsigned short)cm->c >= SCREENHEIGHT) return;
     dest = ylookup[cm->b] + colofs[cm->a];
     step = cm->f1;
     frac = cm->f2 + (cm->b - centery) * step;
@@ -220,7 +192,7 @@ static void rp_exec_span(const rp_cmd_t *cm, const int *colofs)
 
     if ((unsigned short)cm->a >= SCREENHEIGHT ||
         (unsigned short)cm->b >= SCREENWIDTH  ||
-        (unsigned short)cm->c >= SCREENWIDTH)  { rp_badcmd(cm); return; }
+        (unsigned short)cm->c >= SCREENWIDTH)  return;
     dest  = ylookup[cm->a] + colofs[cm->b];
     count = cm->c - cm->b + 1;
 
@@ -255,7 +227,7 @@ static void rp_exec_fuzz(const rp_cmd_t *cm)
        / us_acc and freezes the game.  Check all three like the others. */
     if ((unsigned short)cm->a >= SCREENWIDTH  ||
         (unsigned short)cm->b >= SCREENHEIGHT ||
-        (unsigned short)cm->c >= SCREENHEIGHT) { rp_badcmd(cm); return; }
+        (unsigned short)cm->c >= SCREENHEIGHT) return;
     if (!yl) yl=1;
     if (yh==viewheight-1) yh=viewheight-2;
     count=yh-yl;
@@ -414,22 +386,6 @@ static void rp_finish(void)
         if (cmds[i].type==RP_FUZZ) rp_exec_fuzz(&cmds[i]);
 
     master_cache_purge();
-
-    /* SATURN DEBUG: report new out-of-bounds draw commands (overlay row 7). */
-    {
-        static int rp_diag_last = 0;
-        int c = DIAG->count;
-        if (c != rp_diag_last)
-        {
-            rp_diag_last = c;
-            static char d[45];
-            sprintf(d, "RPBAD n%d t%d a%d b%d c%d ph%d", c,
-                    DIAG->type, DIAG->a, DIAG->b, DIAG->c, DIAG->phase);
-            SRL::Debug::Print(0, 7, d);
-            printf("RPBAD #%d type=%d a=%d b=%d c=%d phase=%d\n", c,
-                   DIAG->type, DIAG->a, DIAG->b, DIAG->c, DIAG->phase);
-        }
-    }
 
 #if RP_DEBUG
     {

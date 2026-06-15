@@ -868,58 +868,35 @@ void R_SetupFrame (player_t* player)
 // CPU is unavailable or low-detail mode is active.
 #include "r_parallel.h"
 
-/* SATURN: FRT probe — measure pre-RP time displayed as 'p' on RP_DEBUG row 2 */
-extern unsigned short sat_frt(void);
-extern unsigned short rp_frt_entry;   /* written here, read in r_parallel.c */
-
 /* SATURN: viewangleoffset corruption canary.
    No longer halts — resets and prints so we can locate the writer without
    freezing the game.  If this fires, look for the OOB write adjacent to
    the r_plane.o BSS boundary (BSS map: viewangleoffset @ 0x060cadf8,
    cachedystep[0] @ 0x060cadfc). */
 #include "i_system.h"
-extern volatile int game_phase;            /* SATURN: defined in dg_saturn.cxx */
-extern void jo_print(int x, int y, char *str);  /* -> SRL::Debug::Print overlay */
-int sat_vao_corrupt_count = 0;             /* SATURN DEBUG: viewangleoffset hits */
 void V_Canary (const char* where)
 {
     if (viewangleoffset != 0)
     {
-        /* SATURN DEBUG: viewangleoffset sits just below r_plane.o's
-           cached*[] arrays; a negative-index / overrun write lands here.
-           Show on overlay row 8 (visible on real hardware, unlike printf
-           which only reaches the disabled in-game console) with the value,
-           the call site, and the game_phase to localise the writer. */
-        static char vbuf[45];
-        ++sat_vao_corrupt_count;
-        snprintf(vbuf, sizeof(vbuf), "VAOCOR n%d vao%08x @%.6s ph%d",
-                 sat_vao_corrupt_count, (unsigned int)viewangleoffset,
-                 where ? where : "?", game_phase);
-        jo_print(0, 8, vbuf);
-        if (sat_vao_corrupt_count <= 8)
-            printf("CANARY: vao=%08x @%s cnt=%d ph%d\n",
-                   (unsigned int)viewangleoffset, where,
-                   sat_vao_corrupt_count, game_phase);
+        static int canary_count = 0;
+        if (canary_count < 8)
+        {
+            printf("CANARY: vao=%08x @%s cnt=%d\n",
+                   (unsigned int)viewangleoffset, where, ++canary_count);
+        }
         viewangleoffset = 0;   /* reset so the view does not rotate away */
     }
 }
 
 /* SATURN: phase indicator (defined in dg_saturn.c). */
 extern volatile int game_phase;
-/* SATURN DEBUG: persistent checkpoint on overlay row 9 (defined dg_saturn.cxx).
-   The ~1-2min freeze is inside this function (ph4); these sub-markers reveal
-   which step loops -- read row 9 when it freezes. */
-extern void sat_stage(const char *s);
 
 void R_RenderPlayerView (player_t* player)
 {
     V_Canary ("frame start");
 
-    rp_frt_entry = sat_frt();   /* SATURN: start of pre-RP window */
-
     game_phase = 4; /* R_RenderPlayerView (BSP + execute) */
 
-    sat_stage("R:setup");
     R_SetupFrame (player);
 
     // Clear buffers.
@@ -934,7 +911,6 @@ void R_RenderPlayerView (player_t* player)
     RP_BeginFrame ();
 
     // The head node is the last node output.
-    sat_stage("R:bsp");
     R_RenderBSPNode (numnodes-1);
 
     V_Canary ("bsp");
@@ -942,7 +918,6 @@ void R_RenderPlayerView (player_t* player)
     // Check for new console commands.
     NetUpdate ();
 
-    sat_stage("R:planes");
     R_DrawPlanes ();
 
     V_Canary ("planes");
@@ -953,18 +928,15 @@ void R_RenderPlayerView (player_t* player)
     RP_BeginMasked ();
 
     game_phase = 5; /* R_DrawMasked */
-    sat_stage("R:masked");
     R_DrawMasked ();
 
     V_Canary ("masked");
 
     game_phase = 4; /* back to render (RP_EndFrame) */
-    sat_stage("R:endf");
     RP_EndFrame ();
 
     V_Canary ("endframe");
 
     // Check for new console commands.
     NetUpdate ();
-    sat_stage("R:done");
 }

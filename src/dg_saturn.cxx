@@ -33,10 +33,17 @@ extern "C" {
    run on a 4MB emulator the same way a no-cart / 1M-cart system would). */
 #define FORCE_CD_STREAM 0
 
-/* Framebuffer->VDP2 blit method.  1 = SCU DMA (fast; validated on real hardware
-   once the indirect descriptor table is built through the cache-through mirror
-   so the cacheless SCU bus master reads valid descriptors -- see dma_table_build).
-   0 = plain CPU copy (slower, kept as a safe fallback). */
+/* Framebuffer->VDP2 blit method.  1 = SCU DMA, 0 = plain CPU copy (~10ms/frame,
+   the reliable fallback -- CURRENT).
+   STEP 4a RESULT (2026-06-16): triggering on VBLANK-IN (D0MD start factor 0) does
+   NOT fix the hang -- real Saturn still locks the bus at F00001.  And the
+   "synchronous" wait is bogus for a deferred trigger: dma_wait_idle (DSTA & 0x30)
+   returns BEFORE the vblank-deferred DMA fires, so it ran effectively async on a
+   single buffer -> the next frame overwrote the framebuffer mid-transfer ->
+   intermittent/torn frames on emulator (e.g. menu text present-or-not).
+   Conclusion: the raw-register SCU DMA blit is a dead end (3rd failure).  Back to
+   the CPU blit.  If the ~10ms is pursued again: dual-CPU blit (idle slave copies
+   half) or SGL slDMACopy -- NOT this raw-register path. */
 #define USE_SCU_DMA 0
 
 extern "C" byte *I_VideoBuffer;
@@ -710,9 +717,13 @@ extern "C" void DG_DrawFrame(void)
     return;
 #endif
 
-    /* SCU DMA blit -- synchronous: wait for previous, kick, wait for this one.
-       Made synchronous to prevent an async DMA from bus-starving the SH-2
-       and freezing the game loop on real hardware. */
+    /* SCU DMA blit -- STEP 4a reliability probe.  D0MD start factor = 0
+       (VBLANK-IN) instead of 7 (immediate): the transfer is deferred to vblank
+       so it no longer fights the VDP for the B-bus during active display (the old
+       hang).  Still SYNCHRONOUS (wait for previous, kick, wait for this one) -- so
+       this is NOT a speed win yet (we pay the vblank latency + transfer); it only
+       answers "does VBLANK-IN stop the hang and render correctly?".  If stable,
+       step 4b drops the wait-after and adds a pre-render wait to reclaim the time. */
 #if SHOW_FPS
     {
         unsigned short t0, t1;
@@ -727,7 +738,7 @@ extern "C" void DG_DrawFrame(void)
         cache_purge();
         SCU_D0W  = (unsigned int)dma_table;
         SCU_D0AD = 0x101;
-        SCU_D0MD = 0x01000007;
+        SCU_D0MD = 0x01000000;   /* indirect + start factor 0 = VBLANK-IN */
         SCU_D0EN = 0x101;
         dma_wait_idle();
 
@@ -741,7 +752,7 @@ extern "C" void DG_DrawFrame(void)
     cache_purge();
     SCU_D0W  = (unsigned int)dma_table;
     SCU_D0AD = 0x101;
-    SCU_D0MD = 0x01000007;
+    SCU_D0MD = 0x01000000;   /* indirect + start factor 0 = VBLANK-IN */
     SCU_D0EN = 0x101;
     dma_wait_idle();
 #endif

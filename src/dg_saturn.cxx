@@ -77,6 +77,13 @@ extern "C" char *gamedescription;
    weapon (the async foundation is hardware-validated).  1 = on, 0 = off. */
 #define VDP1_WEAPON 1
 
+/* VDP1 WORLD-RENDERER Phase-0: draw ONE distorted textured quad (a grid texture on a
+   trapezoid) to validate FUNC_DISTORSP and, above all, SEE the affine perspective
+   WARP -- the #1 risk of the SlaveDriver-style wall renderer (walls = distorted
+   textured sprites).  Grid lines that bow/skew = the affine error to judge (whether
+   sub-quad subdivision is needed).  1 = on (this test), 0 = off. */
+#define VDP1_WALL_TEST 1
+
 extern "C" byte *I_VideoBuffer;
 extern "C" int   gametic;
 extern "C" int   r_visplane_peak;
@@ -159,6 +166,24 @@ void sat_vdp1_wpn_draw(patch_t *patch, int lump, int sx, int sy, int flip,
                        const unsigned char *cmap);
 }
 #endif
+
+#if VDP1_WALL_TEST
+/* VDP1 world-renderer Step 3: textured one-sided walls.  The core hook (r_segs.c)
+   hands each one-sided wall's 4 screen corners + texnum + texture-u at the two ends +
+   light colormap; we build the texture (cached per texnum) and tile it across the wall
+   as distorted sub-quads.  Forward-declared so DG_Init can register it.  texturewidthmask
+   / textureheight are core globals (r_data.c, fixed_t = int). */
+extern "C" {
+extern void (*sat_wall_hook)(int x1, int yl1, int yh1, int x2, int yl2, int yh2,
+                             int texnum, int u1, int u2, const unsigned char *cmap);
+void sat_wall_vdp1(int x1, int yl1, int yh1, int x2, int yl2, int yh2,
+                   int texnum, int u1, int u2, const unsigned char *cmap);
+extern int *textureheight;       /* fixed_t: pixels = >>16 */
+extern int *texturewidthmask;    /* width-1 */
+extern int  sat_wall_skip;       /* 1 = skip the software one-sided wall draw (VDP1 owns it) */
+}
+#endif
+
 /* Potato (solid-colour, flat-shaded) -- big EX/fillrate win, visible quality drop,
    aimed at perf-tight builds (e.g. future 2/4-player split-screen).  POTATO_LEVEL
    is the boot level; cycle live in-game with the pad Z button.  Levels:
@@ -434,6 +459,10 @@ volatile int game_phase = 0;
 #if SHOW_FPS
 extern "C" int rp_timeout_count;
 static unsigned int dg_frame_count = 0;
+/* VDP1 load gauge (set in the kick): commands submitted this frame + whether the previous
+   frame's plot had finished (CEF) by the next kick -> 'D'one (headroom) / 'B'usy (saturated). */
+static int vdp1_last_cmds = 0;
+static int vdp1_prev_done = 1;
 
 static void fps_update(void)
 {
@@ -477,6 +506,19 @@ static void fps_update(void)
             sprintf(rA, "AVG %u.%u inst %u.%u b:" __TIME__,
                     avg10 / 10, avg10 % 10, inst10 / 10, inst10 % 10);
             SRL::Debug::Print(0, 17, rA);
+        }
+        {
+            /* row 16: the 6 (co)processors, for headroom-at-a-glance.  MST = master SH-2
+               frame ms (the synchronous bottleneck).  SLV = slave SH-2 -> its own row 18
+               (i/b%).  VD1 = VDP1 commands this frame + D(one)/B(usy).  VD2 = VDP2 (always
+               compositing, spare capacity).  SCU = SCU-DSP/DMA (idle here = free to offload).
+               68K = SCSP sound CPU (fixed). */
+            static char r6[45];
+            unsigned int mst = inst10 ? (10000u / inst10) : 0;   /* frame ms */
+            sprintf(r6, "MST%ums SLV>r18 VD1 %d%c VD2~ SCU%s 68Ksnd",
+                    mst, vdp1_last_cmds, vdp1_prev_done ? 'D' : 'B',
+                    USE_SCU_DMA ? "dma" : "-");
+            SRL::Debug::Print(0, 16, r6);
         }
         {
             /* row 21: WAD identity detected from the IWAD's own lumps (free row,
@@ -603,7 +645,13 @@ extern "C" void DG_Init(void)
 #if SKY_DEBUG_SHOW
     slPriorityNbg0(6); slPriorityNbg1(5);   /* sky ON TOP to verify Stage A */
 #else
-    slPriorityNbg0(5); slPriorityNbg1(6);   /* sky below game; shown via transparency */
+    /* LAYER INVERSION: software (NBG1) ON TOP with Doom's correct occlusion; the VDP1
+       walls render BELOW NBG1, filling the index-0 (transparent) wall gaps NBG1 leaves
+       where the software wall draw is skipped.  NBG3 debug = 7 (top).
+       NBG1 game = 6  >  every sprite priority = 5  >  NBG0 sky = 4. */
+    slPriorityNbg0(4); slPriorityNbg1(6);
+    slPrioritySpr0(5); slPrioritySpr1(5); slPrioritySpr2(5); slPrioritySpr3(5);
+    slPrioritySpr4(5); slPrioritySpr5(5); slPrioritySpr6(5); slPrioritySpr7(5);
 #endif
     slScrAutoDisp(NBG0ON | NBG1ON | NBG3ON);
 
@@ -612,10 +660,15 @@ extern "C" void DG_Init(void)
     sat_vdp2_sky = 1;
     sat_apply_potato();   /* boot Potato level; pad Z cycles it live */
 
-#if VDP1_WEAPON
-    /* Route the player weapon to the VDP1 hardware sprite layer (core hooks). */
-    sat_psprite_begin = sat_vdp1_wpn_begin;
-    sat_psprite_hook  = sat_vdp1_wpn_draw;
+    /* LAYER INVERSION: the weapon + HUD now render in SOFTWARE (NBG1, on top) -- do NOT
+       route them to VDP1.  VDP1 carries ONLY the walls, BELOW NBG1.  (The VDP1 weapon/
+       HUD path is left in the file but unhooked.) */
+
+#if VDP1_WALL_TEST
+    /* Route one-sided (solid) walls to the VDP1 world renderer AND skip their
+       software column draw -> see the VDP1 coverage + the perf it buys back. */
+    sat_wall_hook = sat_wall_vdp1;
+    sat_wall_skip = 1;
 #endif
 
     SRL::Debug::Print(0, 1, "INIT DOOM...");
@@ -707,27 +760,31 @@ static void sky_upload(void)
 #define VDP1_EWDR  (*(volatile unsigned short *)0x25D00006)
 #define VDP1_EWLR  (*(volatile unsigned short *)0x25D00008)
 #define VDP1_EWRR  (*(volatile unsigned short *)0x25D0000A)
+#define VDP1_EDSR  (*(volatile unsigned short *)0x25D00010)   /* status: bit1 CEF = draw done */
 #define VDP1_VRAM_BASE 0x25C00000u
 
 /* DOUBLE-BUFFERED command list (kills the tearing: VDP1 in 1-cycle mode plots every
    vblank, so rewriting the list in place lets it read a half-written frame -> black
    square / missing parts).  A fixed root command @VRAM 0 (sysclip + JUMP, CTRL
    constant) whose 1-halfword LINK is the ONLY per-frame write -> atomic, race-free
-   buffer flip.  Layout: root@+0, empty@+0x40, bank0@+0x100, bank1@+0x500.  Textures
-   are NOT double-buffered -- they live in a STABLE per-lump cache (below), so VDP1
-   never reads a texture mid-rebuild. */
+   buffer flip.  Layout: root@+0, empty@+0x40, bank0@+0x100, bank1@+0x2100 (256 cmds
+   each).  Textures are NOT double-buffered -- they live in a STABLE per-lump cache
+   (below), so VDP1 never reads a texture mid-rebuild. */
 #define VDP1_ROOT_ADDR  0x25C00000u
 #define VDP1_BANKE_ADDR 0x25C00040u
-static const unsigned int VDP1_BANK[2] = { 0x25C00100u, 0x25C00500u };
+static const unsigned int VDP1_BANK[2] = { 0x25C00100u, 0x25C02100u };
+#define VDP1_BANK_CMDS  256               /* commands per bank (0x2000 VRAM / 32B each) */
+#define VDP1_CMD_GUARD  (VDP1_BANK_CMDS - 2)   /* weapon/HUD stop here (leave end + 1) */
 
 /* Texture cache: each weapon frame's texture lives in a STABLE VRAM slot keyed by
    (lump, colormap) -> unpacked only on a frame/light change, not every frame (most
-   frames are just the cheap, double-buffered command).  8 slots x 44KB @0x25C20000;
-   round-robin eviction (8 slots = enough margin that a slot referenced by the
-   currently-displayed bank isn't evicted within the 1-frame flip). */
-#define WPN_TEX_BASE   0x25C20000u
+   frames are just the cheap, double-buffered command).  4 slots x 44KB @0x25C45000
+   (shrunk from 8 to free VRAM for the wall cache); round-robin eviction (4 slots =
+   enough margin that a slot referenced by the displayed bank survives the 1-frame
+   flip -- the weapon draws only 1-2 sprites/frame). */
+#define WPN_TEX_BASE   0x25C45000u
 #define WPN_TEX_SLOTSZ 0xB000u            /* 44 KB -> up to ~160x140 padded */
-#define WPN_TEX_SLOTS  8
+#define WPN_TEX_SLOTS  4
 static struct { int lump; const unsigned char *cmap; int padW; int H; }
                     wpn_cache[WPN_TEX_SLOTS];
 static int          wpn_cache_rr;
@@ -769,6 +826,266 @@ static inline unsigned short pal_rgb555(int idx)
         |  (colors[idx].r >> 3));
 }
 
+#if VDP1_WALL_TEST
+/* ---- VDP1 world-renderer Step 3: textured one-sided walls -------------------- */
+/* Each one-sided wall (captured by the core hook during the BSP walk) is accumulated,
+   then drained in vdp1_wpn_begin -- after the bank's local-coord and BEFORE the weapon
+   so walls sit behind it.  Its texture (cached per texnum, light baked) is tiled across
+   the wall as FUNC_DISTORSP sub-quads.  The software one-sided wall draw is SKIPPED
+   (sat_wall_skip=1) so this REPLACES them -> walls VDP1 can't cache (wide textures /
+   >cap) leave a hole = exactly the VDP1 coverage gap to see.  v1 approximations (TODO,
+   hw-tune): only ~3
+   textures cached (VRAM gap -- reorganise/shrink the weapon cache for more), light baked
+   per texnum (no per-distance Gouraud), no u-offset / vertical tiling for tall walls. */
+/* Wall texture cache.  The weapon+HUD are now SOFTWARE (layer inversion), so their old
+   VDP1 VRAM is RECLAIMED for walls.  TWO POOLS keyed by texture size: 8 x 32KB (narrow,
+   <=128x128) + 3 x 64KB (wide, up to 256x128) -> wide tech textures (a 32KB slot can't
+   hold them) stop leaving sky-through-wall holes.  PERSISTENT LRU (built once per texnum)
+   + per-frame `locked` (never evicted mid-frame -> no mid-frame clobber).  Narrow textures
+   prefer narrow slots, fall back to wide. */
+#define WTEX_BASE      0x25C05000u
+#define WTEX_NARROW_N  8
+#define WTEX_NARROW_SZ 0x8000u                                      /* 32KB */
+#define WTEX_WIDE_N    3
+#define WTEX_WIDE_SZ   0x10000u                                     /* 64KB -> 256x128 */
+#define WTEX_WIDE_BASE (WTEX_BASE + WTEX_NARROW_N * WTEX_NARROW_SZ) /* 0x25C45000 */
+#define WTEX_SLOTS     (WTEX_NARROW_N + WTEX_WIDE_N)                /* 11; ends 0x25C75000 */
+#define WALL_CMD_CAP   (VDP1_BANK_CMDS - 8)   /* walls stop here -> room for end + margin */
+static struct { int texnum; unsigned int addr, cap; short padW, H;
+                unsigned int lru; unsigned char locked; } wtex_cache[WTEX_SLOTS];
+static unsigned int wtex_tick;     /* per-frame monotonic clock for LRU */
+
+/* one-time: assign each slot its fixed VRAM address + capacity (narrow then wide pool) */
+static void wtex_setup(void)
+{
+    for (int i = 0; i < WTEX_NARROW_N; ++i)
+    { wtex_cache[i].addr = WTEX_BASE + (unsigned int)i * WTEX_NARROW_SZ;
+      wtex_cache[i].cap = WTEX_NARROW_SZ; }
+    for (int i = 0; i < WTEX_WIDE_N; ++i)
+    { wtex_cache[WTEX_NARROW_N + i].addr = WTEX_WIDE_BASE + (unsigned int)i * WTEX_WIDE_SZ;
+      wtex_cache[WTEX_NARROW_N + i].cap = WTEX_WIDE_SZ; }
+}
+
+#define WALL_ACC_MAX 128   /* one-sided mid + two-sided upper/lower quads */
+static struct { short x1, yl1, yh1, x2, yl2, yh2, slot; int texnum, u1, u2;
+                const unsigned char *cmap; } wall_acc[WALL_ACC_MAX];
+static int wall_acc_n;
+
+/* core hook (per one-sided seg, during the BSP walk): stash the wall */
+extern "C" void sat_wall_vdp1(int x1, int yl1, int yh1, int x2, int yl2, int yh2,
+                              int texnum, int u1, int u2, const unsigned char *cmap)
+{
+    if (wall_acc_n >= WALL_ACC_MAX) return;
+    int i = wall_acc_n++;
+    wall_acc[i].x1 = (short)x1; wall_acc[i].yl1 = (short)yl1; wall_acc[i].yh1 = (short)yh1;
+    wall_acc[i].x2 = (short)x2; wall_acc[i].yl2 = (short)yl2; wall_acc[i].yh2 = (short)yh2;
+    wall_acc[i].texnum = texnum; wall_acc[i].u1 = u1; wall_acc[i].u2 = u2;
+    wall_acc[i].cmap = cmap;
+}
+
+/* best victim in [lo,hi): an empty slot, else the least-recently-used UNLOCKED slot */
+static int wtex_find_victim(int lo, int hi)
+{
+    int victim = -1; unsigned int oldest = 0xFFFFFFFFu;
+    for (int i = lo; i < hi; ++i)
+    {
+        if (wtex_cache[i].locked) continue;
+        if (wtex_cache[i].texnum < 0) return i;
+        if (wtex_cache[i].lru < oldest) { oldest = wtex_cache[i].lru; victim = i; }
+    }
+    return victim;
+}
+
+/* resolve texnum -> cache slot, building the texture (light baked from cmap) ONLY on a
+   miss.  LRU-persistent + per-frame locked so a visible texture keeps its slot and is
+   never overwritten while another wall's command still points at it.  -> slot or -1. */
+static int wall_tex_resolve(int texnum, const unsigned char *cmap)
+{
+    for (int i = 0; i < WTEX_SLOTS; ++i)
+        if (wtex_cache[i].texnum == texnum)             /* hit: reuse, touch, lock */
+        {
+            wtex_cache[i].locked = 1;
+            wtex_cache[i].lru = wtex_tick;
+            return i;
+        }
+    int W = texturewidthmask[texnum] + 1;
+    int H = textureheight[texnum] >> 16;                /* fixed_t -> pixels */
+    int padW = (W + 7) & ~7;
+    if (W <= 0 || H <= 0) return -1;
+    unsigned int size = (unsigned int)(padW * H) * 2u;
+    if (size > WTEX_WIDE_SZ) return -1;                 /* too big even for a wide slot */
+
+    int victim;
+    if (size <= WTEX_NARROW_SZ)                         /* narrow: prefer narrow pool */
+    {
+        victim = wtex_find_victim(0, WTEX_NARROW_N);
+        if (victim < 0) victim = wtex_find_victim(WTEX_NARROW_N, WTEX_SLOTS);
+    }
+    else                                                /* wide: only the wide pool fits */
+        victim = wtex_find_victim(WTEX_NARROW_N, WTEX_SLOTS);
+    if (victim < 0) return -1;                          /* all fitting slots used this frame */
+
+    volatile unsigned short *t = (volatile unsigned short *)wtex_cache[victim].addr;
+    for (int x = 0; x < W; ++x)
+    {
+        const unsigned char *col = R_GetColumn(texnum, x);   /* H tall */
+        for (int y = 0; y < H; ++y)
+            t[y * padW + x] = pal_rgb555(cmap[col[y]]);
+    }
+    wtex_cache[victim].texnum = texnum;
+    wtex_cache[victim].padW = (short)padW; wtex_cache[victim].H = (short)H;
+    wtex_cache[victim].locked = 1;
+    wtex_cache[victim].lru = wtex_tick;
+    return victim;
+}
+
+/* Emit one wall, WORLD-U-ANCHORED + WINDOW-CLIPPED.
+   The texture repeats every `texw` in u.  Each tile is one DISTORSP sprite mapping the
+   FULL texture, with corners EXTRAPOLATED to the tile's true screen extent (linear u->x)
+   so the tiling is pinned to the world (no sliding/resizing as you move).  The sprite is
+   VDP1 user-clipped (window) to the wall's visible x-range -> a wall that only shows a
+   sub-range of the texture shows the CORRECT sub-range, not the whole texture squished
+   onto the visible quad, and the extrapolated overhang never spills onto neighbours.
+   Grazing tiles whose extent flies too far off-screen fall back to a clamped squish quad
+   (bounds VDP1 fill + coordinate range). */
+#define MAXWALLTILES 12   /* horizontal tiles per wall (more = fewer long-wall sky gaps) */
+#define WALL_EXT_LO  (-192)       /* extend a sprite this far past a screen edge before the */
+#define WALL_EXT_HI  512          /* grazing squish fallback (VDP1 pre-clipping = cheap) */
+
+static int wall_tilecount(int wi)  /* est. command cost (tiles + 1 user-clip) for budget */
+{
+    int texw = texturewidthmask[wall_acc[wi].texnum] + 1;
+    int du = wall_acc[wi].u2 - wall_acc[wi].u1; if (du < 0) du = -du;
+    int n = (texw > 0) ? du / texw + 1 : 1;
+    if (n > MAXWALLTILES) n = MAXWALLTILES;
+    return n + 1;
+}
+
+static void wall_emit(int wi)
+{
+    int slot = wall_acc[wi].slot;
+    int padW = wtex_cache[slot].padW, H = wtex_cache[slot].H;
+    unsigned short charAddr =
+        (unsigned short)((wtex_cache[slot].addr - VDP1_VRAM_BASE) >> 3);
+    unsigned short charSize = (unsigned short)(((padW >> 3) << 8) | H);
+    int x1 = wall_acc[wi].x1, x2 = wall_acc[wi].x2;
+    int yl1 = wall_acc[wi].yl1, yh1 = wall_acc[wi].yh1;
+    int yl2 = wall_acc[wi].yl2, yh2 = wall_acc[wi].yh2;
+    int u1 = wall_acc[wi].u1, u2 = wall_acc[wi].u2;
+    int texw = texturewidthmask[wall_acc[wi].texnum] + 1;
+    int xspan = x2 - x1, du = u2 - u1;
+    unsigned short cmd[16];
+
+    if (xspan <= 0 || du == 0 || texw <= 0)            /* degenerate -> single quad */
+    {
+        if (vdp1_wnext >= WALL_CMD_CAP) return;
+        memset(cmd, 0, sizeof cmd);
+        cmd[0] = 0x0002; cmd[2] = 0x00A8; cmd[4] = charAddr; cmd[5] = charSize;
+        cmd[6]  = (short)x1; cmd[7]  = (short)yl1;
+        cmd[8]  = (short)x2; cmd[9]  = (short)yl2;
+        cmd[10] = (short)x2; cmd[11] = (short)yh2;
+        cmd[12] = (short)x1; cmd[13] = (short)yh1;
+        vdp1_cmd_at(VDP1_BANK[vdp1_wbank], vdp1_wnext++, cmd);
+        return;
+    }
+
+    /* normalise u (tiling is periodic in texw) so the arithmetic stays small */
+    int ubase = u1 & ~(texw - 1);
+    u1 -= ubase; u2 -= ubase;
+    int umin = (u1 < u2) ? u1 : u2;
+    int umax = (u1 < u2) ? u2 : u1;
+
+    int winset = 0, ntiles = 0;
+    for (int ub = umin & ~(texw - 1); ub < umax && ntiles < MAXWALLTILES; ub += texw, ++ntiles)
+    {
+        if (vdp1_wnext >= WALL_CMD_CAP) break;
+        int xs = x1 + ((ub        - u1) * xspan) / du;   /* screen x of col 0  (u=ub)      */
+        int xe = x1 + ((ub + texw - u1) * xspan) / du;   /* screen x of col texw (u=ub+texw) */
+        int lo = (xs < xe) ? xs : xe, hi = (xs < xe) ? xe : xs;
+        if (hi < x1 || lo > x2) continue;                /* tile outside the visible range */
+
+        int yls = yl1 + (yl2 - yl1) * (xs - x1) / xspan;
+        int yhs = yh1 + (yh2 - yh1) * (xs - x1) / xspan;
+        int yle = yl1 + (yl2 - yl1) * (xe - x1) / xspan;
+        int yhe = yh1 + (yh2 - yh1) * (xe - x1) / xspan;
+
+        if (lo >= WALL_EXT_LO && hi <= WALL_EXT_HI)      /* extend + window-clip (correct) */
+        {
+            if (!winset)
+            {
+                /* extend the window 1px each side so adjacent walls OVERLAP -> no seam
+                   (the gap that, in motion, let the NBG0 sky show between quads). */
+                int wx1 = x1 > 0   ? x1 - 1 : 0;
+                int wx2 = x2 < 319 ? x2 + 1 : 319;
+                memset(cmd, 0, sizeof cmd);
+                cmd[0] = 0x0008;                         /* FUNC_UserClip = wall window */
+                cmd[6]  = (short)wx1; cmd[7]  = 0;       /* upper-left  (XA,YA) */
+                cmd[10] = (short)wx2; cmd[11] = 223;     /* lower-right (XC,YC) */
+                vdp1_cmd_at(VDP1_BANK[vdp1_wbank], vdp1_wnext++, cmd);
+                winset = 1;
+                if (vdp1_wnext >= WALL_CMD_CAP) break;
+            }
+            /* grow the quad 1px top+bottom -> close vertical seams; the overspill into the
+               (software NBG1) floor/ceiling is hidden by the layer inversion. */
+            memset(cmd, 0, sizeof cmd);
+            cmd[0] = 0x0002; cmd[2] = 0x04A8;            /* DISTORSP | Window_In (clip to wall) */
+            cmd[4] = charAddr; cmd[5] = charSize;
+            cmd[6]  = (short)xs; cmd[7]  = (short)(yls - 1);   /* A col0  top */
+            cmd[8]  = (short)xe; cmd[9]  = (short)(yle - 1);   /* B colW  top */
+            cmd[10] = (short)xe; cmd[11] = (short)(yhe + 1);   /* C colW  bot */
+            cmd[12] = (short)xs; cmd[13] = (short)(yhs + 1);   /* D col0  bot */
+            vdp1_cmd_at(VDP1_BANK[vdp1_wbank], vdp1_wnext++, cmd);
+        }
+        else                                             /* grazing -> clamp + squish */
+        {
+            int cxs = xs < x1 ? x1 : (xs > x2 ? x2 : xs);
+            int cxe = xe < x1 ? x1 : (xe > x2 ? x2 : xe);
+            int cyls = yl1 + (yl2 - yl1) * (cxs - x1) / xspan;
+            int chys = yh1 + (yh2 - yh1) * (cxs - x1) / xspan;
+            int cyle = yl1 + (yl2 - yl1) * (cxe - x1) / xspan;
+            int chye = yh1 + (yh2 - yh1) * (cxe - x1) / xspan;
+            memset(cmd, 0, sizeof cmd);
+            cmd[0] = 0x0002; cmd[2] = 0x00A8;
+            cmd[4] = charAddr; cmd[5] = charSize;
+            cmd[6]  = (short)cxs; cmd[7]  = (short)cyls;
+            cmd[8]  = (short)cxe; cmd[9]  = (short)cyle;
+            cmd[10] = (short)cxe; cmd[11] = (short)chye;
+            cmd[12] = (short)cxs; cmd[13] = (short)chys;
+            vdp1_cmd_at(VDP1_BANK[vdp1_wbank], vdp1_wnext++, cmd);
+        }
+    }
+}
+
+/* drain accumulated walls into the current bank (from vdp1_wpn_begin, behind the weapon).
+   PASS 1 resolves+locks each wall's texture slot (near-first -> nearest walls win a slot).
+   PASS 2 paints FAR->NEAR (painter's algorithm: a nearer wall draws OVER a farther one),
+   keeping only the nearest walls that fit the command budget. */
+static void vdp1_walls_flush(void)
+{
+    if (wall_acc_n == 0) return;
+    wtex_tick++;
+    for (int i = 0; i < WTEX_SLOTS; ++i) wtex_cache[i].locked = 0;
+
+    for (int i = 0; i < wall_acc_n; ++i)                 /* PASS 1: resolve + lock (near->far) */
+        wall_acc[i].slot = (short)wall_tex_resolve(wall_acc[i].texnum, wall_acc[i].cmap);
+
+    int budget = WALL_CMD_CAP - vdp1_wnext;              /* keep nearest walls that fit */
+    int used = 0, kept = 0;
+    for (int i = 0; i < wall_acc_n; ++i)
+    {
+        if (wall_acc[i].slot < 0) continue;
+        int cost = wall_tilecount(i);
+        if (used + cost > budget) break;
+        used += cost; kept = i + 1;
+    }
+
+    for (int i = kept - 1; i >= 0; --i)                  /* PASS 2: paint far->near */
+        if (wall_acc[i].slot >= 0) wall_emit(i);
+
+    wall_acc_n = 0;
+}
+#endif
+
 /* One-time: build the fixed root (sysclip + JUMP, link -> empty bank) and the empty
    bank, then put VDP1 in 1-cycle auto mode. */
 static void vdp1_wpn_init(void)
@@ -791,6 +1108,12 @@ static void vdp1_wpn_init(void)
     vdp1_bank = 0; vdp1_wactive = 0;
     for (int i = 0; i < WPN_TEX_SLOTS; ++i) wpn_cache[i].lump = -1;
     wpn_cache_rr = 0;
+#if VDP1_WALL_TEST
+    wtex_setup();                                    /* fixed per-slot VRAM addr + capacity */
+    for (int i = 0; i < WTEX_SLOTS; ++i) { wtex_cache[i].texnum = -1; wtex_cache[i].lru = 0;
+                                           wtex_cache[i].locked = 0; }
+    wtex_tick = 0; wall_acc_n = 0;
+#endif
 
     VDP1_TVMR = 0x0000;
     VDP1_FBCR = 0x0000;                              /* 1-cycle auto erase+draw+swap */
@@ -810,12 +1133,18 @@ extern "C" void sat_vdp1_wpn_begin(void)
     {
         for (int i = 0; i < WPN_TEX_SLOTS; ++i) wpn_cache[i].lump = -1;
         vdp1_hud_csum = 0xFFFFFFFFu;
+#if VDP1_WALL_TEST
+        for (int i = 0; i < WTEX_SLOTS; ++i) wtex_cache[i].texnum = -1;
+#endif
     }
     vdp1_wbank = vdp1_bank ^ 1;                      /* the bank VDP1 isn't showing */
     memset(cmd, 0, sizeof cmd);
     cmd[0] = 0x000A;                                 /* bank cmd0 = local coord (0,0) */
     vdp1_cmd_at(VDP1_BANK[vdp1_wbank], 0, cmd);
     vdp1_wnext   = 1;
+#if VDP1_WALL_TEST
+    vdp1_walls_flush();   /* textured walls -- behind the weapon, in front of NBG1 */
+#endif
     vdp1_wactive = 1;
 }
 
@@ -829,7 +1158,7 @@ extern "C" void sat_vdp1_wpn_draw(patch_t *patch, int lump, int sx, int sy, int 
 {
     int slot = -1, padW, H;
 
-    if (vdp1_wnext >= 30) return;                    /* command-bank slot guard */
+    if (vdp1_wnext >= VDP1_CMD_GUARD) return;         /* command-bank slot guard */
 
     for (int i = 0; i < WPN_TEX_SLOTS; ++i)          /* cache lookup: (lump, cmap) */
         if (wpn_cache[i].lump == lump && wpn_cache[i].cmap == cmap) { slot = i; break; }
@@ -889,7 +1218,7 @@ extern "C" void sat_vdp1_wpn_draw(patch_t *patch, int lump, int sx, int sy, int 
    actually changes (cheap FNV checksum of the 8bpp region). */
 static void vdp1_hud_emit(void)
 {
-    if (!vdp1_wactive || vdp1_wnext >= 30) return;     /* only over a rendered level */
+    if (!vdp1_wactive || vdp1_wnext >= VDP1_CMD_GUARD) return;  /* only over a rendered level */
 
     const unsigned int *s32 = (const unsigned int *)(framebuffer + HUD_Y * 320);
     unsigned int csum = 2166136261u;
@@ -912,12 +1241,17 @@ static void vdp1_hud_emit(void)
     vdp1_cmd_at(VDP1_BANK[vdp1_wbank], vdp1_wnext++, cmd);
 }
 
+
 /* End of frame (DG_DrawFrame): close the off-screen bank, then flip the root LINK
    to it with a single atomic halfword write (race-free).  If the level view wasn't
    rendered (title/intermission), point the root at the empty bank instead. */
 static void vdp1_wpn_kick(void)
 {
     unsigned int link;
+#if SHOW_FPS
+    vdp1_prev_done = (VDP1_EDSR & 0x0002) ? 1 : 0;   /* did the previous plot finish? */
+    vdp1_last_cmds = vdp1_wactive ? vdp1_wnext : 0;
+#endif
     if (vdp1_wactive)
     {
         unsigned short end[16];
@@ -1003,6 +1337,15 @@ extern "C" void DG_DrawFrame(void)
                 if (framebuffer[i] == 0) framebuffer[i] = nb;
     }
 
+#if VDP1_WEAPON
+    /* LAYER INVERSION: VDP1 now carries ONLY the walls (below NBG1).  The walls were
+       accumulated during the BSP walk; build+flush the bank then kick.  Done BEFORE the
+       palette_changed reset so the wall texture cache (which bakes the live palette into
+       RGB555) re-tints on a damage/pickup flash. */
+    sat_vdp1_wpn_begin();   /* resets the bank + flushes the accumulated walls */
+    vdp1_wpn_kick();
+#endif
+
     if (palette_changed)
     {
         palette_changed = false;
@@ -1020,11 +1363,6 @@ extern "C" void DG_DrawFrame(void)
     fps_update();
 #endif
 
-#if VDP1_WEAPON
-    vdp1_hud_emit();   /* HUD on top of the weapon, before closing the bank */
-    vdp1_wpn_kick();
-#endif
-
     /* SATURN: no per-frame slSynch / SRL::Core::Synchronize here -- the freeze is
        handled by rp_sgl_workptr_reset() (core/r_parallel.c) resetting BOTH the
        slave write (GBR+72) and read (GBR+68) pointers each frame.  That avoids
@@ -1039,6 +1377,10 @@ extern "C" void DG_DrawFrame(void)
     cache_purge();
     for (int y = 0; y < 200; ++y)
         memcpy(DOOM_VRAM + y * DOOM_VRAM_STRIDE, framebuffer + y * 320, 320);
+    /* LAYER INVERSION: clear the 3D VIEW (rows 0..167) to index 0 so next frame the
+       SKIPPED wall columns stay transparent -> the VDP1 walls (below NBG1) show through.
+       The status bar (rows 168..199) is owned by ST_Drawer, left intact. */
+    memset(framebuffer, 0, 168 * 320);
     return;
 #endif
 

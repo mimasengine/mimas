@@ -24,6 +24,7 @@ extern "C" {
 #include "doomkeys.h"
 #include "i_video.h"   /* struct color colors[256], palette_changed */
 #include "doomtype.h"
+#include "v_patch.h"   /* patch_t / post_t (for the VDP1 weapon sprite) */
 #include "r_parallel.h"
 }
 
@@ -45,6 +46,30 @@ extern "C" {
    the CPU blit.  If the ~10ms is pursued again: dual-CPU blit (idle slave copies
    half) or SGL slDMACopy -- NOT this raw-register path. */
 #define USE_SCU_DMA 0
+
+/* SATURN PHASE-0 VDP2-ZOOM TEST.  Validate that an NBG1 *bitmap* can be hardware-
+   scaled by VDP2 BEFORE building the real 160-wide render (Phase 1).  With the
+   full 320-wide render unchanged, slScrScaleNbg1(2.0) enlarges NBG1 x2 horizontally
+   -> on screen you see the LEFT 160 columns stretched across the whole width
+   (chunky x2).  That proves (a) the scale register works on a bitmap NBG and (b)
+   the scale-factor convention (2.0 = x2 bigger, per SRL's SetScale wrapper ->
+   slScrScaleNbg1).  If the image instead SHRINKS to the left, the convention is
+   inverse -> set VDP2_ZOOM_FACTOR to 0.5.  Vertical stays x1 (full vertical res,
+   like the d32xr/FastDoom potato).  1 = on (this test), 0 = off (normal display). */
+#define VDP2_ZOOM_TEST   0
+#define VDP2_ZOOM_FACTOR 2.0
+
+/* VDP1 ASYNC bring-up test (foundation for VDP1 rasterization).  slSynch is out
+   (it waits a vblank = ~16% fps tax, which defeats using VDP1 to GAIN fps).  The
+   async pattern (from Lobotomy's SlaveDriver, ../saturn-refs/SlaveDriver-Engine
+   MEGAINIT.C/SPR.C): VDP1 in 1-cycle mode (TVMR=0, FBCR=0 => auto erase+draw+swap
+   each frame), command list at VRAM 0x25C00000, PTMR to plot -- the SH-2 sets the
+   trigger and RETURNS, VDP1 rasterizes in PARALLEL, hardware swaps at vblank.  This
+   draws one white quad + reads the VDP1 status regs to the overlay (rows 22/23) to
+   verify: (a) quad appears, (b) fps UNCHANGED (= parallel, no tax), (c) what state
+   SGL/slInitSystem + its vblank ISR leave VDP1 in.  Now carries the player
+   weapon (the async foundation is hardware-validated).  1 = on, 0 = off. */
+#define VDP1_WEAPON 1
 
 extern "C" byte *I_VideoBuffer;
 extern "C" int   gametic;
@@ -115,6 +140,19 @@ extern "C" int            automapactive;    /* boolean: automap up */
 extern "C" int            sat_vdp2_sky;     /* core: skip software sky (=> VDP2) */
 extern "C" int            sat_potato_floors;/* core: solid-colour floors/ceilings */
 extern "C" int            sat_potato_walls; /* core: solid-colour walls (opaque) */
+
+#if VDP1_WEAPON
+/* VDP1 weapon: the core psprite hook pointers (defined in r_things.c) + our impls
+   (defined below DG_DrawFrame).  Forward-declared here so DG_Init can register them. */
+extern "C" {
+extern void (*sat_psprite_begin)(void);
+extern void (*sat_psprite_hook)(patch_t *patch, int lump, int sx, int sy, int flip,
+                                const unsigned char *cmap);
+void sat_vdp1_wpn_begin(void);
+void sat_vdp1_wpn_draw(patch_t *patch, int lump, int sx, int sy, int flip,
+                       const unsigned char *cmap);
+}
+#endif
 /* Potato (solid-colour, flat-shaded) -- big EX/fillrate win, visible quality drop,
    aimed at perf-tight builds (e.g. future 2/4-player split-screen).  POTATO_LEVEL
    is the boot level; cycle live in-game with the pad Z button.  Levels:
@@ -420,7 +458,8 @@ static void fps_update(void)
         /* Trimmed: fps duplicated row 17's inst, and dma/dsta were dead with the
            SCU DMA blit disabled (USE_SCU_DMA=0).  Kept gt (heartbeat) + vp
            (visplane peak) -- vp is the number sky->VDP2 should pull down. */
-        sprintf(r2, "gt%5d vp%3d pot%d", gametic, r_visplane_peak, potato_level);
+        sprintf(r2, "gt%5d vp%3d pot%d z%d", gametic, r_visplane_peak,
+                potato_level, VDP2_ZOOM_TEST);
         SRL::Debug::Print(0, 2, r2);
         {
             static char rA[45];
@@ -527,6 +566,14 @@ extern "C" void DG_Init(void)
     slBitMapNbg1(COL_TYPE_256, BM_512x256, (void *)DOOM_VRAM);
     slBMPaletteNbg1(1);
     slScrPosNbg1(toFIXED(0.0), toFIXED(0.0));
+#if VDP2_ZOOM_TEST
+    /* Phase-0: enlarge NBG1 x2 horizontally (see the VDP2_ZOOM_TEST note up top).
+       Set once at init like slBitMapNbg1/slBMPaletteNbg1 -- the SGL vblank handler
+       re-pushes the scroll-screen registers each frame (same path that makes the
+       NBG0 sky scroll work without slSynch).  If the scale doesn't stick, move this
+       call into DG_DrawFrame next to slScrPosNbg0. */
+    slScrScaleNbg1(toFIXED(VDP2_ZOOM_FACTOR), toFIXED(1.0));
+#endif
 
     /* SATURN sky: NBG0 = 512x256 8bpp bitmap (VRAM A0, palette bank 1, shared
        with NBG1).  Bitmap content is uploaded per-level by sky_upload() once
@@ -547,6 +594,12 @@ extern "C" void DG_Init(void)
        (transparent) so the VDP2 NBG0 sky shows through. */
     sat_vdp2_sky = 1;
     sat_apply_potato();   /* boot Potato level; pad Z cycles it live */
+
+#if VDP1_WEAPON
+    /* Route the player weapon to the VDP1 hardware sprite layer (core hooks). */
+    sat_psprite_begin = sat_vdp1_wpn_begin;
+    sat_psprite_hook  = sat_vdp1_wpn_draw;
+#endif
 
     SRL::Debug::Print(0, 1, "INIT DOOM...");
 }
@@ -621,6 +674,253 @@ static void sky_upload(void)
     sky_loaded_tex = skytexture;
 }
 
+/* ------------------------------------------------------------------ */
+/* VDP1 weapon sprite -- player gun on the hardware sprite layer        */
+/* ------------------------------------------------------------------ */
+/* The async VDP1 driver (command list @0x25C00000, 1-cycle auto, PTMR plot, no
+   wait -- see the VDP1 note up top) now carries the player weapon.  R_DrawPSprite
+   (core) hands us the cached patch + screen top-left + flip + light colormap via
+   the sat_psprite_* hooks; we unpack it to an RGB555 VDP1 texture (masked gaps
+   transparent) and append a normal sprite command.  VDP1 rasterises it in PARALLEL
+   over the VDP2 game layer, freeing the software masked-column path. */
+#if VDP1_WEAPON
+#define VDP1_TVMR  (*(volatile unsigned short *)0x25D00000)
+#define VDP1_FBCR  (*(volatile unsigned short *)0x25D00002)
+#define VDP1_PTMR  (*(volatile unsigned short *)0x25D00004)
+#define VDP1_EWDR  (*(volatile unsigned short *)0x25D00006)
+#define VDP1_EWLR  (*(volatile unsigned short *)0x25D00008)
+#define VDP1_EWRR  (*(volatile unsigned short *)0x25D0000A)
+#define VDP1_VRAM_BASE 0x25C00000u
+
+/* DOUBLE-BUFFERED command list (kills the tearing: VDP1 in 1-cycle mode plots every
+   vblank, so rewriting the list in place lets it read a half-written frame -> black
+   square / missing parts).  A fixed root command @VRAM 0 (sysclip + JUMP, CTRL
+   constant) whose 1-halfword LINK is the ONLY per-frame write -> atomic, race-free
+   buffer flip.  Layout: root@+0, empty@+0x40, bank0@+0x100, bank1@+0x500.  Textures
+   are NOT double-buffered -- they live in a STABLE per-lump cache (below), so VDP1
+   never reads a texture mid-rebuild. */
+#define VDP1_ROOT_ADDR  0x25C00000u
+#define VDP1_BANKE_ADDR 0x25C00040u
+static const unsigned int VDP1_BANK[2] = { 0x25C00100u, 0x25C00500u };
+
+/* Texture cache: each weapon frame's texture lives in a STABLE VRAM slot keyed by
+   (lump, colormap) -> unpacked only on a frame/light change, not every frame (most
+   frames are just the cheap, double-buffered command).  8 slots x 44KB @0x25C20000;
+   round-robin eviction (8 slots = enough margin that a slot referenced by the
+   currently-displayed bank isn't evicted within the 1-frame flip). */
+#define WPN_TEX_BASE   0x25C20000u
+#define WPN_TEX_SLOTSZ 0xB000u            /* 44 KB -> up to ~160x140 padded */
+#define WPN_TEX_SLOTS  8
+static struct { int lump; const unsigned char *cmap; int padW; int H; }
+                    wpn_cache[WPN_TEX_SLOTS];
+static int          wpn_cache_rr;
+
+static int          vdp1_bank;     /* weapon bank VDP1 is currently displaying */
+static int          vdp1_wbank;    /* bank being written this frame */
+static int          vdp1_wnext;    /* next command slot in the write bank */
+static int          vdp1_wactive;  /* 1 = R_DrawPlayerSprites ran this frame */
+static unsigned int vdp1_hud_csum = 0xFFFFFFFFu;  /* status-bar change detector */
+
+/* HUD on VDP1: the status bar (framebuffer rows 168-199, drawn by ST_Drawer) is
+   re-drawn as a VDP1 sprite -- appended AFTER the weapon so it sits ON TOP of it
+   (the weapon's bob/recoil no longer pokes over the HUD).  Texture rebuilt only when
+   the bar changes.  HUD_Y is parameterised for future per-viewport multiplayer HUDs. */
+#define HUD_W        320
+#define HUD_H        32
+#define HUD_Y        168
+#define VDP1_HUD_TEX 0x25C78000u   /* 320*32*2 = 20KB, just past the weapon cache */
+
+/* Write one 32-byte VDP1 command (16 halfwords) at command index `idx` of `base`. */
+static void vdp1_cmd_at(unsigned int base, int idx, const unsigned short *c)
+{
+    volatile unsigned short *p = (volatile unsigned short *)base + idx * 16;
+    for (int k = 0; k < 16; ++k)
+        p[k] = c[k];
+}
+
+static inline unsigned short bswap16(unsigned short v)
+{ return (unsigned short)((v >> 8) | (v << 8)); }
+static inline unsigned int bswap32(unsigned int v)
+{ return (v >> 24) | ((v >> 8) & 0xFF00u) | ((v << 8) & 0xFF0000u) | (v << 24); }
+
+/* Doom palette index -> VDP1 RGB555 (MSB=1 = opaque), via the live PLAYPAL. */
+static inline unsigned short pal_rgb555(int idx)
+{
+    return (unsigned short)(0x8000
+        | ((colors[idx].b >> 3) << 10)
+        | ((colors[idx].g >> 3) << 5)
+        |  (colors[idx].r >> 3));
+}
+
+/* One-time: build the fixed root (sysclip + JUMP, link -> empty bank) and the empty
+   bank, then put VDP1 in 1-cycle auto mode. */
+static void vdp1_wpn_init(void)
+{
+    unsigned short cmd[16];
+
+    memset(cmd, 0, sizeof cmd);
+    cmd[0] = (unsigned short)(0x0009 | 0x1000);      /* system clip + JUMP_ASSIGN */
+    cmd[1] = (unsigned short)((VDP1_BANKE_ADDR - VDP1_VRAM_BASE) >> 3);  /* link */
+    cmd[10] = 319; cmd[11] = 223;
+    vdp1_cmd_at(VDP1_ROOT_ADDR, 0, cmd);
+
+    memset(cmd, 0, sizeof cmd);
+    cmd[0] = 0x000A;                                 /* empty bank: local coord */
+    vdp1_cmd_at(VDP1_BANKE_ADDR, 0, cmd);
+    memset(cmd, 0, sizeof cmd);
+    cmd[0] = 0x8000;                                 /*             + end */
+    vdp1_cmd_at(VDP1_BANKE_ADDR, 1, cmd);
+
+    vdp1_bank = 0; vdp1_wactive = 0;
+    for (int i = 0; i < WPN_TEX_SLOTS; ++i) wpn_cache[i].lump = -1;
+    wpn_cache_rr = 0;
+
+    VDP1_TVMR = 0x0000;
+    VDP1_FBCR = 0x0000;                              /* 1-cycle auto erase+draw+swap */
+    VDP1_EWDR = 0x0000;                              /* erase to 0 = transparent */
+    VDP1_EWLR = 0x0000;
+    VDP1_EWRR = (unsigned short)(((320 >> 3) << 9) | 223);
+    VDP1_PTMR = 0x0002;
+}
+
+/* core hook: begin this frame's player-sprite list in the OFF-screen bank. */
+extern "C" void sat_vdp1_wpn_begin(void)
+{
+    unsigned short cmd[16];
+    /* the cache bakes the live PLAYPAL into RGB555; on a palette flash (damage /
+       pickup tint) drop it so the weapon + HUD re-tint with the scene. */
+    if (palette_changed)
+    {
+        for (int i = 0; i < WPN_TEX_SLOTS; ++i) wpn_cache[i].lump = -1;
+        vdp1_hud_csum = 0xFFFFFFFFu;
+    }
+    vdp1_wbank = vdp1_bank ^ 1;                      /* the bank VDP1 isn't showing */
+    memset(cmd, 0, sizeof cmd);
+    cmd[0] = 0x000A;                                 /* bank cmd0 = local coord (0,0) */
+    vdp1_cmd_at(VDP1_BANK[vdp1_wbank], 0, cmd);
+    vdp1_wnext   = 1;
+    vdp1_wactive = 1;
+}
+
+/* core hook (per psprite): draw the weapon frame as a VDP1 sprite at the screen
+   position.  The texture is CACHED by (lump, colormap) in stable VRAM, so it is
+   unpacked only when the weapon frame OR the light changes -- not every frame; most
+   frames only rewrite the (double-buffered) command.  Patch fields are little-endian
+   (WAD) on the big-endian SH-2 -> byte-swap width/height/columnofs. */
+extern "C" void sat_vdp1_wpn_draw(patch_t *patch, int lump, int sx, int sy, int flip,
+                                  const unsigned char *cmap)
+{
+    int slot = -1, padW, H;
+
+    if (vdp1_wnext >= 30) return;                    /* command-bank slot guard */
+
+    for (int i = 0; i < WPN_TEX_SLOTS; ++i)          /* cache lookup: (lump, cmap) */
+        if (wpn_cache[i].lump == lump && wpn_cache[i].cmap == cmap) { slot = i; break; }
+
+    if (slot >= 0)
+    {
+        padW = wpn_cache[slot].padW;
+        H    = wpn_cache[slot].H;
+    }
+    else
+    {
+        /* miss: unpack the patch into the next round-robin slot */
+        int W = (int)bswap16((unsigned short)patch->width);
+        H     = (int)bswap16((unsigned short)patch->height);
+        padW  = (W + 7) & ~7;
+        if ((unsigned int)(padW * H) * 2u > WPN_TEX_SLOTSZ) return;  /* too big to cache */
+
+        slot = wpn_cache_rr;
+        wpn_cache_rr = (wpn_cache_rr + 1) % WPN_TEX_SLOTS;
+
+        volatile unsigned short *tex =
+            (volatile unsigned short *)(WPN_TEX_BASE + (unsigned int)slot * WPN_TEX_SLOTSZ);
+        for (int i = 0; i < padW * H; ++i) tex[i] = 0;   /* clear to transparent */
+
+        const unsigned int *colofs = (const unsigned int *)patch->columnofs;
+        for (int x = 0; x < W; ++x)
+        {
+            const post_t *post =
+                (const post_t *)((const unsigned char *)patch + bswap32(colofs[x]));
+            while (post->topdelta != 0xFF)
+            {
+                const unsigned char *s = (const unsigned char *)post + 3;
+                int top = post->topdelta;
+                for (int i = 0; i < post->length; ++i)
+                    tex[(top + i) * padW + x] = pal_rgb555(cmap[s[i]]);
+                post = (const post_t *)((const unsigned char *)post + post->length + 4);
+            }
+        }
+        wpn_cache[slot].lump = lump; wpn_cache[slot].cmap = cmap;
+        wpn_cache[slot].padW = padW; wpn_cache[slot].H = H;
+    }
+
+    unsigned int texaddr = WPN_TEX_BASE + (unsigned int)slot * WPN_TEX_SLOTSZ;
+    unsigned short cmd[16];
+    memset(cmd, 0, sizeof cmd);
+    cmd[0] = (unsigned short)(flip ? 0x0010 : 0x0000);  /* normal sprite, LR flip */
+    cmd[2] = 0x00A8;                                    /* RGB (COLOR_5) | ECD off => SPD on */
+    cmd[4] = (unsigned short)((texaddr - VDP1_VRAM_BASE) >> 3);  /* charAddr */
+    cmd[5] = (unsigned short)(((padW >> 3) << 8) | H);          /* charSize */
+    cmd[6] = (short)sx; cmd[7] = (short)sy;             /* point A = top-left */
+    vdp1_cmd_at(VDP1_BANK[vdp1_wbank], vdp1_wnext++, cmd);
+}
+
+/* DG_DrawFrame, after the render + before the kick: append the status bar as a VDP1
+   sprite ON TOP of the weapon, so the weapon no longer pokes over the HUD.  The
+   texture (framebuffer rows 168-199 -> RGB555, opaque) is rebuilt only when the bar
+   actually changes (cheap FNV checksum of the 8bpp region). */
+static void vdp1_hud_emit(void)
+{
+    if (!vdp1_wactive || vdp1_wnext >= 30) return;     /* only over a rendered level */
+
+    const unsigned int *s32 = (const unsigned int *)(framebuffer + HUD_Y * 320);
+    unsigned int csum = 2166136261u;
+    for (int i = 0; i < HUD_W * HUD_H / 4; ++i) csum = (csum ^ s32[i]) * 16777619u;
+    if (csum != vdp1_hud_csum)
+    {
+        vdp1_hud_csum = csum;
+        const unsigned char *s = framebuffer + HUD_Y * 320;
+        volatile unsigned short *tex = (volatile unsigned short *)VDP1_HUD_TEX;
+        for (int i = 0; i < HUD_W * HUD_H; ++i) tex[i] = pal_rgb555(s[i]);
+    }
+
+    unsigned short cmd[16];
+    memset(cmd, 0, sizeof cmd);
+    cmd[0] = 0x0000;                                   /* normal sprite */
+    cmd[2] = 0x00A8;                                   /* RGB; every texel MSB=1 -> opaque */
+    cmd[4] = (unsigned short)((VDP1_HUD_TEX - VDP1_VRAM_BASE) >> 3);
+    cmd[5] = (unsigned short)(((HUD_W >> 3) << 8) | HUD_H);   /* charSize 0x2820 */
+    cmd[6] = 0; cmd[7] = HUD_Y;                         /* top-left (0,168) */
+    vdp1_cmd_at(VDP1_BANK[vdp1_wbank], vdp1_wnext++, cmd);
+}
+
+/* End of frame (DG_DrawFrame): close the off-screen bank, then flip the root LINK
+   to it with a single atomic halfword write (race-free).  If the level view wasn't
+   rendered (title/intermission), point the root at the empty bank instead. */
+static void vdp1_wpn_kick(void)
+{
+    unsigned int link;
+    if (vdp1_wactive)
+    {
+        unsigned short end[16];
+        memset(end, 0, sizeof end);
+        end[0] = 0x8000;
+        vdp1_cmd_at(VDP1_BANK[vdp1_wbank], vdp1_wnext, end);
+        link = (VDP1_BANK[vdp1_wbank] - VDP1_VRAM_BASE) >> 3;
+        vdp1_bank = vdp1_wbank;
+    }
+    else
+    {
+        link = (VDP1_BANKE_ADDR - VDP1_VRAM_BASE) >> 3;
+    }
+    /* atomic single-halfword flip of the root command's jump target */
+    *((volatile unsigned short *)VDP1_ROOT_ADDR + 1) = (unsigned short)link;
+    VDP1_PTMR = 0x0002;
+    vdp1_wactive = 0;
+}
+#endif
+
 extern "C" void DG_DrawFrame(void)
 {
     static int first_frame = 1;
@@ -631,6 +931,9 @@ extern "C" void DG_DrawFrame(void)
         console_enabled  = 0;
         sat_console_clear();
         dma_table_build();
+#if VDP1_WEAPON
+        vdp1_wpn_init();
+#endif
         SRL::Debug::Print(0, 1, "FRAME1 OK               ");
     }
 
@@ -698,6 +1001,11 @@ extern "C" void DG_DrawFrame(void)
 #if SHOW_FPS
     dg_frame_count++;
     fps_update();
+#endif
+
+#if VDP1_WEAPON
+    vdp1_hud_emit();   /* HUD on top of the weapon, before closing the bank */
+    vdp1_wpn_kick();
 #endif
 
     /* SATURN: no per-frame slSynch / SRL::Core::Synchronize here -- the freeze is

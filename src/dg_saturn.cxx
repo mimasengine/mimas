@@ -28,6 +28,12 @@ extern "C" {
 #include "r_parallel.h"
 }
 
+/* Set by D_SetGameDescription() from the loaded IWAD's lumps; we surface it on
+   the debug overlay (row 21) to confirm which WAD the binary actually detected.
+   See D_FindIWAD/D_IdentifyVersion -- the *mission=none change makes this honest
+   for Doom 1 and Doom 2 alike. */
+extern "C" char *gamedescription;
+
 #define SHOW_FPS 1
 
 /* Set to 1 to ignore the RAM cart and always stream the WAD from CD (e.g. to
@@ -471,6 +477,17 @@ static void fps_update(void)
             sprintf(rA, "AVG %u.%u inst %u.%u b:" __TIME__,
                     avg10 / 10, avg10 % 10, inst10 / 10, inst10 % 10);
             SRL::Debug::Print(0, 17, rA);
+        }
+        {
+            /* row 21: WAD identity detected from the IWAD's own lumps (free row,
+               not overwritten elsewhere).  "(detecting...)" until
+               D_SetGameDescription runs; then e.g. "DOOM Shareware",
+               "The Ultimate DOOM", "DOOM 2: Hell on Earth".  This is the
+               WAD-agnostic self-check: it must match the WAD you flashed. */
+            static char rW[45];
+            const char *gd = gamedescription ? gamedescription : "(detecting...)";
+            sprintf(rW, "WAD: %.38s", gd);
+            SRL::Debug::Print(0, 21, rW);
         }
         t0     = now;
         frames = 0;

@@ -231,6 +231,16 @@ static unsigned short last_dma_ticks;
 static unsigned short pending_cram[256];
 static volatile int   palette_dirty = 0;
 
+/* 8bpp wall lighting: 6 CRAM "dark" banks (2..7) hold the PLAYPAL pre-shaded by a colormap
+   level; bank 1 is NBG1's live full-bright palette.  Built on a palette change (level load /
+   damage flash) into pending_wbank[], then uploaded to CRAM in the vblank handler (avoids
+   mid-display sparkle, like pending_cram).  -> per-wall light + flash re-tint with NO texture
+   re-bake (the texture cache stores raw palette indices, never re-baked). */
+#define WLIGHT_DARK_N 6                                   /* CRAM banks 2..7 */
+static unsigned short pending_wbank[WLIGHT_DARK_N][256];
+static volatile int   wbank_dirty = 0;
+#define CRAM_BANK(b)  ((volatile unsigned short *)(0x25F00000 + (b) * 512))
+
 static unsigned char framebuffer[320 * 224] __attribute__((aligned(4)));  /* = core I_VideoBuffer */
 static unsigned int  dma_table[224][3] __attribute__((aligned(16)));
 
@@ -466,6 +476,16 @@ static void vblank_handler(void)
         for (int i = 0; i < 256; i++)
             CRAM_DOOM_PAL[i] = pending_cram[i];
         palette_dirty = 0;
+    }
+    if (wbank_dirty)
+    {
+        for (int b = 0; b < WLIGHT_DARK_N; ++b)        /* dark light-banks 2..7 */
+        {
+            volatile unsigned short *c = CRAM_BANK(b + 2);
+            const unsigned short    *s = pending_wbank[b];
+            for (int i = 0; i < 256; ++i) c[i] = s[i];
+        }
+        wbank_dirty = 0;
     }
 }
 
@@ -875,55 +895,38 @@ static inline unsigned short pal_rgb555(int idx)
    hold them) stop leaving sky-through-wall holes.  PERSISTENT LRU (built once per texnum)
    + per-frame `locked` (never evicted mid-frame -> no mid-frame clobber).  Narrow textures
    prefer narrow slots, fall back to wide. */
+/* 8BPP: 1 byte/texel (was 2) -> HALF the VRAM per texture -> DOUBLE the slots in the same budget.
+   Two pools keyed by size: 16 x 16KB (narrow, <=128x128) + 6 x 32KB (wide, up to 256x128) = 22
+   slots (was 11).  Same VRAM region 0x25C05000..0x25C75000 (16*16KB + 6*32KB = 448KB, unchanged). */
 #define WTEX_BASE      0x25C05000u
-#define WTEX_NARROW_N  8
-#define WTEX_NARROW_SZ 0x8000u                                      /* 32KB */
-#define WTEX_WIDE_N    3
-#define WTEX_WIDE_SZ   0x10000u                                     /* 64KB -> 256x128 */
+#define WTEX_NARROW_N  16
+#define WTEX_NARROW_SZ 0x4000u                                      /* 16KB -> 128x128 @ 8bpp */
+#define WTEX_WIDE_N    6
+#define WTEX_WIDE_SZ   0x8000u                                      /* 32KB -> 256x128 @ 8bpp */
 #define WTEX_WIDE_BASE (WTEX_BASE + WTEX_NARROW_N * WTEX_NARROW_SZ) /* 0x25C45000 */
-#define WTEX_SLOTS     (WTEX_NARROW_N + WTEX_WIDE_N)                /* 11; ends 0x25C75000 */
+#define WTEX_SLOTS     (WTEX_NARROW_N + WTEX_WIDE_N)                /* 22; ends 0x25C75000 */
 #define WALL_CMD_CAP   (VDP1_BANK_CMDS - 8)   /* walls stop here -> room for end + margin */
 
-/* GOURAUD lighting: bake the texture FULL-BRIGHT once per texnum (cache keyed by texnum -> NO
-   re-bake/thrash, and the light is SMOOTH per-wall -> no "ca saute" pop of the distance-light's
-   one-bake-per-texnum).  Per-wall light via a VDP1 gouraud table.  The Saturn gouraud is ADDITIVE
-   (subtractive darkening) so it must stay GENTLE or it crushes darks = "trop contraste"; the curve
-   below is tuned soft (small slope + high floor).  34 levels x 4 corner entries x 2B at the end of
-   the wall-cache VRAM (free up to the HUD at 0x25C78000). */
-#define VDP1_GOURAUD 1
-#define WTEX_GTAB      (WTEX_WIDE_BASE + WTEX_WIDE_N * WTEX_WIDE_SZ)  /* 0x25C75000 */
-#if VDP1_GOURAUD
-#define WALL_PMOD_GRD  0x0004   /* CMDPMOD gouraud-shading bit */
-#else
-#define WALL_PMOD_GRD  0x0000
-#endif
+/* 8BPP PALETTE LIGHTING (replaces gouraud, which can't light a 256-colour BANK: VDP1 applies
+   gouraud to the palette CODE before the CRAM lookup -> it shifts the index, not the RGB).
+   Each texel = the RAW Doom palette index (1 byte, NEVER re-baked -- not for light, not for
+   flash).  Per-wall light = a CRAM 256-colour BANK chosen by CMDCOLR (bank<<8): bank 1 = NBG1's
+   live full-bright PLAYPAL, banks 2..7 = the PLAYPAL pre-shaded by 6 colormap levels.  So a wall
+   texel idx -> CRAM[bank*256+idx] = the EXACT (multiplicative) colormap colour, matching the
+   software floors/sprites; flash re-tints the banks in CRAM (see wtex_rebuild_banks). */
 static struct { int texnum; unsigned int addr, cap; short padW, H;
-                unsigned short avgcol; unsigned int lru; unsigned char locked; }
+                unsigned int lru; unsigned char locked; }
                 wtex_cache[WTEX_SLOTS];
 static unsigned int wtex_tick;     /* per-frame monotonic clock for LRU */
 
-/* one-time: assign each slot its fixed VRAM address + capacity (narrow then wide pool) */
-#if VDP1_GOURAUD
-/* (re)build the 34 per-level gouraud tables.  b = per-channel value (16 = neutral/full-bright;
-   VDP1 subtracts (16-b) per channel).  ADDITIVE darkening crushes darks if too strong ("trop
-   contraste") -> SOFT: slope L/3 + floor 10 (subtract <=6).  (tr,tg,tb) = a per-channel ADD on
-   top (the damage/pickup FLASH tint -> walls flash via gouraud, no texture re-bake). */
-static void wtex_build_gtab(int tr, int tg, int tb)
-{
-    volatile unsigned short *g = (volatile unsigned short *)WTEX_GTAB;
-    for (int L = 0; L < 34; ++L)
-    {
-        int b = 16 - (L / 3); if (b < 10) b = 10; else if (b > 16) b = 16;
-        int r = b + tr, gg = b + tg, bb = b + tb;
-        if (r < 0) r = 0; else if (r > 31) r = 31;
-        if (gg < 0) gg = 0; else if (gg > 31) gg = 31;
-        if (bb < 0) bb = 0; else if (bb > 31) bb = 31;
-        unsigned short c = (unsigned short)((bb << 10) | (gg << 5) | r);
-        g[L*4+0] = c; g[L*4+1] = c; g[L*4+2] = c; g[L*4+3] = c;
-    }
-}
-#endif
+/* Per-wall light = a CRAM bank.  Bank 1 = full bright (= NBG1 PLAYPAL); the 6 dark banks 2..7
+   hold the PLAYPAL shaded by these colormap levels (0=brightest..31=darkest).  wlight_bank_lut
+   maps a wall's Doom colormap level (0..33) to the nearest of the 7 banks. */
+static const unsigned char wlight_darklevel[WLIGHT_DARK_N] = { 5, 10, 16, 21, 26, 31 };
+static unsigned char wlight_bank_lut[34];
 
+/* one-time: assign each slot its fixed VRAM address + capacity (narrow then wide pool),
+   and build the colormap-level -> CRAM-bank lookup. */
 static void wtex_setup(void)
 {
     for (int i = 0; i < WTEX_NARROW_N; ++i)
@@ -932,17 +935,48 @@ static void wtex_setup(void)
     for (int i = 0; i < WTEX_WIDE_N; ++i)
     { wtex_cache[WTEX_NARROW_N + i].addr = WTEX_WIDE_BASE + (unsigned int)i * WTEX_WIDE_SZ;
       wtex_cache[WTEX_NARROW_N + i].cap = WTEX_WIDE_SZ; }
-#if VDP1_GOURAUD
-    wtex_build_gtab(0, 0, 0);
-#endif
+    for (int L = 0; L < 34; ++L)
+    {
+        int Lc = L > 31 ? 31 : L;
+        int best = 1, bestd = Lc;                        /* bank 1 = level 0 (full bright) */
+        for (int k = 0; k < WLIGHT_DARK_N; ++k)
+        {
+            int d = Lc - (int)wlight_darklevel[k]; if (d < 0) d = -d;
+            if (d < bestd) { bestd = d; best = k + 2; }
+        }
+        wlight_bank_lut[L] = (unsigned char)best;
+    }
 }
 
-/* gouraud table address (CMDGRDA, >>3) for a wall's colormap = its light level's darkening. */
-static inline unsigned short wall_grda(const unsigned char *cmap)
+/* CMDCOLR (= CRAM 256-colour bank base, bank<<8) for a wall's colormap = its light level. */
+static inline unsigned short wall_light_colr(const unsigned char *cmap)
 {
     int L = (int)((cmap - colormaps) >> 8);              /* colormap level 0..33 */
     if (L < 0) L = 0; else if (L > 33) L = 33;
-    return (unsigned short)((WTEX_GTAB + (unsigned int)L * 8u - VDP1_VRAM_BASE) >> 3);
+    return (unsigned short)((unsigned int)wlight_bank_lut[L] << 8);
+}
+
+/* (Re)shade the 6 dark CRAM light-banks from the LIVE palette (colors[] -- already flashed when
+   called on palette_changed) + the colormap.  CRAM-only: NO texture re-bake -> the damage-flash
+   spike is gone, and the dark walls flash together with bank 1 / the software layers.  Uploaded
+   to CRAM in the vblank handler (pending_wbank + wbank_dirty). */
+static void wtex_rebuild_banks(void)
+{
+    if (!colormaps) return;
+    for (int k = 0; k < WLIGHT_DARK_N; ++k)
+    {
+        const unsigned char *cm = colormaps + (unsigned int)wlight_darklevel[k] * 256u;
+        unsigned short *dst = pending_wbank[k];
+        for (int idx = 0; idx < 256; ++idx)
+        {
+            int ci = cm[idx];                            /* light-mapped palette index */
+            dst[idx] = (unsigned short)(0x8000
+                | ((colors[ci].b >> 3) << 10)
+                | ((colors[ci].g >> 3) << 5)
+                |  (colors[ci].r >> 3));
+        }
+    }
+    wbank_dirty = 1;
 }
 
 /* one-sided mid + two-sided upper/lower quads.  Must stay <= the command budget (WALL_CMD_CAP
@@ -997,7 +1031,7 @@ static int wall_tex_resolve(int texnum, const unsigned char *cmap)
     int H = textureheight[texnum] >> 16;                /* fixed_t -> pixels */
     int padW = (W + 7) & ~7;
     if (W <= 0 || H <= 0) return -1;
-    unsigned int size = (unsigned int)(padW * H) * 2u;
+    unsigned int size = (unsigned int)(padW * H) * 1u;  /* 8bpp: 1 byte/texel */
     if (size > WTEX_WIDE_SZ) return -1;                 /* too big even for a wide slot */
 
     int victim;
@@ -1010,25 +1044,21 @@ static int wall_tex_resolve(int texnum, const unsigned char *cmap)
         victim = wtex_find_victim(WTEX_NARROW_N, WTEX_SLOTS);
     if (victim < 0) return -1;                          /* all fitting slots used -> flat in flush */
 
+    /* bake the RAW palette index (1 byte/texel) full-bright; light is applied at draw time via
+       the CMDCOLR CRAM bank.  No re-bake ever (light or flash) -> max cache stability.
+       Write 16-bit packed (two adjacent columns per halfword: hi byte = even col, lo = odd, on the
+       big-endian SH-2) -- VDP VRAM is 16-bit and the SGL/SRL references upload by DMA, never byte
+       writes, so 8-bit stores to VDP1 VRAM are not relied on.  The byte layout is identical. */
     volatile unsigned short *t = (volatile unsigned short *)wtex_cache[victim].addr;
-    unsigned int sr = 0, sg = 0, sb = 0, cnt = 0;        /* mean lit colour -> flat fallback */
-    for (int x = 0; x < W; ++x)
+    int halfW = padW >> 1;                                    /* 16-bit words per texture row */
+    for (int x = 0; x < W; x += 2)
     {
-        const unsigned char *col = R_GetColumn(texnum, x);   /* H tall */
+        const unsigned char *c0 = R_GetColumn(texnum, x);        /* even column (high byte) */
+        const unsigned char *c1 = (x + 1 < W) ? R_GetColumn(texnum, x + 1) : c0;  /* odd (low) */
+        int wx = x >> 1;
         for (int y = 0; y < H; ++y)
-        {
-#if VDP1_GOURAUD
-            unsigned short v = pal_rgb555(col[y]);           /* FULL-BRIGHT: light via gouraud */
-#else
-            unsigned short v = pal_rgb555(cmap[col[y]]);     /* light baked in (per texnum) */
-#endif
-            t[y * padW + x] = v;
-            sr += v & 0x1F; sg += (v >> 5) & 0x1F; sb += (v >> 10) & 0x1F; ++cnt;
-        }
+            t[y * halfW + wx] = (unsigned short)(((unsigned int)c0[y] << 8) | c1[y]);
     }
-    wtex_cache[victim].avgcol = cnt
-        ? (unsigned short)(0x8000 | ((sb / cnt) << 10) | ((sg / cnt) << 5) | (sr / cnt))
-        : 0x8000;
     wtex_cache[victim].texnum = texnum;
     wtex_cache[victim].padW = (short)padW; wtex_cache[victim].H = (short)H;
     wtex_cache[victim].locked = 1;
@@ -1061,8 +1091,12 @@ static int wall_ext = 96;  /* extend past a screen edge before the squish fallba
 static int wall_vbands(int wi)   /* number of vertical texture-height bands this wall needs */
 {
     int H = (wall_acc[wi].slot >= 0) ? wtex_cache[wall_acc[wi].slot].H : 128;
-    int vspan = wall_acc[wi].v1 - wall_acc[wi].v0;
-    int b = (H > 0 && vspan > 0) ? (vspan + H - 1) / H + 1 : 1;   /* +1: a band boundary cross */
+    int v0 = wall_acc[wi].v0, vspan = wall_acc[wi].v1 - v0;
+    /* EXACT count matching wall_emit's band loop (starts at vmod0 = v0%H, then H-aligned steps).
+       The old (vspan+H-1)/H + 1 over-counted ~2x for normal walls -> the budget estimate saturated
+       at ~half the real command count -> far walls dropped to sky.  Tight = more textured. */
+    int b = 1;
+    if (H > 0 && vspan > 0) { int vmod0 = ((v0 % H) + H) % H; b = (vmod0 + vspan + H - 1) / H; }
     if (b > MAXVBANDS) b = MAXVBANDS;
     return b < 1 ? 1 : b;
 }
@@ -1081,7 +1115,7 @@ static int wall_tilecount(int wi)  /* est. command cost (bands x (tiles + 1 user
    screen y at the two seg ends. */
 static void wall_emit_band(int x1, int x2, int yl1, int yh1, int yl2, int yh2,
                            int u1, int u2, int texw,
-                           unsigned short charAddr, unsigned short charSize, unsigned short grda)
+                           unsigned short charAddr, unsigned short charSize, unsigned short colr)
 {
     int xspan = x2 - x1, du = u2 - u1;
     unsigned short cmd[16];
@@ -1090,12 +1124,13 @@ static void wall_emit_band(int x1, int x2, int yl1, int yh1, int yl2, int yh2,
     {
         if (vdp1_wnext >= WALL_CMD_CAP) return;
         memset(cmd, 0, sizeof cmd);
-        cmd[0] = 0x0002; cmd[2] = 0x00A8 | WALL_PMOD_GRD; cmd[4] = charAddr; cmd[5] = charSize;
+        cmd[0] = 0x0002; cmd[2] = 0x00E0;                 /* DISTORSP | COLOR_4 8bpp | SPD | ECD-off */
+        cmd[3] = colr;                                    /* CMDCOLR = CRAM light-bank base */
+        cmd[4] = charAddr; cmd[5] = charSize;
         cmd[6]  = (short)x1; cmd[7]  = (short)yl1;
         cmd[8]  = (short)x2; cmd[9]  = (short)yl2;
         cmd[10] = (short)x2; cmd[11] = (short)yh2;
         cmd[12] = (short)x1; cmd[13] = (short)yh1;
-        cmd[14] = grda;
         vdp1_cmd_at(VDP1_BANK[vdp1_wbank], vdp1_wnext++, cmd);
         return;
     }
@@ -1139,13 +1174,13 @@ static void wall_emit_band(int x1, int x2, int yl1, int yh1, int yl2, int yh2,
             /* grow the quad 1px top+bottom -> close vertical seams; the overspill into the
                (software NBG1) floor/ceiling is hidden by the layer inversion. */
             memset(cmd, 0, sizeof cmd);
-            cmd[0] = 0x0002; cmd[2] = 0x04A8 | WALL_PMOD_GRD;  /* DISTORSP | Window_In | gouraud */
+            cmd[0] = 0x0002; cmd[2] = 0x04E0;  /* DISTORSP | Window_In | COLOR_4 8bpp | SPD | ECD-off */
+            cmd[3] = colr;                                 /* CMDCOLR = CRAM light-bank base */
             cmd[4] = charAddr; cmd[5] = charSize;
             cmd[6]  = (short)xs; cmd[7]  = (short)(yls - 1);   /* A col0  top */
             cmd[8]  = (short)xe; cmd[9]  = (short)(yle - 1);   /* B colW  top */
             cmd[10] = (short)xe; cmd[11] = (short)(yhe + 1);   /* C colW  bot */
             cmd[12] = (short)xs; cmd[13] = (short)(yhs + 1);   /* D col0  bot */
-            cmd[14] = grda;
             vdp1_cmd_at(VDP1_BANK[vdp1_wbank], vdp1_wnext++, cmd);
         }
         else                                             /* grazing -> clamp + squish */
@@ -1157,13 +1192,13 @@ static void wall_emit_band(int x1, int x2, int yl1, int yh1, int yl2, int yh2,
             int cyle = yl1 + (yl2 - yl1) * (cxe - x1) / xspan;
             int chye = yh1 + (yh2 - yh1) * (cxe - x1) / xspan;
             memset(cmd, 0, sizeof cmd);
-            cmd[0] = 0x0002; cmd[2] = 0x00A8 | WALL_PMOD_GRD;
+            cmd[0] = 0x0002; cmd[2] = 0x00E0;                 /* DISTORSP | COLOR_4 8bpp | SPD | ECD-off */
+            cmd[3] = colr;                                    /* CMDCOLR = CRAM light-bank base */
             cmd[4] = charAddr; cmd[5] = charSize;
             cmd[6]  = (short)cxs; cmd[7]  = (short)cyls;
             cmd[8]  = (short)cxe; cmd[9]  = (short)cyle;
             cmd[10] = (short)cxe; cmd[11] = (short)chye;
             cmd[12] = (short)cxs; cmd[13] = (short)chys;
-            cmd[14] = grda;
             vdp1_cmd_at(VDP1_BANK[vdp1_wbank], vdp1_wnext++, cmd);
         }
     }
@@ -1186,14 +1221,14 @@ static void wall_emit(int wi)
     int u1 = wall_acc[wi].u1, u2 = wall_acc[wi].u2;
     int texw = texturewidthmask[wall_acc[wi].texnum] + 1;
     int v0 = wall_acc[wi].v0, v1 = wall_acc[wi].v1, vspan = v1 - v0;
-    unsigned short grda = wall_grda(wall_acc[wi].cmap);   /* per-wall light via gouraud */
+    unsigned short colr = wall_light_colr(wall_acc[wi].cmap);  /* per-wall light = CRAM bank */
 
     if (H <= 0 || vspan <= 0)                          /* no valid v-range -> whole texture once */
     {
         int th = (H > 255) ? 255 : (H > 0 ? H : 1);
         unsigned short ca = (unsigned short)((base - VDP1_VRAM_BASE) >> 3);
         unsigned short cs = (unsigned short)(((padW >> 3) << 8) | th);
-        wall_emit_band(x1, x2, yl1, yh1, yl2, yh2, u1, u2, texw, ca, cs, grda);
+        wall_emit_band(x1, x2, yl1, yh1, yl2, yh2, u1, u2, texw, ca, cs, colr);
         return;
     }
 
@@ -1212,18 +1247,17 @@ static void wall_emit(int wi)
         int yh1b = yl1 + (int)((long long)(vb - v0) * (yh1 - yl1) / vspan);
         int yl2b = yl2 + (int)((long long)(v  - v0) * (yh2 - yl2) / vspan);
         int yh2b = yl2 + (int)((long long)(vb - v0) * (yh2 - yl2) / vspan);
-        unsigned int taddr = base + (unsigned int)vmod * (unsigned int)padW * 2u;
+        unsigned int taddr = base + (unsigned int)vmod * (unsigned int)padW * 1u;  /* 8bpp */
         unsigned short ca = (unsigned short)((taddr - VDP1_VRAM_BASE) >> 3);
         unsigned short cs = (unsigned short)(((padW >> 3) << 8) | rows);
-        wall_emit_band(x1, x2, yl1b, yh1b, yl2b, yh2b, u1, u2, texw, ca, cs, grda);
+        wall_emit_band(x1, x2, yl1b, yh1b, yl2b, yh2b, u1, u2, texw, ca, cs, colr);
         v = vb; ++nb;
     }
 }
 
-/* Fallback FLAT-colour quad for a wall drawn without its texture (degressive far wall / cache
-   miss).  Uses the texture's MEAN lit colour (cached when the texture was built -> matches the
-   textured walls and blends in); only a true cache-miss (no slot) falls back to the dominant
-   palette index.  1px generous like the textured quads. */
+/* Fallback FLAT-colour quad for a wall drawn without its texture (low-detail Z mode / cache
+   miss).  A palette polygon: CMDCOLR = light-bank<<8 | the texture's dominant index, so it is
+   lit by the SAME CRAM bank as the textured walls and flashes via CRAM too.  1px generous. */
 static void wall_emit_flat(int wi)
 {
     if (vdp1_wnext >= WALL_CMD_CAP) return;
@@ -1237,27 +1271,20 @@ static void wall_emit_flat(int wi)
     if (yl2 < WALL_FLAT_YLO) yl2 = WALL_FLAT_YLO; else if (yl2 > WALL_FLAT_YHI) yl2 = WALL_FLAT_YHI;
     if (yh1 < WALL_FLAT_YLO) yh1 = WALL_FLAT_YLO; else if (yh1 > WALL_FLAT_YHI) yh1 = WALL_FLAT_YHI;
     if (yh2 < WALL_FLAT_YLO) yh2 = WALL_FLAT_YLO; else if (yh2 > WALL_FLAT_YHI) yh2 = WALL_FLAT_YHI;
-    /* with gouraud the texture (-> avgcol) is FULL-BRIGHT, so the dominant-index fallback is the
-       raw (unlit) palette colour too; the per-wall light is applied by the gouraud table below. */
-#if VDP1_GOURAUD
-    unsigned short col = (wall_acc[wi].slot >= 0)
-        ? wtex_cache[wall_acc[wi].slot].avgcol
-        : pal_rgb555(R_WallPotatoColor(wall_acc[wi].texnum) & 0xFF);
-#else
-    unsigned short col = (wall_acc[wi].slot >= 0)
-        ? wtex_cache[wall_acc[wi].slot].avgcol
-        : pal_rgb555(wall_acc[wi].cmap[R_WallPotatoColor(wall_acc[wi].texnum) & 0xFF]);
-#endif
+    /* palette polygon: CMDCOLR is written directly to the framebuffer (MSB=0 -> palette pixel),
+       so (light-bank<<8 | dominant index) goes through CRAM = lit by the bank + flashes via CRAM. */
+    unsigned short colr = wall_light_colr(wall_acc[wi].cmap);
+    unsigned short col  = (unsigned short)(colr |
+                          (unsigned int)(R_WallPotatoColor(wall_acc[wi].texnum) & 0xFF));
     unsigned short cmd[16];
     memset(cmd, 0, sizeof cmd);
     cmd[0] = 0x0004;                                  /* FUNC_Polygon (flat) */
-    cmd[2] = 0x00C0 | WALL_PMOD_GRD;                  /* no transparency + gouraud */
-    cmd[3] = col;                                     /* CMDCOLR = RGB555 fill */
+    cmd[2] = 0x00C0;                                  /* SPD (opaque) | ECD-off */
+    cmd[3] = col;                                     /* CMDCOLR = bank<<8 | index -> CRAM */
     cmd[6]  = (short)x1; cmd[7]  = (short)(yl1 - 1);
     cmd[8]  = (short)x2; cmd[9]  = (short)(yl2 - 1);
     cmd[10] = (short)x2; cmd[11] = (short)(yh2 + 1);
     cmd[12] = (short)x1; cmd[13] = (short)(yh1 + 1);
-    cmd[14] = wall_grda(wall_acc[wi].cmap);
     vdp1_cmd_at(VDP1_BANK[vdp1_wbank], vdp1_wnext++, cmd);
 }
 
@@ -1271,10 +1298,12 @@ static int wall_is_flat(int wi)
 }
 
 /* drain accumulated walls into the current bank (from vdp1_wpn_begin, behind the weapon).
-   TEXTURED ONLY (flat fallback DISABLED -- Romain: "on texture tout"): texture the nearest cached
-   walls within the command budget; an uncached / over-budget wall is SKIPPED for now (the flat
-   fallback that guaranteed zero-clipping is off).  Low-detail (Z) mode still draws flat.  Painted
-   far->near (painter's algorithm). */
+   ZERO CLIPPING: EVERY accumulated wall draws AT LEAST a 1-command FLAT (never dropped to sky);
+   the nearest are UPGRADED to textured tiles while the budget allows -- but each upgrade RESERVES
+   1 command for every wall still to come, so a far wall can never be starved out of its flat.
+   (The previous "greedy" flush charged the worst-case tile estimate without that reservation, so an
+   over-estimate -- VD1 finished at ~147/248 yet far walls vanished -- dropped them to mode 0 = sky.)
+   Painted far->near (painter's algorithm). */
 static void vdp1_walls_flush(void)
 {
     if (wall_acc_n == 0) return;
@@ -1284,22 +1313,20 @@ static void vdp1_walls_flush(void)
     for (int i = 0; i < wall_acc_n; ++i)                 /* resolve textures (near-first) */
         wall_acc[i].slot = (short)wall_tex_resolve(wall_acc[i].texnum, wall_acc[i].cmap);
 
-    /* GREEDY near-first: TEXTURE every wall that fits the command budget (the budget has plenty of
-       room, ~59/248, so all cached walls texture); a wall that can't be textured -- UNCACHED (cache
-       overflow, the 12th+ distinct texture) or over-budget -- falls back to a 1-command FLAT instead
-       of being dropped to sky.  So: zero clipping, and flat appears ONLY on the cache-overflow far
-       walls (minimal).  mode: 1 = textured, 2 = flat, 0 = skip (only if even a flat won't fit). */
+    /* mode: 1 = textured, 2 = flat, 0 = skip (only the surplus if wall_acc_n itself > budget).
+       Invariant kept across the loop: used + (#walls from i on) <= budget -> a flat ALWAYS fits. */
     int budget = WALL_CMD_CAP - vdp1_wnext, used = 0;
     for (int i = 0; i < wall_acc_n; ++i)
     {
+        int remaining = wall_acc_n - i - 1;             /* walls after i; each keeps >=1 flat cmd */
         int textured = (wall_acc[i].slot >= 0 && !wall_is_flat(i));
         if (textured)
         {
             int c = wall_tilecount(i);
-            if (used + c <= budget) { used += c; wall_acc[i].mode = 1; continue; }
+            if (used + c + remaining <= budget) { used += c; wall_acc[i].mode = 1; continue; }
         }
-        if (used + 1 <= budget) { used += 1; wall_acc[i].mode = 2; }   /* flat leftover */
-        else                      wall_acc[i].mode = 0;                /* (budget full) skip */
+        if (used + 1 + remaining <= budget) { used += 1; wall_acc[i].mode = 2; }   /* guaranteed flat */
+        else                                  wall_acc[i].mode = 0;                /* surplus (n>budget) */
     }
 
     for (int i = wall_acc_n - 1; i >= 0; --i)            /* paint far->near */
@@ -1353,10 +1380,10 @@ static void vdp1_wpn_init(void)
 extern "C" void sat_vdp1_wpn_begin(void)
 {
     unsigned short cmd[16];
-    /* NO RE-BAKE ON FLASH: the wall cache is NOT dropped on palette_changed any more (that re-baked
-       every visible texture each flash frame -> the damage/pickup SLOWDOWN).  The flash is applied
-       to the VDP1 walls via the GOURAUD tables instead (wtex_build_gtab tint, in DG_DrawFrame).  The
-       weapon/HUD caches below are dead (software now) -- left harmless. */
+    /* NO RE-BAKE ON FLASH: the wall cache stores raw palette indices and is NOT dropped on
+       palette_changed (that re-baked every visible texture each flash frame -> the damage/pickup
+       SLOWDOWN).  The flash re-tints the walls' CRAM light-banks instead (wtex_rebuild_banks, in
+       DG_DrawFrame).  The weapon/HUD caches below are dead (software now) -- left harmless. */
     if (palette_changed)
     {
         for (int i = 0; i < WPN_TEX_SLOTS; ++i) wpn_cache[i].lump = -1;
@@ -1599,23 +1626,11 @@ extern "C" void DG_DrawFrame(void)
                  ((colors[x].g >> 3) << 5)  |
                  (colors[x].r >> 3));
         palette_dirty = 1;
-#if VDP1_GOURAUD
-        /* FLASH on the VDP1 walls via the gouraud tint (no texture re-bake): tint = average
-           (current palette - base palette), base = the un-flashed palette snapshotted once at
-           startup.  Damage -> +red, pickup -> +gold; back to base -> tint 0 (gouraud normal). */
-        {
-            static struct color base_pal[256];
-            static int base_set = 0, last_tr = 0, last_tg = 0, last_tb = 0;
-            if (!base_set) { for (int x = 0; x < 256; ++x) base_pal[x] = colors[x]; base_set = 1; }
-            int sr = 0, sg = 0, sb = 0;
-            for (int x = 0; x < 256; ++x)
-            { sr += (int)colors[x].r - base_pal[x].r;
-              sg += (int)colors[x].g - base_pal[x].g;
-              sb += (int)colors[x].b - base_pal[x].b; }
-            int tr = sr >> 11, tg = sg >> 11, tb = sb >> 11;   /* avg/256 -> 5-bit add */
-            if (tr != last_tr || tg != last_tg || tb != last_tb)
-            { wtex_build_gtab(tr, tg, tb); last_tr = tr; last_tg = tg; last_tb = tb; }
-        }
+#if VDP1_WALL_TEST
+        /* 8bpp walls: re-shade the dark CRAM light-banks from the (possibly flashed) palette.
+           CRAM-only, NO texture re-bake -> the damage-flash spike stays gone AND the dark walls
+           flash in sync with bank 1 / the software floors+sprites.  Uploaded next vblank. */
+        wtex_rebuild_banks();
 #endif
     }
 

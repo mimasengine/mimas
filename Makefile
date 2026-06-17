@@ -108,8 +108,24 @@ CCFLAGS := $(filter-out -I$(SRL_INSTALL_ROOT)/saturnringlib/../modules/dummy,$(C
 # modules/sgl/SRC/) still use the shared.mk default (-std=c2x, needed for bool
 # keyword in sl_def.h), so we restrict this override to src/*.c.
 src/%.o : src/%.c
-	$(CC) $< $(CCFLAGS) -std=gnu11 -o $@
+	$(CC) $< $(CCFLAGS) -std=gnu11 -MMD -MP -o $@
 
 # Shared Doom C sources (core/ submodule) need the same gnu11 override.
 core/%.o : core/%.c
-	$(CC) $< $(CCFLAGS) -std=gnu11 -o $@
+	$(CC) $< $(CCFLAGS) -std=gnu11 -MMD -MP -o $@
+
+# Header-dependency tracking.  -MMD (above) emits a .d next to each .o listing
+# every header that .c included; -include pulls them back in so editing a shared
+# header recompiles EVERY object that includes it -- not just the .c whose
+# timestamp changed.  Without this, changing e.g. core/i_video.h (SCREENHEIGHT)
+# left most core/*.o stale, mixing 200/224 across the binary -> "Bad V_CopyRect".
+# -MP adds phony targets for each header so a deleted/renamed header never breaks
+# the build.  (Covers core/*.c + src/*.c only; src/*.cxx use shared.mk's C++ rule
+# and dg_saturn.cxx is force-touched every build by build.ps1.)
+-include $(wildcard core/*.d src/*.d)
+
+# SATURN PERF NOTE: -O3 on the REC files (r_bsp/r_segs/r_main/r_plane/r_things) was
+# re-tested on the slave-reliable build (2026-06-16) and showed ZERO change (B sub-
+# time identical to -O2).  REC is memory/bus-bound (BSP + visplane pointer-chasing,
+# A-bus colormap/texture reads), not compute-bound, so better codegen doesn't help.
+# Kept at -O2.  Don't re-add -O3 here without a new measurement.

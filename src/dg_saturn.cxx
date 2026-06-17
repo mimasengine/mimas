@@ -109,6 +109,11 @@ extern "C" int   r_visplane_peak;
 
 #define DOOM_VRAM           ((unsigned char *)0x25E40000)  /* VDP2 VRAM B0 */
 #define DOOM_VRAM_STRIDE    512
+/* Doom now renders NATIVE 320x224 (SCREENHEIGHT=224): the 192-line 3D view fills 0..191 and the
+   32px status bar sits at 192..223 (the screen bottom), so no display offset is needed.  Kept at 0
+   (the blit/VDP1-local-coord/sky-scroll terms become no-ops); only set non-zero to re-add a
+   letterbox. */
+#define VIEW_Y_OFFSET       0
 #define CRAM_DOOM_PAL       ((volatile unsigned short *)(0x25F00000 + 256 * 2))
 
 #define TVSTAT              (*(volatile unsigned short *)0x25F80004)
@@ -226,8 +231,8 @@ static unsigned short last_dma_ticks;
 static unsigned short pending_cram[256];
 static volatile int   palette_dirty = 0;
 
-static unsigned char framebuffer[320 * 200] __attribute__((aligned(4)));
-static unsigned int  dma_table[200][3] __attribute__((aligned(16)));
+static unsigned char framebuffer[320 * 224] __attribute__((aligned(4)));  /* = core I_VideoBuffer */
+static unsigned int  dma_table[224][3] __attribute__((aligned(16)));
 
 extern "C" unsigned char *DG_FrameBuffer(void)
 {
@@ -713,13 +718,13 @@ static void dma_table_build(void)
        the same physical RAM we just wrote uncached. */
     unsigned int (*t)[3] =
         (unsigned int (*)[3])((unsigned int)dma_table | 0x20000000u);
-    for (int y = 0; y < 200; ++y)
+    for (int y = 0; y < 224; ++y)
     {
         t[y][0] = 320;
         t[y][1] = (unsigned int)DOOM_VRAM + y * DOOM_VRAM_STRIDE;
         t[y][2] = (unsigned int)framebuffer + y * 320;
     }
-    t[199][2] |= DMA_END_FLAG;
+    t[223][2] |= DMA_END_FLAG;
 }
 
 static void dma_wait_idle(void)
@@ -1049,9 +1054,9 @@ static int wall_ext = 96;  /* extend past a screen edge before the squish fallba
 /* Flat quad screen-y clamp (low-detail / Z mode): a flat fill has NO texture, so clamping its
    geometry to the screen is FREE (no v -> no swim) and bounds the VDP1 fill; the layer
    inversion hides any silhouette overspill.  (Too-close TEXTURED walls are handled upstream
-   by the core CPU fallback, not here.)  3D view is rows 0..167. */
+   by the core CPU fallback, not here.)  3D view is rows 0..191 (320x224). */
 #define WALL_FLAT_YLO  (-8)
-#define WALL_FLAT_YHI  175
+#define WALL_FLAT_YHI  199
 
 static int wall_vbands(int wi)   /* number of vertical texture-height bands this wall needs */
 {
@@ -1363,7 +1368,8 @@ extern "C" void sat_vdp1_wpn_begin(void)
     vdp1_wbank = vdp1_bank;                          /* TEST: single bank (no extra frame?) */
 #endif
     memset(cmd, 0, sizeof cmd);
-    cmd[0] = 0x000A;                                 /* bank cmd0 = local coord (0,0) */
+    cmd[0] = 0x000A;                                 /* bank cmd0 = local coord */
+    cmd[7] = VIEW_Y_OFFSET;                          /* local Y origin -> walls centred like NBG1 */
     vdp1_cmd_at(VDP1_BANK[vdp1_wbank], 0, cmd);
     vdp1_wnext   = 1;
 #if VDP1_WALL_TEST
@@ -1530,13 +1536,13 @@ extern "C" void DG_DrawFrame(void)
     if (skytexture > 0 && skytexture != sky_loaded_tex)
         sky_upload();
 #if SKY_FIXED
-    slScrPosNbg0(toFIXED(0.0), toFIXED(0.0));
+    slScrPosNbg0(toFIXED(0.0), toFIXED(-(double)VIEW_Y_OFFSET));   /* centred like NBG1/VDP1 */
 #else
     {
         /* Negated: invert the scroll direction (Romain -- the un-negated way felt
            wrong-way round; this was the real issue, not the speed). */
         int sx = -(int)(viewangle >> (SKY_ANGLESHIFT + SKY_PARALLAX_SHIFT));
-        slScrPosNbg0((FIXED)(sx << 16), toFIXED(0.0));
+        slScrPosNbg0((FIXED)(sx << 16), toFIXED(-(double)VIEW_Y_OFFSET));
     }
 #endif
 
@@ -1569,7 +1575,7 @@ extern "C" void DG_DrawFrame(void)
         slScrAutoDisp((uint16_t)(show_sky ? (NBG0ON | NBG1ON | NBG3ON)
                                           : (NBG1ON | NBG3ON)));
         if (show_sky)
-            for (int i = 168 * 320; i < 200 * 320; ++i)
+            for (int i = 192 * 320; i < 224 * 320; ++i)   /* status-bar rows (224: 192..223) */
                 if (framebuffer[i] == 0) framebuffer[i] = nb;
     }
 
@@ -1629,13 +1635,17 @@ extern "C" void DG_DrawFrame(void)
        SH-2 bus on real hardware; until that is fixed properly this plain CPU
        copy keeps the game runnable on hardware (slow).  Purge first so the
        master sees the slave's write-through framebuffer pixels. */
+    /* Menus/title/intermission are 320x200 assets; on the 224 framebuffer rows 200..223 are
+       uncovered.  Outside a level (no ST_Drawer), blacken that strip so it's not stale garbage. */
+    if (gamestate != GS_LEVEL)
+        memset(framebuffer + 200 * 320, 0, 24 * 320);
     cache_purge();
-    for (int y = 0; y < 200; ++y)
-        memcpy(DOOM_VRAM + y * DOOM_VRAM_STRIDE, framebuffer + y * 320, 320);
-    /* LAYER INVERSION: clear the 3D VIEW (rows 0..167) to index 0 so next frame the
-       SKIPPED wall columns stay transparent -> the VDP1 walls (below NBG1) show through.
-       The status bar (rows 168..199) is owned by ST_Drawer, left intact. */
-    memset(framebuffer, 0, 168 * 320);
+    for (int y = 0; y < 224; ++y)   /* native 224: blit the full picture (VIEW_Y_OFFSET = 0) */
+        memcpy(DOOM_VRAM + (y + VIEW_Y_OFFSET) * DOOM_VRAM_STRIDE, framebuffer + y * 320, 320);
+    /* LAYER INVERSION: clear the 3D VIEW (rows 0..191) to index 0 so next frame the SKIPPED wall
+       columns stay transparent -> the VDP1 walls (below NBG1) show through.  The status bar (rows
+       192..223) is owned by ST_Drawer, left intact. */
+    memset(framebuffer, 0, 192 * 320);
     return;
 #endif
 

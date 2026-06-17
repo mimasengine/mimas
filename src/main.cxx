@@ -33,6 +33,11 @@ static void __attribute__((noreturn, noinline)) run_on_doom_stack(void)
 
 int main(void)
 {
-    SRL::Core::Initialize(SRL::Types::HighColor::Colors::Black);
+    /* 320x224 (the standard NTSC game resolution) instead of SRL's default 320x240:
+       Doom renders 320x200 and the VDP1 erases 224 lines, so 240 left a 40px black band
+       under the view (status bar/weapon too high).  224 matches the VDP1 -> 24px band, then
+       the view is centred in dg_saturn (VIEW_Y_OFFSET). */
+    SRL::Core::Initialize(SRL::Types::HighColor::Colors::Black,
+                          SRL::TV::Resolutions::Normal320x224);
     run_on_doom_stack();
 }

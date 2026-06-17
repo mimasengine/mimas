@@ -1077,9 +1077,12 @@ static int wall_tex_resolve(int texnum, const unsigned char *cmap)
    (bounds VDP1 fill + coordinate range). */
 #define MAXWALLTILES 12   /* horizontal tiles per wall (more = fewer long-wall sky gaps) */
 #define MAXVBANDS    4    /* vertical texture-height bands per wall (wrap / tall-wall tiling) */
-static int wall_ext = 96;  /* extend past a screen edge before the squish fallback (Romain: 32->96
-                              pushes the edge "squish" out to the extreme border, much less visible;
-                              costs more VDP1 fill -- it rasterizes the whole distorted quad). */
+static int wall_ext = 96;  /* extend past a screen edge before the squish fallback.  MAGNIFIED
+                              (close/face-on) walls -- which squish badly at the edge and CAN'T be
+                              fixed on VDP1 (DISTORSP can't address a texture column-subrange) -- are
+                              rendered in SOFTWARE upstream (core r_segs.c magnification fallback), so
+                              they never reach here; this only handles normal/grazing walls (low mag,
+                              small extrapolation -> squish is rare/mild). */
 
 /* Flat quad screen-y clamp (low-detail / Z mode): a flat fill has NO texture, so clamping its
    geometry to the screen is FREE (no v -> no swim) and bounds the VDP1 fill; the layer

@@ -53,6 +53,24 @@ extern "C" char *gamedescription;
    half) or SGL slDMACopy -- NOT this raw-register path. */
 #define USE_SCU_DMA 0
 
+/* SATURN PERF: dual-CPU framebuffer blit.  The framebuffer->VDP2 copy is the
+   biggest FIXED frame cost (~12ms, constant across configs).  Since the walls
+   moved to VDP1 and floors went flat, the slave SH-2 is ~80% IDLE by the time
+   DG_DrawFrame runs (render+EX long finished) -- so split the 224-row copy: the
+   slave copies the bottom rows [split,224) in parallel while the master copies the
+   top [0,split).  Both purge their own cache before reading
+   (SH7604 is write-through: the writes are in RAM, each CPU must purge to re-read
+   the other's); DOOM_VRAM is uncached so its writes need no flush.  The master
+   waits for the slave BEFORE clearing the framebuffer (else next frame's render
+   overwrites it mid-copy = the SCU-DMA tearing bug).  This is a 2nd slSlaveFunc
+   per frame -> we rewind the SGL slave work pointer before it (rp_sgl_workptr_reset)
+   so the dispatch records can't creep (the ~2-min freeze).  1 = feature compiled in,
+   0 = single-CPU copy only (trivial revert if the 2nd dispatch ever destabilises --
+   freeze zone).  The actual split is chosen LIVE from blit_cfg[] via the pad L+R
+   chord (one press = next config) so several ratios can be A/B'd on the same scene
+   without a rebuild; row-2 'bl' shows the active config + ratio. */
+#define DUAL_CPU_BLIT  1
+
 /* SATURN PHASE-0 VDP2-ZOOM TEST.  Validate that an NBG1 *bitmap* can be hardware-
    scaled by VDP2 BEFORE building the real 160-wide render (Phase 1).  With the
    full 320-wide render unchanged, slScrScaleNbg1(2.0) enlarges NBG1 x2 horizontally
@@ -209,6 +227,27 @@ void sat_walls_kick(void);                /* platform: flush + kick the VDP1 wal
 #define POTATO_LEVEL 0
 static int potato_level = POTATO_LEVEL;
 static int wall_lowdetail = 0;            /* DoomSRL: VDP1 walls drawn flat (set at potato lvl 2) */
+
+/* Dual-CPU blit configs, cycled LIVE by the pad L+R chord (one press = next, wraps).
+   'mpct' = % of the 224 framebuffer rows the MASTER copies ([0,split)); the slave
+   copies the rest [split,224).  The slave reads work-RAM less-cached than the master
+   (which just generated it) so it is slower per row -> shifting rows toward the
+   master (higher mpct) trims the master's spin-wait.  Index 0 = single-CPU baseline
+   (for the A/B reference).  Sweep 50/50 -> 75/25 to bracket the balance point; if
+   even 75/25 still leaves the master waiting, add higher mpct entries (or vice-versa).
+   Row-2 'bl<idx> <mpct>/<spct>' shows the active config so a photo ties bl/MST/fps
+   to its ratio. */
+static const struct { int dual; int mpct; } blit_cfg[] = {
+    { 0, 100 },   /* 0: single-CPU (master copies all 224) */
+    { 1,  50 },   /* 1: 50/50 */
+    { 1,  60 },   /* 2: 60/40 */
+    { 1,  66 },   /* 3: 66/34 */
+    { 1,  75 },   /* 4: 75/25 */
+};
+#define BLIT_CFG_N ((int)(sizeof(blit_cfg) / sizeof(blit_cfg[0])))
+static int blit_mode = DUAL_CPU_BLIT ? 1 : 0;   /* boot: 50/50 if compiled in, else single */
+/* Master row count for the current config: mpct% of 224. */
+static inline int blit_split(void) { return (blit_cfg[blit_mode].mpct * 224) / 100; }
 static void sat_apply_potato(void)
 {
     sat_potato_floors = (potato_level >= 1);
@@ -536,8 +575,9 @@ static void fps_update(void)
         /* Trimmed: fps duplicated row 17's inst, and dma/dsta were dead with the
            SCU DMA blit disabled (USE_SCU_DMA=0).  Kept gt (heartbeat) + vp
            (visplane peak) -- vp is the number sky->VDP2 should pull down. */
-        sprintf(r2, "gt%5d vp%3d pot%d z%d", gametic, r_visplane_peak,
-                potato_level, VDP2_ZOOM_TEST);
+        sprintf(r2, "gt%5d vp%3d pot%d bl%d %d/%d", gametic, r_visplane_peak,
+                potato_level, blit_mode,
+                blit_cfg[blit_mode].mpct, 100 - blit_cfg[blit_mode].mpct);
         SRL::Debug::Print(0, 2, r2);
         {
             static char rA[45];
@@ -1544,6 +1584,32 @@ extern "C" void sat_walls_kick(void)
 }
 #endif
 
+#if DUAL_CPU_BLIT
+/* Slave-done flag for the dual-CPU blit.  SH7604 is write-through so the slave's
+   store reaches RAM, but the master must READ it uncached to see it (its cache
+   would hold the stale 0) -- so go through the cache-through mirror (0x20000000),
+   same trick as r_parallel.c's SYNC.  Plain static storage, accessed only via the
+   mirror macro. */
+static volatile int blit_slave_done_storage;
+#define BLIT_SLAVE_DONE (*(volatile int *)((unsigned int)&blit_slave_done_storage | 0x20000000u))
+
+/* Runs on the SLAVE SH-2 (dispatched from DG_DrawFrame): copy the BOTTOM rows of
+   the framebuffer to VDP2 VRAM while the master copies the top.  'arg' carries the
+   split row (passed by value in the dispatch record -> no cache-coherency concern).
+   Purge first so the slave sees the master's (and its own earlier) write-through
+   framebuffer pixels; DOOM_VRAM is uncached VDP2 VRAM so the writes need no flush. */
+static void blit_slave_body(void *arg)
+{
+    int split = (int)(unsigned int)arg;
+    volatile unsigned char *ccr = (volatile unsigned char *)0xFFFFFE92;
+    *ccr = (unsigned char)(*ccr | 0x10);   /* cache purge on THIS (slave) CPU */
+    for (int y = split; y < 224; ++y)
+        memcpy(DOOM_VRAM + (y + VIEW_Y_OFFSET) * DOOM_VRAM_STRIDE,
+               framebuffer + y * 320, 320);
+    BLIT_SLAVE_DONE = 1;
+}
+#endif
+
 extern "C" void DG_DrawFrame(void)
 {
     static int first_frame = 1;
@@ -1657,9 +1723,43 @@ extern "C" void DG_DrawFrame(void)
        uncovered.  Outside a level (no ST_Drawer), blacken that strip so it's not stale garbage. */
     if (gamestate != GS_LEVEL)
         memset(framebuffer + 200 * 320, 0, 24 * 320);
-    cache_purge();
-    for (int y = 0; y < 224; ++y)   /* native 224: blit the full picture (VIEW_Y_OFFSET = 0) */
-        memcpy(DOOM_VRAM + (y + VIEW_Y_OFFSET) * DOOM_VRAM_STRIDE, framebuffer + y * 320, 320);
+#if DUAL_CPU_BLIT
+    if (blit_cfg[blit_mode].dual)
+    {
+        /* Dual-CPU blit: dispatch the bottom rows [split,224) to the idle slave, copy
+           the top [0,split) on the master, then WAIT for the slave before clearing/
+           returning (else next frame's render overwrites the framebuffer mid-copy =
+           tearing).  rp_sgl_workptr_reset rewinds the SGL slave work pointer so this
+           2nd dispatch per frame can't creep into the freeze -- and covers the
+           rp_disabled serial frame (where rp_restart did not reset it this frame). */
+        int split = blit_split();
+        rp_sgl_workptr_reset();
+        BLIT_SLAVE_DONE = 0;            /* uncached: visible to the slave before it sets 1 */
+        cache_purge();                 /* master purges before reading its half */
+        slSlaveFunc(blit_slave_body, (void *)(unsigned int)split);
+        for (int y = 0; y < split; ++y)
+            memcpy(DOOM_VRAM + (y + VIEW_Y_OFFSET) * DOOM_VRAM_STRIDE, framebuffer + y * 320, 320);
+        {
+            /* Bounded wait: hang-safe in the freeze zone.  If the slave never signals
+               (wedge), the master copies the bottom rows itself -> a slow frame, not a
+               hard freeze.  Guard is generous (slave half ~6-8ms; master is already
+               past its half here so it normally spins only briefly). */
+            int guard = 30000000;
+            while (!BLIT_SLAVE_DONE && --guard) ;
+            if (!guard)
+                for (int y = split; y < 224; ++y)
+                    memcpy(DOOM_VRAM + (y + VIEW_Y_OFFSET) * DOOM_VRAM_STRIDE,
+                           framebuffer + y * 320, 320);
+        }
+    }
+    else
+#endif
+    {
+        /* Single-CPU blit: master copies the whole picture (also the compile-out path). */
+        cache_purge();
+        for (int y = 0; y < 224; ++y)   /* native 224: blit the full picture (VIEW_Y_OFFSET = 0) */
+            memcpy(DOOM_VRAM + (y + VIEW_Y_OFFSET) * DOOM_VRAM_STRIDE, framebuffer + y * 320, 320);
+    }
     /* LAYER INVERSION: clear the 3D VIEW (rows 0..191) to index 0 so next frame the SKIPPED wall
        columns stay transparent -> the VDP1 walls (below NBG1) show through.  The status bar (rows
        192..223) is owned by ST_Drawer, left intact. */
@@ -1849,6 +1949,21 @@ static void poll_pad(void)
         potato_level = (potato_level + 1) % 3;
         sat_apply_potato();
     }
+
+#if DUAL_CPU_BLIT
+    /* Pad L+R held together cycles the blit config live (one press = next entry of
+       blit_cfg[]: single -> 50/50 -> 60/40 -> 66/34 -> 75/25 -> wrap), to A/B the
+       ratios on the same scene without a rebuild.  Buttons are active-low, so both
+       held == (cur & (L|R)) == 0; fire once on the rising edge of that chord.
+       (L/R also emit ','/'.' to Doom -- harmless taps, the real strafe is 0xa0/a1.) */
+    {
+        const unsigned short lr = (unsigned short)(PER_DGT_TL | PER_DGT_TR);
+        static int lr_was = 0;
+        int lr_now = ((cur & lr) == 0);
+        if (lr_now && !lr_was) blit_mode = (blit_mode + 1) % BLIT_CFG_N;
+        lr_was = lr_now;
+    }
+#endif
 
     for (unsigned int i = 0; i < PAD_MAP_LEN; ++i)
     {

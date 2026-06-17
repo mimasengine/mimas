@@ -526,15 +526,21 @@ static void fps_update(void)
             SRL::Debug::Print(0, 17, rA);
         }
         {
-            /* row 16: the 6 (co)processors, for headroom-at-a-glance.  MST = master SH-2
-               frame ms (the synchronous bottleneck).  SLV = slave SH-2 -> its own row 18
-               (i/b%).  VD1 = VDP1 commands this frame + D(one)/B(usy).  VD2 = VDP2 (always
-               compositing, spare capacity).  SCU = SCU-DSP/DMA (idle here = free to offload).
-               68K = SCSP sound CPU (fixed). */
-            static char r6[45];
+            /* row 15: MASTER SH-2 -- its own line (like the slave's row 18).  MST = master frame
+               ms (the synchronous bottleneck); its work split is row 19 (REC/EX/W) + row 20
+               (Bw/Bp/P/M). */
+            static char rM[45];
             unsigned int mst = inst10 ? (10000u / inst10) : 0;   /* frame ms */
-            sprintf(r6, "MST%ums SLV>r18 VD1 %d%c VD2~ SCU%s 68Ksnd",
-                    mst, vdp1_last_cmds, vdp1_prev_done ? 'D' : 'B',
+            sprintf(rM, "MST %ums  split>r19 r20", mst);
+            SRL::Debug::Print(0, 15, rM);
+        }
+        {
+            /* row 16: the AUXILIARY (co)processors only (master = row 15, slave = row 18).
+               VD1 = VDP1 commands this frame + D(one)/B(usy).  VD2 = VDP2 (always compositing,
+               spare).  SCU = SCU-DSP/DMA (idle = free to offload).  68K = SCSP sound CPU. */
+            static char r6[45];
+            sprintf(r6, "VD1 %d%c VD2~ SCU%s 68Ksnd",
+                    vdp1_last_cmds, vdp1_prev_done ? 'D' : 'B',
                     USE_SCU_DMA ? "dma" : "-");
             SRL::Debug::Print(0, 16, r6);
         }
@@ -892,6 +898,27 @@ static struct { int texnum; unsigned int addr, cap; short padW, H;
 static unsigned int wtex_tick;     /* per-frame monotonic clock for LRU */
 
 /* one-time: assign each slot its fixed VRAM address + capacity (narrow then wide pool) */
+#if VDP1_GOURAUD
+/* (re)build the 34 per-level gouraud tables.  b = per-channel value (16 = neutral/full-bright;
+   VDP1 subtracts (16-b) per channel).  ADDITIVE darkening crushes darks if too strong ("trop
+   contraste") -> SOFT: slope L/3 + floor 10 (subtract <=6).  (tr,tg,tb) = a per-channel ADD on
+   top (the damage/pickup FLASH tint -> walls flash via gouraud, no texture re-bake). */
+static void wtex_build_gtab(int tr, int tg, int tb)
+{
+    volatile unsigned short *g = (volatile unsigned short *)WTEX_GTAB;
+    for (int L = 0; L < 34; ++L)
+    {
+        int b = 16 - (L / 3); if (b < 10) b = 10; else if (b > 16) b = 16;
+        int r = b + tr, gg = b + tg, bb = b + tb;
+        if (r < 0) r = 0; else if (r > 31) r = 31;
+        if (gg < 0) gg = 0; else if (gg > 31) gg = 31;
+        if (bb < 0) bb = 0; else if (bb > 31) bb = 31;
+        unsigned short c = (unsigned short)((bb << 10) | (gg << 5) | r);
+        g[L*4+0] = c; g[L*4+1] = c; g[L*4+2] = c; g[L*4+3] = c;
+    }
+}
+#endif
+
 static void wtex_setup(void)
 {
     for (int i = 0; i < WTEX_NARROW_N; ++i)
@@ -901,20 +928,7 @@ static void wtex_setup(void)
     { wtex_cache[WTEX_NARROW_N + i].addr = WTEX_WIDE_BASE + (unsigned int)i * WTEX_WIDE_SZ;
       wtex_cache[WTEX_NARROW_N + i].cap = WTEX_WIDE_SZ; }
 #if VDP1_GOURAUD
-    /* one gouraud table per colormap level: 4 identical corners = uniform darkening for the level.
-       b = per-channel value (16 = neutral/full-bright; VDP1 subtracts (16-b) per channel).  The
-       ADDITIVE darkening crushes darks if too strong ("trop contraste") -> keep it SOFT: gentle slope
-       L/3 + a HIGH floor (min 10 = subtract at most 6).  Tune here: smaller divisor / lower floor =
-       darker & more contrast; bigger divisor / higher floor = flatter & softer. */
-    {
-        volatile unsigned short *g = (volatile unsigned short *)WTEX_GTAB;
-        for (int L = 0; L < 34; ++L)
-        {
-            int b = 16 - (L / 3); if (b < 10) b = 10; else if (b > 16) b = 16;
-            unsigned short c = (unsigned short)((b << 10) | (b << 5) | b);
-            g[L*4+0] = c; g[L*4+1] = c; g[L*4+2] = c; g[L*4+3] = c;
-        }
-    }
+    wtex_build_gtab(0, 0, 0);
 #endif
 }
 
@@ -1252,9 +1266,10 @@ static int wall_is_flat(int wi)
 }
 
 /* drain accumulated walls into the current bank (from vdp1_wpn_begin, behind the weapon).
-   ZERO CLIPPING: EVERY wall is drawn -- at minimum a 1-command FLAT quad (all wall_acc_n <= 128
-   flats always fit the ~248 command cap, so no wall is ever dropped to sky).  Then the NEAREST
-   walls are UPGRADED to full textured tiles while the command budget allows.  Painted far->near. */
+   TEXTURED ONLY (flat fallback DISABLED -- Romain: "on texture tout"): texture the nearest cached
+   walls within the command budget; an uncached / over-budget wall is SKIPPED for now (the flat
+   fallback that guaranteed zero-clipping is off).  Low-detail (Z) mode still draws flat.  Painted
+   far->near (painter's algorithm). */
 static void vdp1_walls_flush(void)
 {
     if (wall_acc_n == 0) return;
@@ -1264,22 +1279,29 @@ static void vdp1_walls_flush(void)
     for (int i = 0; i < wall_acc_n; ++i)                 /* resolve textures (near-first) */
         wall_acc[i].slot = (short)wall_tex_resolve(wall_acc[i].texnum, wall_acc[i].cmap);
 
-    int budget = WALL_CMD_CAP - vdp1_wnext;
-    int used = wall_acc_n;                               /* baseline: every wall flat (1 cmd) */
-    if (used > budget) used = budget;                    /* (n<=128<budget, safety) */
-    for (int i = 0; i < wall_acc_n; ++i) wall_acc[i].mode = 0;   /* 0 = flat */
-    for (int i = 0; i < wall_acc_n; ++i)                 /* near-first: upgrade to textured */
+    /* GREEDY near-first: TEXTURE every wall that fits the command budget (the budget has plenty of
+       room, ~59/248, so all cached walls texture); a wall that can't be textured -- UNCACHED (cache
+       overflow, the 12th+ distinct texture) or over-budget -- falls back to a 1-command FLAT instead
+       of being dropped to sky.  So: zero clipping, and flat appears ONLY on the cache-overflow far
+       walls (minimal).  mode: 1 = textured, 2 = flat, 0 = skip (only if even a flat won't fit). */
+    int budget = WALL_CMD_CAP - vdp1_wnext, used = 0;
+    for (int i = 0; i < wall_acc_n; ++i)
     {
-        if (wall_acc[i].slot < 0 || wall_is_flat(i)) continue;   /* uncached/low-detail stay flat */
-        int extra = wall_tilecount(i) - 1;               /* textured costs this much over flat */
-        if (extra < 0) extra = 0;
-        if (used + extra > budget) break;                /* budget full -> the rest stay flat */
-        used += extra; wall_acc[i].mode = 1;             /* 1 = textured */
+        int textured = (wall_acc[i].slot >= 0 && !wall_is_flat(i));
+        if (textured)
+        {
+            int c = wall_tilecount(i);
+            if (used + c <= budget) { used += c; wall_acc[i].mode = 1; continue; }
+        }
+        if (used + 1 <= budget) { used += 1; wall_acc[i].mode = 2; }   /* flat leftover */
+        else                      wall_acc[i].mode = 0;                /* (budget full) skip */
     }
 
-    for (int i = wall_acc_n - 1; i >= 0; --i)            /* paint far->near (painter's algorithm) */
-        if (wall_acc[i].mode) wall_emit(i);
-        else                  wall_emit_flat(i);
+    for (int i = wall_acc_n - 1; i >= 0; --i)            /* paint far->near */
+    {
+        if (wall_acc[i].mode == 1)      wall_emit(i);
+        else if (wall_acc[i].mode == 2) wall_emit_flat(i);
+    }
 
     wall_acc_n = 0;
 }
@@ -1326,15 +1348,14 @@ static void vdp1_wpn_init(void)
 extern "C" void sat_vdp1_wpn_begin(void)
 {
     unsigned short cmd[16];
-    /* the cache bakes the live PLAYPAL into RGB555; on a palette flash (damage /
-       pickup tint) drop it so the weapon + HUD re-tint with the scene. */
+    /* NO RE-BAKE ON FLASH: the wall cache is NOT dropped on palette_changed any more (that re-baked
+       every visible texture each flash frame -> the damage/pickup SLOWDOWN).  The flash is applied
+       to the VDP1 walls via the GOURAUD tables instead (wtex_build_gtab tint, in DG_DrawFrame).  The
+       weapon/HUD caches below are dead (software now) -- left harmless. */
     if (palette_changed)
     {
         for (int i = 0; i < WPN_TEX_SLOTS; ++i) wpn_cache[i].lump = -1;
         vdp1_hud_csum = 0xFFFFFFFFu;
-#if VDP1_WALL_TEST
-        for (int i = 0; i < WTEX_SLOTS; ++i) wtex_cache[i].texnum = -1;
-#endif
     }
 #if VDP1_DBLBANK
     vdp1_wbank = vdp1_bank ^ 1;                      /* the bank VDP1 isn't showing */
@@ -1572,6 +1593,24 @@ extern "C" void DG_DrawFrame(void)
                  ((colors[x].g >> 3) << 5)  |
                  (colors[x].r >> 3));
         palette_dirty = 1;
+#if VDP1_GOURAUD
+        /* FLASH on the VDP1 walls via the gouraud tint (no texture re-bake): tint = average
+           (current palette - base palette), base = the un-flashed palette snapshotted once at
+           startup.  Damage -> +red, pickup -> +gold; back to base -> tint 0 (gouraud normal). */
+        {
+            static struct color base_pal[256];
+            static int base_set = 0, last_tr = 0, last_tg = 0, last_tb = 0;
+            if (!base_set) { for (int x = 0; x < 256; ++x) base_pal[x] = colors[x]; base_set = 1; }
+            int sr = 0, sg = 0, sb = 0;
+            for (int x = 0; x < 256; ++x)
+            { sr += (int)colors[x].r - base_pal[x].r;
+              sg += (int)colors[x].g - base_pal[x].g;
+              sb += (int)colors[x].b - base_pal[x].b; }
+            int tr = sr >> 11, tg = sg >> 11, tb = sb >> 11;   /* avg/256 -> 5-bit add */
+            if (tr != last_tr || tg != last_tg || tb != last_tb)
+            { wtex_build_gtab(tr, tg, tb); last_tr = tr; last_tg = tg; last_tb = tb; }
+        }
+#endif
     }
 
 #if SHOW_FPS

@@ -167,8 +167,16 @@ extern "C" int W_SaturnCDInit(void);
    WITHOUT breaking the raw-SGL NBG0/NBG1 cycle pattern.  Coefficient table + Mode-7
    perspective + dynamic flat selection are Phases 1-3.  Gated, throwaway. */
 #define VDP2_RBG0_TEST   1
+/* DEBUG: force RBG0 above the game (priority 6, NBG1 dropped to 5) so its content is
+   visible regardless of the index-0 window -- a definitive "does RBG0 render my grid?"
+   check.  Set 0 for the real layering (RBG0 priority 5, shows only through index-0). */
+#define RBG0_DEBUG_ONTOP 1
 #define RBG0_CEL_VRAM    ((void *)0x25E20000)  /* VDP2 VRAM A1: cell (char) data    */
-#define RBG0_MAP_VRAM    ((void *)0x25E22000)  /* VDP2 VRAM A1: pattern name table  */
+/* Jo Engine (jo_engine/vdp2.c) keeps the RBG0 cells and map in SEPARATE banks (cells
+   A0, map B0) because RBG0 fetches a pattern-name AND a character per dot.  We mirror
+   that: cells in A1, map in B1's free region (B1 holds NBG3 font@+0x800, NBG3 map@
+   +0x1D000, the rotation-param table@+0x1ff00 -- +0x10000 is free, 8KB-aligned). */
+#define RBG0_MAP_VRAM    ((void *)0x25E70000)  /* VDP2 VRAM B1: pattern name table  */
 
 /* SKY_FIXED 1 = the sky does NOT scroll with the view angle (Romain's choice:
    a static backdrop).  0 = scroll with viewangle, slowed by SKY_PARALLAX_SHIFT
@@ -640,50 +648,68 @@ static void fps_update(void)
    through the index-0 sky/ceiling region while the game still draws on top -- the test
    is purely "does RBG0 light up without disturbing the raw-SGL NBG0/NBG1 cycle
    pattern?".  Must be set up AFTER slBitMapNbg0/1 in DG_Init. */
-static ROTSCROLL rbg0_rot;   /* RAM-side rotation param; SGL pushes it at vblank */
+/* Drive RBG0's rotation parameters from the SGL matrix stack into SRL's FIXED VRAM
+   rotation-parameter table (Core::Initialize set it at VDP2_VRAM_B1+0x1ff00 via
+   slRparaInitSet -- srl_vdp2.hpp:1529).  slScrMatSet writes the rpara straight to VRAM,
+   so this needs no slSynch.  Phase-0 = OneAxis (flat, NO coefficient table): a plain
+   translate places the plane; perspective (slRotX + a TwoAxis K-table) is Phase-1.
+   Mirrors the working SRL sample's SetCurrentTransform (Samples/VDP2 - RBG0 Rotation). */
+static void rbg0_set_transform(void)
+{
+    slPushMatrix();
+    {
+        slTranslate(toFIXED(0.0), toFIXED(100.0), MsScreenDist);
+        slCurRpara(RA);
+        slPushMatrix();
+        {
+            slScrMatConv();
+            slScrMatSet();
+        }
+        slPopMatrix();
+    }
+    slPopMatrix();
+}
 
 static void rbg0_proto_init(void)
 {
-    /* 1) one 8x8 8bpp tile: bright border + dark fill, so tiling is obvious. */
+    /* 1) one 8x8 8bpp tile: bright RED border + light-GRAY fill (PLAYPAL 176 / 4). */
     unsigned char *cel = (unsigned char *)RBG0_CEL_VRAM;
     for (int i = 0; i < 64; ++i)
     {
         int row = i >> 3, col = i & 7;
         int border = (row == 0 || row == 7 || col == 0 || col == 7);
-        cel[i] = (unsigned char)(border ? 4 : 79);   /* arbitrary PLAYPAL indices */
+        cel[i] = (unsigned char)(border ? 176 : 4);   /* PLAYPAL: 176=red, 4=gray */
     }
 
-    /* 2) pattern name table (2-word): every cell -> char 0, palette 0.  A 1x1 plane
-       page is 64x64 cells; 2-word = 2 uint16 per cell. */
+    /* 2) pattern-name table -- Jo Engine 1-WORD format (jo_engine/vdp2.c __jo_create_map):
+       map word = (char#*2 | palette<<12) + cell_bank_offset.  Every cell -> char 0,
+       palette 1 (PLAYPAL, <<12 = 0x1000), cells at the A1 bank base -> offset 0 -> 0x1000. */
     {
-        unsigned short *pn = (unsigned short *)RBG0_MAP_VRAM;
-        int cells = 64 * 64;
-        for (int i = 0; i < cells; ++i) { pn[2*i] = 0; pn[2*i + 1] = 0; }
+        unsigned short *map = (unsigned short *)RBG0_MAP_VRAM;
+        for (int i = 0; i < 64 * 64; ++i) map[i] = 0x1000;
     }
 
-    /* 3) RBG0 cell config: 256-colour, 8x8 chars, 2-word pattern names, 12-bit CN. */
+    /* 3) RBG0 cell config -- Jo Engine sequence (jo_vdp2_set_rbg0_plane_a + jo_vdp2_enable_rbg0).
+       THE FIX: slPageRbg0's FIRST arg is the CELL/character base, NOT the map.  My old code
+       passed (map, cell) swapped -> RBG0 read pixels from the pattern-name table = garbage =
+       transparent.  Jo: slPageRbg0(cell, 0, PNB_1WORD|CN_12BIT) + sl1MapRA(map).  PNB_1WORD
+       (not 2WORD).  OneAxis flat for now (no K-table); perspective K-table is the next step. */
+    slOverRA(0);                                       /* over-area: repeat the plane  */
     slCharRbg0(COL_TYPE_256, CHAR_SIZE_1x1);
-    slPageRbg0(RBG0_MAP_VRAM, RBG0_CEL_VRAM, PNB_2WORD | CN_12BIT);
+    slPageRbg0(RBG0_CEL_VRAM, 0, PNB_1WORD | CN_12BIT);/* arg1 = CELL base (the fix!)   */
     slPlaneRA(PL_SIZE_1x1);
-    {
-        /* 16-plane rotation map (4x4): all point at plane 0 -> the single page tiles. */
-        static unsigned char map16[16];
-        for (int i = 0; i < 16; ++i) map16[i] = 0;
-        sl16MapRA(map16);
-    }
-    slOverRA(0);                 /* over-area: repeat the plane (seamless ground) */
-    slBMPaletteRbg0(1);          /* share PLAYPAL colour bank 1 with NBG0/NBG1     */
+    sl1MapRA(RBG0_MAP_VRAM);                            /* pattern-name table (B1)      */
+    slRparaMode(RA);
+    slKtableRA((void *)0, K_OFF);                      /* OneAxis: no perspective yet   */
+    slBMPaletteRbg0(1);
 
-    /* 4) IDENTITY ROTSCROLL: flat 1:1 screen<->plane, no perspective, no K-table. */
-    memset(&rbg0_rot, 0, sizeof rbg0_rot);
-    rbg0_rot.MATA = toFIXED(1.0);  rbg0_rot.MATE = toFIXED(1.0);   /* 2x3 identity   */
-    rbg0_rot.KX   = toFIXED(1.0);  rbg0_rot.KY   = toFIXED(1.0);   /* unit zoom      */
-    rbg0_rot.DXST = toFIXED(0.0);  rbg0_rot.DYST = toFIXED(1.0);   /* +1 plane-Y/line */
-    rbg0_rot.DX   = toFIXED(1.0);  rbg0_rot.DY   = toFIXED(0.0);   /* +1 plane-X/dot  */
-    rbg0_rot.KAST = 0; rbg0_rot.DKAST = 0; rbg0_rot.DKA = 0;       /* no coeff table  */
-    slRparaInitSet(&rbg0_rot);
-    slCurRpara(RA);
-    slKtableRA((void *)0, K_OFF);
+    /* 4) DRIVE THE ROTATION FROM THE MATRIX, NOT BY HAND.  We do NOT call slRparaInitSet:
+       SRL::Core::Initialize already pointed the rotation-param table at VRAM (B1+0x1ff00).
+       Pointing it at a RAM struct (the old code) was THE black bug -- VDP2 read the
+       rotation from a RAM address -> garbage -> the plane collapsed to a single point ->
+       uniform opaque black.  Set an initial transform so it shows before frame 1;
+       DG_DrawFrame re-sets it each frame (rbg0_set_transform). */
+    rbg0_set_transform();
 
     slPriorityRbg0(5);           /* > sky(4), < game NBG1(6): shows in index-0 region */
 }
@@ -769,6 +795,14 @@ extern "C" void DG_Init(void)
 
     SRL::Debug::Print(0, 1, "INIT VDP2...");
 
+#if VDP2_RBG0_TEST
+    /* RBG0 floor prototype Phase-0: set up the rotation plane FIRST, BEFORE the NBG0/
+       NBG1 bitmaps, so it reserves its VRAM access cycles (cell + pattern-name reads)
+       before the NBGs grab them.  SRL's own note (srl_vdp2.hpp): "allocate RBG0 before
+       NBG0-3".  RBG0-after-NBG read all-zero cells = opaque black (docs/RBG0_FLOOR_PLAN.md). */
+    rbg0_proto_init();
+#endif
+
     /* VDP2: NBG1 as 512x256 8bpp bitmap, palette bank 1, below console.
        These are direct SGL calls -- still valid under SRL (SGL is linked). */
     for (int y = 0; y < 256; ++y)
@@ -806,9 +840,14 @@ extern "C" void DG_Init(void)
     slPrioritySpr4(5); slPrioritySpr5(5); slPrioritySpr6(5); slPrioritySpr7(5);
 #endif
 #if VDP2_RBG0_TEST
-    /* RBG0 floor prototype Phase-0: bring up the rotation plane AFTER NBG0/NBG1 so we
-       can see whether it disturbs their cycle pattern (docs/RBG0_FLOOR_PLAN.md). */
-    rbg0_proto_init();
+    /* rbg0_proto_init() was called above, before the NBG bitmaps (cycle-pattern order). */
+#if RBG0_DEBUG_ONTOP
+    /* DEBUG: RBG0 above the game so its content is visible regardless of the index-0
+       window.  RBG0=6 > NBG1=5 (overrides the slPriorityNbg1(6) just set); NBG3 text=7
+       stays on top.  Confirms "does RBG0 render my grid?". */
+    slPriorityRbg0(6);
+    slPriorityNbg1(5);
+#endif
     slScrAutoDisp(NBG0ON | NBG1ON | NBG3ON | RBG0ON);
 #else
     slScrAutoDisp(NBG0ON | NBG1ON | NBG3ON);
@@ -1742,8 +1781,14 @@ extern "C" void DG_DrawFrame(void)
         /* keep RBG0 (floor prototype) displayed every frame -- this per-frame
            slScrAutoDisp otherwise drops it (docs/RBG0_FLOOR_PLAN.md). */
         uint16_t rbg0_bit = (show_sky ? RBG0ON : 0);
-        slScrAutoDisp((uint16_t)(show_sky ? (NBG0ON | NBG1ON | NBG3ON | rbg0_bit)
-                                          : (NBG1ON | NBG3ON)));
+        /* DIAGNOSTIC: slScrAutoDisp returns FALSE on a VDP2 cycle-pattern conflict
+           (SRL checks this in ScrollEnable).  If ok=0 with RBG0 requested, RBG0 +
+           our two 8bpp bitmap NBGs don't fit the cycle budget -> RBG0 can't fetch
+           cells -> transparent.  Row 22. */
+        bool rbg0_ok = slScrAutoDisp((uint16_t)(show_sky ? (NBG0ON | NBG1ON | NBG3ON | rbg0_bit)
+                                                         : (NBG1ON | NBG3ON)));
+        { static char rb[40]; sprintf(rb, "RBG0 scrAutoDisp ok=%d sky=%d", (int)rbg0_ok, show_sky);
+          SRL::Debug::Print(0, 22, rb); }
 #else
         slScrAutoDisp((uint16_t)(show_sky ? (NBG0ON | NBG1ON | NBG3ON)
                                           : (NBG1ON | NBG3ON)));
@@ -1752,6 +1797,13 @@ extern "C" void DG_DrawFrame(void)
             for (int i = 192 * 320; i < 224 * 320; ++i)   /* status-bar rows (224: 192..223) */
                 if (framebuffer[i] == 0) framebuffer[i] = nb;
     }
+
+#if VDP2_RBG0_TEST
+    /* Re-write RBG0's rotation params from the matrix each frame (writes straight to the
+       VRAM rpara table -> no slSynch needed).  Static for now (Phase-0); Phase-1 will feed
+       it the player x/y/angle for a tracking Mode-7 floor. */
+    rbg0_set_transform();
+#endif
 
 #if VDP1_WEAPON
     /* LAYER INVERSION: VDP1 carries ONLY the walls (below NBG1).  During a LEVEL render the

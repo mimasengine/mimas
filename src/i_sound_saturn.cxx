@@ -32,13 +32,13 @@ static int cdda_track = 0;
 /* Hardware                                                             */
 /* ------------------------------------------------------------------ */
 
-/* SFX debug overlay (off by default; jo_print shim lives in dg_saturn.cxx):
+/* SFX debug overlay (off by default; dbg_print shim lives in dg_saturn.cxx):
  *   row 6  SFX#<n> ch<c> ns<samples> r<rate> o<sram_off>  (last sound, or CACHE-FAIL)
  *   row 7  PLAY <8-ch live map>  r<sram high-water>  f<cache failures>
  * Used to localise the silent-SFX bug to MVOL=0 and the rapid-retrigger drop. */
 #define SFX_DIAG 0
 #if SFX_DIAG
-extern "C" void jo_print(int x, int y, char *str);
+extern "C" void dbg_print(int x, int y, char *str);
 #endif
 
 #define SOUND_RAM       0x25A00000u
@@ -495,7 +495,7 @@ extern "C" void I_UpdateSound(void)
         static char ln7[45];
         snprintf(ln7, sizeof ln7, "PLAY %s  r%05x f%u   ", map,
                  (unsigned)sram_alloc, dbg_cachefail);
-        jo_print(0, 7, ln7);
+        dbg_print(0, 7, ln7);
     }
 #endif
 }
@@ -519,7 +519,7 @@ extern "C" int I_StartSound(sfxinfo_t *sfxinfo, int channel, int vol, int sep)
                       ++n, channel, c->nsamples, c->rate, c->sram_off);
       else { ++dbg_cachefail;
              snprintf(sb, sizeof sb, "SFX#%u ch%d CACHE-FAIL       ", ++n, channel); }
-      jo_print(0, 6, sb); }
+      dbg_print(0, 6, sb); }
 #endif
     if (!c) return -1;
 

@@ -59,7 +59,7 @@ git add core && git commit -m "bump core"
 `core/r_parallel.c` must stay **pure C** (no C++): DoomJo compiles it with
 GCC 9.3 which errors on C++isms (e.g. unnamed parameters) that DoomSRL's GCC 14
 would only warn about. Its only platform hooks are `slSlaveFunc` (SGL, both
-ports) and an `extern jo_print` debug shim (each port implements it).
+ports) and an `extern dbg_print` debug shim (each port implements it).
 
 ## Architecture: C Doom + C++ SRL
 

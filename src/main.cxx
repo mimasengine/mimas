@@ -1,7 +1,7 @@
 /*
 ** DoomSRL -- entry point for the Sega Saturn (Saturn Ring Library / SGL).
 **
-** SRL::Core::Initialize() replaces jo_core_init(): it calls slInitSystem,
+** SRL::Core::Initialize() calls slInitSystem,
 ** sets up the VBlank IRQ chain, and initializes CD/sound.  No SGL work-area
 ** relocation is needed -- SRL allocates its own work buffers internally.
 **

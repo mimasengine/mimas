@@ -11,7 +11,7 @@
 **   SMPC pad 1  : input
 **   V-blank IRQ : millisecond clock (via SRL::Core::OnVblank)
 **
-** SRL replaces Jo Engine.  Direct SGL calls (slBitMapNbg1, slScrAutoDisp...)
+** SRL is the platform SDK.  Direct SGL calls (slBitMapNbg1, slScrAutoDisp...)
 ** are still valid -- SRL links SGL internally.  SCU DMA, CRAM, FRT timer and
 ** cart probe are direct hardware register accesses as before.
 */
@@ -172,12 +172,24 @@ extern "C" int W_SaturnCDInit(void);
    check.  Set 0 for the real layering (RBG0 priority 5, shows only through index-0). */
 #define RBG0_DEBUG_ONTOP 0
 #define RBG0_CEL_VRAM    ((void *)0x25E20000)  /* VDP2 VRAM A1: cell (char) data    */
-/* Jo Engine (jo_engine/vdp2.c) keeps the RBG0 cells and map in SEPARATE banks (cells
-   A0, map B0) because RBG0 fetches a pattern-name AND a character per dot.  We mirror
-   that: cells in A1, map in B1's free region (B1 holds NBG3 font@+0x800, NBG3 map@
-   +0x1D000, the rotation-param table@+0x1ff00 -- +0x10000 is free, 8KB-aligned). */
-#define RBG0_MAP_VRAM    ((void *)0x25E70000)  /* VDP2 VRAM B1: pattern name table  */
+/* A rotation BG's pattern-name map must live in a VRAM B-bank.  An A-bank (map in A0/A1,
+   tried to keep the NBG3 debug text) gives slScrAutoDisp ok=0 -> RBG0 reads starve ->
+   squished bands.  B0 = the game framebuffer (non-negotiable), so the map goes in B1 and
+   EVICTS the NBG3 debug-text layer (cycle-pattern conflict) -- this is the reliable-floor
+   config (map B1, cells+ktable A1).  Debug overlay is OFF while the floor is on; the (now
+   software) sky stays in its place. */
+#define RBG0_MAP_VRAM    ((void *)0x25E70000)  /* VDP2 VRAM B1: pattern name table */
 #define RBG0_KTAB_VRAM   ((void *)0x25E28000)  /* VDP2 VRAM A1: coefficient (K) table */
+/* Pad Y toggles the RBG0 hardware floor.  ON = floor on RBG0 (NBG3 debug overlay evicted
+   by the RBG0 map in B1).  OFF = software floor + the NBG3 overlay returns -> read REC/EX/
+   P/FLAT to see what the floor offload saves.  Boot = on. */
+static int rbg0_floor_on = 1;
+/* RBG0 plane geometry, tuned against the software floor 2026-06-18 (live X+d-pad tuning,
+   since removed).  PITCH = +4.21deg off the 90deg ground tilt -> raises the plane's far end
+   onto Doom's horizon; YAW = +90deg -> orients the flat to the world.  Texture scale came out
+   1:1 (no slScale needed) once the pitch was right. */
+#define RBG0_PITCH       0x300    /* ANGLE delta on slRotX (~4.21deg) */
+#define RBG0_YAW_OFF     0x4000   /* ANGLE yaw offset (90deg)         */
 
 /* SKY_FIXED 1 = the sky does NOT scroll with the view angle (Romain's choice:
    a static backdrop).  0 = scroll with viewangle, slowed by SKY_PARALLAX_SHIFT
@@ -200,6 +212,8 @@ extern "C" int            menuactive;       /* boolean: menu overlay up */
 extern "C" int            automapactive;    /* boolean: automap up */
 extern "C" int            sat_vdp2_sky;     /* core: skip software sky (=> VDP2) */
 extern "C" int            sat_vdp2_floor;   /* core: skip software floor (=> VDP2 RBG0) */
+extern "C" int            sat_vdp2_floor_h; /* core: player's floor height (fixed_t) */
+extern "C" int            sat_vdp2_floor_pic;/* core: player's floor flat (picnum) */
 extern "C" int            sat_potato_floors;/* core: solid-colour floors/ceilings */
 extern "C" int            sat_potato_walls; /* core: solid-colour walls (opaque) */
 
@@ -278,8 +292,8 @@ static void sat_apply_potato(void)
 #define GS_LEVEL 0
 #define SAT_CMAP_BYTES (34 * 256)           /* COLORMAP: 34 maps of 256 (r_data.c) */
 
-/* Jo Engine compat shim: d_main.c calls jo_print(x, y, str) for debug overlay */
-extern "C" void jo_print(int x, int y, char *str)
+/* Debug-overlay shim: core (d_main.c, r_*.c) calls dbg_print(x, y, str). */
+extern "C" void dbg_print(int x, int y, char *str)
 {
     SRL::Debug::Print((uint8_t)x, (uint8_t)y, str);
 }
@@ -659,18 +673,20 @@ static void fps_update(void)
    Mirrors the working SRL sample's SetCurrentTransform (Samples/VDP2 - RBG0 Rotation). */
 static void rbg0_set_transform(void)
 {
-    /* Mode-7 GROUND matrix (Jo demo draw_3d_planes): rotate the plane 90deg about X so it
+    /* Mode-7 GROUND matrix: rotate the plane 90deg about X so it
        lies flat = the floor, then translate to the camera height/position.  slScrMatConv
        folds the perspective in; slScrMatSet writes the rpara to VRAM (no slSynch needed).
        Values are a first test -- tune the height (z) + position once it's on screen. */
     slPushMatrix();
     {
-        slRotX(0x4000);                                  /* 90 deg = lay plane flat = ground */
-        slRotZ((ANGLE)(-(int)(viewangle >> 16)));        /* yaw: track the view angle        */
+        slRotX((ANGLE)(0x4000 + RBG0_PITCH));            /* 90 deg + baked pitch: plane far end at the horizon */
+        slRotZ((ANGLE)(-(int)(viewangle >> 16) + RBG0_YAW_OFF)); /* yaw track + baked 90deg flat orientation */
         /* viewx/viewy are fixed_t (16.16) in map units; slTranslate's FIXED is also 16.16,
            so passing them directly scrolls the floor by the player's map position (1 unit ->
-           1 texel for a 64-unit flat).  Signs/scale are a first guess -- tune on hardware. */
-        slTranslate(-viewx, -viewy, toFIXED(-35.0));
+           1 texel for a 64-unit flat).  Z = eye height above the player's floor (viewz -
+           floor height) so the plane sits EXACTLY on the floor the player stands on, and
+           follows it up/down stairs.  Signs/scale tune with the real texture. */
+        slTranslate(-viewx, -viewy, -(viewz - sat_vdp2_floor_h));
         slCurRpara(RA);
         slScrMatConv();
         slScrMatSet();
@@ -678,39 +694,62 @@ static void rbg0_set_transform(void)
     slPopMatrix();
 }
 
+extern "C" unsigned char *sat_vdp2_floor_data(void);
+
+/* Swizzle the player's-floor Doom flat (64x64, from sat_vdp2_floor_data) into the RBG0
+   8x8 cells -- only when the floor flat changes (tracked).  Cell (cx,cy) at index cy*8+cx,
+   pixels row-major; the map (rbg0_proto_init) references char# = index*2. */
+static void rbg0_upload_flat(int picnum)
+{
+    static int loaded = -2;
+    if (picnum == loaded || picnum < 0) return;
+    const unsigned char *flat = sat_vdp2_floor_data();
+    if (!flat) return;
+    loaded = picnum;
+    unsigned char *cel = (unsigned char *)RBG0_CEL_VRAM;
+    for (int cy = 0; cy < 8; ++cy)
+        for (int cx = 0; cx < 8; ++cx)
+        {
+            unsigned char *c = cel + (cy * 8 + cx) * 64;
+            for (int ry = 0; ry < 8; ++ry)
+                for (int rx = 0; rx < 8; ++rx)
+                    c[ry * 8 + rx] = flat[(cy * 8 + ry) * 64 + (cx * 8 + rx)];
+        }
+}
+
 static void rbg0_proto_init(void)
 {
-    /* 1) one 8x8 8bpp tile: bright RED border + light-GRAY fill (PLAYPAL 176 / 4). */
-    unsigned char *cel = (unsigned char *)RBG0_CEL_VRAM;
-    for (int i = 0; i < 64; ++i)
-    {
-        int row = i >> 3, col = i & 7;
-        int border = (row == 0 || row == 7 || col == 0 || col == 7);
-        cel[i] = (unsigned char)(border ? 176 : 4);   /* PLAYPAL: 176=red, 4=gray */
-    }
+    /* 1) cells (64 cells x 64B = a 64x64 flat) are filled per-flat by rbg0_upload_flat()
+       on the first level frame; zero them so the brief pre-first-flat frame isn't garbage. */
+    memset((void *)RBG0_CEL_VRAM, 0, 64 * 64);
 
-    /* 2) pattern-name table -- Jo Engine 1-WORD format (jo_engine/vdp2.c __jo_create_map):
-       map word = (char#*2 | palette<<12) + cell_bank_offset.  Every cell -> char 0,
-       palette 1 (PLAYPAL, <<12 = 0x1000), cells at the A1 bank base -> offset 0 -> 0x1000. */
+    /* 2) pattern-name table -- 1-WORD format (map word = char#*2 | palette<<12 + offset).
+       A 64x64-cell page tiling the flat's 8x8 cell grid: cell (cx,cy) = index cy*8+cx ->
+       char# = (cy*8+cx)*2, palette 1 (PLAYPAL, 0x1000), cells at the A1 bank base -> offset 0. */
     {
         unsigned short *map = (unsigned short *)RBG0_MAP_VRAM;
-        for (int i = 0; i < 64 * 64; ++i) map[i] = 0x1000;
+        for (int my = 0; my < 64; ++my)
+            for (int mx = 0; mx < 64; ++mx)
+            {
+                int cellidx = (my & 7) * 8 + (mx & 7);
+                map[my * 64 + mx] = (unsigned short)((cellidx * 2) | 0x1000);
+            }
     }
 
-    /* 3) RBG0 cell config -- Jo Engine sequence (jo_vdp2_set_rbg0_plane_a + jo_vdp2_enable_rbg0).
+    /* 3) RBG0 cell config.
        THE FIX: slPageRbg0's FIRST arg is the CELL/character base, NOT the map.  My old code
        passed (map, cell) swapped -> RBG0 read pixels from the pattern-name table = garbage =
-       transparent.  Jo: slPageRbg0(cell, 0, PNB_1WORD|CN_12BIT) + sl1MapRA(map).  PNB_1WORD
+       transparent.  Sequence: slPageRbg0(cell, 0, PNB_1WORD|CN_12BIT) + sl1MapRA(map).  PNB_1WORD
        (not 2WORD).  OneAxis flat for now (no K-table); perspective K-table is the next step. */
     slOverRA(0);                                       /* over-area: repeat the plane  */
     slCharRbg0(COL_TYPE_256, CHAR_SIZE_1x1);
     slPageRbg0(RBG0_CEL_VRAM, 0, PNB_1WORD | CN_12BIT);/* arg1 = CELL base (the fix!)   */
     slPlaneRA(PL_SIZE_1x1);
     sl1MapRA(RBG0_MAP_VRAM);                            /* pattern-name table (B1)      */
-    /* PERSPECTIVE (Jo jo_vdp2_enable_rbg0): a per-line coefficient table (1/z scaling)
+    /* PERSPECTIVE: a per-line coefficient table (1/z scaling)
        turns the affine plane into a Mode-7 GROUND.  Static table via slMakeKtable -- the
        vblank-filled variant needs slSynch, which we don't run.  K_LINE = one scale per
-       scanline (enough for a floor; far cheaper than Jo's per-dot K_DOT). */
+       scanline (enough for a floor; far cheaper than a per-dot K_DOT). */
     slMakeKtable(RBG0_KTAB_VRAM);
     slKtableRA(RBG0_KTAB_VRAM, K_FIX | K_LINE | K_2WORD | K_ON);
     slRparaMode(K_CHANGE);                              /* use the coefficient table     */
@@ -724,7 +763,9 @@ static void rbg0_proto_init(void)
        DG_DrawFrame re-sets it each frame (rbg0_set_transform). */
     rbg0_set_transform();
 
-    slPriorityRbg0(5);           /* > sky(4), < game NBG1(6): shows in index-0 region */
+    slPriorityRbg0(4);           /* sky(3) < RBG0 floor(4) < VDP1 walls(5) < NBG1 game(6):
+                                    the walls cleanly occlude the infinite floor's overspill
+                                    (no priority tie), so it shows ONLY on the player's floor */
 }
 #endif
 
@@ -836,6 +877,10 @@ extern "C" void DG_Init(void)
     /* SATURN sky: NBG0 = 512x256 8bpp bitmap (VRAM A0, palette bank 1, shared
        with NBG1).  Bitmap content is uploaded per-level by sky_upload() once
        skytexture is known.  NBG3 = SRL debug text (priority 7). */
+    /* VDP2 hardware sky stays (A0); the RBG0 floor map is in B1, no conflict.  Sky A0,
+       RBG0 cells+ktable A1, framebuffer B0, RBG0 map B1.  The only casualty is NBG3 debug
+       text (shares B1 with the map) -> dropped while RBG0 is on; the pad toggle flips RBG0
+       off to read the overlay. */
     for (int y = 0; y < 256; ++y)
         memset(SKY_VRAM + y * SKY_VRAM_STRIDE, 0, SKY_VRAM_STRIDE);
     slBitMapNbg0(COL_TYPE_256, BM_512x256, (void *)SKY_VRAM);
@@ -847,8 +892,12 @@ extern "C" void DG_Init(void)
     /* LAYER INVERSION: software (NBG1) ON TOP with Doom's correct occlusion; the VDP1
        walls render BELOW NBG1, filling the index-0 (transparent) wall gaps NBG1 leaves
        where the software wall draw is skipped.  NBG3 debug = 7 (top).
-       NBG1 game = 6  >  every sprite priority = 5  >  NBG0 sky = 4. */
+       NBG1 game = 6  >  every sprite priority = 5  >  NBG0 sky = 4 (3 with RBG0). */
+#if VDP2_RBG0_TEST
+    slPriorityNbg0(3); slPriorityNbg1(6);   /* sky drops to 3 to sit below the RBG0 floor(4) */
+#else
     slPriorityNbg0(4); slPriorityNbg1(6);
+#endif
     slPrioritySpr0(5); slPrioritySpr1(5); slPrioritySpr2(5); slPrioritySpr3(5);
     slPrioritySpr4(5); slPrioritySpr5(5); slPrioritySpr6(5); slPrioritySpr7(5);
 #endif
@@ -861,7 +910,7 @@ extern "C" void DG_Init(void)
     slPriorityRbg0(6);
     slPriorityNbg1(5);
 #endif
-    slScrAutoDisp(NBG0ON | NBG1ON | NBG3ON | RBG0ON);
+    slScrAutoDisp(NBG0ON | NBG1ON | NBG3ON | RBG0ON);   /* sky(NBG0) + floor(RBG0) both on */
 #else
     slScrAutoDisp(NBG0ON | NBG1ON | NBG3ON);
 #endif
@@ -870,8 +919,8 @@ extern "C" void DG_Init(void)
        (transparent) so the VDP2 NBG0 sky shows through. */
     sat_vdp2_sky = 1;
 #if VDP2_RBG0_TEST
-    /* Enable the core floor-skip: R_DrawPlanes leaves FLOOR visplanes as index 0 so the
-       hardware RBG0 Mode-7 floor shows through (docs/RBG0_FLOOR_PLAN.md Phase-2). */
+    /* Floor on RBG0 at boot; the pad toggle flips it (rbg0_floor_on) so the NBG3 debug
+       overlay -- which loses to the RBG0 map in B1 -- can be read with the floor off. */
     sat_vdp2_floor = 1;
 #endif
     sat_apply_potato();   /* boot Potato level; pad Z cycles it live */
@@ -1796,17 +1845,14 @@ extern "C" void DG_DrawFrame(void)
         (void)menuactive;
         int show_sky = (gamestate == GS_LEVEL) && !automapactive;
 #if VDP2_RBG0_TEST
-        /* keep RBG0 (floor prototype) displayed every frame -- this per-frame
-           slScrAutoDisp otherwise drops it (docs/RBG0_FLOOR_PLAN.md). */
-        uint16_t rbg0_bit = (show_sky ? RBG0ON : 0);
-        /* DIAGNOSTIC: slScrAutoDisp returns FALSE on a VDP2 cycle-pattern conflict
-           (SRL checks this in ScrollEnable).  If ok=0 with RBG0 requested, RBG0 +
-           our two 8bpp bitmap NBGs don't fit the cycle budget -> RBG0 can't fetch
-           cells -> transparent.  Row 22. */
-        bool rbg0_ok = slScrAutoDisp((uint16_t)(show_sky ? (NBG0ON | NBG1ON | NBG3ON | rbg0_bit)
-                                                         : (NBG1ON | NBG3ON)));
-        { static char rb[40]; sprintf(rb, "RBG0 scrAutoDisp ok=%d sky=%d", (int)rbg0_ok, show_sky);
-          SRL::Debug::Print(0, 22, rb); }
+        /* RBG0 floor TOGGLE (rbg0_floor_on, flipped by the pad): ON = sky(NBG0) + game
+           (NBG1) + hardware floor(RBG0); the RBG0 map in B1 evicts the NBG3 overlay.
+           OFF = drop RBG0 -> NBG3 overlay returns AND the floor reverts to software
+           (sat_vdp2_floor=0) -> read REC/EX/P/FLAT to see what the floor offload saves. */
+        sat_vdp2_floor = rbg0_floor_on;
+        uint16_t sky_bit  = (show_sky ? NBG0ON : 0);
+        uint16_t rbg0_bit = (rbg0_floor_on ? RBG0ON : 0);
+        slScrAutoDisp((uint16_t)(sky_bit | NBG1ON | NBG3ON | rbg0_bit));
 #else
         slScrAutoDisp((uint16_t)(show_sky ? (NBG0ON | NBG1ON | NBG3ON)
                                           : (NBG1ON | NBG3ON)));
@@ -1817,10 +1863,14 @@ extern "C" void DG_DrawFrame(void)
     }
 
 #if VDP2_RBG0_TEST
-    /* Re-write RBG0's rotation params from the matrix each frame (writes straight to the
-       VRAM rpara table -> no slSynch needed).  Static for now (Phase-0); Phase-1 will feed
-       it the player x/y/angle for a tracking Mode-7 floor. */
-    rbg0_set_transform();
+    /* When the floor toggle is on: upload the player's floor texture to RBG0 (only when the
+       flat changes), then re-write its rotation params from the matrix each frame
+       (slScrMatSet writes the rpara straight to VRAM -> no slSynch needed). */
+    if (rbg0_floor_on)
+    {
+        rbg0_upload_flat(sat_vdp2_floor_pic);
+        rbg0_set_transform();
+    }
 #endif
 
 #if VDP1_WEAPON
@@ -2097,6 +2147,15 @@ static void poll_pad(void)
         potato_level = (potato_level + 1) % 3;
         sat_apply_potato();
     }
+
+#if VDP2_RBG0_TEST
+    /* Pad Y toggles the RBG0 hardware floor: OFF reverts the floor to software AND brings
+       back the NBG3 debug overlay (the RBG0 map in B1 evicts it while on), so you can read
+       REC/EX/P/FLAT to see what the floor offload saves.  (Y also taps 'y' to Doom --
+       harmless, like the potato Z / blit L+R live toggles.) */
+    if ((changed & PER_DGT_TY) && !(cur & PER_DGT_TY))
+        rbg0_floor_on = !rbg0_floor_on;
+#endif
 
 #if DUAL_CPU_BLIT
     /* Pad L+R held together cycles the blit config live (one press = next entry of

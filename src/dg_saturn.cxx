@@ -177,6 +177,7 @@ extern "C" int W_SaturnCDInit(void);
    that: cells in A1, map in B1's free region (B1 holds NBG3 font@+0x800, NBG3 map@
    +0x1D000, the rotation-param table@+0x1ff00 -- +0x10000 is free, 8KB-aligned). */
 #define RBG0_MAP_VRAM    ((void *)0x25E70000)  /* VDP2 VRAM B1: pattern name table  */
+#define RBG0_KTAB_VRAM   ((void *)0x25E28000)  /* VDP2 VRAM A1: coefficient (K) table */
 
 /* SKY_FIXED 1 = the sky does NOT scroll with the view angle (Romain's choice:
    a static backdrop).  0 = scroll with viewangle, slowed by SKY_PARALLAX_SHIFT
@@ -656,16 +657,17 @@ static void fps_update(void)
    Mirrors the working SRL sample's SetCurrentTransform (Samples/VDP2 - RBG0 Rotation). */
 static void rbg0_set_transform(void)
 {
+    /* Mode-7 GROUND matrix (Jo demo draw_3d_planes): rotate the plane 90deg about X so it
+       lies flat = the floor, then translate to the camera height/position.  slScrMatConv
+       folds the perspective in; slScrMatSet writes the rpara to VRAM (no slSynch needed).
+       Values are a first test -- tune the height (z) + position once it's on screen. */
     slPushMatrix();
     {
-        slTranslate(toFIXED(0.0), toFIXED(100.0), MsScreenDist);
+        slRotX(0x4000);                                       /* 90 deg = lay plane flat  */
+        slTranslate(toFIXED(0.0), toFIXED(0.0), toFIXED(-35.0));
         slCurRpara(RA);
-        slPushMatrix();
-        {
-            slScrMatConv();
-            slScrMatSet();
-        }
-        slPopMatrix();
+        slScrMatConv();
+        slScrMatSet();
     }
     slPopMatrix();
 }
@@ -699,8 +701,13 @@ static void rbg0_proto_init(void)
     slPageRbg0(RBG0_CEL_VRAM, 0, PNB_1WORD | CN_12BIT);/* arg1 = CELL base (the fix!)   */
     slPlaneRA(PL_SIZE_1x1);
     sl1MapRA(RBG0_MAP_VRAM);                            /* pattern-name table (B1)      */
-    slRparaMode(RA);
-    slKtableRA((void *)0, K_OFF);                      /* OneAxis: no perspective yet   */
+    /* PERSPECTIVE (Jo jo_vdp2_enable_rbg0): a per-line coefficient table (1/z scaling)
+       turns the affine plane into a Mode-7 GROUND.  Static table via slMakeKtable -- the
+       vblank-filled variant needs slSynch, which we don't run.  K_LINE = one scale per
+       scanline (enough for a floor; far cheaper than Jo's per-dot K_DOT). */
+    slMakeKtable(RBG0_KTAB_VRAM);
+    slKtableRA(RBG0_KTAB_VRAM, K_FIX | K_LINE | K_2WORD | K_ON);
+    slRparaMode(K_CHANGE);                              /* use the coefficient table     */
     slBMPaletteRbg0(1);
 
     /* 4) DRIVE THE ROTATION FROM THE MATRIX, NOT BY HAND.  We do NOT call slRparaInitSet:

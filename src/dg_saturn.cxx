@@ -160,6 +160,16 @@ extern "C" int W_SaturnCDInit(void);
 #define SKY_VRAM_STRIDE  512
 #define SKY_ANGLESHIFT   22   /* r_sky.h ANGLETOSKYSHIFT: 90deg (0x40000000)->256px */
 
+/* SATURN RBG0 floor prototype (docs/RBG0_FLOOR_PLAN.md).  Phase-0 = bring-up +
+   coexistence test: a cell-based rotation plane (tiled test flat, IDENTITY transform,
+   no perspective yet) in the free VRAM bank A1, shown at priority 5 so it appears
+   through the index-0 sky/ceiling region -- the goal is to confirm RBG0 displays
+   WITHOUT breaking the raw-SGL NBG0/NBG1 cycle pattern.  Coefficient table + Mode-7
+   perspective + dynamic flat selection are Phases 1-3.  Gated, throwaway. */
+#define VDP2_RBG0_TEST   1
+#define RBG0_CEL_VRAM    ((void *)0x25E20000)  /* VDP2 VRAM A1: cell (char) data    */
+#define RBG0_MAP_VRAM    ((void *)0x25E22000)  /* VDP2 VRAM A1: pattern name table  */
+
 /* SKY_FIXED 1 = the sky does NOT scroll with the view angle (Romain's choice:
    a static backdrop).  0 = scroll with viewangle, slowed by SKY_PARALLAX_SHIFT
    (0 = Doom-faithful 256px/90deg, 1 = half, 2 = quarter). */
@@ -543,6 +553,7 @@ static int vdp1_prev_done = 1;
 
 #if SHOW_FPS
 extern "C" int rp_timeout_count;
+extern "C" unsigned int rp_master_ms;   /* master frame ms -> prefixes r_parallel.c's row-18 SLV line */
 static unsigned int dg_frame_count = 0;
 static int vdp1_last_cmds = 0;
 
@@ -590,17 +601,12 @@ static void fps_update(void)
                     avg10 / 10, avg10 % 10, inst10 / 10, inst10 % 10);
             SRL::Debug::Print(0, 17, rA);
         }
+        /* row 15 freed: the standalone MST line was just a pointer to rows 19/20.  The
+           master frame ms (the synchronous bottleneck) now prefixes the slave's row-18
+           SLV line; set the shared value here, r_parallel.c prints it. */
+        rp_master_ms = inst10 ? (10000u / inst10) : 0;   /* frame ms */
         {
-            /* row 15: MASTER SH-2 -- its own line (like the slave's row 18).  MST = master frame
-               ms (the synchronous bottleneck); its work split is row 19 (REC/EX/W) + row 20
-               (Bw/Bp/P/M). */
-            static char rM[45];
-            unsigned int mst = inst10 ? (10000u / inst10) : 0;   /* frame ms */
-            sprintf(rM, "MST %ums  split>r19 r20", mst);
-            SRL::Debug::Print(0, 15, rM);
-        }
-        {
-            /* row 16: the AUXILIARY (co)processors only (master = row 15, slave = row 18).
+            /* row 16: the AUXILIARY (co)processors only (master+slave = row 18, split r19/r20).
                VD1 = VDP1 commands this frame + D(one)/B(usy).  VD2 = VDP2 (always compositing,
                spare).  SCU = SCU-DSP/DMA (idle = free to offload).  68K = SCSP sound CPU. */
             static char r6[45];
@@ -623,6 +629,63 @@ static void fps_update(void)
         t0     = now;
         frames = 0;
     }
+}
+#endif
+
+#if VDP2_RBG0_TEST
+/* RBG0 floor prototype -- Phase-0 bring-up (docs/RBG0_FLOOR_PLAN.md).  Cell-based
+   rotation plane: one recognizable 8x8 tile, repeated across a 1-page plane, with an
+   IDENTITY ROTSCROLL (flat 1:1 map, no perspective, no coefficient table).  Lives in
+   the free VRAM bank A1.  Shown at priority 5 (> sky 4, < game NBG1 6) so it appears
+   through the index-0 sky/ceiling region while the game still draws on top -- the test
+   is purely "does RBG0 light up without disturbing the raw-SGL NBG0/NBG1 cycle
+   pattern?".  Must be set up AFTER slBitMapNbg0/1 in DG_Init. */
+static ROTSCROLL rbg0_rot;   /* RAM-side rotation param; SGL pushes it at vblank */
+
+static void rbg0_proto_init(void)
+{
+    /* 1) one 8x8 8bpp tile: bright border + dark fill, so tiling is obvious. */
+    unsigned char *cel = (unsigned char *)RBG0_CEL_VRAM;
+    for (int i = 0; i < 64; ++i)
+    {
+        int row = i >> 3, col = i & 7;
+        int border = (row == 0 || row == 7 || col == 0 || col == 7);
+        cel[i] = (unsigned char)(border ? 4 : 79);   /* arbitrary PLAYPAL indices */
+    }
+
+    /* 2) pattern name table (2-word): every cell -> char 0, palette 0.  A 1x1 plane
+       page is 64x64 cells; 2-word = 2 uint16 per cell. */
+    {
+        unsigned short *pn = (unsigned short *)RBG0_MAP_VRAM;
+        int cells = 64 * 64;
+        for (int i = 0; i < cells; ++i) { pn[2*i] = 0; pn[2*i + 1] = 0; }
+    }
+
+    /* 3) RBG0 cell config: 256-colour, 8x8 chars, 2-word pattern names, 12-bit CN. */
+    slCharRbg0(COL_TYPE_256, CHAR_SIZE_1x1);
+    slPageRbg0(RBG0_MAP_VRAM, RBG0_CEL_VRAM, PNB_2WORD | CN_12BIT);
+    slPlaneRA(PL_SIZE_1x1);
+    {
+        /* 16-plane rotation map (4x4): all point at plane 0 -> the single page tiles. */
+        static unsigned char map16[16];
+        for (int i = 0; i < 16; ++i) map16[i] = 0;
+        sl16MapRA(map16);
+    }
+    slOverRA(0);                 /* over-area: repeat the plane (seamless ground) */
+    slBMPaletteRbg0(1);          /* share PLAYPAL colour bank 1 with NBG0/NBG1     */
+
+    /* 4) IDENTITY ROTSCROLL: flat 1:1 screen<->plane, no perspective, no K-table. */
+    memset(&rbg0_rot, 0, sizeof rbg0_rot);
+    rbg0_rot.MATA = toFIXED(1.0);  rbg0_rot.MATE = toFIXED(1.0);   /* 2x3 identity   */
+    rbg0_rot.KX   = toFIXED(1.0);  rbg0_rot.KY   = toFIXED(1.0);   /* unit zoom      */
+    rbg0_rot.DXST = toFIXED(0.0);  rbg0_rot.DYST = toFIXED(1.0);   /* +1 plane-Y/line */
+    rbg0_rot.DX   = toFIXED(1.0);  rbg0_rot.DY   = toFIXED(0.0);   /* +1 plane-X/dot  */
+    rbg0_rot.KAST = 0; rbg0_rot.DKAST = 0; rbg0_rot.DKA = 0;       /* no coeff table  */
+    slRparaInitSet(&rbg0_rot);
+    slCurRpara(RA);
+    slKtableRA((void *)0, K_OFF);
+
+    slPriorityRbg0(5);           /* > sky(4), < game NBG1(6): shows in index-0 region */
 }
 #endif
 
@@ -742,7 +805,14 @@ extern "C" void DG_Init(void)
     slPrioritySpr0(5); slPrioritySpr1(5); slPrioritySpr2(5); slPrioritySpr3(5);
     slPrioritySpr4(5); slPrioritySpr5(5); slPrioritySpr6(5); slPrioritySpr7(5);
 #endif
+#if VDP2_RBG0_TEST
+    /* RBG0 floor prototype Phase-0: bring up the rotation plane AFTER NBG0/NBG1 so we
+       can see whether it disturbs their cycle pattern (docs/RBG0_FLOOR_PLAN.md). */
+    rbg0_proto_init();
+    slScrAutoDisp(NBG0ON | NBG1ON | NBG3ON | RBG0ON);
+#else
     slScrAutoDisp(NBG0ON | NBG1ON | NBG3ON);
+#endif
 
     /* Enable the core sky-skip: R_DrawPlanes leaves the sky region as index 0
        (transparent) so the VDP2 NBG0 sky shows through. */
@@ -1668,8 +1738,16 @@ extern "C" void DG_DrawFrame(void)
            would otherwise show sky) and outside a level. */
         (void)menuactive;
         int show_sky = (gamestate == GS_LEVEL) && !automapactive;
+#if VDP2_RBG0_TEST
+        /* keep RBG0 (floor prototype) displayed every frame -- this per-frame
+           slScrAutoDisp otherwise drops it (docs/RBG0_FLOOR_PLAN.md). */
+        uint16_t rbg0_bit = (show_sky ? RBG0ON : 0);
+        slScrAutoDisp((uint16_t)(show_sky ? (NBG0ON | NBG1ON | NBG3ON | rbg0_bit)
+                                          : (NBG1ON | NBG3ON)));
+#else
         slScrAutoDisp((uint16_t)(show_sky ? (NBG0ON | NBG1ON | NBG3ON)
                                           : (NBG1ON | NBG3ON)));
+#endif
         if (show_sky)
             for (int i = 192 * 320; i < 224 * 320; ++i)   /* status-bar rows (224: 192..223) */
                 if (framebuffer[i] == 0) framebuffer[i] = nb;

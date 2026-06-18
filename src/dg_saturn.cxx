@@ -183,7 +183,14 @@ extern "C" int W_SaturnCDInit(void);
 /* Pad Y toggles the RBG0 hardware floor.  ON = floor on RBG0 (NBG3 debug overlay evicted
    by the RBG0 map in B1).  OFF = software floor + the NBG3 overlay returns -> read REC/EX/
    P/FLAT to see what the floor offload saves.  Boot = on. */
-static int rbg0_floor_on = 1;
+/* Pad Y cycles 3 RBG0/debug modes (the RBG0 map in B1 and the NBG3 overlay are mutually
+   exclusive, so the HW floor and the debug text can't show together -- hence the 3 states):
+     0 = VDP2 floor, NO debug   (the ship look: sky+game+RBG0 floor, NBG3 evicted)
+     1 = debug + SOFTWARE floor (NBG3 on, sat_vdp2_floor=0 -> floor drawn by CPU)
+     2 = debug, NO software floor (NBG3 on, sat_vdp2_floor=1 -> floor skipped, RBG0 off)
+   Modes 1 vs 2 (read REC/EX/P/FLAT in both) isolate the software-floor cost = the saving
+   the VDP2 floor buys.  Boot = 0. */
+static int rbg0_mode = 0;
 /* RBG0 plane geometry, tuned against the software floor 2026-06-18 (live X+d-pad tuning,
    since removed).  PITCH = +4.21deg off the 90deg ground tilt -> raises the plane's far end
    onto Doom's horizon; YAW = +90deg -> orients the flat to the world.  Texture scale came out
@@ -214,6 +221,7 @@ extern "C" int            sat_vdp2_sky;     /* core: skip software sky (=> VDP2)
 extern "C" int            sat_vdp2_floor;   /* core: skip software floor (=> VDP2 RBG0) */
 extern "C" int            sat_vdp2_floor_h; /* core: player's floor height (fixed_t) */
 extern "C" int            sat_vdp2_floor_pic;/* core: player's floor flat (picnum) */
+extern "C" unsigned char *sat_vdp2_floor_cmap;/* core: colormap for the floor's sector light (0=full bright) */
 extern "C" int            sat_potato_floors;/* core: solid-colour floors/ceilings */
 extern "C" int            sat_potato_walls; /* core: solid-colour walls (opaque) */
 
@@ -697,15 +705,21 @@ static void rbg0_set_transform(void)
 extern "C" unsigned char *sat_vdp2_floor_data(void);
 
 /* Swizzle the player's-floor Doom flat (64x64, from sat_vdp2_floor_data) into the RBG0
-   8x8 cells -- only when the floor flat changes (tracked).  Cell (cx,cy) at index cy*8+cx,
-   pixels row-major; the map (rbg0_proto_init) references char# = index*2. */
+   8x8 cells, shaded through the floor sector's colormap (sat_vdp2_floor_cmap) so the
+   hardware floor dims with the room.  Re-uploads only when the flat OR the light level
+   changes (~0.6ms = 4096 VDP2-VRAM bytes; cheap even in flicker sectors).  Cell (cx,cy)
+   at index cy*8+cx, pixels row-major; the map (rbg0_proto_init) references char# = idx*2. */
 static void rbg0_upload_flat(int picnum)
 {
     static int loaded = -2;
-    if (picnum == loaded || picnum < 0) return;
+    static const unsigned char *loaded_cmap = (const unsigned char *)1;
+    const unsigned char *cmap = sat_vdp2_floor_cmap;
+    if (picnum < 0) return;
+    if (picnum == loaded && cmap == loaded_cmap) return;
     const unsigned char *flat = sat_vdp2_floor_data();
     if (!flat) return;
     loaded = picnum;
+    loaded_cmap = cmap;
     unsigned char *cel = (unsigned char *)RBG0_CEL_VRAM;
     for (int cy = 0; cy < 8; ++cy)
         for (int cx = 0; cx < 8; ++cx)
@@ -713,7 +727,10 @@ static void rbg0_upload_flat(int picnum)
             unsigned char *c = cel + (cy * 8 + cx) * 64;
             for (int ry = 0; ry < 8; ++ry)
                 for (int rx = 0; rx < 8; ++rx)
-                    c[ry * 8 + rx] = flat[(cy * 8 + ry) * 64 + (cx * 8 + rx)];
+                {
+                    unsigned char px = flat[(cy * 8 + ry) * 64 + (cx * 8 + rx)];
+                    c[ry * 8 + rx] = cmap ? cmap[px] : px;
+                }
         }
 }
 
@@ -919,8 +936,7 @@ extern "C" void DG_Init(void)
        (transparent) so the VDP2 NBG0 sky shows through. */
     sat_vdp2_sky = 1;
 #if VDP2_RBG0_TEST
-    /* Floor on RBG0 at boot; the pad toggle flips it (rbg0_floor_on) so the NBG3 debug
-       overlay -- which loses to the RBG0 map in B1 -- can be read with the floor off. */
+    /* Floor on RBG0 at boot (rbg0_mode 0); pad Y cycles the 3 RBG0/debug modes. */
     sat_vdp2_floor = 1;
 #endif
     sat_apply_potato();   /* boot Potato level; pad Z cycles it live */
@@ -1845,14 +1861,15 @@ extern "C" void DG_DrawFrame(void)
         (void)menuactive;
         int show_sky = (gamestate == GS_LEVEL) && !automapactive;
 #if VDP2_RBG0_TEST
-        /* RBG0 floor TOGGLE (rbg0_floor_on, flipped by the pad): ON = sky(NBG0) + game
-           (NBG1) + hardware floor(RBG0); the RBG0 map in B1 evicts the NBG3 overlay.
-           OFF = drop RBG0 -> NBG3 overlay returns AND the floor reverts to software
-           (sat_vdp2_floor=0) -> read REC/EX/P/FLAT to see what the floor offload saves. */
-        sat_vdp2_floor = rbg0_floor_on;
+        /* RBG0/debug 3-mode cycle (rbg0_mode, pad Y) -- see the rbg0_mode decl:
+           0 = VDP2 floor, no dbg   (RBG0 on, NBG3 off, sw floor skipped)
+           1 = dbg + software floor (RBG0 off, NBG3 on, sw floor drawn)
+           2 = dbg, no software floor (RBG0 off, NBG3 on, sw floor skipped). */
+        sat_vdp2_floor    = (rbg0_mode == 1) ? 0 : 1;        /* mode 1 draws the sw floor; 0,2 skip it */
         uint16_t sky_bit  = (show_sky ? NBG0ON : 0);
-        uint16_t rbg0_bit = (rbg0_floor_on ? RBG0ON : 0);
-        slScrAutoDisp((uint16_t)(sky_bit | NBG1ON | NBG3ON | rbg0_bit));
+        uint16_t rbg0_bit = (rbg0_mode == 0) ? RBG0ON : 0;   /* HW floor only in mode 0           */
+        uint16_t nbg3_bit = (rbg0_mode == 0) ? 0 : NBG3ON;   /* debug overlay only in modes 1,2   */
+        slScrAutoDisp((uint16_t)(sky_bit | NBG1ON | nbg3_bit | rbg0_bit));
 #else
         slScrAutoDisp((uint16_t)(show_sky ? (NBG0ON | NBG1ON | NBG3ON)
                                           : (NBG1ON | NBG3ON)));
@@ -1866,7 +1883,7 @@ extern "C" void DG_DrawFrame(void)
     /* When the floor toggle is on: upload the player's floor texture to RBG0 (only when the
        flat changes), then re-write its rotation params from the matrix each frame
        (slScrMatSet writes the rpara straight to VRAM -> no slSynch needed). */
-    if (rbg0_floor_on)
+    if (rbg0_mode == 0)
     {
         rbg0_upload_flat(sat_vdp2_floor_pic);
         rbg0_set_transform();
@@ -2149,12 +2166,12 @@ static void poll_pad(void)
     }
 
 #if VDP2_RBG0_TEST
-    /* Pad Y toggles the RBG0 hardware floor: OFF reverts the floor to software AND brings
-       back the NBG3 debug overlay (the RBG0 map in B1 evicts it while on), so you can read
-       REC/EX/P/FLAT to see what the floor offload saves.  (Y also taps 'y' to Doom --
+    /* Pad Y cycles the 3 RBG0/debug modes (0 VDP2-floor/no-dbg -> 1 dbg+sw-floor ->
+       2 dbg/no-sw-floor -> wrap).  Modes 1 vs 2 isolate the software-floor cost (read
+       REC/EX/P/FLAT in each) = what the VDP2 floor saves.  (Y also taps 'y' to Doom --
        harmless, like the potato Z / blit L+R live toggles.) */
     if ((changed & PER_DGT_TY) && !(cur & PER_DGT_TY))
-        rbg0_floor_on = !rbg0_floor_on;
+        rbg0_mode = (rbg0_mode + 1) % 3;
 #endif
 
 #if DUAL_CPU_BLIT

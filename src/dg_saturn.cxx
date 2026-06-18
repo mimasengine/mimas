@@ -170,7 +170,7 @@ extern "C" int W_SaturnCDInit(void);
 /* DEBUG: force RBG0 above the game (priority 6, NBG1 dropped to 5) so its content is
    visible regardless of the index-0 window -- a definitive "does RBG0 render my grid?"
    check.  Set 0 for the real layering (RBG0 priority 5, shows only through index-0). */
-#define RBG0_DEBUG_ONTOP 1
+#define RBG0_DEBUG_ONTOP 0
 #define RBG0_CEL_VRAM    ((void *)0x25E20000)  /* VDP2 VRAM A1: cell (char) data    */
 /* Jo Engine (jo_engine/vdp2.c) keeps the RBG0 cells and map in SEPARATE banks (cells
    A0, map B0) because RBG0 fetches a pattern-name AND a character per dot.  We mirror
@@ -192,12 +192,14 @@ extern "C" int W_SaturnCDInit(void);
 
 extern "C" int            skytexture;
 extern "C" unsigned int   viewangle;        /* angle_t (unsigned int) */
+extern "C" int            viewx, viewy, viewz;  /* fixed_t camera pos (16.16 map units) */
 extern "C" unsigned char *R_GetColumn(int tex, int col);
 extern "C" unsigned char *colormaps;        /* lighttable_t* (byte*), saturn_cmap */
 extern "C" int            gamestate;        /* gamestate_t: GS_LEVEL == 0 */
 extern "C" int            menuactive;       /* boolean: menu overlay up */
 extern "C" int            automapactive;    /* boolean: automap up */
 extern "C" int            sat_vdp2_sky;     /* core: skip software sky (=> VDP2) */
+extern "C" int            sat_vdp2_floor;   /* core: skip software floor (=> VDP2 RBG0) */
 extern "C" int            sat_potato_floors;/* core: solid-colour floors/ceilings */
 extern "C" int            sat_potato_walls; /* core: solid-colour walls (opaque) */
 
@@ -663,8 +665,12 @@ static void rbg0_set_transform(void)
        Values are a first test -- tune the height (z) + position once it's on screen. */
     slPushMatrix();
     {
-        slRotX(0x4000);                                       /* 90 deg = lay plane flat  */
-        slTranslate(toFIXED(0.0), toFIXED(0.0), toFIXED(-35.0));
+        slRotX(0x4000);                                  /* 90 deg = lay plane flat = ground */
+        slRotZ((ANGLE)(-(int)(viewangle >> 16)));        /* yaw: track the view angle        */
+        /* viewx/viewy are fixed_t (16.16) in map units; slTranslate's FIXED is also 16.16,
+           so passing them directly scrolls the floor by the player's map position (1 unit ->
+           1 texel for a 64-unit flat).  Signs/scale are a first guess -- tune on hardware. */
+        slTranslate(-viewx, -viewy, toFIXED(-35.0));
         slCurRpara(RA);
         slScrMatConv();
         slScrMatSet();
@@ -863,6 +869,11 @@ extern "C" void DG_Init(void)
     /* Enable the core sky-skip: R_DrawPlanes leaves the sky region as index 0
        (transparent) so the VDP2 NBG0 sky shows through. */
     sat_vdp2_sky = 1;
+#if VDP2_RBG0_TEST
+    /* Enable the core floor-skip: R_DrawPlanes leaves FLOOR visplanes as index 0 so the
+       hardware RBG0 Mode-7 floor shows through (docs/RBG0_FLOOR_PLAN.md Phase-2). */
+    sat_vdp2_floor = 1;
+#endif
     sat_apply_potato();   /* boot Potato level; pad Z cycles it live */
 
     /* LAYER INVERSION: the weapon + HUD now render in SOFTWARE (NBG1, on top) -- do NOT

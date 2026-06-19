@@ -129,3 +129,41 @@ core/%.o : core/%.c
 # time identical to -O2).  REC is memory/bus-bound (BSP + visplane pointer-chasing,
 # A-bus colormap/texture reads), not compute-bound, so better codegen doesn't help.
 # Kept at -O2.  Don't re-add -O3 here without a new measurement.
+
+# -----------------------------------------------------------------------
+# SATURN: dual-compile the renderer for the SECOND SH-2 (parallel-REC / split-
+# screen, docs/MULTIPLAYER_PLAN.md Step B).  The 6 render TUs are compiled a
+# second time with -DRP_SLAVE_BUILD, then every GLOBAL symbol they define is
+# prefixed `slave_` (nm -> objcopy --redefine-syms), so the slave runs an
+# INDEPENDENT renderer with its own state, linked beside the master copy.
+# (file-local statics auto-separate per TU; shared read-only data -- nodes/segs/
+# textures/trig tables -- lives OUTSIDE these TUs so it stays un-renamed = shared.)
+# Completeness is link-checked: a missed global = a duplicate-symbol link error.
+# DoomSRL-only; DoomJo never builds these objects.
+# -----------------------------------------------------------------------
+NM         := $(subst objcopy,nm,$(OBJCOPY))
+SLAVE_TU    = r_bsp r_segs r_plane r_things r_main r_draw
+SLAVE_PRE   = $(addprefix core/,$(addsuffix _slave.pre.o,$(SLAVE_TU)))
+SLAVE_OBJ   = $(addprefix core/,$(addsuffix _slave.o,$(SLAVE_TU)))
+# generated rename map -> build/ (gitignored) so the shared core/ submodule stays clean
+SLAVE_REDEF = $(BUILD_DROP)/slave_redefine.txt
+
+# 1) compile each render TU a 2nd time with the slave define
+core/%_slave.pre.o : core/%.c
+	$(CC) $< $(CCFLAGS) -std=gnu11 -DRP_SLAVE_BUILD -MMD -MP -o $@
+
+# 2) unified rename map: every GLOBAL (T/D/B/R/C, not file-local) defined in ANY
+#    slave pre-object -> slave_<sym>.  Applied to ALL slave objects so cross-TU
+#    references stay consistent; undefined (shared) symbols are left untouched.
+$(SLAVE_REDEF) : $(SLAVE_PRE)
+	@mkdir -p $(@D)
+	$(NM) $(SLAVE_PRE) | awk '$$2 ~ /^[TDBRC]$$/ && $$3 != "" { print $$3" slave_"$$3 }' | sort -u > $@
+
+# 3) rename to produce the final slave objects
+core/%_slave.o : core/%_slave.pre.o $(SLAVE_REDEF)
+	$(OBJCOPY) --redefine-syms=$(SLAVE_REDEF) $< $@
+
+# build them before the link, and add them to the link line ($(OBJECTS) is
+# expanded in the recipe at run time so the += is picked up).
+compile_objects : $(SLAVE_OBJ)
+OBJECTS += $(SLAVE_OBJ)

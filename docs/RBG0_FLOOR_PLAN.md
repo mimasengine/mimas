@@ -5,6 +5,34 @@ Deport the single **largest visible floor/ceiling flat** of each frame to a VDP2
 else. Decided GO from hardware data; **dynamic** (RBG0 re-points to the per-frame
 dominant flat), not a static per-level pick.
 
+## ⚠️ 2026-06-19 hardware reality check (read `docs/VDP2_ARCHITECTURE.md`)
+
+Romain re-tested on a real Saturn: **VDP2 broken** — dead sky + "snow" (white bands).
+Root cause is now fully understood and it is **two stacked defects**, both fatal on
+hardware (and both invisible on Ymir):
+
+1. **Commit gap.** We never run `slSynch`, so the RBG0 cycle pattern + RAMCTL never
+   reach the chip (SGL only flushes its shadow registers inside `slSynch`). The bitmap
+   layers then read an un-scheduled cycle pattern → starve → snow. `HEAD` has **no**
+   commit at all (only `slScrAutoDisp(...|RBG0ON)`); the "one-shot slSynch fix" the
+   memory recorded as built is **not in the committed tree** — treat
+   "hardware-confirmed end-to-end" as **unverified**.
+2. **Bank over-subscription.** A cell RBG0 with a VRAM coefficient table needs **3 whole
+   banks** (pattern-name, character, coefficient — each claims an *entire* bank's
+   timing, per the VDP2 manual). With the mandatory framebuffer that's 4 banks → **no
+   bank left for the hardware sky**. Worse, our layout puts **cells and the K-table both
+   in A1**, which the hardware forbids (two whole-bank reads in one bank).
+
+**Corrected VRAM truth (supersedes the "2 bitmaps + RBG0 FITS" claim below):** you can
+have the **hardware sky OR the RBG0 floor, not both** on a 4-bank budget. To ship the
+floor: **software sky** (frees A0 for the K-table → B0 fb / A1 cells / B1 map / A0 K =
+exactly 4) **and** commit the cycle pattern by **direct register writes** — NOT `slSynch`
+(even one-shot `slSynch` was HW-tested *worse* and reverted), NOT `slScrCycleSet`
+(shadow-only); poke RAMCTL `@0x25F8000E` + CYCxx directly, Jo `0x1327` style. Keeping the
+HW sky is only possible if the coefficient table moves to **Color RAM** (`CRKTE`) without
+breaking the 8bpp palette — unproven, investigate. Full hardware/bandwidth analysis +
+capacity ledger + convictions = **`docs/VDP2_ARCHITECTURE.md`**.
+
 ## Why (the data)
 
 Row-13 `FLAT` profiler over 6 L1/L2 views (all pot0):

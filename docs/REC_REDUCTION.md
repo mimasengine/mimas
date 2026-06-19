@@ -54,7 +54,7 @@ Gain = rough fraction of the targeted phase, to be confirmed on hardware. Risk: 
 | QW1 | **Trim dead `texturecolumn`** in VDP1-owned wall columns (gate on `sw_draws‖maskedtexture`) | Bp | small–med (per-col FixedMul + 2 array reads ×most cols) | 🟢 | ✓ | ✓ | ⟲ | **IMPLEMENTED, built green, awaiting HW** |
 | QW2 | **Potato floors drawn INLINE** (memset in R_MapPlane; skip RP_RecordSpan + executor) | P | med (kills 32 B write + 32 B read / span) | 🟡 | ✓ | ✓ | ⟲ (`SAT_POTATO_INLINE_SPANS 0`) | **IMPLEMENTED, built green, awaiting HW** |
 | L1 | **visplane hash** in R_FindPlane (d32xr-style) — O(n)→O(1) | Bw/P | med in plane-heavy scenes | 🟡 (core, shared w/ DoomJo; behaviourally identical) | ✓ | ✓ | ⟲ (`SAT_VISPLANE_HASH 0`) | **IMPLEMENTED, built green, awaiting HW** (gain HW-only — Bw is 2–3 ms on Ymir vs 7–26 ms on HW) |
-| L2 | **Command buffer → HIGH work-RAM** (shrink to ~32–64 KB so it fits the fast bank) | REC+EX | med (write+read on fast bank) | 🟡 (HWRAM budget; relocation) | ✓ | ✓ | ⟲⟲ | catalogued — needs HWRAM budget check |
+| L2 | **Command buffer → HIGH work-RAM** (shrink to ~32–64 KB so it fits the fast bank) | REC+EX | med (write+read on fast bank) | 🟡 (HWRAM budget; relocation; shared core) | ✓ | ✓ | ⟲⟲ | **budget measured 2026-06-18: feasible-but-tight.** Buf = 160 KB/5120 cmds @0x002D8000 (slow LWRAM) but `c` peaks ~1068 → 64 KB/2048 has 2× margin. HWRAM heap reserve ~125 KB (`_end` 0x060da9e0 → `__heap_end` 0x060fa000); a 64 KB BSS buf leaves ~61 KB heap → OK iff C-malloc < 61 KB (verify). Caveat: gain is **Ymir-invisible** (bank-latency only) + touches shared `r_parallel.h` (DoomJo map) + freeze-zone. See §2. |
 | L3 | **Command compaction** (per-type short records; FUZZ=9 B, COL=28 B vs 32 B) | REC+EX | small–med (less DRAM traffic) | 🔴 (breaks fixed-stride parity index + two-pointer steal) | ✓ | ✓ | ⟲⟲ | catalogued — likely not worth the complexity |
 | T1 | **Idle-camera REC skip** (re-present last frame when output provably identical) | all REC | huge *when it fires* | 🟡🔴 (VDP1-hybrid present path + determinism) | ✓ | ✓ | ⟲ | catalogued — see §4 (safe form low-value at 8 fps) |
 | T2 | **Pure-yaw wall-prep reuse** (cylindrical projection: yaw shifts columns, not heights) | Bp | large (theoretical) | 🔴 (deep; invalidation) | ✓ | ✓ | ✗ | catalogued — research, not near-term |
@@ -239,7 +239,8 @@ otherwise nearly empty). Revert: `SAT_POTATO_INLINE_SPANS 0`.
 1. **QW1 + QW2** (done, gated) → hardware A/B at the 6 spots.
 2. **L1 visplane hash** — **DONE (built green, gated `SAT_VISPLANE_HASH`)**, awaiting the same HW pass. Best remaining *algorithmic* solo win, no slave, helps multi.
 3. **L2 command buffer → fast RAM** (shrink + relocate) — attacks the memory-bound core
-   directly; pending an HWRAM budget check.
+   directly. **SPEC ready-to-build: `docs/REC_L2_SPEC.md`** (budget measured, gated A/B).
+   Code it AFTER the parallel RBG0-floors session (merge overlap on dg_saturn.cxx).
 4. Multi: build the **allocator pre-cache gate (cart-agnostic)** as the first, isolated
    step before any per-view parallelism.
 5. Temporal coherence (T1/T3) only if a concrete idle/menu/multi case justifies the

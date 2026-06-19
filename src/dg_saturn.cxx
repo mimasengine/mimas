@@ -107,6 +107,14 @@ extern "C" char *gamedescription;
    frame -> "every other line shows sky" corruption.  Kept at 1 (double-buffer = correct). */
 #define VDP1_DBLBANK 1
 
+/* VDP1 framebuffer MANUAL-CHANGE (anti-tearing).  0 = 1-cycle auto (FBCR=0: VDP1 swaps its
+   two framebuffers EVERY vblank), 1 = manual change.  The wall list spans several vblanks at
+   our fps, so 1-cycle showed it half-drawn = the VDP1 "déchirures".  Manual change holds the
+   last COMPLETE frame and only swaps when the draw finished (EDSR CEF), triggered from the
+   existing OnVblank -- i.e. vsync the VDP1 presentation WITHOUT slSynch (no fps tax, no SCSP
+   sound conflict, no latency: the CPU never waits).  1 = on (anti-tear), 0 = old auto swap. */
+#define VDP1_MANUAL_CHANGE 1
+
 extern "C" byte *I_VideoBuffer;
 extern "C" int   gametic;
 extern "C" int   r_visplane_peak;
@@ -166,20 +174,37 @@ extern "C" int W_SaturnCDInit(void);
    through the index-0 sky/ceiling region -- the goal is to confirm RBG0 displays
    WITHOUT breaking the raw-SGL NBG0/NBG1 cycle pattern.  Coefficient table + Mode-7
    perspective + dynamic flat selection are Phases 1-3.  Gated, throwaway. */
-#define VDP2_RBG0_TEST   1
+/* 0 = RBG0 hardware floor PAUSED -> known-good build: VDP2 hardware sky + software floor,
+   no RBG0, no RAMCTL poke (set VDP2_HW_SKY=1 with this).  1 = RBG0 Mode-7 floor test
+   (needs VDP2_HW_SKY=0; still snows on HW -- the cycle-pattern commit is unsolved, see
+   docs/VDP2_ARCHITECTURE.md).  Code is kept under #if either way. */
+#define VDP2_RBG0_TEST   0
 /* DEBUG: force RBG0 above the game (priority 6, NBG1 dropped to 5) so its content is
    visible regardless of the index-0 window -- a definitive "does RBG0 render my grid?"
    check.  Set 0 for the real layering (RBG0 priority 5, shows only through index-0). */
 #define RBG0_DEBUG_ONTOP 0
+/* VDP2_HW_SKY: 1 = hardware sky bitmap on NBG0 in bank A0 (old config).  0 = SOFTWARE
+   sky -> frees bank A0 so the textured RBG0 floor's K-table gets its OWN bank, giving
+   the correct 4-bank layout (B0 framebuffer / A1 cells / B1 map / A0 K-table).  The
+   textured floor REQUIRES 0: A0 cannot be both the sky bitmap and the K-table, and
+   swapping it at runtime would need a mid-game RAMCTL/CYC re-commit (fragile -- slSynch
+   makes it worse), so this is a BUILD choice, not a pad-mode toggle.  Software sky costs
+   a little REC back, but it lands on the slave the floor offload frees (slave 46->0%
+   busy).  See docs/VDP2_ARCHITECTURE.md.  PAUSED config = 1 (hardware sky, RBG0 off). */
+#define VDP2_HW_SKY      1
 #define RBG0_CEL_VRAM    ((void *)0x25E20000)  /* VDP2 VRAM A1: cell (char) data    */
 /* A rotation BG's pattern-name map must live in a VRAM B-bank.  An A-bank (map in A0/A1,
    tried to keep the NBG3 debug text) gives slScrAutoDisp ok=0 -> RBG0 reads starve ->
    squished bands.  B0 = the game framebuffer (non-negotiable), so the map goes in B1 and
    EVICTS the NBG3 debug-text layer (cycle-pattern conflict) -- this is the reliable-floor
-   config (map B1, cells+ktable A1).  Debug overlay is OFF while the floor is on; the (now
-   software) sky stays in its place. */
+   config.  Bank layout (VDP2_HW_SKY=0): B0 framebuffer / A1 cells / B1 map / A0 K-table
+   (A0 freed by the software sky).  Debug overlay is OFF while the floor is on. */
 #define RBG0_MAP_VRAM    ((void *)0x25E70000)  /* VDP2 VRAM B1: pattern name table */
-#define RBG0_KTAB_VRAM   ((void *)0x25E28000)  /* VDP2 VRAM A1: coefficient (K) table */
+#if VDP2_HW_SKY
+#define RBG0_KTAB_VRAM   ((void *)0x25E28000)  /* A1: collides w/ cells -- only safe if RBG0 floor off */
+#else
+#define RBG0_KTAB_VRAM   ((void *)0x25E00000)  /* VDP2 VRAM A0: freed by software sky -> K-table's own bank */
+#endif
 /* Pad Y toggles the RBG0 hardware floor.  ON = floor on RBG0 (NBG3 debug overlay evicted
    by the RBG0 map in B1).  OFF = software floor + the NBG3 overlay returns -> read REC/EX/
    P/FLAT to see what the floor offload saves.  Boot = on. */
@@ -191,6 +216,9 @@ extern "C" int W_SaturnCDInit(void);
    Modes 1 vs 2 (read REC/EX/P/FLAT in both) isolate the software-floor cost = the saving
    the VDP2 floor buys.  Boot = 0. */
 static int rbg0_mode = 0;
+/* RBG0 RAMCTL-commit readback (direct chip write of the rotation bank-select RDBS; see
+   rbg0_commit_ramctl).  Shown on overlay row 14 in pad-Y debug modes 1/2. */
+static uint16_t ramctl_before = 0, ramctl_after = 0;
 /* RBG0 plane geometry, tuned against the software floor 2026-06-18 (live X+d-pad tuning,
    since removed).  PITCH = +4.21deg off the 90deg ground tilt -> raises the plane's far end
    onto Doom's horizon; YAW = +90deg -> orients the flat to the world.  Texture scale came out
@@ -648,6 +676,17 @@ static void fps_update(void)
                     USE_SCU_DMA ? "dma" : "-");
             SRL::Debug::Print(0, 16, r6);
         }
+#if VDP2_RBG0_TEST
+        {
+            /* row 14: RBG0 RAMCTL commit readback (visible in pad-Y debug modes 1/2).
+               b = chip RAMCTL before our RDBS write, a = after.  Low byte should read
+               0x8D (A0=coeff A1=char B0=fb B1=PN); bits 8-9 = 4-bank split.  If a != that
+               or snow persists, the rotation banks' CYC pattern also needs writing. */
+            static char rR[45];
+            sprintf(rR, "RAMCTL b=%04X a=%04X", ramctl_before, ramctl_after);
+            SRL::Debug::Print(0, 14, rR);
+        }
+#endif
         {
             /* row 21: WAD identity detected from the IWAD's own lumps (free row,
                not overwritten elsewhere).  "(detecting...)" until
@@ -786,6 +825,28 @@ static void rbg0_proto_init(void)
 }
 #endif
 
+#if VDP2_RBG0_TEST
+/* Direct-to-chip RAMCTL commit -- the cycle-pattern piece SGL would push inside slSynch,
+   which we cannot call (it corrupts our no-slSynch VDP2/sound setup, HW-tested worse).
+   Sets the rotation-data-bank-select (RDBS) so the VDP2 rotation engine reads RBG0 from
+   the right banks: A0=coefficient(K), A1=character(cells), B1=pattern-name(map),
+   B0=framebuffer(normal).  Without it, RBG0ON in BGON (re-pushed each vblank by SGL's IRQ
+   handler) makes the rotation engine read unassigned banks -> whole-screen "snow".
+   RDBS encoding decoded from Jo's NOSGL RAMCTL=0x1327: 1=coeff, 2=pattern-name,
+   3=character.  Byte = (B1=2)<<6 | (B0=0)<<4 | (A1=3)<<2 | (A0=1) = 0x8D.  Bits 8-9 =
+   VRAMD|VRBMD (4-bank split); bits 10-15 (CRMD/CRKTE) preserved. */
+static void rbg0_commit_ramctl(void)
+{
+    volatile uint16_t *const RAMCTL = (volatile uint16_t *)0x25F8000E;
+    ramctl_before = *RAMCTL;
+    uint16_t v = (uint16_t)((ramctl_before & 0xFC00u) | 0x0300u | 0x008Du);
+    *RAMCTL = v;
+    ramctl_after = *RAMCTL;
+    printf("RAMCTL before=%04x after=%04x (rbg0 RDBS commit)\n",
+           ramctl_before, ramctl_after);
+}
+#endif
+
 extern "C" void DG_Init(void)
 {
     if (TVSTAT & 1)
@@ -898,11 +959,13 @@ extern "C" void DG_Init(void)
        RBG0 cells+ktable A1, framebuffer B0, RBG0 map B1.  The only casualty is NBG3 debug
        text (shares B1 with the map) -> dropped while RBG0 is on; the pad toggle flips RBG0
        off to read the overlay. */
+#if VDP2_HW_SKY
     for (int y = 0; y < 256; ++y)
         memset(SKY_VRAM + y * SKY_VRAM_STRIDE, 0, SKY_VRAM_STRIDE);
     slBitMapNbg0(COL_TYPE_256, BM_512x256, (void *)SKY_VRAM);
     slBMPaletteNbg0(1);
     slScrPosNbg0(toFIXED(0.0), toFIXED(0.0));
+#endif
 #if SKY_DEBUG_SHOW
     slPriorityNbg0(6); slPriorityNbg1(5);   /* sky ON TOP to verify Stage A */
 #else
@@ -927,14 +990,25 @@ extern "C" void DG_Init(void)
     slPriorityRbg0(6);
     slPriorityNbg1(5);
 #endif
+#if VDP2_HW_SKY
     slScrAutoDisp(NBG0ON | NBG1ON | NBG3ON | RBG0ON);   /* sky(NBG0) + floor(RBG0) both on */
+#else
+    slScrAutoDisp(NBG1ON | NBG3ON | RBG0ON);            /* software sky -> NBG0 off; floor(RBG0) on */
+#endif
 #else
     slScrAutoDisp(NBG0ON | NBG1ON | NBG3ON);
 #endif
 
+#if VDP2_RBG0_TEST
+    /* Commit the RBG0 bank assignment (RDBS) straight to the chip -- the piece SGL would
+       push inside slSynch.  After slScrAutoDisp so RBG0ON is already live; once is enough
+       (the SGL vblank handler re-pushes BGON/scroll, not RAMCTL). */
+    rbg0_commit_ramctl();
+#endif
+
     /* Enable the core sky-skip: R_DrawPlanes leaves the sky region as index 0
        (transparent) so the VDP2 NBG0 sky shows through. */
-    sat_vdp2_sky = 1;
+    sat_vdp2_sky = VDP2_HW_SKY;   /* 0 = software sky (frees A0 for the RBG0 K-table) */
 #if VDP2_RBG0_TEST
     /* Floor on RBG0 at boot (rbg0_mode 0); pad Y cycles the 3 RBG0/debug modes. */
     sat_vdp2_floor = 1;
@@ -1574,8 +1648,37 @@ static void vdp1_walls_flush(void)
 }
 #endif
 
+#if VDP1_MANUAL_CHANGE
+/* Set by the kick after a plot is triggered: "a new frame is being drawn; present it (swap
+   the VDP1 framebuffers) once its draw completes."  Read/cleared by the vblank handler. */
+static volatile int vdp1_present_pending = 0;
+
+/* Wait one field (init only): used to space the two startup erases a frame apart so each
+   manual change actually executes (FBCR latches but runs at the next field). */
+static void vdp1_wait_field(void)
+{
+    while (TVSTAT & 0x0008) ;        /* leave the current vblank   */
+    while (!(TVSTAT & 0x0008)) ;     /* wait for the next vblank-in */
+}
+
+/* OnVblank: present the VDP1 frame ONLY when its draw has finished (EDSR CEF = bit1).  In
+   1-cycle mode VDP1 swapped its framebuffers every vblank, even mid-draw -> the multi-vblank
+   wall list was shown half-rasterised = tearing.  FBCR = FCM|FCT (0x3) is a manual change:
+   swap the buffers (show the completed frame) and erase the new back buffer.  FCM (mode) is
+   sticky, FCT (trigger) self-clears -> between presents nothing swaps = the last complete
+   frame is held.  No fps/latency cost: we don't wait, the swap is just deferred to draw-done. */
+static void vdp1_vblank_present(void)
+{
+    if (vdp1_present_pending && (VDP1_EDSR & 0x0002))
+    {
+        VDP1_FBCR = 0x0003;          /* manual change: swap + erase the new back buffer */
+        vdp1_present_pending = 0;
+    }
+}
+#endif
+
 /* One-time: build the fixed root (sysclip + JUMP, link -> empty bank) and the empty
-   bank, then put VDP1 in 1-cycle auto mode. */
+   bank, then put VDP1 in 1-cycle auto (or manual-change) mode. */
 static void vdp1_wpn_init(void)
 {
     unsigned short cmd[16];
@@ -1603,12 +1706,23 @@ static void vdp1_wpn_init(void)
     wtex_tick = 0; wall_acc_n = 0;
 #endif
 
-    VDP1_TVMR = 0x0000;
-    VDP1_FBCR = 0x0000;                              /* 1-cycle auto erase+draw+swap */
+    VDP1_TVMR = 0x0000;                              /* 16bpp, VBE=0 (erase in display: full-screen safe) */
     VDP1_EWDR = 0x0000;                              /* erase to 0 = transparent */
     VDP1_EWLR = 0x0000;
     VDP1_EWRR = (unsigned short)(((320 >> 3) << 9) | 223);
+#if VDP1_MANUAL_CHANGE
+    /* Manual-change double-buffer (anti-tear).  Clear BOTH framebuffers first: each change
+       erases the buffer that becomes the new back buffer, so two changes (a field apart) wipe
+       both -> no boot garbage in the index-0 (sky/ceiling) gaps.  Then stay in manual mode;
+       the per-frame swap is driven by vdp1_vblank_present on draw-complete. */
+    VDP1_PTMR = 0x0000;                              /* no draw; first plot kicked per-frame */
+    VDP1_FBCR = 0x0003; vdp1_wait_field();           /* change + erase back buffer #1 */
+    VDP1_FBCR = 0x0003; vdp1_wait_field();           /* change + erase back buffer #2 (both clear) */
+    SRL::Core::OnVblank += vdp1_vblank_present;
+#else
+    VDP1_FBCR = 0x0000;                              /* 1-cycle auto erase+draw+swap (tears) */
     VDP1_PTMR = 0x0002;
+#endif
 }
 
 /* core hook: begin this frame's player-sprite list in the OFF-screen bank. */
@@ -1759,7 +1873,10 @@ static void vdp1_wpn_kick(void)
     }
     /* atomic single-halfword flip of the root command's jump target */
     *((volatile unsigned short *)VDP1_ROOT_ADDR + 1) = (unsigned short)link;
-    VDP1_PTMR = 0x0002;
+    VDP1_PTMR = 0x0002;              /* start the draw (clears EDSR CEF until it finishes) */
+#if VDP1_MANUAL_CHANGE
+    vdp1_present_pending = 1;        /* arm: vdp1_vblank_present swaps once this draw completes */
+#endif
     vdp1_wactive = 0;
 }
 
@@ -1821,6 +1938,7 @@ extern "C" void DG_DrawFrame(void)
     /* SATURN sky -> VDP2: (re)upload on level/episode change; position the layer.
        SKY_FIXED keeps it static; otherwise scroll by viewangle (90deg = 256 sky
        px via SKY_ANGLESHIFT, slowed by SKY_PARALLAX_SHIFT; VDP2 wraps the plane). */
+#if VDP2_HW_SKY
     if (skytexture > 0 && skytexture != sky_loaded_tex)
         sky_upload();
 #if SKY_FIXED
@@ -1832,6 +1950,7 @@ extern "C" void DG_DrawFrame(void)
         int sx = -(int)(viewangle >> (SKY_ANGLESHIFT + SKY_PARALLAX_SHIFT));
         slScrPosNbg0((FIXED)(sx << 16), toFIXED(-(double)VIEW_Y_OFFSET));
     }
+#endif
 #endif
 
     /* SATURN sky index-0 reservation (index 0 = VDP2 transparent code; where NBG1
@@ -1866,7 +1985,7 @@ extern "C" void DG_DrawFrame(void)
            1 = dbg + software floor (RBG0 off, NBG3 on, sw floor drawn)
            2 = dbg, no software floor (RBG0 off, NBG3 on, sw floor skipped). */
         sat_vdp2_floor    = (rbg0_mode == 1) ? 0 : 1;        /* mode 1 draws the sw floor; 0,2 skip it */
-        uint16_t sky_bit  = (show_sky ? NBG0ON : 0);
+        uint16_t sky_bit  = (VDP2_HW_SKY && show_sky) ? NBG0ON : 0;   /* no NBG0 when sky is software */
         uint16_t rbg0_bit = (rbg0_mode == 0) ? RBG0ON : 0;   /* HW floor only in mode 0           */
         uint16_t nbg3_bit = (rbg0_mode == 0) ? 0 : NBG3ON;   /* debug overlay only in modes 1,2   */
         slScrAutoDisp((uint16_t)(sky_bit | NBG1ON | nbg3_bit | rbg0_bit));

@@ -1,0 +1,26 @@
+# DoomSRL hardware captures 2026-06-19 (real Saturn, NBG3 debug overlay on).
+# CONFIG axes: sol (software floor on/off), pot (Potato level), blit (dual-CPU copy split).
+#   sol=yes -> CPU draws the floor (the real cost). sol=no -> floor removed to SIMULATE the
+#   VDP2/RBG0 hardware floor (CPU floor cost taken out). Tell = EX: ~15.6ms+slave-busy with
+#   floor, ~2.9ms+slave-idle without.
+# Same parked view (FLAT 49% n19) except img3 (different angle, wall-heavy, 92% dom n13).
+# Ground truth from Romain: only 4 captures have the floor = img1,2,4,5 (camera IDs 0138/0156/0148/0117).
+# inst fps / MST_ms = per-frame truth (AVG is a lagging EMA -> omitted).
+# Bp = setup+loop (row11); P = alloc+makespans+other (row12); each sums to row20. Times in ms.
+# ? = digit uncertain on photo.
+img,sol,pot,blit,inst_fps,MST_ms,REC,EX,W,c_cmds,Bw,Bp,P_alloc,P_makespans,P_other,P,M,SLV_idle,SLV_busy,VD1_cmds,VD1_cef,FLAT_t_k,FLAT_d_k,FLAT_dom_pct,FLAT_n,note
+1,yes,0,60/40,10.0,100,53.5,15.6,0.2,375,6.7,18.5,0.2,13.4,10.5,24.1,3.8,53,46,133,D,50,25,49,19,floor baseline
+2,yes,0,50/50,10.0,100,53.6,15.6,0.2,375,6.7,18.4,0.2,13.4,11.0,24.6,3.9,53,46,133,D,50,25,49,19,floor baseline
+4,yes,0,66/34,10.0,100,53.6,15.7,0.2,375,7.2,18.5,0.2,13.5,10.3,24.0,3.9,53,46,133,B,50,25,49,19,floor baseline
+5,yes,0,75/25,10.0,100,53.6,15.7,0.2,375,7.0,18.5,0.2,13.5,10.5,24.2,3.9,53,46,133,B,50,25,49,19,floor baseline
+3,no,0,50/50,10.0,100,59.2,10.4,0.2,401,6.7,23.6,0.1,9.0,15.3,24.4,4.1,64,35,105,B,27,25,92,13,angle-outlier wall-heavy
+6,no,1,100/0,12.0,83,52.2,2.9,0.2,113,7.1,18.1,0.2,11.8,10.2,22.2,4.4,100,0,133,D,50,25,49,19,VDP2-sim
+8,no,1,50/50,12.0,83,52.1,2.9,0.2,113,7.1,18.1,0.2,11.9,10.2,22.3,4.3,100,0,133,D,50,25,49,19,VDP2-sim
+9,no,1,60/40,12.0,83,51.7,3.3,0.2,113,7.2,18.1,0.1,11.9,10.4,22.4,3.7,100,0,133,D,50,25,49,19,VDP2-sim
+10,no,1,66/34,12.0,83,51.6,2.9,0.2,113,7.0,17.6,0.2,11.9,10.9,23.0,3.7,100,0,133,B,50,25,49,19,VDP2-sim
+11,no,1,75/25,12.0,83,51.7,2.9,0.2,113,7.1,18.1,0.1,11.9,10.9,22.9,3.8,100,0,133,B,50,25,49,19,VDP2-sim
+7,no,2,100/0,13.3,74,44.5,2.9,0.2,113,6.7,18.7,0.1,11.9,3.0,15.0,3.8,100,0,34,D,50,25,49,19,VDP2-sim
+12,no,2,100/0,13.3,75,44.3,2.9,0.2,113,7.0,17.8,0.1,11.9,2.9,14.9,4.4,100,0,34,D,50,25,49,19,VDP2-sim
+13,no,2,50/50,13.3,75,44.0,3.3,0.2,113,6.6,18.2,0.1,11.4,3.5,15.0,3.8,100,0,34,D,50,25,49,19,VDP2-sim
+14,no,2,60/40,13.3,75,44.5,3.0,0.3,113,6.6,18.7,0.1,11.9,2.9,14.9,3.8,100,0,34,D,50,25,49,19,VDP2-sim
+15,no,2,66/34,13.5,74,44.4,3.0,0.2,113,6.7,18.7,0.1,11.9,2.9,14.9,3.8,100,0,34,D,50,25,49,19,VDP2-sim

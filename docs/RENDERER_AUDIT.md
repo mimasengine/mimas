@@ -5,6 +5,13 @@ is tied to actual source. Action items at the end are split into **implement
 directly** (high confidence) vs **A/B test** (measure first), continuing the
 `SATURN PERF x.y` numbering from `core/r_parallel.c` / the perf notes.
 
+> **⚠️ §4 ("should we go hardware?") is DECIDED as of 2026-06-19.** DoomSRL took
+> **Track B**: VDP1 now renders all walls (hybrid — VDP1 walls below software NBG1).
+> The current VDP1 hardware model, costs, and convictions are in
+> [`VDP1_ARCHITECTURE.md`](VDP1_ARCHITECTURE.md). The §1–§3 *software-renderer*
+> findings (slave-as-worker, kill the per-column memcpy, Potato) remain valid and
+> still relevant — VDP1 offloads EX/fill, not REC, which is still the frame's bulk.
+
 Repos audited (cloned in `../saturn-refs/`):
 - **d32xr** — Doom 32X: Resurrection. Same architecture as DoomSRL (2× SH-2,
   software, no TMU). MIT/Jaguar-Doom license. The closest cousin.

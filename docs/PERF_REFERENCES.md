@@ -10,6 +10,14 @@ blitted to a VDP2 NBG1 bitmap. VDP1 is currently **unused**. Baseline ~5–10 fp
 is a per-frame CPU `memcpy` of 320×200. See `src/dg_saturn.cxx` and
 `core/r_parallel.c`.
 
+> **⚠️ STALE as of 2026-06-19.** This file is the *pre-VDP1* research snapshot.
+> DoomSRL has since gone hybrid: **VDP1 now renders all walls** (8bpp textures +
+> CRAM light-banks, below software NBG1 floors/sprites). For the current VDP1
+> hardware model, cost budget, IN/OUT convictions, and multiplayer capacity, see
+> [`VDP1_ARCHITECTURE.md`](VDP1_ARCHITECTURE.md); for VDP2, [`VDP2_ARCHITECTURE.md`](VDP2_ARCHITECTURE.md).
+> The "two philosophies / should we go hardware" framing below is now decided
+> (we went hybrid), but the d32xr/Hexen/FastDoom *software* lessons still stand.
+
 Compiled June 2026 from web research (sources at the bottom).
 
 ---

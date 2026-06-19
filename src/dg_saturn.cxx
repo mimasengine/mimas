@@ -113,7 +113,7 @@ extern "C" char *gamedescription;
    last COMPLETE frame and only swaps when the draw finished (EDSR CEF), triggered from the
    existing OnVblank -- i.e. vsync the VDP1 presentation WITHOUT slSynch (no fps tax, no SCSP
    sound conflict, no latency: the CPU never waits).  1 = on (anti-tear), 0 = old auto swap. */
-#define VDP1_MANUAL_CHANGE 1
+#define VDP1_MANUAL_CHANGE 0   /* BISECT: 0 = revert 3faaa95's manual-change present -> 1-cycle auto (test if the VDP1 walls come back, with tearing) */
 
 extern "C" byte *I_VideoBuffer;
 extern "C" int   gametic;

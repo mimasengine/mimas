@@ -246,6 +246,7 @@ extern "C" int            gamestate;        /* gamestate_t: GS_LEVEL == 0 */
 extern "C" int            menuactive;       /* boolean: menu overlay up */
 extern "C" int            automapactive;    /* boolean: automap up */
 extern "C" int            sat_vdp2_sky;     /* core: skip software sky (=> VDP2) */
+extern "C" int            sat_frame_has_sky;/* core: a sky visplane was in view this frame */
 extern "C" int            sat_vdp2_floor;   /* core: skip software floor (=> VDP2 RBG0) */
 extern "C" int            sat_vdp2_floor_h; /* core: player's floor height (fixed_t) */
 extern "C" int            sat_vdp2_floor_pic;/* core: player's floor flat (picnum) */
@@ -1978,7 +1979,10 @@ extern "C" void DG_DrawFrame(void)
            behind it.  Drop the sky only for the automap (its index-0 background
            would otherwise show sky) and outside a level. */
         (void)menuactive;
-        int show_sky = (gamestate == GS_LEVEL) && !automapactive;
+        /* SATURN: drop the hardware sky (NBG0) when there is NO sky visplane in view this
+           frame (fully-enclosed room) -> the VDP1 walls' torn index-0 gaps then show the dark
+           backdrop instead of the bright sky, so the tearing is far less visible. */
+        int show_sky = (gamestate == GS_LEVEL) && !automapactive && sat_frame_has_sky;
 #if VDP2_RBG0_TEST
         /* RBG0/debug 3-mode cycle (rbg0_mode, pad Y) -- see the rbg0_mode decl:
            0 = VDP2 floor, no dbg   (RBG0 on, NBG3 off, sw floor skipped)

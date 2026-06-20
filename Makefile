@@ -64,7 +64,7 @@ DOOM_CSRCS = $(addprefix core/,$(DOOM_CORE_C))
 # Platform layer (SRL/C++), stays in src/.
 DOOM_CXXSRCS = \
 	src/main.cxx src/dg_saturn.cxx src/w_file_saturn.cxx \
-	src/i_sound_saturn.cxx
+	src/i_sound_saturn.cxx src/mp_input.cxx
 
 SOURCES  = src/syscalls.c $(DOOM_CSRCS)
 SOURCES += $(DOOM_CXXSRCS)

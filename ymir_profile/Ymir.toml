@@ -196,7 +196,7 @@ PeripheralType = 'ControlPad'
     Left = [ 'A' ]
     R = [ 'P', 'GamepadRightTriggerButton@0' ]
     Right = [ 'D' ]
-    Start = [ 'F', 'G', 'H', 'GamepadStart@0' ]
+    Start = [ 'X', 'G', 'H', 'GamepadStart@0' ]
     Up = [ 'W' ]
     X = [ 'U', 'GamepadLeftBumper@0' ]
     Y = [ 'I', 'GamepadY@0' ]
@@ -278,7 +278,7 @@ PeripheralType = 'ControlPad'
         Thickness = 0.33000001311302185
 
 [Input.Port2]
-PeripheralType = 'None'
+PeripheralType = 'ControlPad'
 
     [Input.Port2.AnalogPad.Binds]
     A = [ 'KeyPad1', 'GamepadX@1' ]
@@ -318,20 +318,20 @@ PeripheralType = 'None'
         Z = [ 'KeyPad6', 'GamepadRightBumper@1' ]
 
     [Input.Port2.ControlPad.Binds]
-    A = [ 'KeyPad1', 'GamepadX@1' ]
-    B = [ 'KeyPad2', 'GamepadA@1' ]
-    C = [ 'KeyPad3', 'GamepadB@1' ]
+    A = [ 'F', 'GamepadX@1' ]
+    B = [ 'G', 'GamepadA@1' ]
+    C = [ 'H', 'GamepadB@1' ]
     DPad = [ 'GamepadDPad@1', 'GamepadLeftStick@1' ]
     Down = [ 'Down', 'End' ]
-    L = [ 'KeyPad7', 'Insert', 'GamepadLeftTriggerButton@1' ]
+    L = [ 'Alpha4', 'Insert', 'GamepadLeftTriggerButton@1' ]
     Left = [ 'Left', 'Delete' ]
-    R = [ 'KeyPad9', 'PageUp', 'GamepadRightTriggerButton@1' ]
-    Right = [ 'Right', 'PageDown' ]
-    Start = [ 'KeyPadEnter', 'GamepadStart@1' ]
+    R = [ 'Alpha7', 'PageUp', 'GamepadRightTriggerButton@1' ]
+    Right = [ 'PageDown', 'Right' ]
+    Start = [ 'Spacebar' ]
     Up = [ 'Up', 'Home' ]
-    X = [ 'KeyPad4', 'GamepadLeftBumper@1' ]
-    Y = [ 'KeyPad5', 'GamepadY@1' ]
-    Z = [ 'KeyPad6', 'GamepadRightBumper@1' ]
+    X = [ 'R' ]
+    Y = [ 'T', 'GamepadY@1' ]
+    Z = [ 'Y', 'GamepadRightBumper@1' ]
 
     [Input.Port2.MissionStick.Binds]
     A = [ 'GamepadX@1' ]

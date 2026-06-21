@@ -19,7 +19,7 @@ extern "C" void doom_start(void);
 extern "C" int sat_plane_parallel;
 extern "C" int sat_masked_parallel;   /* slave draws the right-half vissprites (masked phase) */
 extern "C" int sat_wallprep_defer;    /* STEP 1: defer wall-prep to a post-BSP flush (validation) */
-extern "C" int sat_local_players;     /* local multiplayer player count (1 = single) */
+extern "C" int sat_split_vdp1;        /* split-screen: keep walls on VDP1 per-view (vs software baseline) */
 extern "C" void sat_mp_input_init(void);  /* wires the local-MP pad-2..4 input hook */
 
 /* 40 KB dedicated stack for the Doom main loop, in high work RAM. */
@@ -52,7 +52,11 @@ int main(void)
     sat_plane_parallel = 1;   /* P3: slave SH-2 draws half the visplanes (set rp_disabled via r_main.c) */
     sat_masked_parallel = 1;  /* masked-by-half: slave SH-2 draws the right-half vissprites */
     sat_wallprep_defer  = 0;  /* foundation gated OFF (no overhead); STEP 2 (slave consumer) enables it */
+    sat_split_vdp1      = 1;  /* split-screen renders walls on VDP1 per-view (pad X toggles to the
+                                 software baseline live for HW A/B).  No effect in 1p (split path off). */
     sat_mp_input_init();      /* wire pad-2..4 -> ticcmd for local multiplayer */
-    sat_local_players   = 2;  /* TEST: 2-player local co-op (shared view; P2 = a marine in P1's view) */
+    /* sat_local_players defaults to 1 (single-player).  Local co-op is OPT-IN at the title screen:
+       a 2nd pad pressing A arms 2..4-player split (dg_saturn.cxx poll_pad -> sat_count_local_pads).
+       Default 1 keeps the normal boot single-player and lets the same disc A/B 1p vs Np on HW. */
     run_on_doom_stack();
 }

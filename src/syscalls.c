@@ -28,19 +28,38 @@ static void emu_debug_putc(char c)
 char *__env[1] = { 0 };
 char **environ = __env;
 
-#define HEAP_SIZE (64 * 1024)
+/* SATURN #4: trimmed 64K -> 48K after Ymir measurement (dg_heap_peak stable at
+   36,516 B = DOOM1.WAD lumpinfo, ~2306 lumps x 16B, loaded once -> fixed per WAD).
+   48K leaves ~11.5K margin over the measured peak; failure is graceful (NULL).
+   Recovers 16K HWRAM .bss.  Watch row-22 `hp` stays < 49152 on any new content. */
+#define HEAP_SIZE (48 * 1024)
 static char heap[HEAP_SIZE] __attribute__((aligned(8)));
 static char *heap_end = heap;
+
+/* SATURN VALIDATION (#4 newlib-heap trim): high-water mark of the static libc
+   sbrk heap (NOT the Doom zone, which lives in LWRAM).  Almost everything in Doom
+   goes through Z_Malloc; this heap only serves incidental libc allocs (printf
+   buffers, W_AddFile's lumpinfo calloc).  Read dg_heap_peak on Ymir across a full
+   E1 + WAD load to size HEAP_SIZE down (recovers HWRAM .bss).  Ymir is HONEST here:
+   the high-water is allocation-count driven, not bus/timing.  Exposed for the
+   overlay; do NOT trim HEAP_SIZE until the peak is measured (W_AddFile calloc
+   failing would brick the WAD load -- failure is graceful NULL, not corruption). */
+int dg_heap_peak = 0;            /* bytes ever sbrk'd (high-water)        */
+int dg_heap_size = HEAP_SIZE;    /* the cap, for the overlay denominator  */
 
 void *_sbrk(int incr)
 {
     char *prev = heap_end;
+    int  used;
     if (heap_end + incr > heap + HEAP_SIZE)
     {
         errno = ENOMEM;
         return (void *)-1;
     }
     heap_end += incr;
+    used = (int)(heap_end - heap);
+    if (used > dg_heap_peak)
+        dg_heap_peak = used;
     return prev;
 }
 

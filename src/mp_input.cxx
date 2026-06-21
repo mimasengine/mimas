@@ -32,6 +32,33 @@ static int mp_raw_index(int p)
     return p;
 }
 
+/* Count the connected local pads (1..4), reusing mp_raw_index's exact precedence so the count and
+   the per-player slot mapping never disagree (docs/MULTIPLAYER_PLAN.md, Iter 1 optionality).  P1 is
+   slot [0] (assumed present -- poll_pad bails otherwise); pads must be contiguous from P1, so stop
+   at the first gap (a port-2-only controller gives 2, a 3-pad multitap gives 4, etc.). */
+extern "C" int sat_count_local_pads(void)
+{
+    int n = 1;
+    for (int p = 1; p < 4; ++p)
+    {
+        int idx = mp_raw_index(p);
+        if (idx >= 0 && idx < 24 && Smpc_Peripheral[idx].id != PER_ID_NotConnect)
+            n++;
+        else
+            break;
+    }
+    return n;
+}
+
+/* 1 while the 2nd local pad holds A (the co-op opt-in button; Saturn pads are active-low); 0 if
+   there is no 2nd pad.  Read at the title screen to arm/disarm local multiplayer. */
+extern "C" int sat_mp_pad2_a(void)
+{
+    int idx = mp_raw_index(1);
+    if (idx < 0 || idx >= 24 || Smpc_Peripheral[idx].id == PER_ID_NotConnect) return 0;
+    return !(Smpc_Peripheral[idx].data & PER_DGT_TA);
+}
+
 extern "C" void DG_BuildLocalTiccmd(ticcmd_t *cmd, int p)
 {
     if (p < 0 || p >= 12) return;

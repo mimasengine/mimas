@@ -118,6 +118,13 @@ extern "C" char *gamedescription;
 extern "C" byte *I_VideoBuffer;
 extern "C" int   gametic;
 extern "C" int   r_visplane_peak;
+/* SATURN VALIDATION (Ymir-readable, deterministic): RAM-lever sizing telemetry. */
+extern "C" int   r_visplane_coverage_peak;  /* #1: peak sum of live-plane spans (top-bytes) */
+extern "C" int   r_visplane_pool_peak;      /* #1: peak bytes used in the span pool (0 if off) */
+extern "C" int   dg_heap_peak;              /* #4: peak newlib sbrk usage (bytes)             */
+extern "C" int   dg_heap_size;              /* #4: newlib heap cap (bytes)                    */
+/* split-screen perf breakdown (ms per piece of the 2p render block) -- diagnose the slowdown */
+extern "C" unsigned int sat_spl_sw, sat_spl_v0, sat_spl_v1, sat_spl_kick;
 
 /* ------------------------------------------------------------------ */
 /* Saturn memory map constants                                         */
@@ -274,12 +281,12 @@ void sat_vdp1_wpn_draw(patch_t *patch, int lump, int sx, int sy, int flip,
    as distorted sub-quads.  Forward-declared so DG_Init can register it.  texturewidthmask
    / textureheight are core globals (r_data.c, fixed_t = int). */
 extern "C" {
-extern void (*sat_wall_hook)(int x1, int yl1, int yh1, int x2, int yl2, int yh2,
-                             int texnum, int u1, int u2, int v0, int v1,
-                             const unsigned char *cmap);
-void sat_wall_vdp1(int x1, int yl1, int yh1, int x2, int yl2, int yh2,
-                   int texnum, int u1, int u2, int v0, int v1,
-                   const unsigned char *cmap);
+extern int (*sat_wall_hook)(int x1, int yl1, int yh1, int x2, int yl2, int yh2,
+                            int texnum, int u1, int u2, int v0, int v1,
+                            const unsigned char *cmap);
+int sat_wall_vdp1(int x1, int yl1, int yh1, int x2, int yl2, int yh2,
+                  int texnum, int u1, int u2, int v0, int v1,
+                  const unsigned char *cmap);
 extern int *textureheight;       /* fixed_t: pixels = >>16 */
 extern int *texturewidthmask;    /* width-1 */
 extern int  sat_wall_skip;       /* 1 = skip the software one-sided wall draw (VDP1 owns it) */
@@ -652,6 +659,26 @@ static void fps_update(void)
                 potato_level, blit_mode,
                 blit_cfg[blit_mode].mpct, 100 - blit_cfg[blit_mode].mpct);
         SRL::Debug::Print(0, 2, r2);
+        {
+            /* SATURN VALIDATION row: RAM-lever sizing (all high-water, Ymir-honest).
+               hp = newlib heap peak/cap (#4: trim HEAP_SIZE to peak+margin).
+               cov = peak sum of live-plane spans (#1: a tight pooled top-arena needs
+                     ~cov bytes, +cov for bottom => arena ~= 2*cov; compare to today's
+                     332KB pool to see #1's ceiling).  pool = #1 span-pool peak bytes
+                     (0 unless SAT_VISPLANE_POOL=1).  vp (row 2) sizes #2 MAXVISPLANES. */
+            static char rV[45];
+            sprintf(rV, "VAL hp%d/%d cov%d pool%d",
+                    dg_heap_peak, dg_heap_size,
+                    r_visplane_coverage_peak, r_visplane_pool_peak);
+            SRL::Debug::Print(0, 22, rV);   /* free row (16 = VD1 aux) */
+            /* split-block breakdown (ms): sw = both R_SetViewWindow (size-table recompute),
+               v0/v1 = each R_RenderPlayerView, k = the VDP1 kick -> localises the 2p slowdown
+               (last frame; 0 in 1p). */
+            static char rS[45];
+            sprintf(rS, "SPL sw%u v0%u v1%u k%u",
+                    sat_spl_sw, sat_spl_v0, sat_spl_v1, sat_spl_kick);
+            SRL::Debug::Print(0, 6, rS);   /* high + free row, just under the top block */
+        }
         {
             static char rA[45];
             /* row 17: stable build-comparison number, with the build-identity
@@ -1289,23 +1316,48 @@ static void wtex_rebuild_banks(void)
 /* one-sided mid + two-sided upper/lower quads.  Must stay <= the command budget (WALL_CMD_CAP
    ~248) so the zero-clipping flush's all-flat baseline always fits -> no wall is ever dropped to
    sky.  Was 128 -> dense rooms (tech room) overflowed it and the surplus far walls weren't even
-   accumulated = "clipping". */
+   accumulated = "clipping".
+   SPLIT-SCREEN shares this ONE command bank/budget across BOTH half-views (accumulated together,
+   kicked once).  The cap MUST stay <= the budget: the flush guarantees >=1 flat per wall only while
+   wall_acc_n <= budget; a larger accumulator makes `used+1+remaining > budget` fire for the NEAREST
+   walls instead (they vanish).  So it stays 240 (a 480 would break that); a per-view SOFT cap in the
+   hook (below) reserves the upper half for the right view so a dense LEFT view -- accumulated first
+   -- can't hog every VDP1 slot.  When the cap is hit the hook REJECTS the wall and the core renders
+   it in SOFTWARE (no sky) -- so the cap is also the VDP1->CPU starvation handoff. */
 #define WALL_ACC_MAX 240
-static struct { short x1, yl1, yh1, x2, yl2, yh2, slot, v0, v1; int texnum, u1, u2;
+/* vx/vxr = the view's framebuffer x-range [vx, vxr] this wall belongs to (split-screen: 0..159 for
+   the left view, 160..319 for the right).  x1/x2 are stored ALREADY offset by viewwindowx, so the
+   emit works in absolute framebuffer coords; vx/vxr drive the per-view user-clip window. */
+static struct { short x1, yl1, yh1, x2, yl2, yh2, slot, v0, v1, vx, vxr; int texnum, u1, u2;
                 unsigned char mode; const unsigned char *cmap; } wall_acc[WALL_ACC_MAX];
 static int wall_acc_n;
 
-/* core hook (per one-sided seg, during the BSP walk): stash the wall */
-extern "C" void sat_wall_vdp1(int x1, int yl1, int yh1, int x2, int yl2, int yh2,
-                              int texnum, int u1, int u2, int v0, int v1,
-                              const unsigned char *cmap)
+/* core hook (per one-sided seg, during the BSP walk): stash the wall.  x1/x2 arrive VIEW-relative
+   (0..viewwidth-1); add viewwindowx so the VDP1 quad lands in this view's framebuffer x-range
+   (0 for 1p / left half; 160 for the right half).  Single-view viewwindowx==0 => byte-identical.
+   RETURNS 0 = queued for VDP1; 1 = REJECTED (the accumulator is full -> VDP1 starved): the core
+   then draws this wall in SOFTWARE instead of dropping it to sky (Romain: "fallback CPU, pas skip"). */
+extern "C" int sat_wall_vdp1(int x1, int yl1, int yh1, int x2, int yl2, int yh2,
+                             int texnum, int u1, int u2, int v0, int v1,
+                             const unsigned char *cmap)
 {
-    if (wall_acc_n >= WALL_ACC_MAX) return;
+    extern int viewwindowx, viewwidth;   /* core: per-view origin + width (set by R_SetViewWindow) */
+    extern int sat_split_active;         /* core: 1 while rendering the split half-views */
+    /* Split-screen shares the single command bank across both half-views.  Reserve the upper half of
+       the accumulator for the right view so a dense LEFT view (accumulated first) cannot starve the
+       right view out of VDP1 slots (its overflow falls back to CPU, below).  1p = the full cap.
+       When the cap is hit the wall is REJECTED -> the core renders it in software (no sky). */
+    int cap = (sat_split_active && viewwindowx == 0) ? (WALL_ACC_MAX / 2) : WALL_ACC_MAX;
+    if (wall_acc_n >= cap) return 1;     /* VDP1 list full -> caller draws this wall in SOFTWARE */
+    int vx = viewwindowx;
     int i = wall_acc_n++;
-    wall_acc[i].x1 = (short)x1; wall_acc[i].yl1 = (short)yl1; wall_acc[i].yh1 = (short)yh1;
-    wall_acc[i].x2 = (short)x2; wall_acc[i].yl2 = (short)yl2; wall_acc[i].yh2 = (short)yh2;
+    wall_acc[i].x1 = (short)(x1 + vx); wall_acc[i].yl1 = (short)yl1; wall_acc[i].yh1 = (short)yh1;
+    wall_acc[i].x2 = (short)(x2 + vx); wall_acc[i].yl2 = (short)yl2; wall_acc[i].yh2 = (short)yh2;
     wall_acc[i].texnum = texnum; wall_acc[i].u1 = u1; wall_acc[i].u2 = u2;
     wall_acc[i].v0 = (short)v0; wall_acc[i].v1 = (short)v1; wall_acc[i].cmap = cmap;
+    wall_acc[i].vx  = (short)vx;
+    wall_acc[i].vxr = (short)(vx + viewwidth - 1);
+    return 0;                            /* queued for VDP1 */
 }
 
 /* best victim in [lo,hi): an empty slot, else the least-recently-used UNLOCKED slot */
@@ -1425,7 +1477,8 @@ static int wall_tilecount(int wi)  /* est. command cost (bands x (tiles + 1 user
    screen y at the two seg ends. */
 static void wall_emit_band(int x1, int x2, int yl1, int yh1, int yl2, int yh2,
                            int u1, int u2, int texw,
-                           unsigned short charAddr, unsigned short charSize, unsigned short colr)
+                           unsigned short charAddr, unsigned short charSize, unsigned short colr,
+                           int vx, int vxr)
 {
     int xspan = x2 - x1, du = u2 - u1;
     unsigned short cmd[16];
@@ -1470,9 +1523,11 @@ static void wall_emit_band(int x1, int x2, int yl1, int yh1, int yl2, int yh2,
             if (!winset)
             {
                 /* extend the window 1px each side so adjacent walls OVERLAP -> no seam
-                   (the gap that, in motion, let the NBG0 sky show between quads). */
-                int wx1 = x1 > 0   ? x1 - 1 : 0;
-                int wx2 = x2 < 319 ? x2 + 1 : 319;
+                   (the gap that, in motion, let the NBG0 sky show between quads).  CLAMP to the
+                   view's x-range [vx, vxr] (full-screen 0..319 for 1p; the left/right half in
+                   split) so the overlap never bleeds across the split seam into the other view. */
+                int wx1 = x1 > vx  ? x1 - 1 : vx;
+                int wx2 = x2 < vxr ? x2 + 1 : vxr;
                 memset(cmd, 0, sizeof cmd);
                 cmd[0] = 0x0008;                         /* FUNC_UserClip = wall window */
                 cmd[6]  = (short)wx1; cmd[7]  = 0;       /* upper-left  (XA,YA) */
@@ -1528,6 +1583,7 @@ static void wall_emit(int wi)
     int x1 = wall_acc[wi].x1, x2 = wall_acc[wi].x2;
     int yl1 = wall_acc[wi].yl1, yh1 = wall_acc[wi].yh1;
     int yl2 = wall_acc[wi].yl2, yh2 = wall_acc[wi].yh2;
+    int vx = wall_acc[wi].vx, vxr = wall_acc[wi].vxr;   /* this wall's viewport x-range (split-screen) */
     int u1 = wall_acc[wi].u1, u2 = wall_acc[wi].u2;
     int texw = texturewidthmask[wall_acc[wi].texnum] + 1;
     int v0 = wall_acc[wi].v0, v1 = wall_acc[wi].v1, vspan = v1 - v0;
@@ -1538,7 +1594,7 @@ static void wall_emit(int wi)
         int th = (H > 255) ? 255 : (H > 0 ? H : 1);
         unsigned short ca = (unsigned short)((base - VDP1_VRAM_BASE) >> 3);
         unsigned short cs = (unsigned short)(((padW >> 3) << 8) | th);
-        wall_emit_band(x1, x2, yl1, yh1, yl2, yh2, u1, u2, texw, ca, cs, colr);
+        wall_emit_band(x1, x2, yl1, yh1, yl2, yh2, u1, u2, texw, ca, cs, colr, vx, vxr);
         return;
     }
 
@@ -1560,7 +1616,7 @@ static void wall_emit(int wi)
         unsigned int taddr = base + (unsigned int)vmod * (unsigned int)padW * 1u;  /* 8bpp */
         unsigned short ca = (unsigned short)((taddr - VDP1_VRAM_BASE) >> 3);
         unsigned short cs = (unsigned short)(((padW >> 3) << 8) | rows);
-        wall_emit_band(x1, x2, yl1b, yh1b, yl2b, yh2b, u1, u2, texw, ca, cs, colr);
+        wall_emit_band(x1, x2, yl1b, yh1b, yl2b, yh2b, u1, u2, texw, ca, cs, colr, vx, vxr);
         v = vb; ++nb;
     }
 }
@@ -1623,20 +1679,34 @@ static void vdp1_walls_flush(void)
     for (int i = 0; i < wall_acc_n; ++i)                 /* resolve textures (near-first) */
         wall_acc[i].slot = (short)wall_tex_resolve(wall_acc[i].texnum, wall_acc[i].cmap);
 
-    /* mode: 1 = textured, 2 = flat, 0 = skip (only the surplus if wall_acc_n itself > budget).
-       Invariant kept across the loop: used + (#walls from i on) <= budget -> a flat ALWAYS fits. */
-    int budget = WALL_CMD_CAP - vdp1_wnext, used = 0;
+    /* mode: 1 = textured, 2 = flat, 0 = skip.  Every wall gets at least a 1-cmd FLAT (never sky
+       while wall_acc_n <= budget, which WALL_ACC_MAX guarantees); the leftover budget (the SURPLUS
+       beyond the all-flat baseline) upgrades the nearest walls to textured tiles.
+       SPLIT-SCREEN shares this one command bank, so the textured surplus is divided EQUALLY between
+       the two half-views -- else the left view (accumulated first, painted near-first) spends the
+       whole surplus and the right view stays all-flat.  Each textured upgrade beyond a wall's own
+       flat costs (tiles-1) extra cmds, charged to that view's surplus share.  For 1p (nviews==1)
+       this is ALGEBRAICALLY identical to the old single-budget reservation
+       (extra_used + (c-1) <= budget-n  <=>  used + c + (n-i-1) <= budget). */
+    extern int sat_split_active;                        /* core: 1 while rendering the split views */
+    int budget = WALL_CMD_CAP - vdp1_wnext;
+    int nviews = sat_split_active ? 2 : 1;              /* d_main renders 2 vertical half-views in split */
+    int surplus = budget - wall_acc_n;                 /* cmds available beyond the all-flat baseline */
+    if (surplus < 0) surplus = 0;
+    int surplus_per_view = surplus / nviews;
+    int extra_used[2] = { 0, 0 };
     for (int i = 0; i < wall_acc_n; ++i)
     {
-        int remaining = wall_acc_n - i - 1;             /* walls after i; each keeps >=1 flat cmd */
+        if (i >= budget) { wall_acc[i].mode = 0; continue; }   /* n > budget (cap makes this unreachable) */
+        int v = (nviews > 1 && wall_acc[i].vx > 0) ? 1 : 0;    /* left half = view 0, right half = view 1 */
         int textured = (wall_acc[i].slot >= 0 && !wall_is_flat(i));
         if (textured)
         {
-            int c = wall_tilecount(i);
-            if (used + c + remaining <= budget) { used += c; wall_acc[i].mode = 1; continue; }
+            int extra = wall_tilecount(i) - 1;                 /* cmds beyond this wall's own flat */
+            if (extra < 0) extra = 0;
+            if (extra_used[v] + extra <= surplus_per_view) { extra_used[v] += extra; wall_acc[i].mode = 1; continue; }
         }
-        if (used + 1 + remaining <= budget) { used += 1; wall_acc[i].mode = 2; }   /* guaranteed flat */
-        else                                  wall_acc[i].mode = 0;                /* surplus (n>budget) */
+        wall_acc[i].mode = 2;                                  /* flat baseline (guaranteed to fit) */
     }
 
     for (int i = wall_acc_n - 1; i >= 0; --i)            /* paint far->near */
@@ -2266,6 +2336,16 @@ static unsigned char keyq_encode(unsigned char key)
     }
 }
 
+/* Local-multiplayer opt-in (docs/MULTIPLAYER_PLAN.md, Iter 1): the platform owns the title-screen
+   gesture; the count flows through the core sat_local_players global (read lazily by G_DoNewGame). */
+extern "C" {
+    extern int sat_local_players;       /* core: 1 = single player (default) */
+    extern int sat_split_vdp1;          /* core: split-screen keeps walls on VDP1 per-view (vs software) */
+    extern int usergame;                /* core: true only during a real player-started game */
+    int sat_count_local_pads(void);     /* mp_input.cxx: connected local pads, 1..4 */
+    int sat_mp_pad2_a(void);            /* mp_input.cxx: 1 while pad-2 holds A */
+}
+
 static void poll_pad(void)
 {
     static unsigned short prev = 0xffff;
@@ -2312,11 +2392,46 @@ static void poll_pad(void)
     }
 #endif
 
+    /* Split-screen wall-path A/B (live, mid-game): in local multiplayer, pad-1 X toggles the
+       half-views' walls between VDP1 (sat_split_vdp1=1, the new mode) and pure software
+       (sat_split_vdp1=0, the baseline) so both can be compared on the same scene on hardware.
+       Gated to sat_local_players>1 so X is inert in single-player.  In split the X->KEY_TAB
+       (automap) forward is suppressed below so X is ONLY this toggle; 1p keeps X = automap. */
+    if (sat_local_players > 1 && (changed & PER_DGT_TX) && !(cur & PER_DGT_TX))
+        sat_split_vdp1 = !sat_split_vdp1;
+
+    /* Local co-op opt-in: outside a level (title/menu/demo), the 2nd pad's A toggles local
+       multiplayer on (= the detected pad count, 2..4) / off (1p).  G_DoNewGame reads
+       sat_local_players lazily at skill-confirm, so arming it at the title is enough; gating to
+       non-level means it can never change mid-game (the split render + ticcmd build read it live).
+       The gesture IS the A/B toggle -- don't arm = 1p (VDP1 hybrid), arm = Np split, same disc. */
+    {
+        static int p2a_was = 0, shown = -2;
+        int p2a_now = sat_mp_pad2_a();
+        if (p2a_now && !p2a_was && !usergame)   /* attract loop only -> never changes mid-game */
+            sat_local_players = (sat_local_players > 1) ? 1 : sat_count_local_pads();
+        p2a_was = p2a_now;
+
+        /* Attract-loop feedback so the gesture is visibly confirmed before starting a game;
+           cleared once a real game is running so it never lingers over the 3D view. */
+        if (!usergame)
+        {
+            int n = sat_local_players;
+            if (n != shown) { SRL::Debug::Print(0, 23, "PLAYERS: %d  (A on pad 2 toggles)", n); shown = n; }
+        }
+        else if (shown != -2) { SRL::Debug::Print(0, 23, "                                "); shown = -2; }
+    }
+
     for (unsigned int i = 0; i < PAD_MAP_LEN; ++i)
     {
         if (changed & pad_map[i].mask)
         {
             int pressed = !(cur & pad_map[i].mask);
+            /* SATURN: in split, pad-X is the live sat_split_vdp1 A/B toggle (above),
+               so DON'T also forward its KEY_TAB (= automap) -- the minimap would open
+               over the 3D view and ruin the comparison.  1p keeps X = automap. */
+            if (pad_map[i].mask == PER_DGT_TX && sat_local_players > 1)
+                continue;
             keyq_push(pressed, keyq_encode(pad_map[i].key));
             if (pad_map[i].mask == PER_DGT_TA)
                 keyq_push(pressed, KEY_ENTER);

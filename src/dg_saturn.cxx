@@ -299,16 +299,24 @@ void sat_walls_kick(void);                /* platform: flush + kick the VDP1 wal
 }
 #endif
 
-/* Potato (solid-colour, flat-shaded) -- big EX/fillrate win, visible quality drop,
-   aimed at perf-tight builds (e.g. future 2/4-player split-screen).  POTATO_LEVEL
-   is the boot level; cycle live in-game with the pad Z button.  Levels:
-   0 = off (textured), 1 = floors/ceilings flat, 2 = + VDP1 walls flat (low-detail).
-   Level 2 is the DoomSRL-only "po2": the now-dead software wall-potato (walls live on
-   VDP1) is replaced by drawing the VDP1 walls as flat mean-colour quads (wall_lowdetail).
-   DoomJo (software walls) keeps the original sat_potato_walls path -- this is platform-side. */
+/* Potato / quality levels cycled live with pad Z -- 6 modes for in-game A/B comparison.
+   pot0 = textured; pot1 = flat floors; pot2 = flat-shaded walls (bd = banded texture stripes
+   that scroll, fl = single flat colour).  +ld = low-detail (half horizontal res), meaningful
+   ONLY in the 2-player split (it gates the d_main.c split block).  pot2+ld is omitted (low-detail
+   of flat/banded walls is invisible).  Everything is platform-side EXCEPT sat_split_lowdetail
+   (core flag, default 0 -> DoomJo/1p unaffected). */
 #define POTATO_LEVEL 0
-static int potato_level = POTATO_LEVEL;
-static int wall_lowdetail = 0;            /* DoomSRL: VDP1 walls drawn flat (set at potato lvl 2) */
+static int potato_level = POTATO_LEVEL;    /* 0..5, index into potato_modes */
+static int wall_potato_mode = 0;           /* DoomSRL VDP1 wall mode: 0=textured 1=banded 2=flat */
+/* the 6 modes: floors flat?, wall mode (0=tex 1=banded 2=flat), low-detail?, display name. */
+static const struct { int floors, wmode, ld; const char *name; } potato_modes[6] = {
+    { 0, 0, 0, "pot0"    },
+    { 0, 0, 1, "pot0+ld" },
+    { 1, 0, 0, "pot1"    },
+    { 1, 0, 1, "pot1+ld" },
+    { 1, 1, 0, "pot2-bd" },
+    { 1, 2, 0, "pot2-fl" },
+};
 
 /* Dual-CPU blit configs, cycled LIVE by the pad L+R chord (one press = next, wraps).
    'mpct' = % of the 224 framebuffer rows the MASTER copies ([0,split)); the slave
@@ -332,9 +340,13 @@ static int blit_mode = DUAL_CPU_BLIT ? 1 : 0;   /* boot: 50/50 if compiled in, e
 static inline int blit_split(void) { return (blit_cfg[blit_mode].mpct * 224) / 100; }
 static void sat_apply_potato(void)
 {
-    sat_potato_floors = (potato_level >= 1);
-    sat_potato_walls  = (potato_level >= 2);
-    wall_lowdetail    = (potato_level >= 2);
+    extern int sat_split_lowdetail;            /* core flag (only acts in the split block) */
+    int L = potato_level; if (L < 0 || L >= 6) L = 0;
+    sat_potato_floors   = potato_modes[L].floors;
+    sat_potato_walls    = (potato_modes[L].wmode == 2);  /* DoomJo software-wall flat parity; also
+                                                            gates the pot2-fl CPU-fallback skip */
+    wall_potato_mode    = potato_modes[L].wmode;         /* DoomSRL VDP1 3-way (tex/banded/flat) */
+    sat_split_lowdetail = potato_modes[L].ld;
 }
 #define GS_LEVEL 0
 #define SAT_CMAP_BYTES (34 * 256)           /* COLORMAP: 34 maps of 256 (r_data.c) */
@@ -658,8 +670,8 @@ static void fps_update(void)
         /* Trimmed: fps duplicated row 17's inst, and dma/dsta were dead with the
            SCU DMA blit disabled (USE_SCU_DMA=0).  Kept gt (heartbeat) + vp
            (visplane peak) -- vp is the number sky->VDP2 should pull down. */
-        sprintf(r2, "gt%5d vp%3d pot%d bl%d %d/%d", gametic, r_visplane_peak,
-                potato_level, blit_mode,
+        sprintf(r2, "gt%5d vp%3d %-7s bl%d %d/%d", gametic, r_visplane_peak,
+                potato_modes[potato_level].name, blit_mode,
                 blit_cfg[blit_mode].mpct, 100 - blit_cfg[blit_mode].mpct);
         SRL::Debug::Print(0, 2, r2);
         {
@@ -1332,7 +1344,7 @@ static void wtex_rebuild_banks(void)
    the left view, 160..319 for the right).  x1/x2 are stored ALREADY offset by viewwindowx, so the
    emit works in absolute framebuffer coords; vx/vxr drive the per-view user-clip window. */
 static struct { short x1, yl1, yh1, x2, yl2, yh2, slot, v0, v1, vx, vxr; int texnum, u1, u2;
-                unsigned char mode; const unsigned char *cmap; } wall_acc[WALL_ACC_MAX];
+                unsigned char mode, special; const unsigned char *cmap; } wall_acc[WALL_ACC_MAX];
 static int wall_acc_n;
 
 /* core hook (per one-sided seg, during the BSP walk): stash the wall.  x1/x2 arrive VIEW-relative
@@ -1346,6 +1358,8 @@ extern "C" int sat_wall_vdp1(int x1, int yl1, int yh1, int x2, int yl2, int yh2,
 {
     extern int viewwindowx, viewwidth;   /* core: per-view origin + width (set by R_SetViewWindow) */
     extern int sat_split_active;         /* core: 1 while rendering the split half-views */
+    extern int sat_wall_textured;        /* core: this seg's linedef is a special (door/switch) */
+    extern int detailshift;              /* core: 1 = low-detail (half-res, x is the halved column) */
     /* Split-screen shares the single command bank across both half-views.  Reserve the upper half of
        the accumulator for the right view so a dense LEFT view (accumulated first) cannot starve the
        right view out of VDP1 slots (its overflow falls back to CPU, below).  1p = the full cap.
@@ -1354,12 +1368,15 @@ extern "C" int sat_wall_vdp1(int x1, int yl1, int yh1, int x2, int yl2, int yh2,
     if (wall_acc_n >= cap) return 1;     /* VDP1 list full -> caller draws this wall in SOFTWARE */
     int vx = viewwindowx;
     int i = wall_acc_n++;
-    wall_acc[i].x1 = (short)(x1 + vx); wall_acc[i].yl1 = (short)yl1; wall_acc[i].yh1 = (short)yh1;
-    wall_acc[i].x2 = (short)(x2 + vx); wall_acc[i].yl2 = (short)yl2; wall_acc[i].yh2 = (short)yh2;
+    /* low-detail: x arrives as the HALVED column (0..viewwidth-1); the framebuffer is full width,
+       so screen x = vx + (x<<detailshift).  detailshift==0 (1p / hi-detail) => byte-identical. */
+    wall_acc[i].x1 = (short)((x1 << detailshift) + vx); wall_acc[i].yl1 = (short)yl1; wall_acc[i].yh1 = (short)yh1;
+    wall_acc[i].x2 = (short)((x2 << detailshift) + vx); wall_acc[i].yl2 = (short)yl2; wall_acc[i].yh2 = (short)yh2;
     wall_acc[i].texnum = texnum; wall_acc[i].u1 = u1; wall_acc[i].u2 = u2;
     wall_acc[i].v0 = (short)v0; wall_acc[i].v1 = (short)v1; wall_acc[i].cmap = cmap;
     wall_acc[i].vx  = (short)vx;
-    wall_acc[i].vxr = (short)(vx + viewwidth - 1);
+    wall_acc[i].vxr = (short)(vx + (viewwidth << detailshift) - 1);
+    wall_acc[i].special = (unsigned char)(sat_wall_textured ? 1 : 0);   /* force textured in pot2 */
     return 0;                            /* queued for VDP1 */
 }
 
@@ -1474,6 +1491,15 @@ static int wall_tilecount(int wi)  /* est. command cost (bands x (tiles + 1 user
     int n = (texw > 0) ? du / texw + 1 : 1;
     if (n > MAXWALLTILES) n = MAXWALLTILES;
     return wall_vbands(wi) * (n + 1);
+}
+
+static int wall_banded_cost(int wi)  /* est. cmd cost of a banded wall = ONE band's u-tiles + clip */
+{
+    int texw = texturewidthmask[wall_acc[wi].texnum] + 1;
+    int du = wall_acc[wi].u2 - wall_acc[wi].u1; if (du < 0) du = -du;
+    int n = (texw > 0) ? du / texw + 1 : 1;
+    if (n > MAXWALLTILES) n = MAXWALLTILES;
+    return n + 1;
 }
 
 /* Emit the horizontal u-tiles of ONE vertical band: the texture rows at [charAddr, +charSize.h]
@@ -1684,13 +1710,46 @@ static void wall_emit_flat(int wi)
     vdp1_cmd_at(VDP1_BANK[vdp1_wbank], vdp1_wnext++, cmd);
 }
 
-/* a wall is drawn FLAT only in low-detail (Z) mode now: the cost-based flat fallback was
-   replaced by the core close-wall CPU fallback (SAT_WALL_CPU_SPAN, r_segs.c) -- a too-close
-   wall is rendered in SOFTWARE (correct, no swim) and never reaches the platform. */
-static int wall_is_flat(int wi)
+/* Banded wall (pot2-bd): emit ONE narrow band (BAND_ROWS texels at a fixed source row) and let
+   VDP1's DISTORSP magnify it over the WHOLE wall height -> per-column horizontal texel variation =
+   vertical stripes that SCROLL with u (player movement) and track vertical movement via v0, keeping
+   the texture's hue/pattern (unlike the flat quad) but ~as cheap (1 band, not N).  Distance-shaded
+   via the CRAM light bank (colr).  Does NOT call R_WallPotatoColor. */
+#define BAND_ROWS 4
+static void wall_emit_banded(int wi)
+{
+    int slot = wall_acc[wi].slot;
+    int padW = wtex_cache[slot].padW, H = wtex_cache[slot].H;
+    unsigned int base = wtex_cache[slot].addr;
+    int x1 = wall_acc[wi].x1, x2 = wall_acc[wi].x2;
+    int yl1 = wall_acc[wi].yl1, yh1 = wall_acc[wi].yh1;
+    int yl2 = wall_acc[wi].yl2, yh2 = wall_acc[wi].yh2;
+    int vx = wall_acc[wi].vx, vxr = wall_acc[wi].vxr;
+    int u1 = wall_acc[wi].u1, u2 = wall_acc[wi].u2;
+    int texw = texturewidthmask[wall_acc[wi].texnum] + 1;
+    int v0 = wall_acc[wi].v0;
+    unsigned short colr = wall_light_colr(wall_acc[wi].cmap);
+    int vmod, rows;
+    unsigned int taddr;
+    unsigned short ca, cs;
+
+    if (H <= 0) H = 1;
+    vmod = ((v0 % H) + H) % H;                       /* one source row set, tracks vertical movement */
+    /* clamp to the baked tile [vmod, H): the tile is only padW*H bytes, so reading past row H-1
+       would sample the NEXT slot's texture (corruption).  Mirrors wall_emit's rows = H - vmod. */
+    rows = BAND_ROWS; if (rows > H - vmod) rows = H - vmod; if (rows > 255) rows = 255; if (rows < 1) rows = 1;
+    taddr = base + (unsigned int)vmod * (unsigned int)padW;
+    ca = (unsigned short)((taddr - VDP1_VRAM_BASE) >> 3);
+    cs = (unsigned short)(((padW >> 3) << 8) | rows);
+    wall_emit_band(x1, x2, yl1, yh1, yl2, yh2, u1, u2, texw, ca, cs, colr, vx, vxr);
+}
+
+/* the VDP1 wall mode (0=textured 1=banded 2=flat).  Global per level (set in sat_apply_potato);
+   the flush forces flat for a wall with no texture slot, and forces textured for special walls. */
+static int wall_potato(int wi)
 {
     (void)wi;
-    return wall_lowdetail;
+    return wall_potato_mode;
 }
 
 /* drain accumulated walls into the current bank (from vdp1_wpn_begin, behind the weapon).
@@ -1730,19 +1789,29 @@ static void vdp1_walls_flush(void)
     {
         if (i >= budget) { wall_acc[i].mode = 0; continue; }   /* n > budget (cap makes this unreachable) */
         int v = (nviews > 1 && wall_acc[i].vx > 0) ? 1 : 0;    /* left half = view 0, right half = view 1 */
-        int textured = (wall_acc[i].slot >= 0 && !wall_is_flat(i));
-        if (textured)
+        /* 3-way: 0=textured 1=banded 2=flat; a wall with no texture slot must be flat.  A SPECIAL
+           wall (door/switch, wall_acc[i].special) is forced TEXTURED for readability even in pot2. */
+        int wmode = (wall_acc[i].slot < 0) ? 2
+                  : (wall_acc[i].special)  ? 0
+                  : wall_potato(i);
+        if (wmode != 2)                                        /* textured/banded: charge extra to surplus */
         {
-            int extra = wall_tilecount(i) - 1;                 /* cmds beyond this wall's own flat */
+            int extra = ((wmode == 1) ? wall_banded_cost(i) : wall_tilecount(i)) - 1;
             if (extra < 0) extra = 0;
-            if (extra_used[v] + extra <= surplus_per_view) { extra_used[v] += extra; wall_acc[i].mode = 1; continue; }
+            if (extra_used[v] + extra <= surplus_per_view)
+            {
+                extra_used[v] += extra;
+                wall_acc[i].mode = (wmode == 1) ? 3 : 1;       /* banded=3, textured=1 */
+                continue;
+            }
         }
         wall_acc[i].mode = 2;                                  /* flat baseline (guaranteed to fit) */
     }
 
     for (int i = wall_acc_n - 1; i >= 0; --i)            /* paint far->near */
     {
-        if (wall_acc[i].mode == 1)      wall_emit(i);
+        if      (wall_acc[i].mode == 1) wall_emit(i);
+        else if (wall_acc[i].mode == 3) wall_emit_banded(i);
         else if (wall_acc[i].mode == 2) wall_emit_flat(i);
     }
 
@@ -2395,7 +2464,7 @@ static void poll_pad(void)
        -> 2 + VDP1 walls flat / low-detail), for A/B testing quality vs fps without a rebuild. */
     if ((changed & PER_DGT_TZ) && !(cur & PER_DGT_TZ))
     {
-        potato_level = (potato_level + 1) % 3;
+        potato_level = (potato_level + 1) % 6;
         sat_apply_potato();
     }
 

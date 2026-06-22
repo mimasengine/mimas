@@ -125,6 +125,9 @@ extern "C" int   dg_heap_peak;              /* #4: peak newlib sbrk usage (bytes
 extern "C" int   dg_heap_size;              /* #4: newlib heap cap (bytes)                    */
 /* split-screen perf breakdown (ms per piece of the 2p render block) -- diagnose the slowdown */
 extern "C" unsigned int sat_spl_sw, sat_spl_v0, sat_spl_v1, sat_spl_kick;
+/* VDP1 wall-texture bakes (cache misses) THIS flush -- diagnoses the `k` cost: if the 2 split
+   views thrash the 22 shared slots, bk stays high every frame => re-bake is the kick cost. */
+static int wtex_bakes = 0;
 
 /* ------------------------------------------------------------------ */
 /* Saturn memory map constants                                         */
@@ -675,8 +678,8 @@ static void fps_update(void)
                v0/v1 = each R_RenderPlayerView, k = the VDP1 kick -> localises the 2p slowdown
                (last frame; 0 in 1p). */
             static char rS[45];
-            sprintf(rS, "SPL sw%u v0%u v1%u k%u",
-                    sat_spl_sw, sat_spl_v0, sat_spl_v1, sat_spl_kick);
+            sprintf(rS, "SPL sw%u v0%u v1%u k%u bk%u",
+                    sat_spl_sw, sat_spl_v0, sat_spl_v1, sat_spl_kick, wtex_bakes);
             SRL::Debug::Print(0, 6, rS);   /* high + free row, just under the top block */
         }
         {
@@ -1402,6 +1405,7 @@ static int wall_tex_resolve(int texnum, const unsigned char *cmap)
     else                                                /* wide: only the wide pool fits */
         victim = wtex_find_victim(WTEX_NARROW_N, WTEX_SLOTS);
     if (victim < 0) return -1;                          /* all fitting slots used -> flat in flush */
+    wtex_bakes++;                                       /* cache miss -> a real bake follows (the `k` cost) */
 
     /* bake the RAW palette index (1 byte/texel) full-bright; light is applied at draw time via
        the CMDCOLR CRAM bank.  No re-bake ever (light or flash) -> max cache stability.
@@ -1475,6 +1479,26 @@ static int wall_tilecount(int wi)  /* est. command cost (bands x (tiles + 1 user
 /* Emit the horizontal u-tiles of ONE vertical band: the texture rows at [charAddr, +charSize.h]
    mapped across the wall's u-range, window-clipped to [x1,x2].  The yl/yh args are THIS band's
    screen y at the two seg ends. */
+/* SATURN: reciprocal-multiply the wall perspective math.  The SH-2 has NO hardware divide,
+   and wall_emit/wall_emit_band did ~6 int + ~4 int64 software divisions PER TILE/BAND by the
+   PER-WALL constants du / xspan / vspan -> the `k` (VDP1 flush) cost (11-28ms, measured).
+   Precompute round(2^S / den) once per band/wall, then multiply (hardware) -> ~5-10x.  S=22
+   keeps the error sub-pixel; round-to-nearest + sign-fold.  Pixel-validate the seams on Ymir.
+   Flip SAT_WALL_RMUL to 0 for the original divisions (A/B). */
+#define SAT_WALL_RMUL 1
+#if SAT_WALL_RMUL
+#define WRMUL_S 22
+static inline int wrecip(int den)            /* den > 0 */
+{ return (int)(((1u << WRMUL_S) + ((unsigned)den >> 1)) / (unsigned)den); }
+static inline int wrmul_(long long num, int recip)   /* ~= num/den, rounded, sign-correct */
+{ return (num >= 0) ?  (int)(( num * recip + (1 << (WRMUL_S - 1))) >> WRMUL_S)
+                    : -(int)((-num * recip + (1 << (WRMUL_S - 1))) >> WRMUL_S); }
+#define WDIV(numP, denP, recip)  wrmul_((long long)(numP), (recip))
+#else
+#define wrecip(den)              (0)
+#define WDIV(numP, denP, recip)  ((int)((long long)(numP) / (denP)))
+#endif
+
 static void wall_emit_band(int x1, int x2, int yl1, int yh1, int yl2, int yh2,
                            int u1, int u2, int texw,
                            unsigned short charAddr, unsigned short charSize, unsigned short colr,
@@ -1498,6 +1522,11 @@ static void wall_emit_band(int x1, int x2, int yl1, int yh1, int yl2, int yh2,
         return;
     }
 
+    /* per-band constants: reciprocals of du (signed) and xspan (>0 here) -> multiply per tile */
+    int adu = (du < 0) ? -du : du, sdu = (du < 0) ? -1 : 1;
+    int inv_du = wrecip(adu);
+    int inv_xspan = wrecip(xspan);
+
     /* normalise u (tiling is periodic in texw) so the arithmetic stays small */
     int ubase = u1 & ~(texw - 1);
     u1 -= ubase; u2 -= ubase;
@@ -1508,15 +1537,15 @@ static void wall_emit_band(int x1, int x2, int yl1, int yh1, int yl2, int yh2,
     for (int ub = umin & ~(texw - 1); ub < umax && ntiles < MAXWALLTILES; ub += texw, ++ntiles)
     {
         if (vdp1_wnext >= WALL_CMD_CAP) break;
-        int xs = x1 + ((ub        - u1) * xspan) / du;   /* screen x of col 0  (u=ub)      */
-        int xe = x1 + ((ub + texw - u1) * xspan) / du;   /* screen x of col texw (u=ub+texw) */
+        int xs = x1 + WDIV((long long)(ub        - u1) * xspan * sdu, adu, inv_du);  /* /du */
+        int xe = x1 + WDIV((long long)(ub + texw - u1) * xspan * sdu, adu, inv_du);  /* /du */
         int lo = (xs < xe) ? xs : xe, hi = (xs < xe) ? xe : xs;
         if (hi < x1 || lo > x2) continue;                /* tile outside the visible range */
 
-        int yls = yl1 + (yl2 - yl1) * (xs - x1) / xspan;
-        int yhs = yh1 + (yh2 - yh1) * (xs - x1) / xspan;
-        int yle = yl1 + (yl2 - yl1) * (xe - x1) / xspan;
-        int yhe = yh1 + (yh2 - yh1) * (xe - x1) / xspan;
+        int yls = yl1 + WDIV((long long)(yl2 - yl1) * (xs - x1), xspan, inv_xspan);
+        int yhs = yh1 + WDIV((long long)(yh2 - yh1) * (xs - x1), xspan, inv_xspan);
+        int yle = yl1 + WDIV((long long)(yl2 - yl1) * (xe - x1), xspan, inv_xspan);
+        int yhe = yh1 + WDIV((long long)(yh2 - yh1) * (xe - x1), xspan, inv_xspan);
 
         if (lo >= -wall_ext && hi <= 320 + wall_ext)     /* extend + window-clip (correct) */
         {
@@ -1552,10 +1581,10 @@ static void wall_emit_band(int x1, int x2, int yl1, int yh1, int yl2, int yh2,
         {
             int cxs = xs < x1 ? x1 : (xs > x2 ? x2 : xs);
             int cxe = xe < x1 ? x1 : (xe > x2 ? x2 : xe);
-            int cyls = yl1 + (yl2 - yl1) * (cxs - x1) / xspan;
-            int chys = yh1 + (yh2 - yh1) * (cxs - x1) / xspan;
-            int cyle = yl1 + (yl2 - yl1) * (cxe - x1) / xspan;
-            int chye = yh1 + (yh2 - yh1) * (cxe - x1) / xspan;
+            int cyls = yl1 + WDIV((long long)(yl2 - yl1) * (cxs - x1), xspan, inv_xspan);
+            int chys = yh1 + WDIV((long long)(yh2 - yh1) * (cxs - x1), xspan, inv_xspan);
+            int cyle = yl1 + WDIV((long long)(yl2 - yl1) * (cxe - x1), xspan, inv_xspan);
+            int chye = yh1 + WDIV((long long)(yh2 - yh1) * (cxe - x1), xspan, inv_xspan);
             memset(cmd, 0, sizeof cmd);
             cmd[0] = 0x0002; cmd[2] = 0x00E0;                 /* DISTORSP | COLOR_4 8bpp | SPD | ECD-off */
             cmd[3] = colr;                                    /* CMDCOLR = CRAM light-bank base */
@@ -1598,6 +1627,7 @@ static void wall_emit(int wi)
         return;
     }
 
+    int inv_vspan = wrecip(vspan);   /* vspan > 0 here; reciprocal -> multiply per band */
     int v = v0, nb = 0;
     while (v < v1 && nb < MAXVBANDS)
     {
@@ -1609,10 +1639,10 @@ static void wall_emit(int wi)
         if (rows <= 0) break;
         int vb = v + rows;
         /* this band's screen y at the two seg ends (linear v->y over the whole [v0,v1] range) */
-        int yl1b = yl1 + (int)((long long)(v  - v0) * (yh1 - yl1) / vspan);
-        int yh1b = yl1 + (int)((long long)(vb - v0) * (yh1 - yl1) / vspan);
-        int yl2b = yl2 + (int)((long long)(v  - v0) * (yh2 - yl2) / vspan);
-        int yh2b = yl2 + (int)((long long)(vb - v0) * (yh2 - yl2) / vspan);
+        int yl1b = yl1 + WDIV((long long)(v  - v0) * (yh1 - yl1), vspan, inv_vspan);
+        int yh1b = yl1 + WDIV((long long)(vb - v0) * (yh1 - yl1), vspan, inv_vspan);
+        int yl2b = yl2 + WDIV((long long)(v  - v0) * (yh2 - yl2), vspan, inv_vspan);
+        int yh2b = yl2 + WDIV((long long)(vb - v0) * (yh2 - yl2), vspan, inv_vspan);
         unsigned int taddr = base + (unsigned int)vmod * (unsigned int)padW * 1u;  /* 8bpp */
         unsigned short ca = (unsigned short)((taddr - VDP1_VRAM_BASE) >> 3);
         unsigned short cs = (unsigned short)(((padW >> 3) << 8) | rows);
@@ -1672,6 +1702,7 @@ static int wall_is_flat(int wi)
    Painted far->near (painter's algorithm). */
 static void vdp1_walls_flush(void)
 {
+    wtex_bakes = 0;                      /* count this frame's texture re-bakes (the `k` driver) */
     if (wall_acc_n == 0) return;
     wtex_tick++;
     for (int i = 0; i < WTEX_SLOTS; ++i) wtex_cache[i].locked = 0;

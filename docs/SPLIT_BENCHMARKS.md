@@ -27,13 +27,17 @@ On **console**: pot0 ≈ **~100ms / ~7fps = "playable"** (Romain, 2026-06-21).
 
 ### Reading the baseline — three levers, ranked
 
-1. **The kick (`k` = 18-28ms) GROWS with pot level** (pot2 > pot0). Counter-intuitive for a
-   wall flush (pot doesn't change wall count) → it's an **exposed VDP1 wait**: at high fps
-   (pot2) the master kicks before the previous frame's VDP1 plot has finished (`EDSR` CEF),
-   so it stalls; at low fps (pot0) VDP1 finishes during the long CPU frame → cheap kick. So
-   the kick ≈ the VDP1 wall **fill/overdraw** time, exposed only when the CPU is fast. Lever:
-   reduce VDP1 overdraw (world-anchored vertical cull / close-wall software fallback /
-   band-cull, see [[doomsrl-vdp1-capacity]]) — the pot2 lever. HW-relevant.
+1. **The kick (`k` = 11-28ms) = the VDP1 wall flush CPU work (`vdp1_walls_flush`) — and the cost
+   is the PERSPECTIVE-MATH DIVISIONS, FIXED 2026-06-22.** Investigation chain (each step read
+   the code / measured, not assumed): (a) NO spin-wait in the kick path ("exposed VDP1 wait" was
+   wrong); (b) added `bk` telemetry (bakes/frame) → **`bk`=0 on Ymir in BOTH split and 1p** (bk
+   is deterministic = HW too) → the 22-slot texture cache does NOT thrash, baking is NOT the cost;
+   (c) read `wall_emit`/`wall_emit_band` → the cost is ~6 int + ~4 int64 **software divisions per
+   tile/band** by the per-wall constants `du`/`xspan`/`vspan` (the SH-2 has no hardware divide).
+   **FIX (`SAT_WALL_RMUL`, default 1): reciprocal-multiply** — precompute `round(2^22/den)` once
+   per band/wall, multiply (hardware) instead of divide; sign-folded, round-to-nearest, sub-pixel
+   error. **Validated on Ymir (Romain, 2026-06-22): `k` drops, no seams.** Flip `SAT_WALL_RMUL` 0
+   for the original divisions (A/B). [append the measured k-drop in the table below]
 2. **Bp (software wall-prep) = 5.5-11.4ms/view**, the dominant per-view software term in dense
    scenes. Lever: **detailshift** (halve the columns → ~half Bp; ~5-11ms/frame; a quality hit)
    or the parked slave wall-prep offload. detailshift caveat: the VDP1 wall emit

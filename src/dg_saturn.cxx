@@ -27,6 +27,7 @@ extern "C" {
 #include "v_patch.h"   /* patch_t / post_t (for the VDP1 weapon sprite) */
 #include "r_parallel.h"
 }
+#include "hud2p_panel.h"   /* generated 2-player compact HUD panel + field anchors */
 
 /* Set by D_SetGameDescription() from the loaded IWAD's lumps; we surface it on
    the debug overlay (row 21) to confirm which WAD the binary actually detected.
@@ -335,9 +336,19 @@ static const struct { int dual; int mpct; } blit_cfg[] = {
     { 1,  75 },   /* 4: 75/25 */
 };
 #define BLIT_CFG_N ((int)(sizeof(blit_cfg) / sizeof(blit_cfg[0])))
-static int blit_mode = DUAL_CPU_BLIT ? 1 : 0;   /* boot: 50/50 if compiled in, else single */
+static int blit_mode = 0;   /* boot: single-CPU blit.  2026-06-22 HW (pot0 tech room):
+   dual NEVER beats single -- blit is only ~5.5ms (not the assumed ~12ms) and is bus-bound
+   (S~1.3); 50/50 was the WORST (6.0 vs 5.5).  Verdict DROP; L+R chord still A/Bs configs. */
 /* Master row count for the current config: mpct% of 224. */
 static inline int blit_split(void) { return (blit_cfg[blit_mode].mpct * 224) / 100; }
+/* SATURN PERF: last frame's framebuffer->VDP2 blit wall-clock in ms*10 (master FRT delta
+   around the copy, INCLUDING the dual-blit slave-join spin).  This is the number that
+   decides dual-CPU blit GO/DROP -- fps/MST are too coarse (~12ms of a ~100ms frame).
+   Read it on row 2 as 'b<ms.tenth>'; compare config 0 (single) vs 4 (75/25), same scene. */
+static unsigned int sat_blit_ms10 = 0;
+/* core/r_plane.c L1 toggle (1 = visplane hash, 0 = vanilla linear scan); pad Y A/Bs it
+   live on hardware -> read the REC profiler's Bw bucket ON (h1) vs OFF (h0). */
+extern "C" int sat_visplane_hash;
 static void sat_apply_potato(void)
 {
     extern int sat_split_lowdetail;            /* core flag (only acts in the split block) */
@@ -376,6 +387,74 @@ static volatile int   wbank_dirty = 0;
 
 static unsigned char framebuffer[320 * 224] __attribute__((aligned(4)));  /* = core I_VideoBuffer */
 static unsigned int  dma_table[224][3] __attribute__((aligned(16)));
+
+/* 2-player compact HUD: blit the two 160x64 panels (P1 left, P2 right) into the
+   bottom 64 rows of the framebuffer; the core then draws each player's widgets
+   (numbers/face/keys) on top via ST_DrawCompactWidgets. */
+extern "C" void ST_DrawCompactWidgets(int pnum, int ox, int oy);  /* core: per-player HUD widgets */
+#define HUD2P_TOP  (224 - HUD2P_H)            /* = 160 */
+static void hud2p_blit_panels(void)
+{
+    for (int y = 0; y < HUD2P_H; ++y)
+    {
+        unsigned char *row = framebuffer + (HUD2P_TOP + y) * 320;
+        memcpy(row,       hud2p_panel + y * HUD2P_W, HUD2P_W);   /* P1 (left)  */
+        memcpy(row + 160, hud2p_panel + y * HUD2P_W, HUD2P_W);   /* P2 (right) */
+    }
+}
+
+/* 2-player flash (per-half software wash): the hardware palette is shared by both
+   viewports, so each player's damage/pickup flash is applied by remapping that
+   half's framebuffer indices through a LUT = base-palette index nearest to
+   PLAYPAL[level][i].  The 13 LUTs are built once (first 2p frame) from PLAYPAL. */
+extern "C" int   ST_PlayerPaletteIndex(int pnum);   /* core: flash level for players[pnum] */
+extern "C" void *W_CacheLumpName(char *name, int tag);
+#define HUD2P_NPAL 14                               /* PLAYPAL sub-palettes (0 = base) */
+static unsigned char hud2p_flash_lut[HUD2P_NPAL][256];
+static int           hud2p_flash_built = 0;
+
+static void hud2p_flash_build(void)
+{
+    const unsigned char *pp = (const unsigned char *)W_CacheLumpName((char *)"PLAYPAL", 1 /*PU_STATIC*/);
+    if (!pp) return;
+    for (int L = 1; L < HUD2P_NPAL; ++L)
+    {
+        const unsigned char *sub = pp + L * 768;
+        for (int i = 0; i < 256; ++i)
+        {
+            int r = sub[i*3], g = sub[i*3+1], b = sub[i*3+2];
+            int best = 1 << 30, bj = 0;
+            for (int j = 0; j < 256; ++j)
+            {
+                int dr = pp[j*3] - r, dg = pp[j*3+1] - g, db = pp[j*3+2] - b;
+                int d = dr*dr + dg*dg + db*db;
+                if (d < best) { best = d; bj = j; if (!d) break; }
+            }
+            hud2p_flash_lut[L][i] = (unsigned char)bj;
+        }
+    }
+    hud2p_flash_built = 1;
+}
+
+/* per-half flash: remap each flashing player's column-half (all 224 rows) in place. */
+static void hud2p_apply_flash(void)
+{
+    if (!hud2p_flash_built) hud2p_flash_build();
+    int l1 = ST_PlayerPaletteIndex(0);
+    int l2 = ST_PlayerPaletteIndex(1);
+    for (int half = 0; half < 2; ++half)
+    {
+        int lvl = half ? l2 : l1;
+        if (lvl <= 0 || lvl >= HUD2P_NPAL) continue;
+        const unsigned char *lut = hud2p_flash_lut[lvl];
+        int x0 = half ? 160 : 0;
+        for (int y = 0; y < 224; ++y)
+        {
+            unsigned char *row = framebuffer + y * 320 + x0;
+            for (int x = 0; x < 160; ++x) row[x] = lut[row[x]];
+        }
+    }
+}
 
 extern "C" unsigned char *DG_FrameBuffer(void)
 {
@@ -669,10 +748,12 @@ static void fps_update(void)
         static char r2[45];
         /* Trimmed: fps duplicated row 17's inst, and dma/dsta were dead with the
            SCU DMA blit disabled (USE_SCU_DMA=0).  Kept gt (heartbeat) + vp
-           (visplane peak) -- vp is the number sky->VDP2 should pull down. */
-        sprintf(r2, "gt%5d vp%3d %-7s bl%d %d/%d", gametic, r_visplane_peak,
+           (visplane peak).  bl<idx> = active blit config (0 single .. 4 = 75/25);
+           b<ms.t> = measured blit wall-clock (the dual-CPU GO/DROP number);
+           h<0|1> = visplane hash (pad Y) on/off for its Bw A/B. */
+        sprintf(r2, "gt%5d vp%3d %-7s bl%d b%u.%u h%d", gametic, r_visplane_peak,
                 potato_modes[potato_level].name, blit_mode,
-                blit_cfg[blit_mode].mpct, 100 - blit_cfg[blit_mode].mpct);
+                sat_blit_ms10 / 10, sat_blit_ms10 % 10, sat_visplane_hash);
         SRL::Debug::Print(0, 2, r2);
         {
             /* SATURN VALIDATION row: RAM-lever sizing (all high-water, Ymir-honest).
@@ -2151,8 +2232,12 @@ extern "C" void DG_DrawFrame(void)
         (void)menuactive;
         /* SATURN: drop the hardware sky (NBG0) when there is NO sky visplane in view this
            frame (fully-enclosed room) -> the VDP1 walls' torn index-0 gaps then show the dark
-           backdrop instead of the bright sky, so the tearing is far less visible. */
-        int show_sky = (gamestate == GS_LEVEL) && !automapactive && sat_frame_has_sky;
+           backdrop instead of the bright sky, so the tearing is far less visible.
+           Also drop it in 2-player: NBG0 is a single layer scrolled by one viewangle and
+           cannot serve two split views -> the split renders the SOFTWARE sky instead. */
+        extern int sat_local_players;
+        int show_sky = (gamestate == GS_LEVEL) && !automapactive && sat_frame_has_sky
+                       && sat_local_players <= 1;
 #if VDP2_RBG0_TEST
         /* RBG0/debug 3-mode cycle (rbg0_mode, pad Y) -- see the rbg0_mode decl:
            0 = VDP2 floor, no dbg   (RBG0 on, NBG3 off, sw floor skipped)
@@ -2231,6 +2316,21 @@ extern "C" void DG_DrawFrame(void)
        uncovered.  Outside a level (no ST_Drawer), blacken that strip so it's not stale garbage. */
     if (gamestate != GS_LEVEL)
         memset(framebuffer + 200 * 320, 0, 24 * 320);
+    {
+        /* SATURN 2p: paint the two compact-HUD panels into the bottom 64 rows
+           (rows 160..223), draw each player's widgets on top (P1 left, P2 right),
+           then apply each player's damage/pickup flash as a per-half wash -- all
+           into the framebuffer before the blit. */
+        extern int sat_local_players;
+        if (sat_local_players > 1 && gamestate == GS_LEVEL)
+        {
+            hud2p_blit_panels();
+            ST_DrawCompactWidgets(0, 0,   HUD2P_TOP);   /* P1 (left)  */
+            ST_DrawCompactWidgets(1, 160, HUD2P_TOP);   /* P2 (right) */
+            hud2p_apply_flash();                        /* per-half damage/pickup flash */
+        }
+    }
+    unsigned short blit_t0 = frt_read();   /* SATURN PERF: time the blit (-> sat_blit_ms10) */
 #if DUAL_CPU_BLIT
     if (blit_cfg[blit_mode].dual)
     {
@@ -2268,10 +2368,18 @@ extern "C" void DG_DrawFrame(void)
         for (int y = 0; y < 224; ++y)   /* native 224: blit the full picture (VIEW_Y_OFFSET = 0) */
             memcpy(DOOM_VRAM + (y + VIEW_Y_OFFSET) * DOOM_VRAM_STRIDE, framebuffer + y * 320, 320);
     }
-    /* LAYER INVERSION: clear the 3D VIEW (rows 0..191) to index 0 so next frame the SKIPPED wall
-       columns stay transparent -> the VDP1 walls (below NBG1) show through.  The status bar (rows
-       192..223) is owned by ST_Drawer, left intact. */
-    memset(framebuffer, 0, 192 * 320);
+    {
+        /* SATURN PERF: blit wall-clock = master FRT delta across the copy (incl. slave join). */
+        unsigned short blit_t1 = frt_read();
+        sat_blit_ms10 = ((unsigned int)(unsigned short)(blit_t1 - blit_t0) * ns_per_frt) / 100000u;
+    }
+    /* LAYER INVERSION: clear the 3D VIEW to index 0 so next frame the SKIPPED wall columns stay
+       transparent -> the VDP1 walls (below NBG1) show through.  The HUD rows are left intact
+       (1p: status bar 192..223 owned by ST_Drawer; 2p: panels 160..223 owned by hud2p). */
+    {
+        extern int sat_local_players;
+        memset(framebuffer, 0, (sat_local_players > 1 ? 160 : 192) * 320);
+    }
     return;
 #endif
 
@@ -2475,6 +2583,13 @@ static void poll_pad(void)
        harmless, like the potato Z / blit L+R live toggles.) */
     if ((changed & PER_DGT_TY) && !(cur & PER_DGT_TY))
         rbg0_mode = (rbg0_mode + 1) % 3;
+#else
+    /* Pad Y is free here (VDP2_RBG0_TEST off, so Y only taps a harmless 'y' to Doom):
+       toggle the visplane hash (SATURN PERF L1) live to A/B its hardware effect -- read the
+       REC profiler's Bw bucket ON (h1) vs OFF (h0) on the same scene, no rebuild.  Like the
+       Z=potato / L+R=blit live toggles; row 2 shows h<state>. */
+    if ((changed & PER_DGT_TY) && !(cur & PER_DGT_TY))
+        sat_visplane_hash = !sat_visplane_hash;
 #endif
 
 #if DUAL_CPU_BLIT

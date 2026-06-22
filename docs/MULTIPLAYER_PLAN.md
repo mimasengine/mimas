@@ -1,6 +1,8 @@
 # DoomSRL — Local multiplayer (multitap) plan
 
-**Status:** planned, not started. No code yet (parked behind the VDP1 / HUD work).
+**Status:** in progress. **2-player vertical split + per-viewport compact HUD are implemented**
+(Iter 1 plumbing, the 2-view sequential render, and Iter 4's HUD). Still TODO: parallel-REC per-CPU
+render state (Iter 2 perf — views still render sequentially on the master), 4-player (Iter 3), DM polish.
 **Target:** **4-player local split-screen**, potato floor, VDP1 walls, **REC parallelised across both SH-2**.
 **Scope:** *local* split-screen only. No link-cable / no netcode (`FEATURE_MULTIPLAYER` stays off). Coop first, then DM.
 
@@ -72,10 +74,17 @@ void (*sat_build_local_ticcmd)(ticcmd_t*, int) = NULL;   /* platform hook, playe
 ```
 Default (`sat_local_players==1`, hook `NULL`) → DoomJo + shipping build unchanged.
 
-### HUD dependency (coordinate with the VDP1 HUD session)
-Per-viewport HUD draws health/ammo into an **arbitrary rect**. `HUD_Y` is already "parameterised for future
-per-viewport multiplayer HUDs" (`dg_saturn.cxx:1085`) — design the HUD primitive rect-based **now**.
-`ST_Drawer`'s single 320-wide bar is unusable in split.
+### HUD dependency — DONE (per-viewport compact HUD)
+Each viewport gets a **160×64 compact HUD** (two 32px rows) recomposed from the original STBAR:
+`tools/make_hud2p.py` decodes STBAR + moves its wells/labels into two rows, emitting the panel pixels
+(`src/hud2p_panel.h`) + the shared field anchors (`core/hud2p_layout.h`). The core draws each player's
+widgets via **`ST_DrawCompactWidgets(pnum, ox, oy)`** (st_stuff.c) — no backing-screen/diff, reads
+`players[pnum]` directly, so it is safe per player; the platform blits the panel and calls it per
+viewport in `DG_DrawFrame` (P1 @ (0,160), P2 @ (160,160)). The 3D view is 160px tall; the bottom 64px
+hold the two blocks. `ST_Drawer`'s single 320 bar is skipped in 2p. Per-player flash (damage/pickup) is
+a **per-half software wash** (`ST_PlayerPaletteIndex` + nearest-colour LUTs, dg_saturn) since the hardware
+palette is shared. Weapon dropped to the view bottom (`sat_psprite_yoff`). Sky forced to **software** in
+2p (NBG0 is one layer, can't serve two viewangles).
 
 ---
 
@@ -193,8 +202,12 @@ change per task (cheap). With per-CPU render state these tables are also per-CPU
 - **Risk:** med (reuses Iter 2's foundation). Watch Bw-tax in dense scenes (caveat 2).
 
 ### Iter 4 — Per-viewport HUD + potato + DM polish
-- **Touch:** per-viewport HUD (reuse the VDP1 HUD rect primitive); force/auto potato in MP; the
-  single-view-hardcoded composition constants (§1) → per-view; DM mode (`sat_deathmatch`).
+- **HUD: DONE (2-player)** — compact 160×64 per-viewport HUD (see §2 "HUD dependency"): STBAR-recomposed
+  panel + `ST_DrawCompactWidgets` + per-half flash wash + weapon drop + software sky in 2p. Open items:
+  face is health-based (no animation/attacker yet); `sat_psprite_yoff=30` to fine-tune on HW; the flash
+  LUTs build once on the first 2p frame (~0.2-0.3s one-shot, nearest-colour over PLAYPAL).
+- **TODO:** force/auto potato in MP; remaining single-view-hardcoded composition constants (§1) → per-view;
+  DM mode (`sat_deathmatch`); a 4-player HUD layout (the 160×64 block is 2p-specific).
 - **Accept:** 4 views with HUDs; 4-player DM in a closed arena = the sweet spot (caveat 2).
 
 ---

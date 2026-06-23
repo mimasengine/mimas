@@ -210,7 +210,14 @@ static cached_sfx_t *cache_sfx(sfxinfo_t *sfxinfo)
     sfxinfo->driver_data = c;
 
     if (sfxinfo->lumpnum < 0) return NULL;
-    lump    = (const unsigned char *)W_CacheLumpNum(sfxinfo->lumpnum, 1);
+    /* SATURN LEAK FIX (PU_CACHE=8, was PU_STATIC=1): in CD-streaming mode (no cart)
+       W_CacheLumpNum COPIES the lump into the Doom zone.  We immediately upload the
+       PCM to the separate SCSP sound RAM below and NEVER read this work-RAM copy
+       again (later plays use driver_data->sram_off), so keeping it PU_STATIC leaked
+       ~one block per unique sfx -> the zone PU_STATIC floor grew every fight until
+       Z_Malloc OOM'd (~1 min into Doom II).  PU_CACHE lets it purge; cart mode is
+       unaffected (zero-copy mapped pointer, tag ignored). */
+    lump    = (const unsigned char *)W_CacheLumpNum(sfxinfo->lumpnum, 8 /* PU_CACHE */);
     lumplen = W_LumpLength(sfxinfo->lumpnum);
     if (lumplen < 32 || lump[0] != 0x03 || lump[1] != 0x00) return NULL;
 

@@ -59,6 +59,15 @@ extern "C" int sat_mp_pad2_a(void)
     return !(Smpc_Peripheral[idx].data & PER_DGT_TA);
 }
 
+/* 1 while the 2nd local pad holds START (the title-screen player-count cycle; active-low);
+   0 if there is no 2nd pad.  Read at the title to cycle sat_local_players 1->2->3->4->1. */
+extern "C" int sat_mp_pad2_start(void)
+{
+    int idx = mp_raw_index(1);
+    if (idx < 0 || idx >= 24 || Smpc_Peripheral[idx].id == PER_ID_NotConnect) return 0;
+    return !(Smpc_Peripheral[idx].data & PER_DGT_ST);
+}
+
 extern "C" void DG_BuildLocalTiccmd(ticcmd_t *cmd, int p)
 {
     if (p < 0 || p >= 12) return;
@@ -79,7 +88,10 @@ extern "C" void DG_BuildLocalTiccmd(ticcmd_t *cmd, int p)
     }
 #endif
 
-    int idx = mp_raw_index(p);
+    /* TEST harness (docs/MULTIPLAYER_PLAN.md): emulators can't map 4 controllers, so J3 mirrors
+       J1 and J4 mirrors J2 -- read the same pad as the mirrored player.  J1/J2 read their own. */
+    int src = (p == 2) ? 0 : (p == 3) ? 1 : p;
+    int idx = mp_raw_index(src);
     if (Smpc_Peripheral[idx].id == PER_ID_NotConnect) return;  /* no pad -> no input */
 
     unsigned short d = Smpc_Peripheral[idx].data;              /* Saturn digital pad = active-low */

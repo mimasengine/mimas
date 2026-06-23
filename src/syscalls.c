@@ -28,11 +28,23 @@ static void emu_debug_putc(char c)
 char *__env[1] = { 0 };
 char **environ = __env;
 
-/* SATURN #4: trimmed 64K -> 48K after Ymir measurement (dg_heap_peak stable at
-   36,516 B = DOOM1.WAD lumpinfo, ~2306 lumps x 16B, loaded once -> fixed per WAD).
-   48K leaves ~11.5K margin over the measured peak; failure is graceful (NULL).
-   Recovers 16K HWRAM .bss.  Watch row-22 `hp` stays < 49152 on any new content. */
-#define HEAP_SIZE (48 * 1024)
+/* SATURN: the newlib libc heap is a dedicated static array, kept SEPARATE from
+   SRL's TLSF pool (which owns the whole linker __heap_start..__heap_end region --
+   see srl_memory.hpp).  Its dominant consumer is W_AddFile's lumpinfo array:
+   numlumps * sizeof(lumpinfo_t), and lumpinfo_t is 28 B (name[8] + 5x 4-byte
+   fields), NOT 16 B as an earlier note claimed.  Shareware DOOM1.WAD = 1259
+   lumps = 35 KB (fit the old 48 KB cap); the full Ultimate Doom IWAD = 2306
+   lumps = 64.6 KB OVERFLOWED it -> "Couldn't realloc lumpinfo".  Raised to 72 KB
+   so the full IWAD directory fits.  This grows .bss, shrinking the TLSF pool
+   above _end by the same amount (~81 KB pool at the original 48 KB heap; each KB
+   added here costs the TLSF pool 1 KB).  SRL's TLSF working set in this
+   framebuffer-only port is small, so the shrink is ample (boot console prints
+   TLSF used/free to confirm).  Sized here for Doom II = 2919 lumps = 81.7 KB ->
+   88 KB heap (~6 KB margin; TLSF pool ~41 KB).  Shareware = 1259 lumps = 35 KB,
+   Ultimate Doom = 2306 = 64.6 KB both still fit.  A still-bigger IWAD (TNT 3101
+   lumps = 87 KB) would push TLSF lower -- at that point move lumpinfo to the
+   roomy LWRAM Doom zone instead.  Watch row-22 `hp` stays < HEAP_SIZE. */
+#define HEAP_SIZE (88 * 1024)
 static char heap[HEAP_SIZE] __attribute__((aligned(8)));
 static char *heap_end = heap;
 

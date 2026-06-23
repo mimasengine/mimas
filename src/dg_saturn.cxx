@@ -165,7 +165,7 @@ static int wtex_bakes = 0;
 
 extern "C" unsigned char  *sat_wad_base    = nullptr;
 extern "C" unsigned int    sat_wad_size     = 0;
-extern "C" int             sat_streaming_mode = 0;
+extern "C" int             sat_streaming_mode;   /* defined in core/p_setup.c; set to 1 below in CD-streaming mode */
 extern "C" int W_SaturnCDInit(void);
 
 /* ------------------------------------------------------------------ */
@@ -630,6 +630,29 @@ static int load_wad(void)
         return 0;
     }
     wad.Open();
+
+    /* Peek the 12-byte header to learn the WAD's TRUE size before committing
+       to the cart.  The lump directory sits at the END of the WAD
+       (infotableofs + numlumps*16); a WAD bigger than the 4MB cart would load
+       directory-less (truncated) -> black screen.  Refuse here so the caller
+       falls back to CD streaming (same guard already used for 1M/2M carts). */
+    {
+        unsigned char hdr[12];
+        if (wad.LoadBytes(0, 12, hdr) >= 12)
+        {
+            int32_t numlumps     = (int32_t)(hdr[4] | (hdr[5]<<8) | (hdr[6]<<16) | (hdr[7]<<24));
+            int32_t infotableofs = (int32_t)(hdr[8] | (hdr[9]<<8) | (hdr[10]<<16) | (hdr[11]<<24));
+            unsigned int true_sz = (unsigned int)(infotableofs + numlumps * 16);
+            if (true_sz > (unsigned int)CART_RAM_SIZE)
+            {
+                printf("WAD %u bytes > %u cart -- CD streaming\n",
+                       true_sz, (unsigned int)CART_RAM_SIZE);
+                wad.Close();
+                return 0;
+            }
+        }
+    }
+
     int len = wad.LoadBytes(0, (int)CART_RAM_SIZE, (void *)CART_RAM_UNCACHED);
     wad.Close();
 
@@ -1014,14 +1037,17 @@ extern "C" void DG_Init(void)
 #if FORCE_CD_STREAM
     cart_sz = 0;   /* test override: ignore the cart, force CD streaming */
 #endif
-    /* The 3.94MB IWAD only fits a full 4MB cart.  A 1M/2M (or 1M-mode AR)
-       cart cannot hold it -- stream from CD instead of loading a truncated,
-       aliased WAD that renders as a black screen on hardware. */
+    /* The cart path only works if the WAD actually FITS in the 4MB cart.  A
+       1M/2M (or 1M-mode AR) cart, OR a WAD bigger than 4MB (e.g. the full
+       Ultimate Doom / Doom II IWADs), cannot be cart-loaded -- load_wad()
+       refuses oversized WADs and returns 0 -- so we stream from CD instead of
+       loading a truncated, aliased WAD that renders as a black screen. */
+    int cart_loaded = 0;
     if (cart_sz >= 0x400000u)
     {
         SRL::Debug::Print(0, 1, "INIT WAD(cart 4MB)...");
-        if (!load_wad())
-            DG_Fatal("DOOM1.WAD load failed");
+        cart_loaded = load_wad();
+        if (cart_loaded)
         {
             static char ws[45];
             sprintf(ws, "WAD OK sz=%u", sat_wad_size);
@@ -1029,15 +1055,17 @@ extern "C" void DG_Init(void)
             unsigned int t = vbl_count; while (vbl_count - t < 120) ;
         }
     }
-    else
+    if (!cart_loaded)
     {
-        if (cart_sz)
+        if (cart_sz >= 0x400000u)
+            printf("4MB cart but WAD too big/load failed -- CD streaming\n");
+        else if (cart_sz)
             printf("cart only %uKB (<4MB) -- IWAD too big, CD streaming\n",
                    cart_sz / 1024u);
         else
             printf("No usable RAM cart -- CD streaming mode\n");
         sat_streaming_mode = 1;
-        SRL::Debug::Print(0, 1, cart_sz ? "CART<4MB -> CD STREAM..."
+        SRL::Debug::Print(0, 1, cart_sz ? "CART -> CD STREAM..."
                                         : "NO CART -> CD STREAM...");
         if (!W_SaturnCDInit())
             DG_Fatal("DOOM1.WAD not found on CD");
@@ -2320,9 +2348,10 @@ extern "C" void DG_DrawFrame(void)
         /* SATURN 2p: paint the two compact-HUD panels into the bottom 64 rows
            (rows 160..223), draw each player's widgets on top (P1 left, P2 right),
            then apply each player's damage/pickup flash as a per-half wash -- all
-           into the framebuffer before the blit. */
+           into the framebuffer before the blit.  (2-player only; the 3/4-player
+           quadrant HUD is a later iteration -> those use full-screen views.) */
         extern int sat_local_players;
-        if (sat_local_players > 1 && gamestate == GS_LEVEL)
+        if (sat_local_players == 2 && gamestate == GS_LEVEL)
         {
             hud2p_blit_panels();
             ST_DrawCompactWidgets(0, 0,   HUD2P_TOP);   /* P1 (left)  */
@@ -2375,10 +2404,12 @@ extern "C" void DG_DrawFrame(void)
     }
     /* LAYER INVERSION: clear the 3D VIEW to index 0 so next frame the SKIPPED wall columns stay
        transparent -> the VDP1 walls (below NBG1) show through.  The HUD rows are left intact
-       (1p: status bar 192..223 owned by ST_Drawer; 2p: panels 160..223 owned by hud2p). */
+       (1p: status bar 192..223 owned by ST_Drawer; 2p: panels 160..223 owned by hud2p; 3/4p:
+       no HUD -> clear the whole frame). */
     {
         extern int sat_local_players;
-        memset(framebuffer, 0, (sat_local_players > 1 ? 160 : 192) * 320);
+        int clear_rows = (sat_local_players >= 3) ? 224 : (sat_local_players == 2 ? 160 : 192);
+        memset(framebuffer, 0, clear_rows * 320);
     }
     return;
 #endif
@@ -2552,6 +2583,7 @@ extern "C" {
     extern int usergame;                /* core: true only during a real player-started game */
     int sat_count_local_pads(void);     /* mp_input.cxx: connected local pads, 1..4 */
     int sat_mp_pad2_a(void);            /* mp_input.cxx: 1 while pad-2 holds A */
+    int sat_mp_pad2_start(void);        /* mp_input.cxx: 1 while pad-2 holds START */
 }
 
 static void poll_pad(void)
@@ -2621,18 +2653,20 @@ static void poll_pad(void)
        non-level means it can never change mid-game (the split render + ticcmd build read it live).
        The gesture IS the A/B toggle -- don't arm = 1p (VDP1 hybrid), arm = Np split, same disc. */
     {
-        static int p2a_was = 0, shown = -2;
-        int p2a_now = sat_mp_pad2_a();
-        if (p2a_now && !p2a_was && !usergame)   /* attract loop only -> never changes mid-game */
-            sat_local_players = (sat_local_players > 1) ? 1 : sat_count_local_pads();
-        p2a_was = p2a_now;
+        static int p2s_was = 0, shown = -2;
+        int p2s_now = sat_mp_pad2_start();
+        if (p2s_now && !p2s_was && !usergame)   /* attract loop only -> never changes mid-game */
+            /* cycle 1 -> 2 -> 3 -> 4 -> 1 so 3/4-player can be forced for testing even when
+               the emulator only exposes 2 pads (J3/J4 mirror J1/J2 -- see mp_input.cxx). */
+            sat_local_players = (sat_local_players >= 4) ? 1 : sat_local_players + 1;
+        p2s_was = p2s_now;
 
         /* Attract-loop feedback so the gesture is visibly confirmed before starting a game;
            cleared once a real game is running so it never lingers over the 3D view. */
         if (!usergame)
         {
             int n = sat_local_players;
-            if (n != shown) { SRL::Debug::Print(0, 23, "PLAYERS: %d  (A on pad 2 toggles)", n); shown = n; }
+            if (n != shown) { SRL::Debug::Print(0, 23, "PLAYERS: %d  (START on pad 2 cycles)", n); shown = n; }
         }
         else if (shown != -2) { SRL::Debug::Print(0, 23, "                                "); shown = -2; }
     }

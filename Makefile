@@ -87,6 +87,7 @@ endif
 # -DNDEBUG: silence assert() (no abort() on Saturn anyway).
 SRL_CUSTOM_CCFLAGS = -w -fsigned-char \
     -DCMAP256 -DDOOMGENERIC_RESX=320 -DDOOMGENERIC_RESY=200 -DNDEBUG \
+    -DMAXVISPLANES=256 \
     -Isaturn_libc \
     -Isrc \
     -Icore \

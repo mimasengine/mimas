@@ -152,3 +152,22 @@ core/%.o : core/%.c
 # pool, which OVERFLOWS the Saturn's full 2MB (~96KB HWRAM heap free).  The viable path is the
 # d32xr phase-split model (shared render state, ~24-byte per-CPU GBR-TLS, producer/consumer),
 # NOT duplication.  See docs/PARALLEL_REC_AUDIT.md.
+
+# -----------------------------------------------------------------------
+# Per-level repack (STREAMING_ANALYSIS.md §7.4/7.9-7.10) -- OPT-IN.
+# -----------------------------------------------------------------------
+# Emit the per-map LZSS container into cd/data so the disc carries BOTH the full WAD
+# (raw fallback) AND the repacked blobs.  Build a repacked disc with:
+#     make repack build           (or, on Windows: build.ps1 -Repack)
+# The Step-3 loader auto-detects DOOMRP.DRP (magic "DRP1" + matching dir_crc32) and
+# falls back to raw full-WAD streaming when it is absent/mismatched -- both stay
+# loadable.  Needs python on PATH.  ASSETS_DIR (= ./cd/data) comes from shared.mk.
+PYTHON  ?= python
+DRP_WAD  = $(ASSETS_DIR)/DOOM1.WAD
+DRP_OUT  = $(ASSETS_DIR)/DOOMRP.DRP
+
+.PHONY: repack
+repack: $(DRP_OUT)
+
+$(DRP_OUT): tools/repack_wad.py $(DRP_WAD) core/info.c
+	$(PYTHON) tools/repack_wad.py $(DRP_WAD) core/info.c --emit=$(DRP_OUT)

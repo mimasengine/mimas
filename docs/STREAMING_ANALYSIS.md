@@ -650,11 +650,133 @@ superset that must be staged). Two consequences:
 - **Per-level repack (streaming): works for every map.** The per-map blob lives on the disc
   (1.35–4.09 MB, contiguous, streamed on demand) — it does NOT need to fit RAM, so size is a
   non-issue; the win is seek-light contiguous reads.
-- **Big-WAD cart load-once (S5): fits most maps, NOT the heaviest.** The 4 MB cart holds the
-  light/medium maps comfortably, but MAP28 (~4.09 MB) + its MUS lump + the cart lump table
-  **overflows 4 MB**. So big-WAD cart-load-once is **partial** — it can give CDDA + speed on the
-  lighter maps and must fall back to streaming + MUS-synth on the heaviest. (A tighter,
-  non-superset subset could squeeze them, but that risks the hard-`I_Error` class — not worth it.)
+- **Big-WAD cart load-once (S5): fits EVERY map if the cart store is COMPRESSED.** Raw, MAP28
+  (~4.09 MB) overflows the 4 MB cart. But the per-map subset zlib-compresses to **1.35→0.65 MB …
+  4.09→2.57 MB** (ratio ~48–63 %; sprites/patches compress well). **Worst map = 2.57 MB
+  compressed vs the 4 MB cart → all 32 maps fit with ~1.5 MB headroom, CD fully idle → CDDA
+  always clean.** This is the PowerSlave/PSX "keep art compressed in the arena, expand on
+  page-in" model: the cart holds the compressed subset; the LRU decompresses one lump per
+  page-in into work-RAM (a light LZSS/RLE codec, not zlib, for fast SH-2 decode — zlib here is
+  only the ratio proxy). So the earlier "partial / fall back to MUS on the heaviest" verdict is
+  **superseded** — compression keeps CDDA on every map, and also shrinks the streaming blob (less
+  CD traffic) and the disc. Other escape hatches if a codec is unwanted: hot-cart + CD
+  cold-fallback with a music fade on the rare cold miss (door/area-transition masking), or exile
+  the cold death/raise sprite frames + big-rare lumps to CD-fallback. Compression is the clean
+  winner (no music dips, all maps).
 
-Next sub-steps: (1b) the WAD-writer + per-map offset table; (2) disc-build integration;
-(3) the `P_SetupLevel` loader (Option B, name-stable directory → no in-engine index relocation).
+### 7.9 Consolidated roadmap (music + streaming + cart)
+
+Dependency-ordered. **Option 1 = compression** (cart/blob holds a light-LZSS-compressed subset,
+decompressed per-lump on page-in) and **Option 2 = hot-cart + CD cold-fallback + music fade**
+(cart holds the hot set; rare cold misses read from CD, masked by an event-timed music fade) are
+folded into the steps below.
+
+**SHIPPED**
+- Runtime music backend (MUS-synth ↔ CDDA), split-screen multi-listener SFX, `CDDAMAP.TXT`
+  loader (§7.3/7.7). Memory robustness: TXC split-gate + fixed slab, `Z_Malloc` OOM retry,
+  COLORMAP leak. Per-level repack **Step 1** = offline subset computer (`tools/repack_wad.py`,
+  §7.8), validated; measured subset 1.35–4.09 MB raw / 0.65–2.57 MB LZSS-proxy.
+
+**Per-level repack (foundation — do next, benefits ALL maps, mostly PC/Ymir-testable)**
+- **Step 1b — DONE (2026-06-24).** WAD-writer: emits the `.DRP` container — a name-stable
+  directory (lump numbers unchanged) + per-map offset table + each subset lump **LZSS-compressed**
+  (Option 1, baked in). Serves both the streaming path (less CD traffic) and the future cart store.
+  PC round-trip byte-validated (re-read from disk → decode every lump → compare to source WAD).
+  See §7.10 for results, the codec spec, and the subset-safety hardening.
+- **Step 2 — DONE (2026-06-24).** Disc-build integration: `build.ps1 -Repack` (or `make repack
+  build`) emits `cd/data/DOOMRP.DRP` before the ISO step, so the disc carries BOTH the full WAD
+  (raw fallback) AND the repacked blobs (`cd/data` is packaged wholesale by `xorrisofs`). Opt-in;
+  default build is unchanged (raw). Freshness-checked (regenerates only when WAD/`info.c`/tool
+  change). **Marker = the `.DRP` itself** (no side file): the Step-3 loader opens `DOOMRP.DRP`,
+  validates magic `DRP1` + `dir_crc32` against the loaded WAD, and uses per-map blobs if it
+  matches, else falls back to raw streaming — both layouts stay loadable. See §7.11.
+- **Step 3** — `P_SetupLevel` loader (Option B, name-stable directory → no in-engine index
+  relocation): retarget the subset's `lumpinfo[].position/.wad_file`; **decompress per lump on
+  page-in (Option 1)**; out-of-subset reads fall back to the full WAD (miss → today's behaviour,
+  not a crash). Ymir-testable for correctness; smoothness gain = hardware.
+
+**Cart load-once (S5 — after repack; big-WAD; hardware-only validation)**
+- **Step 4a** — generalize the cart write driver into `cart_load_region(cd_sector, len, cart_ofs)`
+  (factor `load_wad`'s whole-file copy).
+- **Step 4b — compressed cart store (Option 1):** at level start, stage the map's **compressed**
+  blob CD→cart once (≤2.57 MB worst → fits 4 MB with headroom), build the cart lump table; the LRU
+  decompresses cart→work-RAM on page-in. CD goes idle → **CDDA on every map**.
+- **Step 4c — hot-cart + CD cold-fallback (Option 2), the codec-free alternative/complement:**
+  if a lump isn't cart-resident, read it from the CD (full WAD) and **fade the music** over the
+  seek. Use as a safety net for Option 1, or standalone if a decoder is undesirable.
+- **Step 4d** — a "CD-free during play" signal (cart-resident OR `!streaming`) so `I_InitSound`'s
+  predicate auto-enables the already-shipped CDDA dispatch + `CDDAMAP.TXT` for big-WAD-from-cart.
+
+**Transition polish (Option 2's fade — standalone value, any time)**
+- Music fade-out/in on door openings / area transitions / level loads — masks *any* CD access
+  (level loads, cold misses), smooth either way. Ties into `TRANSITIONS_PLAN.md`.
+
+**Codec — RESOLVED at Step 1b: LZSS-12/4** (12-bit offset / 4-bit length, THRESHOLD 2, F 18;
+window = the output buffer itself, so no ring buffer and a ~20-line byte-wise SH-2 decoder;
+PSX/Jaguar precedent). Incompressible lumps are STORED raw (never expand). Real LZSS ratio on
+Doom II ≈ 64–80 % (vs the zlib proxy in §7.8); good enough to fit the cart (§7.10). RLE rejected
+(worse ratio for ~no decode-cost win on already-byte-wise LZSS).
+
+### 7.10 Step 1b results — the `.DRP` emitter, codec, and subset-safety (2026-06-24)
+
+`tools/repack_wad.py` now emits `cd/data/DOOMRP.DRP` and self-validates. Measured on the 14.6 MB
+Doom II IWAD (32 maps):
+
+- **Round-trip: OK** — all 34,108 lump instances decode byte-identical to the source WAD (the tool
+  re-reads the container from disk, not just the in-memory buffer). Codec self-test (empty / 1-byte
+  / runs / random / overlap) passes.
+- **Worst per-map blob = 3523 KB LZSS** (raw 4508 KB) — fits the 4 MB cart with ~570 KB headroom.
+  Container on disc ≈ 70 MB (per-map blobs are self-contained → one contiguous read/map; trivial on
+  a 650 MB CD).
+- **`.DRP` format + the big-endian SH-2 C-loader read discipline** (LE byte-assembly, alignment,
+  uint32, the binary-search-by-lump_idx + full-WAD-fallback per-lump contract, dir_crc32) are
+  specified in the `repack_wad.py` header — the Step-3 loader is to be transcribed from it.
+
+**Subset-safety (adversarially verified, 3-lens workflow + reconciliation against core sources).**
+The static subset must cover every lump the engine references *at runtime*, or that reference takes
+the Step-3 loader's full-WAD fallback (a streaming hitch / cart-CDDA music dip). Fixed gaps:
+- **Animated flats & textures** (`p_spec.c animdefs[]`) — a referenced frame expands to the whole
+  cycle range (NUKAGE1→3, BLODGR1→4, …) by directory/texture index.
+- **Switch pairs** (`p_switch.c alphSwitchList[]`) — a referenced `SW1xxx`/`SW2xxx` pulls in its
+  partner (swapped on use).
+- **Sky textures** (`g_game.c`) — `SKY1/2/3/4` are chosen in code, never named by a SIDEDEF →
+  forced into the base set.
+- **Code-played sounds** (`ALWAYS_SOUNDS`) — weapons/doors/plats/switches/pickups/HUD DS\* lumps
+  have no map THING; they're cached lazily on first play (`I_PrecacheSounds` is a **no-op stub** in
+  this port; `I_StartSound`→`cache_sfx`→`W_CacheLumpNum`), so they must be reachable from the blob.
+- **Finale background flats** (`f_finale.c textscreens[]`) — chosen by gamemap → all added to base
+  (≈24 KB).
+- **Intentionally NOT included:** the **MAP30 cast call** (all ~17 monster sprite sets). It is a
+  one-time *static* end screen; unioning it pushes MAP30 to ~4.05 MB (eats cart headroom, PWAD-
+  fragile). It is served by the Step-3 full-WAD fallback (CD free on a static screen; cart-CDDA
+  uses the Option-2 music fade). Gameplay assets stay complete so play is smooth; only the static
+  finale falls back.
+
+### 7.11 Step 2 results — disc-build integration & the repacked-vs-raw marker (2026-06-24)
+
+The repack is **opt-in**; the default disc is unchanged (raw streaming).
+
+- **Build hooks.** `build.ps1 -Repack` (Windows) and `make repack build` (CI/non-Windows) both run
+  `tools/repack_wad.py <wad> core/info.c --emit=cd/data/DOOMRP.DRP` *before* the ISO step. The
+  Windows hook runs after any `-Wad` IWAD swap (so it repacks the IWAD that actually ships) and is
+  freshness-checked: it regenerates only when the WAD, `core/info.c`, or the tool is newer than the
+  existing `.DRP` (≈30 s repack, skipped otherwise). `--emit` alone skips the analysis report so the
+  build does a single compression pass; `--report` re-enables the per-map table.
+- **Packaging.** `cd/data` is the SRL assets dir (`ASSETS_DIR` in `shared.mk`), copied wholesale
+  into the ISO by `xorrisofs`. Dropping `DOOMRP.DRP` there is all that's needed — no Makefile-iso
+  surgery. The disc then holds the full WAD (≈14.6 MB) **and** the `.DRP` (≈70 MB of self-contained
+  per-map blobs); ~85 MB total, trivial on a 650 MB CD. `cd/data` is git-ignored, so the `.DRP` is a
+  pure build artifact (never committed).
+- **The marker = the `.DRP` itself (self-validating, no side file).** The disc *always* carries the
+  full WAD, so raw streaming is always possible. The Step-3 loader decides layout by opening
+  `DOOMRP.DRP` and checking the header: magic `DRP1`, `codec == 1`, `n_lumps == WAD numlumps`, and
+  `dir_crc32 == CRC32(WAD directory)`. **All match → repacked mode** (retarget the subset's
+  `lumpinfo[].position` into the blob, decompress per lump on page-in). **Absent or any mismatch →
+  raw streaming** (today's behaviour). The CRC fingerprint means a stale `.DRP` (built against a
+  different WAD) is auto-rejected rather than mis-read — you can't ship a broken repacked disc by
+  accident. (A future loader debug flag could force-raw even when a valid `.DRP` is present, for A/B
+  perf measurement.)
+
+**Next: Step 3** — the `P_SetupLevel` loader that consumes this (auto-detect per the marker above;
+per-map `lumpinfo` retarget; LZSS page-in; full-WAD fallback). The `.DRP` format and the big-endian
+SH-2 read discipline it must follow are fully specified in the `tools/repack_wad.py` header.

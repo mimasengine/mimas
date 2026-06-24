@@ -16,6 +16,9 @@ cd/data/
 cd/DOOM1.WAD
 DOOM1.WAD
 
+# Benchmark witness WADs (IWADs copyrighted; community PWADs are local downloads)
+wads_temoins/
+
 # CDDA audio (raw converted + source WAVs)
 cd/music/
 music/

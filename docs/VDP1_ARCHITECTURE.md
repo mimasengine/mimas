@@ -227,10 +227,19 @@ capacity.
    write, zero per-pixel cost, no re-bake of anything**. Same for screen fades. Move the
    flash to VDP2 colour-offset; keep CRAM-bank re-tint as the fallback. (Cross-ref
    [`VDP2_ARCHITECTURE.md`](VDP2_ARCHITECTURE.md) §6 "bank-free features".)
-4. **Floors / ceilings — not VDP1.** Doom visplanes are thousands of arbitrary spans,
-   not tile-quads (unlike tile-based PowerSlave) → expressing them as VDP1 quads is
-   impractical. Floors belong on **VDP2 RBG0** (Mode-7), per
-   [`VDP2_ARCHITECTURE.md`](VDP2_ARCHITECTURE.md). VDP1 floors are explicitly rejected.
+4. **Floors / ceilings — *full* floors not VDP1; the *dominant flat* yes (and it beats
+   RBG0).** Expressing **all** Doom visplanes as VDP1 quads is impractical and a hard
+   **NO-GO**: they are thousands of runtime arbitrary spans (not tile-quads like
+   PowerSlave), so full per-subsector tessellation = 2 000–8 000 quads/frame, busting the
+   command bank *and* the ~1 300–2 000 quad/30 fps Saturn CPU ceiling. **BUT** the *single
+   dominant flat* (~49–93 % / avg ~64 % of floor fill) **is** a GO-PARTIAL on VDP1, as a
+   stack of horizontal **affine strips** (Mode-7-on-VDP1) shown through the index-0 gap
+   below NBG1 — bounded (~30–72 cmds, 4 KB), and it **beats the VDP2 RBG0 alternative**
+   because it rides the hardware-validated async driver (RBG0's cycle-pattern never
+   commits without `slSynch` and broke on real HW). Full plan +
+   capacity + increments: **[`VDP1_FLOOR_PLAN.md`](VDP1_FLOOR_PLAN.md)**. (This supersedes
+   the earlier flat "VDP1 floors are rejected" stance — *full* is rejected, *dominant
+   partial* is the recommended next floor lever.)
 5. **Weapon / HUD — leave software.** They were on VDP1 (validated the pipeline) but the
    layer inversion forced them back to software (all RGB sprites share one priority, so
    the weapon couldn't stay *above* NBG1 while walls went *below* it). Software
@@ -305,10 +314,18 @@ VDP1 because flat is the cheap primitive.
 - **The 8bpp + CRAM-light-bank model is the correct one for this hardware** — exact
   multiplicative light, no re-bake, half VRAM, lighter fetch — and it retired the
   gouraud and lit-bake approaches for good.
-- **Keep ON VDP1:** opaque textured walls + flat fallback. **Keep OFF:**
-  half-transparency (6×), gouraud lighting, the flash (→ VDP2 colour-offset), floors
-  (→ VDP2 RBG0), weapon/HUD (software). World sprites are a deferred maybe (occlusion
-  cost > the small `M` win).
+- **Keep ON VDP1:** opaque textured walls + flat fallback. **Add (next lever):** the
+  **dominant flat** as VDP1 affine strips ([`VDP1_FLOOR_PLAN.md`](VDP1_FLOOR_PLAN.md)) —
+  recovers ~4–9 ms on the proven async driver, beating the broken-on-HW RBG0. **Keep
+  OFF:** half-transparency (6×), gouraud lighting, the flash (→ VDP2 colour-offset),
+  *full* multi-height floors (busts the quad/CPU budget), weapon/HUD (software). World
+  sprites are a deferred maybe (occlusion cost > the small `M` win).
+- **Housekeeping:** VDP1 currently carries **only walls** — nothing mis-routed. The dead
+  **weapon/HUD VDP1 code** (`sat_vdp1_wpn_draw`, `vdp1_hud_emit`, `wpn_cache`, the
+  `WPN_TEX`/`VDP1_HUD_TEX` reservations) is unhooked-but-resident; `WPN_TEX_BASE`
+  `0x25C45000` even **overlaps** the wide wall pool (harmless only because it is never
+  written). Remove it to reclaim the ~44 KB free tail cleanly for the floor texture +
+  second command bank.
 - **Multiplayer (2/4) holds on VDP1**: one framebuffer tiled via clip windows, overdraw
   *shrinks* with viewport size, fill stays <4 % of frame. Scale the **command bank**
   (cheap VRAM) and rely on the **22 cache slots + flat fallback**. The N-player ceiling

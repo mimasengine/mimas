@@ -1,8 +1,73 @@
 # Big-WAD CD Streaming on the 2MB Saturn (No Cart) — Deep Analysis
 
-Status: analysis only, no code changes. Synthesis of 6 parallel investigations
-(Doom core memory model, DoomSRL RAM map, SlaveDriver/PowerSlave, d32xr, FastDoom,
-web survey of PSX-Doom / RP2040-Doom / Saturn GFS).
+Status: **Phase 0 SHIPPED 2026-06-23** (port `99ced62` + core `b3acd9f`) — Doom II
+and all >4MB IWADs now load and play from CD with **no cart**, proven playable on
+Doom II MAP01 (Ymir). Phase 1 (robust streaming / bounded LRU cache) is the current
+work. See **§0** for what shipped vs. what remains. Below: the original synthesis of
+6 parallel investigations (Doom core memory model, DoomSRL RAM map,
+SlaveDriver/PowerSlave, d32xr, FastDoom, web survey of PSX-Doom / RP2040-Doom /
+Saturn GFS).
+
+---
+
+## 0. Status (2026-06-23)
+
+### Shipped — Phase 0 (Doom II loads + plays from CD, no cart)
+- **S1 — skip `R_PrecacheLevel` in CD-streaming mode**: DONE. Gated on the new
+  `sat_streaming_mode` global (`core/p_setup.c:747,847`; defined in core so both
+  ports link — DoomJo leaves it 0, precache unchanged). Graphics stream lazily as
+  self-purging PU_CACHE instead of front-loading the level's whole working set.
+- **`MAXVISPLANES` 512→256** (S2 *Change B*, the blunt cut): DONE
+  (`Makefile:90` `-DMAXVISPLANES=256`, made `-D`-overridable in `core/r_plane.c`).
+  Frees ~166 KB of the 884 KB LWRAM zone. **S2 *Change A* (the `SAT_VISPLANE_POOL`
+  span arena) was NOT done** — still on the table as further headroom.
+- **libc heap 48→88 KB**: DONE (`src/syscalls.c`) — the full Doom II 2919-lump
+  directory fits.
+- **Cart guard**: DONE (`src/dg_saturn.cxx`) — refuse to cart-load a WAD bigger than
+  the 4 MB cart (its directory is at the end → truncation → black screen) and fall
+  back to CD streaming.
+- **sfx lump PU_CACHE not PU_STATIC** (the streaming PU_STATIC-leak class, see the
+  "Quick freebies" note): DONE (`src/i_sound_saturn.cxx`) — fixed a zone OOM ~1 min
+  into Doom II combat (the SCSP-uploaded sfx lump is never re-read, so the PU_STATIC
+  copy leaked one block per unique sound).
+- **Render-corruption fix** (the Doom II first-frame freeze):
+  `spanstart_l`/`spanstart`/`spanstop` sized `[256]` not `[224]`. See
+  `RENDER_CORRUPTION_ANALYSIS.md §0`.
+
+### CD-read reliability — "W_ReadLump: only read 0 of N" — fix implemented, pending Ymir
+Root cause found: `GFS_Load` (under `SRL::Cd::File::LoadBytes`) **requires a
+4-byte-aligned destination** (`GFS_ERR_ALIGN = -21`). `Saturn_Read`'s old tail read
+wrote to `buffer + (2048 - offset%2048)`, which is unaligned whenever `offset%2048`
+isn't a multiple of 4; GFS rejected it and `Saturn_Read` collapsed the negative code
+to `0` → the "only read 0 of N" failure (missing textures/sounds). Fix
+(`src/w_file_saturn.cxx`): bounce non-aligned reads sector-by-sector through a
+4-byte-aligned buffer (fully-aligned reads keep the one-call fast path), and keep the
+WAD file CLOSED so each `LoadBytes` is a churn-free `GFS_Load` (latent perf win).
+*Implemented + compiles; awaiting Ymir validation before commit.*
+
+### Phase 1 — bounded LRU texture cache — IMPLEMENTED, pending Ymir
+- **z_zone multi-zone extensions** (S4 foundation): `Z_MainZone` / `Z_InitZone` /
+  `Z_Malloc2` / `Z_Free2` / `Z_LargestFreeBlock` / `Z_ForEachBlock` added to
+  `core/z_zone.{c,h}` on the existing `memblock_t` — additive, the classic
+  allocator hot path is untouched.
+- **S4(a) bounded LRU composite cache** (`core/r_cache.{c,h}`, new): multi-patch
+  wall composites build into a recency-evicted sub-zone (one PU_STATIC slab
+  carved from leftover zone *after* geometry, adaptive 128KB-margin / 256KB-cap /
+  24KB-min) instead of accumulating in the main zone. Seam = `R_GenerateComposite`
+  / `R_GetColumn` (touch on hit, lifecount 3); aged per view in
+  `R_PostTexCacheFrame` (`R_RenderPlayerView`); per-level carve/teardown in
+  `P_SetupLevel`. Gated `sat_streaming_mode && single-player && !sat_xsplit`, with
+  graceful fallback to the classic main-zone PU_CACHE path → worst case is exactly
+  today's behaviour; DoomJo (`sat_streaming_mode=0`) is byte-identical.
+  Adversarially reviewed (allocator/lifecycle/portability) — clean; the one
+  cross-port action is **adding `core/r_cache.c` to DoomJo's makefile** when it
+  pulls this revision (else 6 undefined-symbol link errors).
+- **S4(b) composite-on-demand `decals[]`** — deferred (heavier structural change);
+  the classic `R_GenerateComposite` producer is reused under the LRU instead.
+- **Not yet cached**: single-patch wall lumps, flats, sprite patches (still classic
+  PU_CACHE) — the same pool can be extended to them in a follow-up.
+- **S4(d) per-level disc repack**, **S4(c) per-level bump arena**, **S5 optional
+  cart accelerator** — unchanged, future.
 
 ---
 
@@ -169,7 +234,14 @@ which is cold scratch with zero render-perf cost.
   to the LWRAM zone — trades LWRAM pressure for HWRAM headroom; only useful
   combined with S2.
 - **Disable the f_wipe screen-melt:** 2 × 320×224 = ~143 KB PU_STATIC during the
-  transition (`core/f_wipe.c:237,249`). Cosmetic; reclaim 143 KB cheaply.
+  transition (`core/f_wipe.c:237,249`). Cosmetic; reclaim 143 KB cheaply. **DONE
+  in streaming mode (2026-06-23):** the melt Z_Malloc-failed at end-of-level even
+  after freeing PU_LEVEL (`Z_Malloc fail 71704 ... lv0K` = the ~620 KB PU_STATIC
+  floor fragments the free space below the 70 KB contiguous run the melt needs).
+  Now a hard cut when `sat_streaming_mode` (`core/d_main.c` leaving-level branch).
+  Bringing back proper start/end fades (no big buffer, no slSynch) is designed in
+  **`docs/TRANSITIONS_PLAN.md`** — recommended path is a software CRAM palette
+  fade reusing the proven no-slSynch vblank palette-upload seam.
 - **Effort:** low–medium. Net ceiling for "grow LWRAM" alone is ~+160 KB
   (RP_CMD_BUF) + ~+200 KB (S2) ≈ effective working set ~1.05–1.2 MB inside 2 MB.
 

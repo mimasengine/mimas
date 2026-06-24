@@ -53,8 +53,14 @@ extern "C" int W_SaturnCDInit(void)
         wad_cd_file = nullptr;
         return 0;
     }
-    sat_debug_row0("CD:open...");
-    wad_cd_file->Open();
+    /*
+    ** Keep the file CLOSED for the game's lifetime.  SRL::Cd::File::LoadBytes
+    ** reads by file id via GFS_Load and works on a closed handle (the
+    ** constructor already opened-probed-then-closed it).  When the handle is
+    ** left OPEN, every LoadBytes pays a GFS_Close + reopen; staying closed
+    ** makes each lump read a single churn-free GFS_Load.
+    */
+    sat_debug_row0("CD:ready");
 
     /*
     ** Determine WAD size from the header instead of a sequential probe.
@@ -132,6 +138,27 @@ static wad_file_t *Saturn_OpenFile(char *path)
 
 static void Saturn_CloseFile(wad_file_t *file) { (void)file; }
 
+/* SATURN CD read-retry (the SlaveDriver whackCD pattern).  LoadBytes is a single
+** synchronous GFS_Load with NO internal retry (srl_cd.hpp): a transient seek/read
+** error mid-game returns <=0 and, unretried, becomes the fatal "W_ReadLump: only
+** read 0 of N" halt (the crash).  Each LoadBytes is self-contained (it re-seeks by
+** file id), so simply re-calling re-attempts the read cleanly.  Retry hard before
+** giving up; sat_cd_read_retries is surfaced on the overlay (row 0 `cd`) so a high
+** count flags a flaky disc rather than a one-off. */
+extern "C" int sat_cd_read_retries = 0;   /* cumulative retried reads this session */
+#define SAT_CD_READ_RETRIES 8
+
+static int sat_cd_load(size_t sector, int32_t bytes, void *dst)
+{
+    int got = wad_cd_file->LoadBytes(sector, bytes, dst);
+    for (int attempt = 1; got <= 0 && attempt < SAT_CD_READ_RETRIES; ++attempt)
+    {
+        sat_cd_read_retries++;
+        got = wad_cd_file->LoadBytes(sector, bytes, dst);
+    }
+    return got;
+}
+
 static size_t Saturn_Read(wad_file_t *file, unsigned int offset,
                           void *buffer, size_t buffer_len)
 {
@@ -148,38 +175,52 @@ static size_t Saturn_Read(wad_file_t *file, unsigned int offset,
         return n;
     }
 
-    /* CD mode: LoadBytes(sectorOffset, size, dest) where sectorOffset is the
-    ** number of 2048-byte sectors to skip at the start of the file -- NOT a
-    ** byte offset.  We must convert the byte offset ourselves:
-    **   sector = offset / 2048
-    **   sub    = offset % 2048   (bytes into that sector where the data starts)
-    ** For the non-aligned case read the first partial sector into a static
-    ** lead buffer, copy the tail of it, then issue a second call for the rest.
+    /* CD mode: LoadBytes(sectorOffset, byteSize, dest) -> GFS_Load, where
+    ** sectorOffset is the number of 2048-byte sectors to skip at the start of
+    ** the file (NOT a byte offset), byteSize is a byte count, and dest MUST be
+    ** 4-byte aligned.  GFS rejects an unaligned destination with GFS_ERR_ALIGN
+    ** (-21), which surfaces here as a 0-byte read and upstream as the
+    ** "W_ReadLump: only read 0 of N" failure (missing textures/sounds).
+    **
+    ** Convert the byte offset to a sector + in-sector offset, and NEVER hand
+    ** GFS an unaligned pointer:
+    **   - a fully sector-aligned read into a 4-byte-aligned buffer goes
+    **     straight through (one GFS_Load, the fast path);
+    **   - anything else (the common case: a lump whose offset%2048 is not a
+    **     multiple of 4) is bounced sector-by-sector through an aligned buffer
+    **     and memcpy'd into the caller's buffer, so GFS only ever writes to the
+    **     aligned bounce buffer regardless of the lump's offset%4.
+    ** (The old code read the tail straight into buffer+(2048-sub), which is
+    ** unaligned whenever sub%4 != 0 -- that was the GFS_ERR_ALIGN trigger.)
     */
     if (!wad_cd_file || n == 0) return 0;
 
     size_t sector = (size_t)(offset >> 11);   /* offset / 2048 */
     size_t sub    = (size_t)(offset & 2047);  /* offset % 2048 */
 
-    if (sub == 0)
+    if (sub == 0 && ((size_t)buffer & 3u) == 0)
     {
-        /* Perfectly sector-aligned: one LoadBytes call */
-        int got = wad_cd_file->LoadBytes(sector, (int32_t)n, buffer);
+        /* Sector-aligned offset into a 4-byte-aligned dest: one GFS_Load (retried). */
+        int got = sat_cd_load(sector, (int32_t)n, buffer);
         return (got > 0) ? (size_t)got : 0;
     }
 
-    /* Non-aligned: read first (partial) sector into a lead buffer */
-    static unsigned char lead_buf[2048];
-    int lgot = wad_cd_file->LoadBytes(sector, 2048, lead_buf);
-    if (lgot <= (int)sub) return 0;
-
-    size_t first = (size_t)(2048 - sub);  /* bytes available after the skip */
-    if (first > n) first = n;
-    memcpy(buffer, lead_buf + sub, first);
-    if (first >= n) return n;
-
-    /* Read the remaining bytes, now sector-aligned */
-    int rgot = wad_cd_file->LoadBytes(sector + 1, (int32_t)(n - first),
-                                      (unsigned char *)buffer + first);
-    return first + (size_t)(rgot > 0 ? (size_t)rgot : 0);
+    /* Bounce path: read whole sectors into an aligned buffer, copy what we
+    ** need.  GFS therefore only ever writes to sect_buf (always aligned). */
+    static unsigned char sect_buf[2048] __attribute__((aligned(4)));
+    size_t done = 0;
+    while (done < n)
+    {
+        int got = sat_cd_load(sector, 2048, sect_buf);
+        if (got <= (int)sub) break;              /* read error or short of our start */
+        size_t avail = (size_t)got - sub;        /* usable bytes after the in-sector skip */
+        size_t want  = n - done;
+        if (want > avail) want = avail;
+        memcpy((unsigned char *)buffer + done, sect_buf + sub, want);
+        done += want;
+        if (want < avail) break;                 /* satisfied n within this sector */
+        sector++;
+        sub = 0;
+    }
+    return done;
 }

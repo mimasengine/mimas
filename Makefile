@@ -53,7 +53,7 @@ DOOM_CORE_C = \
 	p_doors.c p_enemy.c p_floor.c p_inter.c p_lights.c \
 	p_map.c p_maputl.c p_mobj.c p_plats.c p_pspr.c \
 	p_saveg.c p_setup.c p_sight.c p_spec.c p_switch.c \
-	p_telept.c p_tick.c p_user.c r_bsp.c r_data.c \
+	p_telept.c p_tick.c p_user.c r_bsp.c r_cache.c r_data.c \
 	r_draw.c r_main.c r_plane.c r_segs.c r_sky.c \
 	r_things.c sha1.c sounds.c statdump.c st_lib.c \
 	st_stuff.c s_sound.c tables.c v_video.c wi_stuff.c \
@@ -81,6 +81,18 @@ ifeq ($(CDDA_MUSIC),1)
   CDDA_FLAG = -DSATURN_CDDA_MUSIC
 endif
 
+# Benchmark warp: boot straight into a map (skips the title menu) for reproducible
+# witness measurements -- see docs/REC_BENCHMARKS.md "WADs temoins".  Empty (default)
+# = normal menu boot, no behaviour change.
+#   Doom II:  make SAT_WARP_MAP=15      (-> MAP15)
+#   Doom 1:   make SAT_WARP_MAP="4 2"   (-> E4M2, two single digits)
+# SAT_WARP_SKILL = skill 1-5 (4 = Ultra-Violence).
+SAT_WARP_MAP   ?=
+SAT_WARP_SKILL ?= 4
+ifneq ($(SAT_WARP_MAP),)
+  WARP_FLAG = -DSAT_WARP_MAP='"$(SAT_WARP_MAP)"' -DSAT_WARP_SKILL='"$(SAT_WARP_SKILL)"'
+endif
+
 # SRL puts modules/dummy/ in the path which stubs out stdio.h (no FILE type).
 # Put the compiler's real newlib headers first so Doom's uses of FILE* work.
 # -Isrc: Doom sources include each other with relative paths.
@@ -88,10 +100,14 @@ endif
 SRL_CUSTOM_CCFLAGS = -w -fsigned-char \
     -DCMAP256 -DDOOMGENERIC_RESX=320 -DDOOMGENERIC_RESY=200 -DNDEBUG \
     -DMAXVISPLANES=256 \
+    -DSAT_VISPLANE_POOL=1 -DVP_POOL_PLANES=96 \
+    -DRP_CMD_BUF_SIZE=0x14000 \
+    -DTEXCACHE_MARGIN=0x10000 \
     -Isaturn_libc \
     -Isrc \
     -Icore \
-    $(CDDA_FLAG)
+    $(CDDA_FLAG) \
+    $(WARP_FLAG)
 
 # -----------------------------------------------------------------------
 # Include SRL shared makefile

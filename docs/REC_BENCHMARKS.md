@@ -131,3 +131,71 @@ pot1/2 ; QW2 → P↓ + `c`↓ fort ; surveiller tout tear/garbage dans les sols
 3. Quand un set HW post-QW remplace la baseline B, **garder B en historique** (ne pas
    l'écraser — c'est notre seul point de comparaison pré/post quick-wins).
 4. Conclusions de gain REC = **section C (HW) uniquement**. Ymir = sanity + mécanique.
+
+---
+
+# WADs témoins — banc de stress
+
+But : disposer de **scènes de référence reproductibles** dont on connaît à l'avance le
+poste de coût dominant, pour **attribuer** chaque chute de fps. WADs locaux dans
+`wads_temoins/` (gitignoré ; IWADs copyright id copiés depuis `Downloads/`, PWADs libres
+téléchargés depuis idgames — voir `wads_temoins/README.md` pour les chemins/warps exacts).
+
+## Pourquoi un WAD est « gourmand » — 4 postes (+ mémoire)
+
+Sur le rasterizer logiciel, la gourmandise se décompose en axes **séparables**, chacun
+mappé à un coût Saturn — c'est ce qui rend les témoins utiles (un témoin = un axe isolé).
+
+| Poste | Déclencheur | Limite vanilla | Coût Saturn |
+|---|---|---|---|
+| **Visplanes / span-fill** | Beaucoup de sols/plafonds co-visibles à hauteur/flat/lumière distincts | `MAXVISPLANES=128` → **256** (`spanstart_l[256]`) | 1 passe span-draw/visplane ; en **LWRAM lente** → double peine |
+| **Walls / drawsegs / openings** | Longues visées dégagées, murs two-sided | `MAXDRAWSEGS=256`, `MAXSEGS=32` | segs à clipper + colonnes au SH-2 esclave |
+| **Overdraw** | Géométrie empilée, gros sprites chevauchants (pas de z-buffer) | — | cycles SH-2 gaspillés sur segs occultés ensuite |
+| **Simulation (AI/intercepts/vissprites)** | Beaucoup de monstres ; Arch-Viles (IA la + chère), Pain Elementals | `MAXVISSPRITES=128` (flicker non-fatal) | **tout sur le SH-2 maître AVANT le rendu** ; le split dual-SH-2 **n'aide PAS** (l'esclave ne fait que rendre) |
+| **Mémoire** (transversal) | Grosses maps, sauvegardes lourdes | save buffer **~180 KB** | sur heap 88K + streaming CD : mode d'échec à part, hors fps |
+
+Règle de classification décisive : **vanilla** (sous les limites → tourne) vs
+**limit-removing** (crash « No more visplanes » / « too many drawsegs » sur l'exe d'origine
+→ crash sur le port aussi, sauf si le tableau concerné a été agrandi).
+
+## L'échelle de témoins (sûr → torture)
+
+| Témoin | WAD | Carte | Vanilla | Isole |
+|---|---|---|---|---|
+| Phobos Anomaly | Doom1.WAD | E1M8 | ✅ | drawsegs/solidsegs — **seul sur cartouche, zéro CD** → baseline propre |
+| Industrial Zone | Doom2.wad | MAP15 | ✅ | drawsegs + openings (chemin murs/colonnes) — déjà sur le CD |
+| The Living End | Doom2.wad | MAP29 | ✅ | visplanes + overdraw (géométrie étagée) |
+| Hunted | Plutonia.wad | MAP11 | ✅ | **AI pure** (≈18 Arch-Viles) — inverse exact des maps géométriques |
+| Tricks and Traps | Doom2.wad | MAP08 | ✅ | vissprites + intercepts (gros sprites, espace confiné) |
+| Downtown | Doom2.wad | MAP13 | ⚠️ | visplanes — overflow vanilla « après la clôture » → valide le cap 256 |
+| **Mount Pain** | Tnt.wad | MAP27 | ⚠️ | **seul overflow visplane IWAD confirmé** (chambre est, face mur) + 332 monstres |
+| Go 2 It | Plutonia.wad | MAP32 | ✅ | combat le + dense **légal** (11 Pain El. + 19 Arch-Viles) — ne crashe pas, rame |
+| Unholy Cathedral | Doom-ud.wad | E2M5 | ✅ | **mémoire/heap** (le 32X ne la chargeait pas) — réussite = budget validé |
+| Post Mortem | +HR.WAD | MAP24 | ⚠️ | **save buffer ~180 KB** — le **SAVE** est le témoin, pas les fps |
+| (torture) nuts | +nuts.wad | MAP01 | ❌ | plafond débit thinkers+vissprites — **contrôle négatif**, crash/crawl attendu |
+
+Protocole : **grimper l'échelle dans l'ordre**, point de vue **fixe** par map, lire
+REC/frame (rows 19/20/11/12). E1M8 d'abord (zéro latence CD parasite) ; **soustraire la
+latence CD** pour toute map non-shareware (Doom II/Plutonia/TNT/Ultimate streament). Si les
+fps s'effondrent sur Hunted mais tiennent sur MAP29 → limiteur = **sim maître**, pas le
+rasterizer. Pour valider 256 : MAP13 / TNT27, surveiller `r_visplane_peak` franchir 128
+sans crash/HOM. ⚠️ **Ne pas mesurer sur slaughter Boom** (Sunder, Okuplok, Cosmogenesis,
+Deus Vult, Holy Hell, Chillax) : linedefs/actions Boom non gérés par Chocolate → logique
+de carte potentiellement fausse.
+
+## Accès direct aux cartes (warp) — port Saturn — **CÂBLÉ**
+
+Le core gère **`-warp`** (`d_main.c:1934` → `startmap`/`autostart` → `G_InitNew`, **saute le
+menu** ; Doom II = `atoi` 1 token, Doom 1 = 2 chiffres). Câblé derrière le flag compile
+**`SAT_WARP_MAP`** (Makefile) → `doom_start()` construit l'`argv` `-warp`/`-skill`
+(`dg_saturn.cxx`). **Vide par défaut = boot menu normal, aucun changement.**
+
+```sh
+make SAT_WARP_MAP=15        # Doom II -> MAP15 (UV)
+make SAT_WARP_MAP="4 2"     # Doom 1  -> E4M2 (deux chiffres)
+make SAT_WARP_MAP=27 SAT_WARP_SKILL=4   # TNT MAP27, skill 1-5 (4 = UV, défaut)
+```
+
+`SAT_WARP_MAP` est tokenisé sur l'espace : `"15"` → `-warp 15` ; `"4 2"` → `-warp 4 2`.
+**IDCLEV** (`st_stuff.c:610`) existe dans le core mais exige de taper « idclev15 » au
+clavier → non câblé au pad, inutilisable tel quel.

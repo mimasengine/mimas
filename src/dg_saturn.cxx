@@ -103,6 +103,14 @@ extern "C" char *gamedescription;
    sub-quad subdivision is needed).  1 = on (this test), 0 = off. */
 #define VDP1_WALL_TEST 1
 
+/* VDP1 FLOOR inc-1: deport SECONDARY floors/ceilings (other heights + ceilings; NOT the RBG0
+   dominant, NOT sky) to the VDP1 strip layer.  This increment is the index-0 SKIP ONLY -- with the
+   stub hook below, the owned surfaces go BLACK (index 0), which (a) validates the skip targets the
+   right surfaces and (b) shows the coverage the strip emitter (inc-3) will fill.  Runtime-gated by
+   the core flag sat_vdp1_floor (default 0 = normal software floors); pad Y toggles it live when this
+   compile flag is 1.  Set this 0 to remove the feature entirely (ship/DoomJo unaffected: hook NULL). */
+#define VDP1_FLOOR_TEST 1
+
 /* VDP1 command double-buffer.  0 = single bank, 1 = double bank.  Single-bank TESTED = BAD:
    the VDP1 reads a bank we're already overwriting (and a texture we're re-baking) the next
    frame -> "every other line shows sky" corruption.  Kept at 1 (double-buffer = correct). */
@@ -119,9 +127,18 @@ extern "C" char *gamedescription;
 extern "C" byte *I_VideoBuffer;
 extern "C" int   gametic;
 extern "C" int   r_visplane_peak;
+extern "C" int   sat_floor_vq_cur, sat_floor_vq_peak;  /* VDP1-floor inc-0 estimate, shown on row 2 */
 /* SATURN VALIDATION (Ymir-readable, deterministic): RAM-lever sizing telemetry. */
 extern "C" int   r_visplane_coverage_peak;  /* #1: peak sum of live-plane spans (top-bytes) */
 extern "C" int   r_visplane_pool_peak;      /* #1: peak bytes used in the span pool (0 if off) */
+extern "C" int   r_visplane_pool_ovf;       /* #1: planes that overflowed VP_POOL_PLANES (0 = ok) */
+extern "C" int   sat_texcache_active, sat_texcache_poolkb, sat_texcache_entries,
+                 sat_texcache_builds, sat_texcache_evicts;  /* streaming texture cache (core/r_cache.c) */
+extern "C" int   sat_texcache_carve_lf;     /* largest free block (KB) at the last carve attempt */
+extern "C" int   sat_tex_numtex, sat_tex_sumwidth, sat_tex_dirbytes,
+                 sat_tex_mptex, sat_tex_mpwidth;  /* Phase-0 texture-floor measurement (r_data.c) */
+extern "C" int   Z_FreeMemory(void);          /* total reclaimable (free + purgeable) bytes */
+extern "C" int   Z_LargestAllocatable(void);  /* largest contiguous run after purging */
 extern "C" int   dg_heap_peak;              /* #4: peak newlib sbrk usage (bytes)             */
 extern "C" int   dg_heap_size;              /* #4: newlib heap cap (bytes)                    */
 /* split-screen perf breakdown (ms per piece of the 2p render block) -- diagnose the slowdown */
@@ -264,6 +281,12 @@ extern "C" int            sat_vdp2_floor_pic;/* core: player's floor flat (picnu
 extern "C" unsigned char *sat_vdp2_floor_cmap;/* core: colormap for the floor's sector light (0=full bright) */
 extern "C" int            sat_potato_floors;/* core: solid-colour floors/ceilings */
 extern "C" int            sat_potato_walls; /* core: solid-colour walls (opaque) */
+#if VDP1_FLOOR_TEST
+extern "C" int            sat_vdp1_floor;   /* core: skip secondary floors/ceilings (=> VDP1 strips) */
+extern "C" int          (*sat_floor_vdp1_hook)(int picnum, int height, int minx, int maxx,
+                                               const unsigned char *top, const unsigned char *bottom,
+                                               int lightlevel);  /* core: 1 => platform owns this surface */
+#endif
 
 #if VDP1_WEAPON
 /* VDP1 weapon: the core psprite hook pointers (defined in r_things.c) + our impls
@@ -309,14 +332,18 @@ void sat_walls_kick(void);                /* platform: flush + kick the VDP1 wal
 #define POTATO_LEVEL 0
 static int potato_level = POTATO_LEVEL;    /* 0..5, index into potato_modes */
 static int wall_potato_mode = 0;           /* DoomSRL VDP1 wall mode: 0=textured 1=banded 2=flat */
-/* the 6 modes: floors flat?, wall mode (0=tex 1=banded 2=flat), low-detail?, display name. */
-static const struct { int floors, wmode, ld; const char *name; } potato_modes[6] = {
-    { 0, 0, 0, "pot0"    },
-    { 0, 0, 1, "pot0+ld" },
-    { 1, 0, 0, "pot1"    },
-    { 1, 0, 1, "pot1+ld" },
-    { 1, 1, 0, "pot2-bd" },
-    { 1, 2, 0, "pot2-fl" },
+/* the modes: floors flat?, wall mode (0=tex 1=banded 2=flat), low-detail?, floor-low-detail?,
+   display name.  pot0.5 = textured floors drawn at HALF-rate fill (1 texel / 2 screen px) with
+   FULL VDP1 walls -- the floor-only low-detail the global +ld can't give (global +ld halves the
+   whole render geometry, walls included).  Inserted right after pot0 (a finer first step). */
+static const struct { int floors, wmode, ld, fld; const char *name; } potato_modes[7] = {
+    { 0, 0, 0, 0, "pot0"    },
+    { 0, 0, 0, 1, "pot0.5" },
+    { 0, 0, 1, 0, "pot0+ld" },
+    { 1, 0, 0, 0, "pot1"    },
+    { 1, 0, 1, 0, "pot1+ld" },
+    { 1, 1, 0, 0, "pot2-bd" },
+    { 1, 2, 0, 0, "pot2-fl" },
 };
 
 /* Dual-CPU blit configs, cycled LIVE by the pad L+R chord (one press = next, wraps).
@@ -352,12 +379,14 @@ extern "C" int sat_visplane_hash;
 static void sat_apply_potato(void)
 {
     extern int sat_split_lowdetail;            /* core flag (only acts in the split block) */
-    int L = potato_level; if (L < 0 || L >= 6) L = 0;
+    extern int sat_floor_ld;                   /* core/r_plane.c -- pot0.5 half-rate textured floors */
+    int L = potato_level; if (L < 0 || L >= 7) L = 0;
     sat_potato_floors   = potato_modes[L].floors;
     sat_potato_walls    = (potato_modes[L].wmode == 2);  /* DoomJo software-wall flat parity; also
                                                             gates the pot2-fl CPU-fallback skip */
     wall_potato_mode    = potato_modes[L].wmode;         /* DoomSRL VDP1 3-way (tex/banded/flat) */
     sat_split_lowdetail = potato_modes[L].ld;
+    sat_floor_ld        = potato_modes[L].fld;           /* pot0.5: textured floors at half-rate fill */
 }
 #define GS_LEVEL 0
 #define SAT_CMAP_BYTES (34 * 256)           /* COLORMAP: 34 maps of 256 (r_data.c) */
@@ -420,9 +449,15 @@ static void hud2p_flash_build(void)
     for (int L = 1; L < HUD2P_NPAL; ++L)
     {
         const unsigned char *sub = pp + L * 768;
+        /* SATURN: PLAYPAL 1..8 = red damage, 9..12 = gold pickup, 13 = green radsuit. */
+        int damage = (L <= 8);
         for (int i = 0; i < 256; ++i)
         {
             int r = sub[i*3], g = sub[i*3+1], b = sub[i*3+2];
+            /* The raw damage tint, matched on the base palette, reads too "pink"
+               (light red) in 2p.  Cut green/blue on the RED damage palettes so the
+               nearest match lands on a deeper BLOOD red (gold/green left intact). */
+            if (damage) { g >>= 1; b >>= 1; }
             int best = 1 << 30, bj = 0;
             for (int j = 0; j < 256; ++j)
             {
@@ -432,6 +467,15 @@ static void hud2p_flash_build(void)
             }
             hud2p_flash_lut[L][i] = (unsigned char)bj;
         }
+        /* SATURN layer inversion: index 0 is the RESERVED transparent code in NBG1 --
+           the VDP1 walls (and the VDP2 sky) show THROUGH it (see the darkest-index note
+           ~:1282).  The nearest-colour search above maps index 0 (= PLAYPAL black tinted
+           toward the flash) to a dark-RED index, which makes every transparent wall/sky
+           hole OPAQUE during a flash -> the whole VDP1 wall layer is occluded ("all walls
+           go black" in 2p).  Force index 0 to stay transparent so walls/sky remain visible
+           through the flash.  (The VDP1 walls don't tint with the flash -- separate layer,
+           shared CRAM -- but staying visible beats being blacked out.) */
+        hud2p_flash_lut[L][0] = 0;
     }
     hud2p_flash_built = 1;
 }
@@ -750,34 +794,34 @@ static void fps_update(void)
     unsigned int now = vbl_count;
     unsigned int hz  = (us_per_frame == 20000) ? 50 : 60;
 
-    /* row 1: per-frame live counter; row 0 reserved for boot/fatal */
-    {
-        static char r1[45];
-        sprintf(r1, "F%05u ph%d to%d vbl%u",
-                dg_frame_count % 100000, game_phase,
-                rp_timeout_count, (unsigned int)(vbl_count & 0xFFFF));
-        SRL::Debug::Print(0, 1, r1);
-    }
     frames++;
     if (now - t0 >= hz)
     {
         unsigned int elapsed = now - t0;
-        unsigned int fps = (frames * hz + elapsed / 2) / elapsed;
         /* tenths of an fps, for resolution at 5-10 fps; EMA (~4s) for a stable
            average to compare builds with. */
         unsigned int inst10 = (frames * 10u * hz + elapsed / 2) / elapsed;
         static unsigned int avg10 = 0;
         avg10 = avg10 ? (avg10 * 3 + inst10) / 4 : inst10;
-        static char r2[45];
-        /* Trimmed: fps duplicated row 17's inst, and dma/dsta were dead with the
-           SCU DMA blit disabled (USE_SCU_DMA=0).  Kept gt (heartbeat) + vp
-           (visplane peak).  bl<idx> = active blit config (0 single .. 4 = 75/25);
-           b<ms.t> = measured blit wall-clock (the dual-CPU GO/DROP number);
-           h<0|1> = visplane hash (pad Y) on/off for its Bw A/B. */
-        sprintf(r2, "gt%5d vp%3d %-7s bl%d b%u.%u h%d", gametic, r_visplane_peak,
+        /* OVERLAY 2026-06-24 (audited): useful values packed onto the top rows; cut the
+           WAD line, the F/ph/vbl/gt heartbeats, and the VD2~/SCU/68K nominal labels.
+           Row 0 = HEADLINE: inst fps, EMA(~4s) avg (THE build-comparison number), and
+           to = slave-timeout count (must stay 0 -- the RP_CMD_BUF-shrink safety);
+           cd = CD read-retries (whackCD): 0 = clean disc, climbing = flaky reads. */
+        extern int sat_cd_read_retries;   /* w_file_saturn.cxx */
+        static char r0[45];
+        sprintf(r0, "%u.%u fps avg%u.%u to%d cd%d",
+                inst10 / 10, inst10 % 10, avg10 / 10, avg10 % 10,
+                rp_timeout_count, sat_cd_read_retries);
+        SRL::Debug::Print(0, 0, r0);
+        /* row 1: vp = visplane peak (MAXVISPLANES sizing) + the live pad toggles:
+           potato mode (pad Z), blit config bl + measured blit ms b (pad L+R, dual-CPU
+           GO/DROP), visplane-hash h (pad Y). */
+        static char r1[45];
+        sprintf(r1, "vp%3d %-7s bl%d b%u.%u h%d", r_visplane_peak,
                 potato_modes[potato_level].name, blit_mode,
                 sat_blit_ms10 / 10, sat_blit_ms10 % 10, sat_visplane_hash);
-        SRL::Debug::Print(0, 2, r2);
+        SRL::Debug::Print(0, 1, r1);
         {
             /* SATURN VALIDATION row: RAM-lever sizing (all high-water, Ymir-honest).
                hp = newlib heap peak/cap (#4: trim HEAP_SIZE to peak+margin).
@@ -785,43 +829,55 @@ static void fps_update(void)
                      ~cov bytes, +cov for bottom => arena ~= 2*cov; compare to today's
                      332KB pool to see #1's ceiling).  pool = #1 span-pool peak bytes
                      (0 unless SAT_VISPLANE_POOL=1).  vp (row 2) sizes #2 MAXVISPLANES. */
+            /* TEX = Phase-0 texturecolumnlump floor measurement (one-shot at load,
+               docs/TEXTURECOLUMNLUMP_PLAN.md): nt=numtextures, w=total columns (Sum
+               width), d=the columnlump+columnofs PU_STATIC floor in KB (=4*w), mp=#
+               multi-patch textures.  Confirms the ~400-600K floor on real hardware.
+               (Replaced the VAL visplane-sizing telemetry -- that lever shipped.) */
             static char rV[45];
-            sprintf(rV, "VAL hp%d/%d cov%d pool%d",
-                    dg_heap_peak, dg_heap_size,
-                    r_visplane_coverage_peak, r_visplane_pool_peak);
-            SRL::Debug::Print(0, 22, rV);   /* free row (16 = VD1 aux) */
+            sprintf(rV, "TEX nt%d w%d d%dK mp%d",
+                    sat_tex_numtex, sat_tex_sumwidth, sat_tex_dirbytes >> 10, sat_tex_mptex);
+            SRL::Debug::Print(0, 8, rV);     /* memory levers grouped on rows 6-8 */
             /* split-block breakdown (ms): sw = both R_SetViewWindow (size-table recompute),
                v0/v1 = each R_RenderPlayerView, k = the VDP1 kick -> localises the 2p slowdown
                (last frame; 0 in 1p). */
             static char rS[45];
             sprintf(rS, "SPL sw%u v0%u v1%u k%u bk%u",
                     sat_spl_sw, sat_spl_v0, sat_spl_v1, sat_spl_kick, wtex_bakes);
-            SRL::Debug::Print(0, 6, rS);   /* high + free row, just under the top block */
+            SRL::Debug::Print(0, 16, rS);   /* 2p-split only -> kept lower */
+            /* streaming texture cache (core/r_cache.c): a=active (0 in split/non-stream),
+               <pool>K size, e=live composites, b=builds this level, x=evictions.  a1 + b>0
+               = the LRU is doing work; a0 = inactive (2p split / shareware / cart mode). */
+            /* TXC = streaming texture cache (core/r_cache.c): a=active, <pool>K size,
+               e=live composites, b=builds, x=evicts.  lf = largest free block (KB) the
+               carve saw -- a0 with lf below ~88K means the zone was too tight to slice
+               the slab (64K margin + 24K min), so the cache is BLOCKED ON THE FLOOR
+               (the TEX-row cut is what frees it), not a measurement bug. */
+            static char rTC[45];
+            sprintf(rTC, "TXC a%d %dK e%d b%d x%d lf%dK",
+                    sat_texcache_active, sat_texcache_poolkb, sat_texcache_entries,
+                    sat_texcache_builds, sat_texcache_evicts, sat_texcache_carve_lf);
+            SRL::Debug::Print(0, 6, rTC);
+            /* LWRAM zone pressure (the Z_Malloc OOM lever): fr = total reclaimable
+               (free+purgeable); mx = largest CONTIGUOUS run after a purge.  At an
+               'Z_Malloc: failed on N' crash: mx < N while fr >> N => FRAGMENTATION;
+               fr < N => true EXHAUSTION. */
+            static char rZ[45];
+            sprintf(rZ, "ZON fr%dK mx%dK", Z_FreeMemory() >> 10, Z_LargestAllocatable() >> 10);
+            SRL::Debug::Print(0, 7, rZ);
         }
-        {
-            static char rA[45];
-            /* row 17: stable build-comparison number, with the build-identity
-               stamp (b:__TIME__) folded in -- build.ps1 touches dg_saturn.cxx so
-               __TIME__ refreshes every build, letting you confirm on hardware you
-               flashed the latest.  (Was row 18; the boot IRQ probe it shared the
-               row with answered 1.1 and was removed.) */
-            sprintf(rA, "AVG %u.%u inst %u.%u b:" __TIME__,
-                    avg10 / 10, avg10 % 10, inst10 / 10, inst10 % 10);
-            SRL::Debug::Print(0, 17, rA);
-        }
-        /* row 15 freed: the standalone MST line was just a pointer to rows 19/20.  The
-           master frame ms (the synchronous bottleneck) now prefixes the slave's row-18
-           SLV line; set the shared value here, r_parallel.c prints it. */
+        /* master frame ms (the synchronous bottleneck) -> prefixes r_parallel.c's row-18
+           SLV line; set the shared value here (the AVG row is gone, fps is on row 0). */
         rp_master_ms = inst10 ? (10000u / inst10) : 0;   /* frame ms */
         {
-            /* row 16: the AUXILIARY (co)processors only (master+slave = row 18, split r19/r20).
-               VD1 = VDP1 commands this frame + D(one)/B(usy).  VD2 = VDP2 (always compositing,
-               spare).  SCU = SCU-DSP/DMA (idle = free to offload).  68K = SCSP sound CPU. */
-            static char r6[45];
-            sprintf(r6, "VD1 %d%c VD2~ SCU%s 68Ksnd",
-                    vdp1_last_cmds, vdp1_prev_done ? 'D' : 'B',
-                    USE_SCU_DMA ? "dma" : "-");
-            SRL::Debug::Print(0, 16, r6);
+            /* row 2: VDP1 load + the build-identity stamp.  VD1 = VDP1 cmds this frame +
+               D(one)/B(usy) EDSR-CEF -- the only LIVE aux-processor metric (VD2~/SCU/68K
+               were nominal labels with no per-frame value, cut).  b:__TIME__ = build stamp
+               (build.ps1 touches dg_saturn.cxx so it refreshes -> confirms the flashed bin). */
+            static char r2v[45];
+            snprintf(r2v, sizeof r2v, "VD1 %d%c b:" __TIME__,
+                    vdp1_last_cmds, vdp1_prev_done ? 'D' : 'B');
+            SRL::Debug::Print(0, 2, r2v);
         }
 #if VDP2_RBG0_TEST
         {
@@ -834,17 +890,7 @@ static void fps_update(void)
             SRL::Debug::Print(0, 14, rR);
         }
 #endif
-        {
-            /* row 21: WAD identity detected from the IWAD's own lumps (free row,
-               not overwritten elsewhere).  "(detecting...)" until
-               D_SetGameDescription runs; then e.g. "DOOM Shareware",
-               "The Ultimate DOOM", "DOOM 2: Hell on Earth".  This is the
-               WAD-agnostic self-check: it must match the WAD you flashed. */
-            static char rW[45];
-            const char *gd = gamedescription ? gamedescription : "(detecting...)";
-            sprintf(rW, "WAD: %.38s", gd);
-            SRL::Debug::Print(0, 21, rW);
-        }
+        /* (cut: the "WAD:" identity line -- served its purpose, owner flagged it useless.) */
         t0     = now;
         frames = 0;
     }
@@ -991,6 +1037,21 @@ static void rbg0_commit_ramctl(void)
     ramctl_after = *RAMCTL;
     printf("RAMCTL before=%04x after=%04x (rbg0 RDBS commit)\n",
            ramctl_before, ramctl_after);
+}
+#endif
+
+#if VDP1_FLOOR_TEST
+/* VDP1 floor inc-1 stub: own EVERY candidate visplane (return 1) -> all secondary
+   floors/ceilings go index 0 (black) while sat_vdp1_floor is on (pad Y).  Validates that
+   the core skip targets exactly the non-sky / non-RBG0-dominant surfaces, and shows the
+   coverage the affine-strip emitter (inc-3) will have to fill.  No strips emitted yet. */
+extern "C" int sat_floor_vdp1_stub(int picnum, int height, int minx, int maxx,
+                                   const unsigned char *top, const unsigned char *bottom,
+                                   int lightlevel)
+{
+    (void)picnum; (void)height; (void)minx; (void)maxx;
+    (void)top; (void)bottom; (void)lightlevel;
+    return 1;
 }
 #endif
 
@@ -1179,6 +1240,14 @@ extern "C" void DG_Init(void)
     /* kick VDP1 right after the BSP walk (parallel with the CPU floors/sprites) so the
        walls present the SAME frame as the framebuffer (no 1-frame lag / sky-at-the-seam). */
     sat_walls_done_hook = sat_walls_kick;
+#endif
+
+#if VDP1_FLOOR_TEST
+    /* inc-1: register the floor-skip hook (claims secondary floors/ceilings).  Left OFF
+       (sat_vdp1_floor = 0) so the boot render is normal software floors; pad Y toggles it
+       live to A/B the index-0 coverage (owned surfaces go black until the strip emitter). */
+    sat_floor_vdp1_hook = sat_floor_vdp1_stub;
+    sat_vdp1_floor      = 0;
 #endif
 
     SRL::Debug::Print(0, 1, "INIT DOOM...");
@@ -1435,6 +1504,69 @@ static void wtex_rebuild_banks(void)
         }
     }
     wbank_dirty = 1;
+}
+
+/* ------------------------------------------------------------------ */
+/* SATURN level-transition fade (docs/TRANSITIONS_PLAN.md option 1):  */
+/* a buffer-FREE CRAM palette dip-to-black, replacing the f_wipe melt */
+/* (which OOM'd the fragmented streaming zone).  Reuses the proven    */
+/* no-slSynch vblank palette path: write pending_cram (full-bright    */
+/* bank 1) + pending_wbank (dark wall light-banks 2..7) scaled toward */
+/* black, flag dirty, and the vblank handler copies them to CRAM.     */
+/* The framebuffer + VDP1 command list are UNTOUCHED -- only CRAM     */
+/* ramps -- so the currently-displayed frame dims out / the freshly-  */
+/* drawn frame rises in.  Blocking (~FADE_STEPS frames); called from  */
+/* d_main.c's gamestate transition (streaming mode only).             */
+#define FADE_STEPS 16
+
+static void dg_fade_bake(int num)   /* brightness num/FADE_STEPS: 0 = black .. FADE_STEPS = full */
+{
+    int i;
+    for (i = 0; i < 256; ++i)
+    {
+        int r = colors[i].r * num / FADE_STEPS;
+        int g = colors[i].g * num / FADE_STEPS;
+        int b = colors[i].b * num / FADE_STEPS;
+        pending_cram[i] = (unsigned short)(0x8000 | ((b >> 3) << 10) | ((g >> 3) << 5) | (r >> 3));
+    }
+    palette_dirty = 1;
+#if VDP1_WALL_TEST
+    if (colormaps)   /* fade the dark wall light-banks in step, else VDP1 walls wouldn't dim */
+    {
+        int k;
+        for (k = 0; k < WLIGHT_DARK_N; ++k)
+        {
+            const unsigned char *cm = colormaps + (unsigned int)wlight_darklevel[k] * 256u;
+            unsigned short *dst = pending_wbank[k];
+            for (i = 0; i < 256; ++i)
+            {
+                int ci = cm[i];
+                int r = colors[ci].r * num / FADE_STEPS;
+                int g = colors[ci].g * num / FADE_STEPS;
+                int b = colors[ci].b * num / FADE_STEPS;
+                dst[i] = (unsigned short)(0x8000 | ((b >> 3) << 10) | ((g >> 3) << 5) | (r >> 3));
+            }
+        }
+        wbank_dirty = 1;
+    }
+#endif
+}
+
+static void dg_fade_wait(void)      /* one frame: the vblank uploads pending_* to CRAM + clears dirty */
+{
+    unsigned int t = vbl_count;
+    while (vbl_count - t < 1) ;
+}
+
+extern "C" void DG_FadeOut(void)    /* dip the current frame to black */
+{
+    for (int s = FADE_STEPS - 1; s >= 0; --s) { dg_fade_bake(s); dg_fade_wait(); }
+}
+
+extern "C" void DG_FadeIn(void)     /* rise the freshly-drawn frame from black */
+{
+    for (int s = 1; s <= FADE_STEPS; ++s) { dg_fade_bake(s); dg_fade_wait(); }
+    palette_changed = true;         /* re-assert the true palette + light banks next normal frame */
 }
 
 /* one-sided mid + two-sided upper/lower quads.  Must stay <= the command budget (WALL_CMD_CAP
@@ -2604,7 +2736,7 @@ static void poll_pad(void)
        -> 2 + VDP1 walls flat / low-detail), for A/B testing quality vs fps without a rebuild. */
     if ((changed & PER_DGT_TZ) && !(cur & PER_DGT_TZ))
     {
-        potato_level = (potato_level + 1) % 6;
+        potato_level = (potato_level + 1) % 7;
         sat_apply_potato();
     }
 
@@ -2621,7 +2753,11 @@ static void poll_pad(void)
        REC profiler's Bw bucket ON (h1) vs OFF (h0) on the same scene, no rebuild.  Like the
        Z=potato / L+R=blit live toggles; row 2 shows h<state>. */
     if ((changed & PER_DGT_TY) && !(cur & PER_DGT_TY))
+#if VDP1_FLOOR_TEST
+        sat_vdp1_floor = !sat_vdp1_floor;   /* inc-1: A/B the VDP1 floor-skip (owned floors -> index 0) */
+#else
         sat_visplane_hash = !sat_visplane_hash;
+#endif
 #endif
 
 #if DUAL_CPU_BLIT
@@ -2709,8 +2845,30 @@ extern "C" void doomgeneric_Tick(void);
 
 extern "C" void doom_start(void)
 {
+#ifdef SAT_WARP_MAP
+    /* SATURN: benchmark warp -- boot straight into a map, skipping the menu.
+       SAT_WARP_MAP is the core's -warp argument string: "15" (Doom II MAPxx)
+       or "4 2" (Doom 1 ExMy, two single digits).  SAT_WARP_SKILL = skill 1-5
+       (4 = Ultra-Violence).  Set via the Makefile, e.g. `make SAT_WARP_MAP=15`.
+       Undefined (default) keeps the normal menu boot below. */
+#  ifndef SAT_WARP_SKILL
+#    define SAT_WARP_SKILL "4"
+#  endif
+    static char  warpbuf[32] = SAT_WARP_MAP;     /* mutable copy for strtok */
+    static char *argv[12];                       /* static: core keeps myargv */
+    int argc = 0;
+    argv[argc++] = (char *)"doom";
+    argv[argc++] = (char *)"-warp";
+    for (char *tok = strtok(warpbuf, " "); tok && argc < 9; tok = strtok(NULL, " "))
+        argv[argc++] = tok;
+    argv[argc++] = (char *)"-skill";
+    argv[argc++] = (char *)SAT_WARP_SKILL;
+    argv[argc]   = 0;
+    doomgeneric_Create(argc, argv);
+#else
     static char *argv[] = { (char *)"doom", 0 };
     doomgeneric_Create(1, argv);
+#endif
     for (;;)
         doomgeneric_Tick();
 }

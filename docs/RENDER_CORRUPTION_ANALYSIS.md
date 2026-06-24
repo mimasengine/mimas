@@ -1,5 +1,31 @@
 # DoomSRL — Doom II first-frame render: master-stack corruption root-cause analysis
 
+## 0. RESOLUTION (shipped 2026-06-23, core `b3acd9f`) — root cause was Rank 4, not #1
+
+**This crash is FIXED.** The root cause turned out to be the **Rank-4** candidate
+below (§2 Rank 4 / "y-axis stack write"), NOT the document's #1 suspect. The
+arrays `spanstart_l[]` (on the master's C stack), `spanstart[]`/`spanstop[]` (BSS)
+were sized `[SCREENHEIGHT=224]` but are indexed by visplane `top`/`bottom`, which
+are **BYTE values 0..255** (the `0xff` column sentinel + `bottom==viewheight`). A
+`top`/`bottom` byte in [224..255] drove the index past the array end; the OOB write
+past `spanstart_l[]` smashed the master's saved return address (PR) on the stack →
+CPU exception on RETURN from the render — exactly the "`R:5-end` printed, fault on
+RETURN" signature. **Fix: size all three arrays `[256]`** (`core/r_plane.c:169-170`
+`spanstart[256]`/`spanstop[256]`, `:695` `spanstart_l[256]`). Confirmed in the
+`b3acd9f` commit message and proven playable on Doom II MAP01 (Ymir).
+
+The document's #1 suspect — `openings[]` overflow in `R_StoreWallRange` — was **not**
+the cause; the preventive openings guard (§4b/§5) was **not** shipped. It remains a
+valid *latent* defensive backstop (it is the only large unguarded bulk write in the
+render path) and could still be added if openings telemetry ever shows a genuine
+overflow, but it is not required for the Doom II first-frame crash.
+
+The ranked-hypothesis analysis below is preserved as the historical investigation
+record — note that the confirmation plan in §4 was superseded by directly fixing
+Rank 4.
+
+---
+
 Branch: feat/multiplayer-xsplit. Build: build/DoomSRL2.elf + build/DoomSRL2.map.
 Constants in this build: `SCREENWIDTH=320`, `SCREENHEIGHT=224` (core/i_video.h:27-28),
 `MAXVISPLANES=256` (Makefile:90, overrides core default 512), `MAXDRAWSEGS=256`

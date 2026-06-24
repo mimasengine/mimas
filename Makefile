@@ -14,7 +14,10 @@ SRL_MODE                  = NTSC
 SRL_HIGH_RES              = 0
 SRL_FRAMERATE             = 0
 SRL_MAX_CD_BACKGROUND_JOBS = 1
-SRL_MAX_CD_FILES          = 8
+SRL_MAX_CD_FILES          = 24   # GFS reads at most this many dir entries (incl. '.'/'..');
+                                 # cd/data now holds DOOM1.WAD + DOOMRP.DRP + CDDAMAP.TXT +
+                                 # SGL drivers/text (~12 entries). At 8, DOOM1.WAD sorted past
+                                 # the cutoff -> "DOOM1.WAD not found on CD". Headroom for more.
 SRL_MAX_CD_RETRIES        = 5
 
 # Keep 68K + SGL sound driver alive (required for SRL::Sound::Cdda CDDA routing)
@@ -64,7 +67,7 @@ DOOM_CSRCS = $(addprefix core/,$(DOOM_CORE_C))
 # Platform layer (SRL/C++), stays in src/.
 DOOM_CXXSRCS = \
 	src/main.cxx src/dg_saturn.cxx src/w_file_saturn.cxx \
-	src/i_sound_saturn.cxx src/mp_input.cxx
+	src/i_sound_saturn.cxx src/mp_input.cxx src/w_drp_saturn.cxx
 
 SOURCES  = src/syscalls.c $(DOOM_CSRCS)
 SOURCES += $(DOOM_CXXSRCS)
@@ -103,6 +106,7 @@ SRL_CUSTOM_CCFLAGS = -w -fsigned-char \
     -DSAT_VISPLANE_POOL=1 -DVP_POOL_PLANES=96 \
     -DRP_CMD_BUF_SIZE=0x14000 \
     -DTEXCACHE_MARGIN=0x20000 \
+    -DSAT_REPACK \
     -Isaturn_libc \
     -Isrc \
     -Icore \

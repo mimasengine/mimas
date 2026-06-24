@@ -117,6 +117,17 @@ world-texels needs sub-quads (like `wall_emit_band`'s u-loop). A near strip can 
 Every `core/` change is a **NULL-default function-pointer / flag hook** (DoomJo never sets
 it → byte-identical, pure C). Mirrors the proven `sat_vdp2_floor` / `sat_wall_*` pattern.
 
+> **RECONCILED 2026-06-24 — status of the increments below:**
+> - **inc-0 (profiler): BUILT** (`RP_PlanePixels`, `RP_PROF`), but its GO/NO-GO peak `Vp`
+>   has **NOT been read** on HW/Ymir — the single number that decides the approach is still
+>   unmeasured.
+> - **inc-1: STUB ONLY.** What exists is an own-everything skip stub (`sat_floor_vdp1_stub`
+>   returns 1 for *every* candidate, `sat_vdp1_floor=0` boot default, pad-Y toggle) that
+>   validates coverage but has **no per-dominant skip logic and emits zero strips**.
+> - **inc-2..6: UNBUILT.** No kick plumbing, no affine strip emitter, no silhouette clip,
+>   no lighting, no gate. **NO floor strip is emitted today.**
+> Net: floor offload is **PARTIAL / STILL-TODO**, gated on reading `Vp` first.
+
 0. **MEASURE — BUILT (2026-06-23, the GO/NO-GO gate).** The profiler lives in
    `RP_PlanePixels` (`core/r_parallel.c`, under `RP_PROF`): for every non-sky **regular
    flat** — which is exactly the VDP1 candidate set (other-height floors + ceilings; the
@@ -132,10 +143,14 @@ it → byte-identical, pure C). Mirrors the proven `sat_vdp2_floor` / `sat_wall_
    Pure C, **zero DoomJo impact** (shared core, `sat_vdp2_floor=0` there). Compiles clean.
    *This single number decides the whole approach — measure it on HW/Ymir first.*
 
-1. **Index-0 skip via the existing hook.** Extend `sat_vdp2_floor`'s skip to a `sat_vdp1_floor`
-   gate: when set, leave the dominant visplane index-0 (the **exact** existing loop) and
-   stash the silhouette+height+cmap for the platform. Off by default. *Check:* the dominant
-   floor becomes a transparent hole — confirms selection+skip; byte-identical OFF.
+1. **Index-0 skip via the existing hook.** [STUB-ONLY 2026-06-24] Extend `sat_vdp2_floor`'s
+   skip to a `sat_vdp1_floor` gate: when set, leave the dominant visplane index-0 (the
+   **exact** existing loop) and stash the silhouette+height+cmap for the platform. Off by
+   default. *Check:* the dominant floor becomes a transparent hole — confirms selection+skip;
+   byte-identical OFF.
+   > **As-built:** only `sat_floor_vdp1_stub` exists, which claims **every** candidate
+   > (returns 1), not the per-dominant skip described here — it validates coverage but does
+   > not stash silhouette/height/cmap and emits nothing. The real inc-1 is unbuilt.
 
 2. **Kick/paint-order plumbing (the riskiest plumbing).** Floors are known only *in*
    `R_DrawPlanes`, but the wall kick fires *after BSP, before planes*. Two options:

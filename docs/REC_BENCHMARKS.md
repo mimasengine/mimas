@@ -65,7 +65,12 @@ QW1 **on** (toujours) · QW2 **on** (`SAT_POTATO_INLINE_SPANS=1`). Blit 50/50 pa
    était **7–26 ms sur HW** → le gain de **L1 (hash visplane, attaque Bw/R_FindPlane)
    est invisible sur Ymir**, HW-only.
 
-### A.bis — Ymir L1 (post-QW + visplane hash `SAT_VISPLANE_HASH=1`, 2026-06-18)
+### A.bis — Ymir L1 (post-QW + visplane hash `sat_visplane_hash`, 2026-06-18)
+
+> **RECONCILED 2026-06-24 :** L1 n'est plus un `#define SAT_VISPLANE_HASH` mais un
+> **toggle RUNTIME `sat_visplane_hash`** (défaut 1, A/B live au pad-Y, core ea452d8).
+> QW1/QW2/L1 sont tous **SHIPPÉS + default-on** ; la table HW §C reste le **seul livrable
+> de mesure restant** pour les verdicts de gain.
 
 Validation de **L1 byte-identity** : Romain s'est replacé aux mêmes spots.
 
@@ -89,9 +94,56 @@ salle écrans concentre **~74 % du remplissage sol dans UN flat** sur 33 visplan
 n modéré = candidat RBG0 « un gros flat » intéressant) ; Y-eau fragmenté (49 %). À creuser plus
 tard si on attaque P par le hardware VDP2.
 
+## A.ter — Ymir shareware E1M1, NOUVEAU profiler fenêtré (1j, h1, 2026-06-24, build b:20:07)
+
+Premières captures avec le profiler fenêtré (p50/p95/max, peaks par phase, sizers floor,
+calibration mémoire). **⚠️ Doom shareware NON-STRIPPÉ (~14MB ici, >4MB → CD-STREAMING, pas
+de cart)** — donc CD-thrash comme Doom 2, PAS résident. ⚠️ Spots DIFFÉRENTS d'une capture à
+l'autre (FLR `n` varie 584→3823 = vues plus/moins chargées) → le p50/p95 inter-config
+**mélange mode ET spot** ; pour une échelle propre, rester immobile à UN spot plane-heavy et
+cycler pad Z.
+
+**RUN 2 (build b:21:59, garde `RP_REC_SANE` actif → `d0` = ZÉRO frame droppée = PROPRE).** Vues
+INTÉRIEURES (salles bois, `FLR n3` = quasi pas de sol → PAS plane-heavy ; p50/p95 = vues simples,
+pas le pire-cas). Spots ~identiques entre modes (cycle pad-Z immobile). **Toujours streaming** mais
+ces vues n'ont pas stallé (d0).
+
+| pot | fps i/avg | p50 | p95 | mx | MST | SLVi | Dr | PK Bw | PK Bp | PK P | PK M |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| pot0    | 36.4/26.3 | 32.0 | 58.0 | 88.7 | 27 | 21% | 94% | 7.0 | 54.4 | 44.0 | 26.3 |
+| pot0.5  | 41.0/27.5 | 28.0 | 54.0 | 75.5 | 24 | 24% | 93% | 6.6 | 53.6 | 34.8 | 24.6 |
+| pot1    | 53.0/45.1 | 18.0 | 42.0 | 75.2 | 18 | 39% | 93% | 6.9 | 53.9 | 18.4 | 23.9 |
+| pot2-bd | 52.0/37.9 | 18.0 | 40.0 | 71.0 | 19 | 39% | 93% | 7.4 | 54.5 | 17.0 | 24.4 |
+
+MEM **rL0.7** (lw512 hw664) — ⚠️ **SWAPPÉ** vs run1 (lw662 hw512 → rL1.2) : les deux valeurs ont
+littéralement échangé (total ~constant 1176) ⇒ **MEM-bench NON FIABLE sur Ymir** (variance inverse =
+pollution VBlank-IRQ probable landant dans l'un OU l'autre bench). HW-only, ET **à durcir** (min-of-N,
+IRQ off) avant de s'y fier. *(RUN 1 b:20:07, spots différents + non-gardé → PK/mx pollués CD
+`Bp~300 mx433-647`, superseded ; p50/p95 run1 ≈ run2.)*
+
+**Ce que ça établit (Ymir = mécanique/sanity, PAS les gains memory-bound) :**
+1. **Garde anti-glitch OK** (`d0`) → les PK redeviennent du RENDU (plus de `Bp~300`). ⚠️ peut rester
+   du leak <300ms ; le **p50/p95 reste le signal robuste**.
+2. **Les PK révèlent la structure du pire-cas** (= la valeur de l'idée « peaks par phase ») :
+   - **PK Bp ~54ms POTATO-INDÉPENDANT** (54.4/53.6/53.9/54.5 identiques) = le pire frame mur ; **le
+     potato ne touche PAS Bp**.
+   - **PK P 44→17 POTATO-DÉPENDANT** (le sol) ; **PK M ~24-26** (sprites combat).
+   - ⇒ **Hypothèse forte à valider HW : potato améliore la MOYENNE (p50 32→18) mais PAS le PIRE
+     (Bp~54 partout)** → pour la fluidité, attaquer **Bp** (murs), pas le sol.
+3. **`Dr 93-94 %`** — VDP1 finit ~93% des frames → marge réelle (« always B » périmé). HW à relire.
+4. **`FLR dom% 90-100 % mais n3`** — vues simples (3 visplanes) → **PAS le cas floor-offload** (exige
+   grand sol ouvert, `n` élevé) → re-mesurer au **spot EXTÉRIEUR plane-heavy** (cour/nukage E1M1).
+5. **MEM rL non fiable Ymir** (swap 1.2↔0.7) → ne rien conclure ; HW + bench durci.
+
 ---
 
 ## B. Hardware — baseline PRÉ-QW1/QW2 (réel Saturn, 2026-06-17, 6 photos)
+
+> **RECONCILED 2026-06-24 — section B = baseline STALE.** Ce set est **PRÉ-QW1/QW2/L1**
+> ET sa colonne **blit (~11.7–12.1 ms) est SUPERSEDED**. Le blit a été **recalibré à
+> ~5.5 ms single-CPU** (`dg_saturn.cxx:366-368`, 2026-06-22) → **soustraire ~6 ms de
+> chaque somme frame-ms de ce tableau** pour le build courant. **Conservé** comme seul
+> point de comparaison pré-QW (cf. protocole §3, ne pas écraser).
 
 Dernières vraies mesures hardware avant les quick-wins. Pas de Bw/M/splits sur ce set.
 **À remplacer par un set post-QW (section C) dès accès hardware.**
@@ -105,12 +157,23 @@ Dernières vraies mesures hardware avant les quick-wins. Pas de Bw/M/splits sur 
 | sombre/esc | 0 | 175 | 5.7 | 105.6 | 31.4 | 55.6 | 30.7 | 11.8 | i41 | 134B |
 | brun/eau | 0 | 94 | 10.6 | 53.7 | 20.5 | 21.9 | 12.5 | 12.1 | i59 | 133B |
 
-Rappel HW : blit **~12 ms constant**, slave **~80 % idle** à pot1/2, REC = 60–70 % de
-la frame. Échelle HW ≈ 2–4× les chiffres Ymir (et Bw/P encore plus, memory-bound).
+Rappel HW : blit **~5.5 ms single-CPU** (RECONCILED 2026-06-22 ; était noté ~12 ms ici,
+chiffre PÉRIMÉ ; **dual-CPU blit ESSAYÉ puis DROPPÉ** — aucune config ne bat le single,
+blit bus-bound S~1.3), slave **~80 % idle** à pot1/2, REC = 60–70 % de la frame. Échelle
+HW ≈ 2–4× les chiffres Ymir (et Bw/P encore plus, memory-bound).
 
 ---
 
-## C. Hardware — post-QW1/QW2 + L1/L2 — **À REMPLIR (pas d'accès HW avant ~2026-06-21)**
+## C. Hardware — post-QW1/QW2 + L1/L2 — **À REMPLIR (la fenêtre « pas d'accès HW » est passée)**
+
+> **RECONCILED 2026-06-24.** La note « pas d'accès HW avant ~2026-06-21 » est **datée
+> dépassée** : QW2 (`SAT_POTATO_INLINE_SPANS=1`), L1 (devenu le toggle **runtime**
+> `sat_visplane_hash`, core `ea452d8`, A/B pad-Y live) et le pool visplane
+> (`SAT_VISPLANE_POOL=1`, `VP_POOL_PLANES=96`) sont **SHIPPED dans le build** (Makefile/core),
+> blit recalibré ~5.5 ms. **QW1 et L2-SHRINK** (cmd buffer **80 KB** via
+> `-DRP_CMD_BUF_SIZE=0x14000`) sont **SHIPPÉS** aussi ; L2-RELOCATE→HWRAM reste non codé.
+> Cette section C reste **vide** → **la capture HW post-QW est la
+> mesure #1 en suspens** de tout le projet perf.
 
 | Spot | pot | REC | Bw | Bp (s/l) | P (a/m/o) | M | EX | c | SLV i% | inst | bl/f | Build |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|

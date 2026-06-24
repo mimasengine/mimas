@@ -48,6 +48,14 @@ On **console**: pot0 ≈ **~100ms / ~7fps = "playable"** (Romain, 2026-06-21).
 
 **Slave idle 58-65% at pot1/2** → spare capacity for the parked Bp offload (freeze-zone).
 
+> **RECONCILED 2026-06-24.** The slave is NOT idle-doing-nothing: it already runs **P3 plane-split
+> + masked-by-half SHIPPED** within each view (the slave draws half the visplane worklist and the
+> RIGHT-half vissprites of every view — `r_parallel.c` `RP_DispatchPlanes`/`RP_DispatchMasked`,
+> gates `sat_plane_parallel`/`sat_masked_parallel`=1). The 58-65% idle is the headroom **AFTER**
+> that phase work. The "parked offload" still open is specifically **Bp (wall-prep)**, the
+> freeze-zone item — distinct from the already-shipped P/M phase-split. (NB: this is the master/slave
+> LEFT/RIGHT masked split, not the x-split 2nd-renderer, which is compiled off — overflows 2MB.)
+
 ## Future rows (append measured runs here for comparison)
 
 | change | scene | pot | v0 | v1 | k | MST | fps | notes |

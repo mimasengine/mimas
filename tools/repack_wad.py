@@ -682,12 +682,29 @@ def main():
     info = args[1] if len(args) > 1 else 'core/info.c'
     out  = None
     want_report = False
+    if_stale = False
     for o in opts:
         if o.startswith('--emit='): out = o.split('=',1)[1]
         elif o == '--emit':        out = 'cd/data/DOOMRP.DRP'
         elif o == '--report':      want_report = True
+        elif o == '--if-stale':    if_stale = True   # skip emit if the .DRP already matches the WAD
         elif o == '--selftest':
             print("codec self-test:", codec_selftest(), "cases OK"); return
+
+    # --if-stale: regenerate only when the existing .DRP does NOT match this WAD.  Compares
+    # the .DRP header's n_lumps + dir_crc32 to the WAD -- catches a WAD *swap* (which file
+    # mtime alone misses, since the swapped-in file can be older than the .DRP).
+    if out and if_stale and os.path.exists(out):
+        try:
+            h = open(out, 'rb').read(HDR_SZ)
+            magic, n_lumps, crc = struct.unpack_from('<4sII', h, 0)
+            d, lumps, _ = read_wad(wad)
+            if magic == b'DRP1' and n_lumps == len(lumps) and crc == dir_crc32(d, lumps):
+                print(f"{out} already matches {wad} (CRC {crc:#010x}) -- skipping repack.")
+                return
+            print(f"{out} stale vs {wad} -- regenerating.")
+        except Exception as e:
+            print(f"{out} unreadable ({e}) -- regenerating.")
 
     # plain run -> report; --emit -> emit only (single compression pass, for builds);
     # --emit --report -> both.

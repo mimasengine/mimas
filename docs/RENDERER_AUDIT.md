@@ -25,6 +25,16 @@ Repos audited (cloned in `../saturn-refs/`):
 > the ~8.6 fps baseline is **serial master-only** rendering. We are nowhere near
 > the software ceiling — the second SH-2 is effectively idle. This reframes the
 > whole "should we go hardware?" question (see §4).
+>
+> **RECONCILED 2026-06-24 — THIS REALITY CHECK IS STALE.** The slave is no longer
+> idle and the renderer no longer disables itself in ship config. The slave now
+> actively runs the **P plane-half** (`r_plane.c:1206`) AND the **M sprite-half**
+> (`r_things.c:1185`), both SHIPPED on by default (`main.cxx:52-53`). The
+> `rp_disabled=1` at `r_main.c:1181` is now *intentional* — plane-parallel forces
+> the legacy parity renderer off so there is no double-dispatch conflict; it is not
+> a timeout failure. Residual slave idle = the serial **B phase** (BSP/clip), of
+> which only **Bp wall-prep** is offloadable. The ~8.6 fps figure also predates the
+> potato ship config; current solo is ~5–12 fps depending on scene (hardware-measured).
 
 ---
 
@@ -39,6 +49,18 @@ Repos audited (cloned in `../saturn-refs/`):
   GBR+72 hack to avoid the SGL leak/freeze, and a single timeout permanently
   disables it.
 - The slave does **nothing** during the BSP walk except spin on `ready`.
+
+> **RECONCILED 2026-06-24 — dual-CPU framebuffer blit is HW-REJECTED, do not
+> re-investigate.** A separate "use the slave to copy the bottom framebuffer rows"
+> lever was built and measured on real hardware (2026-06-22). Verdict: **DROP** — no
+> dual config beats single. `src/dg_saturn.cxx`: `DUAL_CPU_BLIT=1` is compiled
+> (full dual path :2495-2523, `blit_slave_body` copies the bottom rows with a
+> bounded-wait fallback to the master), but `blit_mode` boot default = **0
+> (single-CPU)** (:366-368). Measured: blit ~5.5ms (recalibrated down from ~12ms),
+> **bus-bound S~1.3**; the 50/50 split is the WORST at 6.0ms vs 5.5ms single. The
+> code is KEPT GATED (not dead-stripped) only as the live **L+R-chord A/B harness**
+> (:2773) and because it shares `rp_sgl_workptr_reset` plumbing with the P/M
+> dispatch; compiled-out cost is ~nil since `blit_mode=0` takes the single path.
 
 ### d32xr (the model to copy)
 - The secondary SH-2 runs a **persistent dispatch loop**, `Mars_Secondary()`
@@ -170,6 +192,23 @@ parallel renderer is confirmed live again — today's numbers are serial.
 |---|-----------|---------------|----------------|
 | **2.4** | **Give the slave whole phases, not half the columns**: move wall-prep / visplane setup / sprite-half onto the slave (producer/consumer with the master's BSP). | d32xr `r_phase2.c:346`. Bigger change to the sync core (freeze history) → careful. | REC should drop (master does less); W tells if balanced |
 | **2.5** | **Rebalance the column split** by the `W` measurement: W≈0 ⇒ master-bound, give slave >50%; W≈EX ⇒ slave-bound, give master more. | perf-notes 2.1 "two pointers meet in the middle" | row-19 `W` before/after |
+
+> **RECONCILED 2026-06-24 — 2.4 is PARTLY DONE (SHIPPED), 2.5 is SHIPPED:**
+> - **2.4 → PARTLY DONE.** The "whole phases" model is shipped for two of the three
+>   phases: **planes** (P, `r_plane.c:1206`) and **sprite-half** (M, `r_things.c:1185`)
+>   are committed and on by default. Only **wall-prep** remains (the `Bp`
+>   producer/consumer): STEP-1 master-only defer harness is committed but gated OFF
+>   (`sat_wallprep_defer=0`), STEP-2 slave-consumes-while-master-produces overlap is
+>   NOT built (the freeze-zone). Pixel-weighting the fixed 50/50 plane/sprite split
+>   is a low-priority refinement.
+> - **2.5 → SHIPPED, but INACTIVE in ship config.** The two-pointer meet-in-the-middle
+>   work-steal is committed in `core/r_parallel.c` (master forward from 0 / slave
+>   backward from `mat-1` in 16-cmd chunks, sync fields :122-123, steal loop :627-660,
+>   init :777-782; SYNC struct uncached via the `0x20000000` alias). It is NOT
+>   "uncertain — measure". HOWEVER it is **DEAD on the active 1p path**: it lives in
+>   the parity renderer, which `sat_plane_parallel=1` disables (`rp_disabled=1`,
+>   `r_main.c:1180-1181`). It runs only in the legacy `sat_plane_parallel=0`
+>   (non-ship) config. Zero cost when disabled; keep, mutually exclusive with P/M.
 | **2.6** | **Hand-asm the column loop** (tight SH-2 loop, GBR colormap, shift-stride, `dt`+delayed-branch), *tight, not unrolled*. | d32xr `sh2_draw.s`. Risk: I-cache; only worth it if EX is fillrate-bound. | EX per-command |
 | **2.7** | **Overlap the SH-2 hardware divider** (`DIVU`): start a divide, do work, collect the quotient — for scale/perspective math. | d32xr `r_phase2.c:178` (`SH2_DIVU_DVSR/DVDNT`). Saturn SH-2 has the same unit. | REC |
 | **2.8** | **Sky → VDP2 scroll layer** instead of software columns; frees fillrate + command count. | classic Saturn trick; reduces `c` | EX, `c` |

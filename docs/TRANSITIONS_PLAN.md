@@ -1,6 +1,12 @@
 # Level Start/End Transitions (Fades) — Design Note
 
-Status: **Option 1 IMPLEMENTED 2026-06-23 (pending Ymir/HW validation), uncommitted.**
+Status: **Option 1 SHIPPED + COMMITTED — core 4f06d65 (`d_main.c` hooks) + port a693a4e (`DG_FadeOut`/`DG_FadeIn` in `dg_saturn.cxx`). No longer uncommitted.**
+> RECONCILED 2026-06-24: the fade is live in the ship build. `DG_FadeOut`/`DG_FadeIn`
+> (`src/dg_saturn.cxx:1561-1570`) drive `dg_fade_bake` (`:1522`, `FADE_STEPS=16` at `:1520`),
+> ramping `pending_cram` (+ `pending_wbank`) for the no-`slSynch` vblank handler to copy to CRAM;
+> hooked in `core/d_main.c` (`DG_FadeOut` :265 leaving-level, `DG_FadeIn` :437-441 after
+> `I_FinishUpdate`). Only the HW-read-quality items below remain — a short validation checklist,
+> not a blocking status. Options 2/3/4 stay as rejected/fallback documentation.
 The vanilla screen-melt (`f_wipe`) is disabled in CD-streaming mode because it
 crashes (see *Why the melt is gone*); it's now replaced by the **software CRAM
 palette dip-to-black** (option 1): `DG_FadeOut`/`DG_FadeIn` in `src/dg_saturn.cxx`
@@ -10,9 +16,13 @@ no-`slSynch` path), driven from the gamestate transition in `core/d_main.c`
 (streaming only): fade the current frame out, draw the new gamestate while CRAM
 is black, fade in after the blit. Works BOTH directions (fade-in needs no
 captured screen, so entering a level transitions too — the melt never could).
-FADE_STEPS=16 (~0.27 s each way). Open: HW-validate the VDP1 wall layer behaves
-during the blocking fade (it should keep redrawing the last command list, dimming
-via CRAM); tune FADE_STEPS to taste.
+FADE_STEPS=16 (~0.27 s each way). Validation checklist (no code work outstanding):
+HW-confirm the VDP1 wall layer dims cleanly during the blocking fade; tune
+FADE_STEPS to taste.
+> RECONCILED 2026-06-24: the wall-bank ramp inside `dg_fade_bake` is gated
+> `#if VDP1_WALL_TEST` (`src/dg_saturn.cxx:1533-1552`), so in the non-VDP1 **ship**
+> build only `pending_cram` ramps — the "VDP1 wall layer behaves during the fade"
+> open item applies ONLY to the experimental VDP1-wall build.
 
 ---
 
@@ -56,8 +66,8 @@ So any replacement transition must:
 
 Doom's `I_SetPalette` writes the 256-entry `colors[]` and sets `palette_changed`.
 On the next frame `dg_saturn.cxx` bakes `colors[]` → `pending_cram[256]` (RGB555,
-MSB=1) and sets `palette_dirty` (`src/dg_saturn.cxx:2372-2381`); the **vblank
-handler copies `pending_cram` straight into CRAM** (`src/dg_saturn.cxx:729-734`)
+MSB=1) and sets `palette_dirty` (`src/dg_saturn.cxx:2445-2450`); the **vblank
+handler copies `pending_cram` straight into CRAM** (`src/dg_saturn.cxx:753-757`)
 — a direct CRAM write, **no `slSynch`, proven every frame**. A fade is nothing
 more than driving this exact path with a toward-black (or from-black) ramp over
 N frames.
@@ -154,8 +164,9 @@ fallback if a CRAM/offset fade proves unworkable.
 
 - Disabled melt + the crash anatomy: `docs/STREAMING_ANALYSIS.md` §3 S3,
   `core/d_main.c` (leaving-level branch), `core/f_wipe.c:237,249`.
-- Proven no-`slSynch` CRAM path: `src/dg_saturn.cxx:729-734` (vblank copy),
-  `:2372-2381` (bake from `colors[]`).
+- Proven no-`slSynch` CRAM path: `src/dg_saturn.cxx:753-757` (vblank copy),
+  `:2445-2450` (bake from `colors[]`). Fade impl: `DG_FadeOut`/`DG_FadeIn` `:1561-1570`,
+  `dg_fade_bake` `:1522`, `FADE_STEPS=16` `:1520` (wall-bank ramp gated `#if VDP1_WALL_TEST` `:1533-1552`).
 - SRL colour-offset/calc: `SaturnRingLib/saturnringlib/srl_vdp2.hpp`
   (`ColorOffset` :1538, `SetColorOffsetA` :1626, `UseColorOffset` :684);
   sample `SaturnRingLib/Samples/VDP2 - ColorCalc/`.

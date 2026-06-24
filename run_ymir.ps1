@@ -1,14 +1,16 @@
 # Launch Ymir with DoomSRL.
-# Usage: powershell -ExecutionPolicy Bypass -File run_ymir.ps1 [-Build] [-Paused] [-Debug]
+# Usage: powershell -ExecutionPolicy Bypass -File run_ymir.ps1 [-Build] [-Paused] [-Debug] [-Wad <name>]
 #
 # -Build  : rebuild the disc image before launching
 # -Paused : start Ymir paused (useful with -Debug)
 # -Debug  : enable Ymir debug tracing (F11 to toggle in-session)
+# -Wad    : IWAD from wads_temoins/ to bundle (forwarded to build.ps1; needs -Build)
 
 param(
     [switch]$Build,
     [switch]$Paused,
-    [switch]$Debug
+    [switch]$Debug,
+    [string]$Wad
 )
 
 $ErrorActionPreference = "Stop"
@@ -23,7 +25,13 @@ if (-not (Test-Path $ymir)) {
 
 if ($Build) {
     Write-Host "Building..."
-    powershell -ExecutionPolicy Bypass -File (Join-Path $root "build.ps1")
+    $buildArgs = @("-ExecutionPolicy", "Bypass", "-File", (Join-Path $root "build.ps1"))
+    if ($Wad) { $buildArgs += @("-Wad", $Wad) }
+    powershell @buildArgs
+    if ($LASTEXITCODE -ne 0) { throw "build.ps1 failed (exit $LASTEXITCODE)" }
+}
+elseif ($Wad) {
+    Write-Warning "-Wad has no effect without -Build (the existing disc image is reused as-is)."
 }
 
 $cue = Join-Path $root "build\DoomSRL.cue"

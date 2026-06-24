@@ -163,6 +163,15 @@ so it looked fine in the emulator (and that is the trap behind the "hardware-con
 end-to-end" claim in older notes — **treat that claim as unverified**; the committed
 `HEAD` has *no* commit of the pattern, only `slScrAutoDisp(... | RBG0ON)`).
 
+> **RECONCILED 2026-06-24:** The "*no* commit of the pattern" line is stale for the
+> RDBS half. The tree now has `rbg0_commit_ramctl()` (`dg_saturn.cxx:1031-1039`) which
+> direct-writes RAMCTL `@0x25F8000E` (RDBS / rotation-data-bank-select) with before/after
+> readback (overlay row 14), called at :1219 — gated under `VDP2_RBG0_TEST`. So the
+> **RAMCTL/RDBS direct-register commit exists**. What is still absent is the
+> **CYCA0/A1/B0/B1 cycle-pattern direct-poke** — and per the failure law (§2) that is the
+> half that actually causes the snow. RDBS alone is implemented but insufficient; still
+> gated + unverified on HW.
+
 **Jo Engine, by contrast, calls `slSynch()` every frame** (`core.c:560/629`,
 `console.c:307`) — which is why Jo's RBG0 floor works: Jo's whole frame is built around
 `slSynch`, so its shadow registers always reach the chip. DoomSRL is not.
@@ -279,6 +288,10 @@ Is the RBG0 floor's measured hardware CPU win  >  the cost of losing the HW sky?
                    (b) commit RAMCTL/CYC by DIRECT register writes — NOT slSynch
                        (even one-shot slSynch was HW-tested worse), NOT slScrCycleSet
                        (shadow-only). Poke RAMCTL @0x25F8000E + CYCxx, Jo 0x1327 style.
+                       [RECONCILED 2026-06-24] The RAMCTL/RDBS direct-register write
+                       NOW EXISTS in the tree (rbg0_commit_ramctl, gated). The STILL-
+                       MISSING piece is the CYCA0/A1/B0/B1 cycle-pattern direct-poke —
+                       RAMCTL RDBS alone is implemented but insufficient (snow persists).
          optional: keep HW sky only if the coefficient table goes in Color RAM
                    (CRKTE) without breaking the 8bpp palette — unproven, investigate.
 ```
@@ -300,7 +313,16 @@ Reframing question first — **is the sky a bigger REC sink than the floor? No.*
 indoors** (only F_SKY1 ceilings/outdoor upper walls) and only grows outdoors — exactly
 where the floor is *also* large.
 
-**Hardware A/B (Romain, 2026-06-19) — the floor offload is the single biggest lever:**
+**Hardware A/B (Romain, 2026-06-19) — the floor offload is the single biggest lever**
+*(pot0, pre-potato-ship)*:
+
+> **RECONCILED 2026-06-24:** This 6-row table is **pot0, pre-potato-ship**. The actual
+> ship config is now **potato (pot1/pot2)**: solo baseline ~5-12 fps depending on scene,
+> blit ~5.5 ms (recalibrated down from ~12), slave **~80 % idle** at pot1/2. So at the
+> ship config the RBG0 floor's **CPU prize shrinks** (already noted §6) AND its
+> **slave-relief is smaller** (the slave is already mostly idle, not 46% busy). The
+> floor's value at potato is therefore mostly **quality** (textured-in-perspective
+> dominant flat) rather than a large fps gain.
 
 | | frame | fps | master EX | slave |
 |---|---|---|---|---|

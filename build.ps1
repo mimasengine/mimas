@@ -70,8 +70,9 @@ if ($Wad) {
 }
 
 # Per-level repack: emit cd/data/DOOMRP.DRP before the ISO step (runs after any -Wad
-# swap so it repacks the IWAD that will actually ship). Regenerate only when an input
-# (WAD / info.c / the tool) is newer than the existing .DRP.
+# swap so it repacks the IWAD that will actually ship). The tool's --if-stale compares
+# the .DRP header (n_lumps + dir_crc32) to the WAD and regenerates only on a real
+# mismatch -- robust to a WAD SWAP (which file mtime alone misses).
 if ($Repack) {
     $wadFile = Join-Path $root "cd\data\DOOM1.WAD"
     $drpFile = Join-Path $root "cd\data\DOOMRP.DRP"
@@ -82,21 +83,10 @@ if ($Repack) {
     if (-not $py) { $py = (Get-Command py -ErrorAction SilentlyContinue).Source }
     if (-not $py) { throw "-Repack: python not found on PATH (needed to build the .DRP)" }
 
-    $stale = $true
-    if (Test-Path $drpFile) {
-        $drpT = (Get-Item $drpFile).LastWriteTimeUtc
-        $stale = ((Get-Item $wadFile).LastWriteTimeUtc  -gt $drpT) -or
-                 ((Get-Item $infoFile).LastWriteTimeUtc -gt $drpT) -or
-                 ((Get-Item $toolFile).LastWriteTimeUtc -gt $drpT)
-    }
-    if ($stale) {
-        Write-Host "Repacking per-map .DRP (LZSS) -> cd/data/DOOMRP.DRP ..."
-        & $py $toolFile $wadFile $infoFile "--emit=$drpFile"
-        if ($LASTEXITCODE -ne 0) { throw "repack_wad.py failed (exit $LASTEXITCODE)" }
-        Write-Host "Repack OK ($('{0:N0}' -f (Get-Item $drpFile).Length) bytes)"
-    } else {
-        Write-Host "Per-map .DRP up to date -- skipping repack."
-    }
+    Write-Host "Repack: ensuring cd/data/DOOMRP.DRP matches the IWAD..."
+    & $py $toolFile $wadFile $infoFile "--emit=$drpFile" "--if-stale"
+    if ($LASTEXITCODE -ne 0) { throw "repack_wad.py failed (exit $LASTEXITCODE)" }
+    Write-Host "Repack OK ($('{0:N0}' -f (Get-Item $drpFile).Length) bytes)"
 }
 
 function ConvertTo-Msys2Path([string]$p) {

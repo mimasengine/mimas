@@ -1,8 +1,14 @@
 # L2 — Command buffer → fast HWRAM : spec prête-à-coder
 
-Statut : **SPEC (non codé)**, 2026-06-18. À coder **après** la session RBG0-floors en
-cours (overlap probable sur `dg_saturn.cxx` — voir §8). Budget mesuré : voir
-`docs/REC_REDUCTION.md` L2 + ce doc §6. Gain **HW-only et invisible sur Ymir**.
+Statut : **RELOCATE = SPEC (non codé)** ; **SHRINK = SHIPPÉ** (voir RECONCILED ci-dessous).
+Budget mesuré : voir `docs/REC_REDUCTION.md` L2 + ce doc §6. Gain **HW-only et invisible sur Ymir**.
+
+> **RECONCILED 2026-06-24 :** La moitié SHRINK est **déjà shippée** via Makefile
+> `-DRP_CMD_BUF_SIZE=0x14000` = **80 KB** (PAS le 0x10000/64 KB de cette spec). Le buffer
+> reste en haut de LWRAM (adresse dérivée `0x300000-SIZE`), `DG_ZoneBase` rend les 80 KB
+> à la zone heap streaming. Seule la moitié **RELOCATE** (buffer → HWRAM BSS) reste non codée.
+> Le gate §8 « coder après RBG0 » est **caduc** : RBG0-floors a cassé sur HW (snow + ciel
+> mort) et a été reverté — il n'y a plus de session RBG0 vivante à coordonner.
 
 ## 1. Objectif
 
@@ -30,9 +36,16 @@ d'équilibre du work-steal 2.5 (et du blit dual-CPU) peut bouger** → re-mesure
 filet si dépassé). Garder la **même taille dans les deux bras** A/B pour n'isoler que
 la banque.
 
+> **RECONCILED 2026-06-24 :** le shrink a en fait SHIPPÉ à **0x14000 (80 KB)**, pas
+> 0x10000 (64 KB). Le RELOCATE doit réutiliser cette taille **80 KB déjà shippée** (ou
+> shrinker plus), et **re-vérifier le build.map** : +80 KB BSS pousse `_end` 0x060da9e0
+> → ~0x060eea9e0, laissant **~45 KB** de heap C (et non les ~61 KB calculés ici pour 64 KB).
+
 ### 3a. `core/r_parallel.h`
 ```c
-#define RP_CMD_BUF_SIZE  0x00010000   /* 64KB = 2048 cmds (was 0x28000/5120) */
+/* RECONCILED 2026-06-24: SHIPPED value is 0x14000 (80KB) via Makefile -D, NOT 0x10000.
+   RP_CMD_BUF_SIZE is already -D-overridable in r_parallel.h; keep the shipped 80KB. */
+#define RP_CMD_BUF_SIZE  0x00010000   /* spec was 64KB = 2048 cmds (was 0x28000/5120) */
 
 #define RP_CMD_BUF_IN_HWRAM 1         /* A/B: 1 = fast HWRAM BSS, 0 = legacy slow LWRAM addr */
 #if RP_CMD_BUF_IN_HWRAM
@@ -88,7 +101,10 @@ HWRAM ; n doit rester 0 comme aujourd'hui.
 
 ## 6. Budget
 
-- **DoomSRL** : +64 KB BSS pousse `_end` 0x060da9e0 → 0x060ea9e0, laisse **~61 KB** de
+- **DoomSRL** : *(RECONCILED 2026-06-24 : pour la taille SHIPPÉE 80 KB, +80 KB BSS pousse
+  `_end` 0x060da9e0 → ~0x060eea9e0, laisse **~45 KB** de heap C — re-vérifier le build.map
+  avant de committer le RELOCATE.)* Chiffres spec d'origine (64 KB) : +64 KB BSS pousse
+  `_end` 0x060da9e0 → 0x060ea9e0, laisse **~61 KB** de
   heap C (sur ~125). OK **ssi** malloc (newlib, distinct du Z_Malloc LWRAM) < 61 KB →
   **à vérifier** (grep usages malloc/calloc/sbrk ; Doom utilise Z_Malloc, donc heap C
   probablement quasi vide). Si le link échoue (overflow region) → réduire à 48 KB (1536)
@@ -105,12 +121,17 @@ HWRAM ; n doit rester 0 comme aujourd'hui.
 3. RPBAD row-15 = 0 sur les deux bras (cohérence).
 4. Si gain net ≤ bruit → garder LWRAM (flag 0) et clore L2.
 
-## 8. Coordination RBG0 (session parallèle)
+## 8. Coordination RBG0 (session parallèle) — **CADUC**
 
-RBG0-floors touche très probablement **`dg_saturn.cxx`** (setup VDP2/RBG0) et la
+> **RECONCILED 2026-06-24 :** ce gate est annulé. RBG0-floors a **cassé sur HW** (snow +
+> ciel mort : RAMCTL/cycle-pattern jamais committé sans slSynch) et a été reverté — il
+> n'y a **plus de session RBG0 vivante** à coordonner. Le hunk `DG_ZoneBase` du RELOCATE
+> peut être codé directement.
+
+~~RBG0-floors touche très probablement **`dg_saturn.cxx`** (setup VDP2/RBG0) et la
 floor-path de `r_plane.c`. **L2 touche `dg_saturn.cxx` (DG_ZoneBase)** → **point de merge
 commun**. Coder L2 **après** RBG0 et rebaser le hunk DG_ZoneBase dessus. `r_parallel.{c,h}`
-n'a pas d'overlap attendu avec RBG0.
+n'a pas d'overlap attendu avec RBG0.~~
 
 ## 9. Fichiers & revert
 

@@ -51,15 +51,16 @@ Gain = rough fraction of the targeted phase, to be confirmed on hardware. Risk: 
 
 | # | Piste | Phase | Gain (est.) | Risk | Solo | Multi | Revert | Statut |
 |---|-------|-------|------------|------|------|-------|--------|--------|
-| QW1 | **Trim dead `texturecolumn`** in VDP1-owned wall columns (gate on `sw_draws‖maskedtexture`) | Bp | small–med (per-col FixedMul + 2 array reads ×most cols) | 🟢 | ✓ | ✓ | ⟲ | **IMPLEMENTED, built green, awaiting HW** |
-| QW2 | **Potato floors drawn INLINE** (memset in R_MapPlane; skip RP_RecordSpan + executor) | P | med (kills 32 B write + 32 B read / span) | 🟡 | ✓ | ✓ | ⟲ (`SAT_POTATO_INLINE_SPANS 0`) | **IMPLEMENTED, built green, awaiting HW** |
-| L1 | **visplane hash** in R_FindPlane (d32xr-style) — O(n)→O(1) | Bw/P | med in plane-heavy scenes | 🟡 (core, shared w/ DoomJo; behaviourally identical) | ✓ | ✓ | ⟲ (`SAT_VISPLANE_HASH 0`) | **IMPLEMENTED, built green, awaiting HW** (gain HW-only — Bw is 2–3 ms on Ymir vs 7–26 ms on HW) |
-| L2 | **Command buffer → HIGH work-RAM** (shrink to ~32–64 KB so it fits the fast bank) | REC+EX | med (write+read on fast bank) | 🟡 (HWRAM budget; relocation; shared core) | ✓ | ✓ | ⟲⟲ | **budget measured 2026-06-18: feasible-but-tight.** Buf = 160 KB/5120 cmds @0x002D8000 (slow LWRAM) but `c` peaks ~1068 → 64 KB/2048 has 2× margin. HWRAM heap reserve ~125 KB (`_end` 0x060da9e0 → `__heap_end` 0x060fa000); a 64 KB BSS buf leaves ~61 KB heap → OK iff C-malloc < 61 KB (verify). Caveat: gain is **Ymir-invisible** (bank-latency only) + touches shared `r_parallel.h` (DoomJo map) + freeze-zone. See §2. |
+| QW1 | **Trim dead `texturecolumn`** in VDP1-owned wall columns (gate on `sw_draws‖maskedtexture`) | Bp | small–med (per-col FixedMul + 2 array reads ×most cols) | 🟢 | ✓ | ✓ | ⟲ | **SHIPPED** (committed, default-on, byte-identical on DoomJo); HW GAIN measurement pending |
+| QW2 | **Potato floors drawn INLINE** (memset in R_MapPlane; skip RP_RecordSpan + executor) | P | med (kills 32 B write + 32 B read / span) | 🟡 | ✓ | ✓ | ⟲ (`SAT_POTATO_INLINE_SPANS 0`) | **SHIPPED** (committed, default-on; ship config IS potato → on the hot path); HW A/B GAIN pending |
+| L1 | **visplane hash** in R_FindPlane (d32xr-style) — O(n)→O(1) | Bw/P | med in plane-heavy scenes | 🟡 (core, shared w/ DoomJo; behaviourally identical) | ✓ | ✓ | ⟲ (runtime `sat_visplane_hash=0`) | **SHIPPED** (committed, default-on; now a RUNTIME toggle `sat_visplane_hash`, core ea452d8 — NOT a `#define`; live pad-Y A/B on HW); HW GAIN pending (Bw is 2–3 ms on Ymir vs 7–26 ms on HW) |
+| L2-SHRINK | **Command buffer shrink** (return slow-LWRAM space to the streaming zone heap) | REC+EX | med | 🟡 | ✓ | ✓ | ⟲ | **SHIPPED** — Makefile `-DRP_CMD_BUF_SIZE=0x14000` = **80 KB** (not the spec's 64 KB), 1.9× the ~1068-cmd Ymir peak; buffer still top-of-LWRAM (addr derived), `DG_ZoneBase` reclaims the 80 KB to the zone. |
+| L2-RELOCATE | **Command buffer → HIGH work-RAM** (BSS `rp_cmd_buf[]` on the fast bank) | REC+EX | med (write+read on fast bank) | 🟡 (HWRAM budget; relocation; shared core) | ✓ | ✓ | ⟲⟲ | **STILL-TODO.** Un-coded (`RP_CMDS` still points to LWRAM; no `RP_CMD_BUF_IN_HWRAM` / `rp_cmd_buf[]`). Spec `docs/REC_L2_SPEC.md` §3 — but recompute the HWRAM budget for the SHIPPED 80 KB BSS (~45 KB heap-C left, not the spec's 61 KB). Gain **Ymir-invisible** (bank-latency only) + freeze-zone. RBG0-merge gate dropped (RBG0 broke on HW, session closed). |
 | L3 | **Command compaction** (per-type short records; FUZZ=9 B, COL=28 B vs 32 B) | REC+EX | small–med (less DRAM traffic) | 🔴 (breaks fixed-stride parity index + two-pointer steal) | ✓ | ✓ | ⟲⟲ | catalogued — likely not worth the complexity |
 | T1 | **Idle-camera REC skip** (re-present last frame when output provably identical) | all REC | huge *when it fires* | 🟡🔴 (VDP1-hybrid present path + determinism) | ✓ | ✓ | ⟲ | catalogued — see §4 (safe form low-value at 8 fps) |
 | T2 | **Pure-yaw wall-prep reuse** (cylindrical projection: yaw shifts columns, not heights) | Bp | large (theoretical) | 🔴 (deep; invalidation) | ✓ | ✓ | ✗ | catalogued — research, not near-term |
 | T3 | **Half-rate planes** (regenerate P every other frame) | P | ~½ P | 🔴 (visible artefact on motion) | ✓ | ✓ | ⟲ | catalogued — quality risk |
-| L4 | **DIVU overlap** for remaining per-seg divisions | Bp | tiny (few divs left after VDP1 walls) | 🟡 | ✓ | ✓ | ⟲⟲ | catalogued — low value now |
+| L4 | **DIVU overlap** for remaining per-seg divisions | Bp | tiny (few divs left after VDP1 walls) | 🟡 | ✓ | ✓ | ⟲⟲ | **STILL-TODO (catalogued, low value).** Async DIVU-overlap unbuilt; residual tiny because QW1/lever-C already skip the per-column `dc_iscale` divide (r_segs.c:558-570). |
 | L5 | **Scratchpad (CCR TW=0x08)** for a hot REC datum | — | ~0 / negative | 🔴 (halves the 4 KB cache on a cache-bound load) | ✓ | ✓ | ⟲ | **rejected** — see §2 |
 | M1 | **Per-view parallelism** (master=P1, slave=P2, independent contexts) | N×REC→~1×REC | large (multi only) | 🔴 (context dup + allocator gate + VDP1 ×N) | — | ✓ | ✗ | catalogued — see §5, gate is make-or-break |
 | — | PVS/REJECT culling of the BSP walk | Bw | ~0 | — | — | — | — | **rejected** — Doom's renderer does exact visibility via solidsegs; REJECT is sight-only |
@@ -84,9 +85,12 @@ Gain = rough fraction of the targeted phase, to be confirmed on hardware. Risk: 
   but **halves the cache to 2 KB**. On a cache/memory-bound master this is almost
   certainly a net loss; the only candidates small enough (colormap 256 B, clip arrays
   640 B) are either EX-side or already on the fast bank. **Rejected (L5).**
-- **DIVU.** After VDP1 walls + lever-C, the per-column `0xffffffff/rw_scale` divide is
-  already skipped; remaining REC divisions are a few per seg (R_ScaleFromGlobalAngle,
-  rw_scalestep). DIVU-overlap value is now small (L4).
+- **DIVU.** QW1/lever-C already **eliminate the dominant per-COLUMN** `0xffffffff/rw_scale`
+  divide for VDP1-owned/solid walls — nested guards at `r_segs.c:558` (`if (sw_draws)`)
+  and the `!wall_solid` guard near `r_segs.c:569-570`. Remaining REC divisions are a few
+  *per seg* (R_ScaleFromGlobalAngle, rw_scalestep). The async DIVU-overlap (L4) of those
+  residual per-seg divides is **unbuilt**, and its value is now small precisely because
+  the costly per-column divide is already skip-gated.
 - **Bus contention (the Saturn curse).** Two SH-2 cannot both hit RAM at full rate; the
   2.5 work-steal already measured the slave ~1.5× slower reading commands from RAM.
   This **bounds every parallelism gain** — it is why per-view multi (M1) cannot reach a
@@ -99,7 +103,8 @@ Gain = rough fraction of the targeted phase, to be confirmed on hardware. Risk: 
 - **d32xr — visplane HASH (`visplanes_hash`, `R_FindPlane` by `flatandlight`).** Ours
   is a linear scan (r_plane.c:301) called per subsector for floor+ceiling → O(n²) slow-
   DRAM reads in plane-heavy rooms. A hash (or even a small picnum bucket) is the single
-  most transferable *algorithmic* REC win that needs no slave → **L1**.
+  most transferable *algorithmic* REC win that needs no slave → **L1** (SHIPPED, default-on
+  via the runtime toggle `sat_visplane_hash`, core ea452d8).
 - **d32xr — compact `VINT`/16-bit fields + cache-aligned hot functions.** Less memory
   traffic on a memory-bound path. Our shared core uses 32-bit everywhere; the one
   DoomSRL-ownable compaction is the command record (L3).
@@ -236,11 +241,11 @@ otherwise nearly empty). Revert: `SAT_POTATO_INLINE_SPANS 0`.
 
 ## 7. Recommended order
 
-1. **QW1 + QW2** (done, gated) → hardware A/B at the 6 spots.
-2. **L1 visplane hash** — **DONE (built green, gated `SAT_VISPLANE_HASH`)**, awaiting the same HW pass. Best remaining *algorithmic* solo win, no slave, helps multi.
-3. **L2 command buffer → fast RAM** (shrink + relocate) — attacks the memory-bound core
-   directly. **SPEC ready-to-build: `docs/REC_L2_SPEC.md`** (budget measured, gated A/B).
-   Code it AFTER the parallel RBG0-floors session (merge overlap on dg_saturn.cxx).
+1. **QW1 + QW2** — **SHIPPED** (committed, default-on) → hardware A/B GAIN at the 6 spots still pending.
+2. **L1 visplane hash** — **SHIPPED** (committed, default-on; RUNTIME toggle `sat_visplane_hash`, NOT a `#define`; live pad-Y A/B on HW). Best remaining *algorithmic* solo win, no slave, helps multi. HW GAIN pending.
+3. **L2 command buffer** — **SHRINK SHIPPED** (Makefile `-DRP_CMD_BUF_SIZE=0x14000` = 80 KB; `DG_ZoneBase` reclaims it to the streaming zone). **RELOCATE → fast RAM is STILL-TODO** — attacks the memory-bound core
+   directly. **SPEC: `docs/REC_L2_SPEC.md`** (recompute HWRAM budget for the shipped 80 KB BSS).
+   RBG0-floors merge gate dropped (RBG0 broke on HW, that session is closed).
 4. Multi: build the **allocator pre-cache gate (cart-agnostic)** as the first, isolated
    step before any per-view parallelism.
 5. Temporal coherence (T1/T3) only if a concrete idle/menu/multi case justifies the

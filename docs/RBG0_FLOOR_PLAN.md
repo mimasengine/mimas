@@ -17,6 +17,12 @@ hardware (and both invisible on Ymir):
    commit at all (only `slScrAutoDisp(...|RBG0ON)`); the "one-shot slSynch fix" the
    memory recorded as built is **not in the committed tree** — treat
    "hardware-confirmed end-to-end" as **unverified**.
+   > **RECONCILED 2026-06-24:** Stale on one point — the tree now HAS a direct-register
+   > RAMCTL/RDBS commit: `dg_saturn.cxx rbg0_commit_ramctl()` (:1031-1039) pokes
+   > RAMCTL `@0x25F8000E` with before/after readback (overlay row 14), called at :1219
+   > (gated under `VDP2_RBG0_TEST`). So the RDBS half of the commit exists. What is still
+   > missing is the **CYCxx cycle-pattern direct-poke** — the half that actually fixes
+   > the snow (RAMCTL RDBS alone is insufficient). Still gated + unverified on HW.
 2. **Bank over-subscription.** A cell RBG0 with a VRAM coefficient table needs **3 whole
    banks** (pattern-name, character, coefficient — each claims an *entire* bank's
    timing, per the VDP2 manual). With the mandatory framebuffer that's 4 banks → **no
@@ -94,7 +100,17 @@ RBG0 needs a **dedicated bank with all 8 access cycles** (SRL `srl_vdp2.hpp`:
 
 ## Phases (validate riskiest-cheapest first, hardware each step)
 
-- **Phase 0 — bring-up + coexistence (CURRENT).** RBG0 cell plane, single repeating
+> **RECONCILED 2026-06-24 — phase status:** Phases 0-3 are **CODE-COMPLETE-BUT-GATED**,
+> not "Phase 0 CURRENT". The gated prototype (`VDP2_RBG0_TEST`) already has the full
+> Mode-7 transform (`slScrMatSet`, :914-936), a real per-frame K-table
+> (`slMakeKtable/slKtableRA K_FIX|K_LINE|K_2WORD|K_ON`, :1002-1003), per-frame dynamic
+> dominant-flat upload + sector-colormap shading (:944-967), and the core
+> same-flat/height/band visplane skip (`r_plane.c:1078-1081`, leaves index 0 for RBG0).
+> The real **CURRENT** blocker is **not** bring-up — it is the **CYCxx cycle-pattern
+> commit** (snow on HW). Next HW session: enable `VDP2_RBG0_TEST=1` + `VDP2_HW_SKY=0`
+> and direct-poke CYCA0/A1/B0/B1 alongside `rbg0_commit_ramctl`. Do NOT re-try slSynch.
+
+- **Phase 0 — bring-up + coexistence (was CURRENT; see reconciliation above).** RBG0 cell plane, single repeating
   tile, *identity* ROTSCROLL (flat, no perspective, no K-table), priority 5 so it shows
   through the index-0 sky/ceiling region. Goal: does RBG0 display **without breaking
   NBG0/NBG1** (the cycle-pattern risk)? Gated `VDP2_RBG0_TEST`, throwaway. dg_saturn.cxx.

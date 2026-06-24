@@ -1,5 +1,17 @@
 # Parallel-REC audit — putting the slave SH-2 on the render GENERATION
 
+> **STATUS BANNER — RECONCILED 2026-06-24:** Option C is no longer "future" — it is
+> SHIPPED. **P (plane-half) + M (sprite right-half) are SHIPPED, on by default**
+> (`main.cxx:52-53` `sat_plane_parallel=1` / `sat_masked_parallel=1`;
+> `r_plane.c:1206`, `r_things.c:1185`). The **two-pointer EX work-steal is SHIPPED
+> but INACTIVE in the ship config** (plane-parallel forces `rp_disabled=1` at
+> `r_main.c:1181`, so the parity renderer that hosts the steal is never dispatched
+> in 1p). **Bp wall-prep STEP-1 defer is committed but gated OFF**
+> (`sat_wallprep_defer=0`); **STEP-2 producer/consumer overlap is NOT built** (the
+> only remaining future lever here). **Dual-CPU framebuffer blit is HW-REJECTED**
+> (2026-06-22). Consequently the "slave ~80% idle" framing below is STALE — in ship
+> config the slave already runs P+M; see the §4 reconciliation note.
+
 **Question:** how to make the second SH-2 do REC work (wall-prep / planes / sprites generation),
 not just draw columns, to break the master-only REC ceiling (the 1p speed bonus + multiplayer).
 
@@ -61,8 +73,18 @@ duplication model. THAT is why it fits.
 |---|--------|-------|------|-------------|
 | **A** | **Full duplication** (the x-split as built) | ❌ no (~430KB over) | 1p-bonus + 4p | **dead** without major memory surgery |
 | **B** | **d32xr phase-split, full** — slave does wall-prep (producer/consumer) + planes + sprites-by-half; shared state; 24B GBR-TLS | ✅ yes | **2–4×, proven** (1p AND multi) | **big renderer refactor** (producer/consumer protocol, scratch→stack, mutable→GBR-TLS) + freeze-zone cache coherency |
-| **C** | **d32xr phase-split, incremental** — start with ONE self-contained phase (sprites-by-half, or planes) | ✅ yes | partial (~M or ~P) | **low** — isolated phase, small coherency surface; de-risks B |
+| **C** | **d32xr phase-split, incremental** — start with ONE self-contained phase (sprites-by-half, or planes) | ✅ **SHIPPED** | partial (~M or ~P) | **low** — isolated phase, small coherency surface; de-risks B |
 | **D** | **x-range split + SHARED arrays** (disjoint-x access) + scratch/draw-state in GBR-TLS | ✅ likely | 1p-bonus + multi | medium — must partition the allocators (visplanes/drawsegs); less proven than d32xr |
+
+> **RECONCILED 2026-06-24:** Option C is **SHIPPED**, not future. BOTH self-contained
+> phases shipped on by default: **plane-split (P)** — `r_plane.c:1206-1212` slave
+> draws worklist `[half,n)` via `RP_DispatchPlanes`, master `[0,half)`,
+> `RP_WaitPlanes` joins (dispatch `r_parallel.c:861-879`, dedicated 4KB slave stack);
+> and **sprites-by-screen-half (M)** — `r_things.c:1170-1210` master pre-caches every
+> sprite patch (PU_CACHE) then `RP_DispatchMasked(half,viewwidth)`, slave draws the
+> right half via `R_SlaveDrawMasked`, master the left (dispatch `r_parallel.c:904-916`).
+> Only **Option B's wall-prep producer/consumer (Bp) remains future** — STEP-1 defer
+> harness is committed but gated OFF (`sat_wallprep_defer=0`), STEP-2 overlap not built.
 
 **Notes**
 - **B/C keep the 1p bonus:** the phase-split accelerates EACH view (intra-view parallelism), so 1p
@@ -84,6 +106,22 @@ duplication model. THAT is why it fits.
 — it's `M`, small, self-contained, low coherency; or **planes**) to validate the trio
 *producer/consumer + GBR-TLS + cache coherency* on Ymir + hardware, then extend to the wall-prep
 producer/consumer (the big `Bp` lever).
+
+> **RECONCILED 2026-06-24:** This recommendation is **describing already-shipped code**.
+> Both entry phases — sprites-by-half (M) and planes (P) — are committed and on by
+> default. The validated trio (producer/consumer + per-CPU state + cache coherency)
+> is proven on hardware. The ONLY remaining future work is the wall-prep `Bp` lever
+> (Option B big step): STEP-1 master-only defer is committed gated OFF and currently
+> has ZERO runtime validation (flip `sat_wallprep_defer=1` once to confirm STEP-1 is
+> byte-identical before attempting STEP-2 overlap). STEP-2 is the d32xr freeze-zone.
+>
+> **Slave idle correction:** the "second SH-2 effectively idle / ~80% idle" claim in
+> the original prose **predates P+M shipping and is STALE**. In ship config the slave
+> actively runs the P plane-half AND the M sprite-half. Its residual idle is the
+> **B phase** (BSP walk + clip + sprite projection), of which only **Bp (wall-prep,
+> `R_StoreWallRange`)** is coherency-safe to offload; **Bw (the solidsegs occlusion
+> walk)** is inherently serial (single occlusion chain) and is foreclosed. So the last
+> safe REC lever is Bp only.
 
 ## 5. Leads to study (local `saturn-refs/d32xr/`)
 - `marsnew.c` — the mailbox loop + GBR-TLS setup (`Mars_Secondary`, `I_Init`).

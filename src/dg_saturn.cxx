@@ -777,15 +777,59 @@ volatile int game_phase = 0;
 
 /* VDP1 completion signal (set in the kick from EDSR CEF): did the previous frame's plot
    FINISH before this kick?  'D'one = VDP1 had headroom, 'B'usy = it overran the frame.
-   (Always 'B' on real hardware -- VDP1 never finishes a wall list within one frame; the EDSR
-   fill-calibration metric built on it was useless and has been removed.) */
+   2026-06-24: the old "always B" note was PRE-8bpp -- since the 8bpp wall pack (half the
+   VDP1 writes) the list CAN finish within a frame, so D/B is a live, meaningful headroom
+   signal again.  Row 2 shows D/B + Dr = the % of frames Done over the measurement window
+   (vd1_win_done/vd1_win_tot, reset with the REC window) -- the go/no-go input for the
+   VDP1-floor offload (high Dr => spare VDP1 budget for floor strips). */
 static int vdp1_prev_done = 1;
+static unsigned int vd1_win_done = 0, vd1_win_tot = 0;   /* VDP1 done-rate over the window */
 
 #if SHOW_FPS
 extern "C" int rp_timeout_count;
 extern "C" unsigned int rp_master_ms;   /* master frame ms -> prefixes r_parallel.c's row-18 SLV line */
 static unsigned int dg_frame_count = 0;
 static int vdp1_last_cmds = 0;
+
+/* SATURN PERF (2026-06-24): windowed REC stats exported by core/r_parallel.c (set on the
+   ship path's rp_p3_prof_show), surfaced on the 1/s overlay tick + reset by RP_ProfReset
+   when the config under test changes.  Defined unconditionally in r_parallel.c so they
+   link with RP_PROF off (then 0). */
+extern "C" int sat_prof_rec_max;                                 /* window max (= p100), tenths-ms */
+extern "C" int sat_prof_pk_bw, sat_prof_pk_bp, sat_prof_pk_p, sat_prof_pk_m;  /* per-phase peaks */
+extern "C" int sat_prof_mx_map, sat_prof_mx_x, sat_prof_mx_y, sat_prof_mx_ang, sat_prof_mx_t;
+extern "C" int sat_prof_dom_pct, sat_prof_plane_n;               /* RBG0-floor sizer */
+extern "C" int sat_prof_dropped;                                 /* glitch frames excluded from the window */
+extern "C" int RP_ProfPercentile(int pct);                       /* windowed REC percentile, tenths-ms */
+extern "C" void RP_ProfReset(void);
+extern "C" int gamemap;   /* core doomstat: drives the per-map window reset */
+
+/* SATURN PERF (2026-06-24): one-shot memory-latency calibration.  The memory-bound
+   ceiling is the root cause of REC cost but is unmeasurable directly (no SH7604 PMU),
+   so cold-read a 32 KB block from each work-RAM bank and FRT-time it.  rL = LWRAM/HWRAM
+   ratio (>1.0 => LWRAM -- where the cmd buffer + visplanes live -- is the slow bank;
+   this is the size of the L2-relocate / placement upside, quantified on THIS hardware).
+   Read-only (non-destructive); 32 KB >> the 4 KB cache so it measures real RAM latency. */
+static unsigned int mem_lw_ticks = 0, mem_hw_ticks = 0;
+static inline unsigned int dg_mem_frt(void)
+{
+    unsigned char h = *(volatile unsigned char *)0xFFFFFE12;
+    unsigned char l = *(volatile unsigned char *)0xFFFFFE13;
+    return (unsigned short)((h << 8) | l);
+}
+static unsigned int dg_mem_bench(volatile unsigned int *base)
+{
+    volatile unsigned int sink = 0;
+    unsigned int t0 = dg_mem_frt();
+    for (int i = 0; i < 8192; i++) sink += base[i];   /* 32 KB cold read */
+    (void)sink;
+    return (unsigned short)(dg_mem_frt() - t0);        /* < 65536 ticks -> no wrap */
+}
+static void dg_mem_calibrate(void)
+{
+    mem_lw_ticks = dg_mem_bench((volatile unsigned int *)0x00200000);  /* LWRAM (slow DRAM) */
+    mem_hw_ticks = dg_mem_bench((volatile unsigned int *)0x06000000);  /* HWRAM (fast SDRAM) */
+}
 
 static void fps_update(void)
 {
@@ -803,6 +847,25 @@ static void fps_update(void)
         unsigned int inst10 = (frames * 10u * hz + elapsed / 2) / elapsed;
         static unsigned int avg10 = 0;
         avg10 = avg10 ? (avg10 * 3 + inst10) / 4 : inst10;
+        /* one-shot memory-latency calibration on the first 1/s tick (a single ~30ms
+           hitch at startup, off the render path) -> row 18. */
+        static int mem_done = 0;
+        if (!mem_done) { dg_mem_calibrate(); mem_done = 1; }
+        /* SATURN PERF (2026-06-24): auto-reset the windowed stats (REC histogram p50/p95,
+           per-phase peaks, floor sizers, VDP1 done-rate) whenever the variable under test
+           changes (new map / potato / visplane-hash / blit config),
+           so each A/B run starts a clean min/avg/max window -- no manual button needed
+           (the pad is already saturated: Y=hash X=split Z=potato L+R=blit). */
+        {
+            static int l_map=-1, l_pot=-1, l_hash=-1, l_blit=-1;
+            if (gamemap != l_map || (int)potato_level != l_pot ||
+                sat_visplane_hash != l_hash || blit_mode != l_blit) {
+                RP_ProfReset();
+                vd1_win_done = vd1_win_tot = 0;
+                l_map=gamemap; l_pot=(int)potato_level;
+                l_hash=sat_visplane_hash; l_blit=blit_mode;
+            }
+        }
         /* OVERLAY 2026-06-24 (audited): useful values packed onto the top rows; cut the
            WAD line, the F/ph/vbl/gt heartbeats, and the VD2~/SCU/68K nominal labels.
            Row 0 = HEADLINE: inst fps, EMA(~4s) avg (THE build-comparison number), and
@@ -870,14 +933,59 @@ static void fps_update(void)
            SLV line; set the shared value here (the AVG row is gone, fps is on row 0). */
         rp_master_ms = inst10 ? (10000u / inst10) : 0;   /* frame ms */
         {
-            /* row 2: VDP1 load + the build-identity stamp.  VD1 = VDP1 cmds this frame +
-               D(one)/B(usy) EDSR-CEF -- the only LIVE aux-processor metric (VD2~/SCU/68K
-               were nominal labels with no per-frame value, cut).  b:__TIME__ = build stamp
-               (build.ps1 touches dg_saturn.cxx so it refreshes -> confirms the flashed bin). */
+            /* row 2: VDP1 load + done-rate + build stamp.  VD1 = cmds this frame + D/B
+               (EDSR-CEF this frame) + Dr = % of plotted frames Done over the window.
+               Post-8bpp the VDP1 CAN finish within a frame, so Dr is a live VDP1-floor
+               headroom signal (high Dr => spare budget for floor strips).  b:__TIME__ =
+               build stamp (build.ps1 touches this file so it refreshes). */
+            unsigned int dr = vd1_win_tot ? (vd1_win_done * 100u / vd1_win_tot) : 0;
             static char r2v[45];
-            snprintf(r2v, sizeof r2v, "VD1 %d%c b:" __TIME__,
-                    vdp1_last_cmds, vdp1_prev_done ? 'D' : 'B');
+            snprintf(r2v, sizeof r2v, "VD1 %d%c Dr%u%% b:" __TIME__,
+                    vdp1_last_cmds, vdp1_prev_done ? 'D' : 'B', dr);
             SRL::Debug::Print(0, 2, r2v);
+            /* row 4: WINDOWED REC distribution p50/p95/max (tenths-ms) -- robust to the
+               single-outlier max (a lone CD hitch) AND to an arbitrary threshold.  p50 =
+               typical, p95 = sustained worst, mx = absolute worst (located on row 9).
+               Window auto-resets on a config change (above).  ~29 cols. */
+            static char r4[45];
+            int p50 = RP_ProfPercentile(50), p95 = RP_ProfPercentile(95);
+            snprintf(r4, sizeof r4, "REC p50 %d.%d p95 %d.%d mx%d.%d d%d   ",
+                    p50/10, p50%10, p95/10, p95%10,
+                    sat_prof_rec_max/10, sat_prof_rec_max%10, sat_prof_dropped);
+            SRL::Debug::Print(0, 4, r4);
+            /* row 10: per-PHASE INDEPENDENT peaks (each phase's own worst across the
+               window, possibly different frames) -- the basis to size each offload
+               (Bp -> slave wall-prep, P -> VDP1/RBG0 floor).  ~31 cols worst case. */
+            static char r10[45];
+            snprintf(r10, sizeof r10, "PK Bw%d.%d Bp%d.%d P%d.%d M%d.%d        ",
+                    sat_prof_pk_bw/10, sat_prof_pk_bw%10, sat_prof_pk_bp/10, sat_prof_pk_bp%10,
+                    sat_prof_pk_p/10,  sat_prof_pk_p%10,  sat_prof_pk_m/10,  sat_prof_pk_m%10);
+            SRL::Debug::Print(0, 10, r10);
+            /* row 9: WHERE/WHEN the REC-max frame was (the locator), so the worst frame is
+               reproducible.  m=map, x,y=player render pos (map units), a=angle 0-255,
+               t=sec into the level.  ~31 cols worst case (6-digit coords). */
+            static char r9[45];
+            snprintf(r9, sizeof r9, "MX m%d %d,%d a%d t%ds        ",
+                    sat_prof_mx_map, sat_prof_mx_x, sat_prof_mx_y, sat_prof_mx_ang,
+                    sat_prof_mx_t/35);
+            SRL::Debug::Print(0, 9, r9);
+            /* row 17: FLOOR offload sizers.  Vs/Vp = VDP1-floor candidate quad count this
+               frame / window peak (go/no-go: GO if Vp fits the VDP1 cmd budget).  d% = the
+               dominant single-flat share of plane pixels, n = visplane count (RBG0 sweet
+               spot = high d% + low n => one flat owns the floor).  ~24 cols. */
+            static char r17[45];
+            snprintf(r17, sizeof r17, "FLR Vs%d Vp%d d%d%% n%d        ",
+                    sat_floor_vq_cur, sat_floor_vq_peak, sat_prof_dom_pct, sat_prof_plane_n);
+            SRL::Debug::Print(0, 17, r17);
+            /* row 18: memory-latency calibration (one-shot cold 32 KB read per bank, FRT
+               ticks).  rL = LWRAM/HWRAM ratio -- >1.0 means LWRAM (cmd buf + visplanes) is
+               the slow bank, = the memory-bound penalty + the L2-relocate upside, measured
+               on THIS hardware (Ymir will read ~1.0 -- it does not model the bank gap). */
+            unsigned int rL10 = mem_hw_ticks ? (mem_lw_ticks * 10u / mem_hw_ticks) : 0;
+            static char r18[45];
+            snprintf(r18, sizeof r18, "MEM lw%u hw%u rL%u.%u        ",
+                    mem_lw_ticks, mem_hw_ticks, rL10/10, rL10%10);
+            SRL::Debug::Print(0, 18, r18);
         }
 #if VDP2_RBG0_TEST
         {
@@ -888,6 +996,22 @@ static void fps_update(void)
             static char rR[45];
             sprintf(rR, "RAMCTL b=%04X a=%04X", ramctl_before, ramctl_after);
             SRL::Debug::Print(0, 14, rR);
+        }
+#endif
+#ifdef SAT_REPACK
+        {
+            /* row 21: per-level repack (.DRP) status (STREAMING_ANALYSIS.md §7.9-7.11).
+               ON => DOOMRP.DRP validated for streaming; s = lumps served from the blob
+               this session (grows as you play => the loader is working); r = .DRP read
+               retries.  off code: -1 cart/not-stream, -2 no file, -3 hdr, -4 CRC, -5 tbl. */
+            extern int sat_drp_state, sat_drp_n_maps, sat_drp_served, sat_drp_read_retries;
+            static char r21[45];
+            if (sat_drp_state == 1)
+                snprintf(r21, sizeof r21, "DRP ON m%d s%d r%d",
+                         sat_drp_n_maps, sat_drp_served, sat_drp_read_retries);
+            else
+                snprintf(r21, sizeof r21, "DRP off (%d)         ", sat_drp_state);
+            SRL::Debug::Print(0, 21, r21);
         }
 #endif
         /* (cut: the "WAD:" identity line -- served its purpose, owner flagged it useless.) */
@@ -2269,6 +2393,9 @@ static void vdp1_wpn_kick(void)
     vdp1_prev_done = (VDP1_EDSR & 0x0002) ? 1 : 0;   /* did the previous frame's plot finish? */
 #if SHOW_FPS
     vdp1_last_cmds = vdp1_wactive ? vdp1_wnext : 0;
+    /* accumulate the done-rate only on frames that actually plotted a world list
+       (skip title/intermission empty banks, which always read 'D' and would inflate Dr). */
+    if (vdp1_wactive) { vd1_win_tot++; if (vdp1_prev_done) vd1_win_done++; }
 #endif
     if (vdp1_wactive)
     {
@@ -2753,11 +2880,8 @@ static void poll_pad(void)
        REC profiler's Bw bucket ON (h1) vs OFF (h0) on the same scene, no rebuild.  Like the
        Z=potato / L+R=blit live toggles; row 2 shows h<state>. */
     if ((changed & PER_DGT_TY) && !(cur & PER_DGT_TY))
-#if VDP1_FLOOR_TEST
-        sat_vdp1_floor = !sat_vdp1_floor;   /* inc-1: A/B the VDP1 floor-skip (owned floors -> index 0) */
-#else
-        sat_visplane_hash = !sat_visplane_hash;
-#endif
+        sat_visplane_hash = !sat_visplane_hash;   /* L1 A/B (row 1 h<state>); the VDP1-floor
+                                                     toggle that shared Y was retired -- parked. */
 #endif
 
 #if DUAL_CPU_BLIT

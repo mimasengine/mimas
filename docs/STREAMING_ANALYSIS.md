@@ -624,6 +624,37 @@ stalks 3     # Doom II MAP02
   `cd/data/`. Document the track order in the cue ↔ the names here. (A future `tools/strip_wad.py`
   / disc-build step can emit a default `CDDAMAP.TXT` from the WAD's `S_music` table.)
 
-Status: **format designed + documented (here); the runtime loader is a follow-up.** Until it
-lands, CDDA uses the hardcoded Doom-1-E1 map; every other WAD gets music via the MUS-synth path
-(which is the no-cart baseline anyway, so no one is left silent).
+Status: **SHIPPED 2026-06-24.** The loader is implemented in `src/i_sound_saturn.cxx`
+(`cdda_load_trackmap`, called from `cdda_InitMusic` only when `sat_music_use_cdda`): it seeds
+the built-in Doom-1-E1 default, then parses `CDDAMAP.TXT` (if present on the disc) and overrides
+by name (`cdda_name_eq` vs `S_music[].name`). `cdda_RegisterSong` now reads the runtime
+`cdda_trackmap[]`. A self-documenting template ships at `cd/data/CDDAMAP.TXT` (all examples
+commented → no override → built-in map, so the current data-only disc is unaffected). Dormant
+unless CDDA is active (audio-track disc + resident WAD); MUS-synth WADs need no mapping.
+
+### 7.8 Per-map subset — MEASURED (`tools/repack_wad.py`, 2026-06-24)
+
+Step 1 of per-level repack (S4d) is the offline per-map subset computer
+(`tools/repack_wad.py` — forks `measure_texfloor.py`'s WAD parser, adds `core/info.c`
+parsing for the sprite chain). For each map it computes the **safe superset** of lumps the
+map can reference: geometry ∪ textures(SIDEDEFS→PNAMES patches) ∪ flats(SECTORS) ∪
+sprites(THINGS→`mobjinfo` state-graph→`SPR_` prefix→all rotations) ∪ spawned `DS*` sounds ∪
+an always-on UI/weapons/blood/puff/fog set. It **validates** that every subset lump exists
+(a miss in streaming = a hard `I_Error`, not graceful) — Doom II passes clean.
+
+**Measured (Doom II, the on-disc `DOOM1.WAD`, music excluded):** per-map subset =
+**1.35–4.09 MB, avg 2.6 MB, worst MAP28 = 4090 KB.** Sprites dominate. This is bigger than the
+§7.1 "~0.5–2 MB" rough estimate (which was the *visible* set; this is the full referenceable
+superset that must be staged). Two consequences:
+
+- **Per-level repack (streaming): works for every map.** The per-map blob lives on the disc
+  (1.35–4.09 MB, contiguous, streamed on demand) — it does NOT need to fit RAM, so size is a
+  non-issue; the win is seek-light contiguous reads.
+- **Big-WAD cart load-once (S5): fits most maps, NOT the heaviest.** The 4 MB cart holds the
+  light/medium maps comfortably, but MAP28 (~4.09 MB) + its MUS lump + the cart lump table
+  **overflows 4 MB**. So big-WAD cart-load-once is **partial** — it can give CDDA + speed on the
+  lighter maps and must fall back to streaming + MUS-synth on the heaviest. (A tighter,
+  non-superset subset could squeeze them, but that risks the hard-`I_Error` class — not worth it.)
+
+Next sub-steps: (1b) the WAD-writer + per-map offset table; (2) disc-build integration;
+(3) the `P_SetupLevel` loader (Option B, name-stable directory → no in-engine index relocation).

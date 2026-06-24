@@ -740,7 +740,14 @@ static boolean mus_MusicIsPlaying(void) { return mus.playing; }
    data-driven, per-WAD mapping file is the documented follow-up (see
    STREAMING_ANALYSIS.md S4d / the music-mapping note). */
 
-static void cdda_InitMusic(void) { cdda_track = 0; }
+static void cdda_load_trackmap(void);   /* fwd: data-driven musicnum->track map */
+
+static void cdda_InitMusic(void)
+{
+    cdda_track = 0;
+    if (sat_music_use_cdda)        /* read the disc's CDDAMAP.TXT only when CDDA is active */
+        cdda_load_trackmap();
+}
 
 static void cdda_SetMusicVolume(int volume)
 {
@@ -760,25 +767,76 @@ static void cdda_ResumeSong(void)
     SRL::Sound::Cdda::Resume();
 }
 
-static void *cdda_RegisterSong(void *data, int len)
+/* musicnum -> CD audio track, built by cdda_load_trackmap() (defaults below, can be
+ * overridden per-WAD by a CDDAMAP.TXT data file on the disc -- STREAMING_ANALYSIS 7.7). */
+static uint8_t cdda_trackmap[NUMMUSIC];
+
+static int cdda_name_eq(const char *a, const char *b)   /* case-insensitive, NUL-terminated */
 {
-    static const uint8_t cdda_track_map[] = {
+    if (!a || !b) return 0;
+    for (;; a++, b++)
+    {
+        char ca = *a, cb = *b;
+        if (ca >= 'A' && ca <= 'Z') ca += 32;
+        if (cb >= 'A' && cb <= 'Z') cb += 32;
+        if (ca != cb) return 0;
+        if (ca == 0) return 1;
+    }
+}
+
+static void cdda_load_trackmap(void)
+{
+    /* Built-in default (Doom-1 episode 1 + the inter/intro cluster; track 01 is the
+       data/WAD track, audio is 02+).  An absent CDDAMAP.TXT -> exactly this map, so
+       the current data-only disc is unaffected. */
+    static const uint8_t defmap[] = {
         0,
         2, 3, 4, 5, 6, 7, 8, 9, 10,   /* 1-9  e1m1-e1m9  */
         0, 0, 0, 0, 0, 0, 0, 0, 0,    /* 10-18 e2m1-e2m9 */
         0, 0, 0, 0, 0, 0, 0, 0, 0,    /* 19-27 e3m1-e3m9 */
         11, 12, 13, 14, 15,            /* 28-32 inter/intro/bunny/victor/introa */
     };
+    int i, ndef = (int)(sizeof defmap / sizeof defmap[0]);
+    for (i = 0; i < NUMMUSIC; i++)
+        cdda_trackmap[i] = (i < ndef) ? defmap[i] : 0;
+
+    /* Optional per-WAD override: a "<music-name> <track>" text file on the disc
+       ('#' line comments).  <music-name> matches S_music[].name (the part after
+       d_), case-insensitive -> lets a disc builder map any WAD's music to audio
+       tracks with no code change.  See STREAMING_ANALYSIS.md 7.7. */
+    SRL::Cd::File f("CDDAMAP.TXT");
+    if (!f.Exists()) return;
+    static unsigned char buf[2048] __attribute__((aligned(4)));
+    int got = f.LoadBytes(0, (int32_t)(sizeof buf - 1), buf);
+    if (got <= 0) return;
+    buf[got] = 0;
+
+    int p = 0, overrides = 0;
+    while (p < got)
+    {
+        char nm[16];
+        int nl = 0, trk = 0, td = 0;
+        while (p < got && (buf[p]==' '||buf[p]=='\t'||buf[p]=='\r'||buf[p]=='\n')) p++;
+        if (p < got && buf[p] == '#') { while (p < got && buf[p] != '\n') p++; continue; }
+        while (p < got && buf[p] > ' ' && nl < (int)sizeof(nm) - 1) nm[nl++] = (char)buf[p++];
+        nm[nl] = 0;
+        while (p < got && buf[p] > ' ') p++;                 /* drop any overlong-name tail */
+        while (p < got && (buf[p]==' '||buf[p]=='\t')) p++;
+        while (p < got && buf[p] >= '0' && buf[p] <= '9') { trk = trk*10 + (buf[p]-'0'); p++; td++; }
+        while (p < got && buf[p] != '\n') p++;               /* to end of line */
+        if (!nl || !td || trk < 0 || trk > 99) continue;
+        for (i = 1; i < NUMMUSIC; i++)
+            if (cdda_name_eq(nm, S_music[i].name)) { cdda_trackmap[i] = (uint8_t)trk; overrides++; break; }
+    }
+    printf("CDDAMAP.TXT: %d track override(s)\n", overrides);
+}
+
+static void *cdda_RegisterSong(void *data, int len)
+{
     (void)len;
     for (int i = 1; i < NUMMUSIC; i++)
-    {
         if (S_music[i].data == data)
-        {
-            if (i < (int)(sizeof(cdda_track_map) / sizeof(cdda_track_map[0])))
-                return (void *)(intptr_t)cdda_track_map[i];
-            return NULL;
-        }
-    }
+            return (void *)(intptr_t)cdda_trackmap[i];
     return NULL;
 }
 

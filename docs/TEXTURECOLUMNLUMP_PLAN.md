@@ -1,13 +1,24 @@
 # Cutting the `texturecolumnlump` / `texturecomposite` PU_STATIC floor — deep plan
 
-Status: **RESEARCH / NOT STARTED 2026-06-24.** Three parallel investigations done
+Status: **PHASE 0 COMPLETE 2026-06-24 — MEASURED; GATE VERDICT = DEFER (NO-GO for now).**
+The directory floor was measured exactly by parsing the shipping WADs' `TEXTURE1/2`/`PNAMES`
+lumps (`tools/measure_texfloor.py`, mirrors `R_InitTextures`/`R_GenerateLookup`; numbers
+cross-checked and adversarially verified high-confidence). **It is 117–253 KB, NOT the
+~400–600 KB estimated below** (the estimate assumed ~1000–1400 Doom II textures; the real
+count is **428**). This trips the plan's own Phase-0 gate (§7: "deprioritize if <250 KB") for
+3 of 4 IWADs. Option E specifically would *worsen* pool pressure (its `height×width` slabs
+are 2.2–2.7× the current `height×mpc` composites against a fixed 256 KB pool cap). **See the
+new §9 (PHASE 0 RESULTS) for the full measured table, the Option-E pool-pressure finding, the
+cheaper-lever ranking, and the gate verdict.** The original research below (§1–§8) is retained
+as the design study; §1's byte estimates are superseded by §9's measurements.
+
+Original framing (superseded where noted): three parallel investigations done
 (current `core/r_data.c` system, the VDP1 wall-path dependency, the d32xr
 composite-on-demand reference model). This document ranks the options to cut the
-**~400–600 KB** `texturecolumnlump`+`texturecolumnofs` directory floor that sits in the
+`texturecolumnlump`+`texturecolumnofs` directory floor that sits in the
 ~884 KB→964 KB LWRAM zone after the already-landed wins (visplane-pool span arena
-deferred, `MAXVISPLANES=256`, reject-skip, `RP_CMD_BUF` shrink, sfx `PU_CACHE`). It is the
-**deepest remaining structural memory lever** for big-WAD CD streaming and the natural
-follow-on to [`STREAMING_ANALYSIS.md` **§S4(b)**](STREAMING_ANALYSIS.md) ("composite-on-demand
+**now landed**, `MAXVISPLANES=256`, reject-skip, `RP_CMD_BUF` shrink, sfx `PU_CACHE`). It is the
+natural follow-on to [`STREAMING_ANALYSIS.md` **§S4(b)**](STREAMING_ANALYSIS.md) ("composite-on-demand
 `decals[]` — deferred (heavier structural change)").
 
 Companion docs: [`STREAMING_ANALYSIS.md`](STREAMING_ANALYSIS.md) (the CD-streaming
@@ -45,15 +56,20 @@ texturecolumnofs[tex]   = Z_Malloc(texture->width * sizeof(unsigned short), PU_S
 
 Combined per-column cost = **`4 bytes × Σ(texture width)`** = `4 × numtextures × avg_width`.
 
+> ⚠ **SUPERSEDED by §9 measurement.** The estimates in the table below were wrong — they
+> assumed ~1000–1400 Doom II textures. The **real** count is **428** (Σwidth 40,240 → floor
+> **157 KB**), measured exactly from the WAD. See §9 for the verified per-WAD floor.
+
 | WAD | numtextures | avg width | Σ width (cols) | columnlump+ofs total |
 |---|---|---|---|---|
-| Doom shareware | ~125 | ~100 | ~12,500 | **~50 KB** |
-| Doom II (lower) | ~1000 | ~100 | ~100,000 | **~400 KB** |
-| Doom II (upper) | ~1400 | ~110 | ~154,000 | **~600 KB** |
+| Doom shareware | ~125 | ~100 | ~12,500 | ~~~50 KB~~ → **42 KB** (§9) |
+| Doom II (lower) | ~~~1000~~ **428** | ~~~100~~ **94** | ~~~100,000~~ **40,240** | ~~~400 KB~~ → **157 KB** (§9) |
+| Doom II (upper) | ~~~1400~~ — | — | — | ~~~600 KB~~ — |
 
-Doom II is the binding case: **~400–600 KB of unconditional PU_STATIC**, allocated once at
-`R_InitData`, **never freed**, present for the whole session regardless of which textures
-are ever drawn. This is the floor this plan attacks.
+The original "Doom II is the binding case at ~400–600 KB" claim is **false**; the measured
+binding case is **TNT at 253 KB** (Doom II 157 KB, Plutonia 202 KB, Ultimate 117 KB). These
+arrays are still unconditional PU_STATIC, allocated once at `R_InitTextures`, never freed —
+but at a third of the assumed size. See §9.
 
 ### The secondary terms (smaller, listed for completeness)
 
@@ -520,3 +536,89 @@ D (WAD-format + correctness cap + residency hazard as a *first* move).
   726-727,527`; `core/r_cache.c:40,124,138,159,169`; `core/r_segs.c:180,595,623,658`;
   `core/r_plane.c:1044`; `core/r_things.c:427,464,1111,1124`; `src/dg_saturn.cxx:1323,1649,
   1659-1660,1686-1687`.
+
+---
+
+## 9. PHASE 0 RESULTS — measured & adversarially verified (2026-06-24)
+
+Tool: `tools/measure_texfloor.py` — parses each WAD's `TEXTURE1/2`+`PNAMES`, replicating
+`R_InitTextures`/`R_GenerateLookup` **exactly** (column-by-column `patchcount`, the `-1`
+multi-patch sentinel, `texturecompositesize += height` per multi-patch column). The floor
+numbers were cross-checked by a second independent reader of the raw lump headers, and the
+whole model (parser-vs-engine, the Option-E slab math, the alternative-lever ranking) was
+adversarially verified by three independent auditors — **all high-confidence**.
+
+### 9.1 The measured floor (exact, never-freed PU_STATIC)
+
+| WAD | #textures | Σwidth | **floor = 4·Σw** | pure¹ | mno² | tmp³ | today composite⁴ | Option-E slab⁵ | slab/today | max single slab |
+|---|---|---|---|---|---|---|---|---|---|---|
+| Doom II | 428 | 40,240 | **157 KB** | 248 | 38 | 142 | 1012 KB | 2246 KB | **2.22×** | 32 KB |
+| TNT | 562 | 64,736 | **253 KB** | 308 | 49 | 205 | 1719 KB | 4586 KB | **2.67×** | 128 KB |
+| Plutonia | 505 | 51,840 | **202 KB** | 311 | 40 | 154 | 1241 KB | 2694 KB | **2.17×** | 128 KB |
+| Ultimate | 287 | 29,912 | **117 KB** | 102 | 42 | 143 | 1218 KB | 2368 KB | 1.94× | 32 KB |
+| Shareware | 125 | 10,776 | 42 KB | 34 | 12 | 79 | 659 KB | 976 KB | 1.48× | 32 KB |
+
+¹ **pure** = single patch covering the whole texture → direct-from-lump, **never needs a slab/directory**.
+² **mno** = >1 patch but no column overlap (every column `patchcount==1`) → today direct-from-lump per column; **under Option E it MUST be slabbed** (a per-texture flag cannot encode the per-column lump/offset — verified).
+³ **tmp** = ≥1 multi-patch column → needs a composite today, a slab under E.
+⁴ **today composite** = Σ over tmp of `height × (#multi-patch cols)`, *if every tmp texture were drawn* (upper bound; built on-demand into the LRU).
+⁵ **Option-E slab** = Σ over (mno+tmp) of `height × width`, *if all drawn* (upper bound).
+
+### 9.2 Per-map working set (SIDEDEFS-referenced wall textures, the LRU resident bound)
+
+Worst maps (referenced wall-texture set, Option-E slab footprint if co-resident — an upper
+bound; the LRU only holds the *visible* sub-set):
+
+| WAD | worst map | #ref tex | Option-E slab | today composite |
+|---|---|---|---|---|
+| Doom II | MAP19 | 72 | **572 KB** | 311 KB |
+| Doom II | MAP08 | 66 | 533 KB | 272 KB |
+| Plutonia | (similar) | — | >600 KB | — |
+
+The pool caps at **256 KB** (`TEXCACHE_MAX`). Even *today's* composites for a big map's
+referenced set (311 KB MAP19) exceed the cap → the LRU already evicts within a map (correct:
+visible set < referenced set). Option E ~2.2× that pressure against the same 256 KB cap.
+
+### 9.3 Verified findings
+
+1. **The floor is 117–253 KB, not 400–600 KB.** Gate (§7): "deprioritize if <250 KB" → Doom II
+   (157), Plutonia (202), Ultimate (117) are all under; only TNT (253) marginally clears.
+2. **Option E makes pool pressure WORSE, on two axes** (verified high-confidence): (a) each slab
+   is `height×width` vs today's `height×mpc` (2.2–2.7× bigger) → the 256 KB pool holds 2.2–2.7×
+   *fewer* textures → lower hit-rate; (b) it pulls the **mno** textures and the single-patch
+   columns of mixed textures — which today cost the pool **zero** (direct-from-lump) — *into* the
+   bounded pool. More misses = more composite rebuilds + more CD re-reads in streaming mode. It
+   also loses the `lump>0` direct-lump fast path. The win is real (~157 KB static → gone) but the
+   honest cost is higher dynamic churn + CD traffic, not lower. **mno MUST be slabbed** (a single
+   per-texture flag cannot encode per-column lump/offset — confirmed from `R_GetColumn`).
+3. **The cheaper levers already shipped:** visplane span arena (`SAT_VISPLANE_POOL=1`, ~99 KB vs
+   the 256-cap baseline / ~265 KB vs vanilla — **now landed**, contra the stale STREAMING §0 note),
+   `RP_CMD_BUF` 160→80 KB (+80 KB zone), `MAXVISPLANES=256` (~166 KB), f_wipe cut (~143–192 KB
+   transient), the S4(a) LRU pixel cache. The texture-directory refactor is the **most expensive,
+   highest-risk** remaining lever (shared-core, every wall/masked/sky path + the VDP1 bake,
+   DoomJo GCC-9.3 re-validation, eviction races, + WAD-format/`numdecals≤3` cap for D).
+4. **The real remaining bind is PU_LEVEL geometry (700–900 KB on big maps)** — which this refactor
+   does **not** touch. The 157 KB floor is ~16–18 % of the zone / ~40–45 % of the PU_STATIC
+   residents, small next to the geometry it competes with.
+5. **Candidate cheap unblock (verify on Ymir first):** `R_SetupTextureCaches` sizes the LRU carve
+   from `Z_LargestFreeBlock` (**pure-free only**, `r_cache.c:99`), while the real reclaimable run
+   is `Z_LargestAllocatable` (**purge-inclusive**, already shown as overlay `ZON mx`). At
+   level-load the zone is full of just-loaded PU_CACHE graphics, so pure-free (`TXC lf`) is tiny
+   while `mx` may be large. If the overlay shows `mx ≫ lf`, switching the carve to size from
+   purge-inclusive space unblocks the LRU **with a ~1-line change and zero shared-core risk**.
+   Tradeoff: it purges freshly-loaded level graphics at carve time (one-off re-read); measure.
+
+### 9.4 GATE VERDICT — **DEFER the texture-directory refactor (C/D/E).**
+
+Not justified now: the floor is a third of the estimate and under the deprioritize gate; Option E
+(the recommended path) would worsen the pool churn it aims to relieve; the cheap levers already
+shipped; and the dominant zone consumer is PU_LEVEL geometry, untouched by this work.
+
+**Recommended order instead:** (1) validate the pending CD-read-alignment fix + S4(a) LRU on
+Ymir/hardware across all 32 maps, and read `TXC lf` vs `ZON mx` to test §9.3(5); (2) if the carve
+is starved by pure-free accounting, ship the §9.3(5) one-liner; (3) if specific big maps still
+`I_Error` at load, attack **PU_LEVEL geometry** directly (per-level bump arena S4(c), geometry
+trims) — that is where the bytes are; (4) revisit this refactor **only** if, after the above, the
+carve is *still* starved **and** on TNT-class WADs where the floor exceeds 250 KB — and then prefer
+**Option C** (lazy directory, keeps the small `height×mpc` composites) over E for DoomSRL's real
+WADs, since C caps the actual floor *without* the 2.2× slab inflation that E adds.

@@ -102,7 +102,7 @@ SRL_CUSTOM_CCFLAGS = -w -fsigned-char \
     -DMAXVISPLANES=256 \
     -DSAT_VISPLANE_POOL=1 -DVP_POOL_PLANES=96 \
     -DRP_CMD_BUF_SIZE=0x14000 \
-    -DTEXCACHE_MARGIN=0x10000 \
+    -DTEXCACHE_MARGIN=0x20000 \
     -Isaturn_libc \
     -Isrc \
     -Icore \

@@ -22,11 +22,22 @@ extern "C" {
 #include "w_wad.h"
 #include "deh_str.h"
 #include "m_config.h"
-#ifdef SATURN_CDDA_MUSIC
-#include "sounds.h"    /* S_music[], NUMMUSIC */
-static int cdda_track = 0;
-#endif
+#include "sounds.h"    /* S_music[], NUMMUSIC -- music-number -> CD-track lookup */
 }
+
+/* Music backend chosen at RUNTIME in I_InitSound (replaces the old build-time
+   -DSATURN_CDDA_MUSIC switch).  Both backends are now compiled in; the public
+   I_*Music / I_*Song wrappers near the end dispatch on sat_music_use_cdda:
+     1 = CDDA (Red Book audio) -- only when the WAD is fully resident (cart/small
+         WAD, CD drive free) AND the disc has audio tracks;
+     0 = MUS/SCSP software synth -- the fallback, needs no CD, so it plays during
+         big-WAD CD streaming.
+   sat_streaming_mode (1 = WAD streamed from CD) is the main input.
+   sat_music_use_cdda is DEFINED in core/s_sound.c so the shared core links it. */
+extern "C" int sat_streaming_mode;
+extern "C" int sat_music_use_cdda;
+
+static int cdda_track = 0;   /* CDDA: current audio track, 0 = stopped */
 
 /* ------------------------------------------------------------------ */
 /* Hardware                                                             */
@@ -429,33 +440,54 @@ static void mus_step(uint32_t now_ms)
 /* Doom I_ interface -- SFX                                            */
 /* ================================================================== */
 
+/* Does the disc have CDDA audio tracks (a track of type Audio after the data
+ * track)?  A data-only disc -- the big-WAD streaming disc, or a small-WAD build
+ * pressed without Red Book audio -- returns false, so the runtime music backend
+ * falls back to the MUS/SCSP synth instead of playing silence.  Checks the
+ * well-defined LastTrack (audio tracks follow the data track, so the last track is
+ * Audio iff the disc has any); defensive -- any TOC anomaly reads as no-audio
+ * (-> MUS).  Safe here: SRL::Cd::Initialize ran in DG_Init before I_InitSound. */
+static bool cdda_has_audio_tracks(void)
+{
+    SRL::Cd::TableOfContents toc = SRL::Cd::TableOfContents::GetTable();
+    return toc.LastTrack.Number >= 2 &&
+           toc.LastTrack.GetType() == SRL::Cd::TableOfContents::TrackType::Audio;
+}
+
 extern "C" void I_InitSound(boolean use_sfx_prefix)
 {
     (void)use_sfx_prefix;
 
-#ifdef SATURN_CDDA_MUSIC
-    /* CDDA mode: SRL already initialised sound (SRL::Core::Initialize called
-       SRL::Sound::Hardware::Initialize).  The 68K is running.
-       Place SFX allocator past a safe offset to avoid the SRL sound driver area.
-       Clear SFX slots 0-7 from SH-2. */
-    sram_alloc = 0x1000;   /* reserve first 4 KB for SRL sound driver */
-    for (int s = 0; s < 8; ++s)
-    {
-        volatile unsigned short *slot = SCSP_SLOT(s);
-        for (int r = 0; r < 16; ++r) slot[r] = 0;
-        slot[R_EG2] = 0x001Fu;
-    }
-    /* SRL/SGL leaves the SCSP master volume at 0 in CDDA mode (CD-DA is mixed
-     * on a separate path, so music is audible while every slot stays muted --
-     * that's the SFX bug). Force MVOL=15, preserving MEM4MB/DAC18B as set by
-     * the SGL driver. */
-    SCSP_CONTROL = (unsigned short)((SCSP_CONTROL & 0xFFF0u) | 0x000Fu);
-    sound_ready = true;
-    printf("I_InitSound: CDDA (SRL), SFX sram @ 0x%x, ctl=0x%x\n",
-           (unsigned)sram_alloc, (unsigned)SCSP_CONTROL);
-    return;
-#endif
+    /* Decide the music backend NOW, before the SCSP/68K setup (which differs per
+     * backend and is mutually exclusive -- CDDA keeps the 68K running for CD-DA
+     * mixing, MUS halts it and uploads waveforms).  CDDA only when the CD is free
+     * during play (WAD fully resident, not streaming) AND the disc has audio
+     * tracks; otherwise the MUS/SCSP synth.  sat_streaming_mode is final by now
+     * (set in DG_Init, before doom_start calls I_InitSound). */
+    sat_music_use_cdda = (!sat_streaming_mode) && cdda_has_audio_tracks();
 
+    if (sat_music_use_cdda)
+    {
+        /* CDDA: SRL already initialised sound (SRL::Core::Initialize ->
+           Sound::Hardware::Initialize); the 68K stays running.  Reserve the SRL
+           driver area, clear only SFX slots 0-7, and force MVOL=15 (SGL leaves it
+           0 -> muted SFX) preserving MEM4MB/DAC18B. */
+        sram_alloc = 0x1000;
+        for (int s = 0; s < 8; ++s)
+        {
+            volatile unsigned short *slot = SCSP_SLOT(s);
+            for (int r = 0; r < 16; ++r) slot[r] = 0;
+            slot[R_EG2] = 0x001Fu;
+        }
+        SCSP_CONTROL = (unsigned short)((SCSP_CONTROL & 0xFFF0u) | 0x000Fu);
+        sound_ready = true;
+        printf("I_InitSound: CDDA (SRL), SFX sram @ 0x%x, ctl=0x%x\n",
+               (unsigned)sram_alloc, (unsigned)SCSP_CONTROL);
+        return;
+    }
+
+    /* MUS/SCSP synth: halt the 68K, set the SCSP fresh, clear all 32 slots, and
+       upload the saw/sine/tri waveforms used by the music voices (slots 8-22). */
     smpc_command(SMPC_SNDOFF);
     SCSP_CONTROL = (1u << 9) | 0xFu;
 
@@ -467,7 +499,7 @@ extern "C" void I_InitSound(boolean use_sfx_prefix)
     }
     upload_waveforms();
     sound_ready = true;
-    printf("I_InitSound: SCSP direct (68K halted), waves @ 0x%x/0x%x/0x%x\n",
+    printf("I_InitSound: MUS/SCSP synth (68K halted), waves @ 0x%x/0x%x/0x%x\n",
            wave_off[WAVE_SAW], wave_off[WAVE_SINE], wave_off[WAVE_TRI]);
 }
 
@@ -483,10 +515,8 @@ extern "C" int I_GetSfxLumpNum(sfxinfo_t *sfxinfo)
 
 extern "C" void I_UpdateSound(void)
 {
-#ifndef SATURN_CDDA_MUSIC
-    if (mus.playing && !mus.paused)
+    if (!sat_music_use_cdda && mus.playing && !mus.paused)
         mus_step(DG_GetTicksMs());
-#endif
 #if SFX_DIAG
     /* Row 7: per-channel live map. For each channel 0-7 show its index while it
      * is still inside its playback window (our chan_end_ms bookkeeping = Doom
@@ -530,11 +560,10 @@ extern "C" int I_StartSound(sfxinfo_t *sfxinfo, int channel, int vol, int sep)
 #endif
     if (!c) return -1;
 
-#ifdef SATURN_CDDA_MUSIC
-    /* Defensive: keep the SCSP master volume up in case the SGL driver zeroed
-     * it after I_InitSound (see the MVOL note there). */
-    SCSP_CONTROL = (unsigned short)((SCSP_CONTROL & 0xFFF0u) | 0x000Fu);
-#endif
+    if (sat_music_use_cdda)
+        /* Defensive: keep the SCSP master volume up in case the SGL driver zeroed
+         * it after I_InitSound (see the MVOL note there). */
+        SCSP_CONTROL = (unsigned short)((SCSP_CONTROL & 0xFFF0u) | 0x000Fu);
     volatile unsigned short *slot = SCSP_SLOT(channel);
 
     /* Restart cleanly on a slot that may already be playing (rapid same-channel
@@ -590,10 +619,17 @@ extern "C" void I_PrecacheSounds(sfxinfo_t *sounds, int num_sounds)
 /* Doom I_ interface -- Music                                          */
 /* ================================================================== */
 
-#ifndef SATURN_CDDA_MUSIC
-/* ---- MUS sequencer ------------------------------------------------ */
+/* ================================================================== */
+/* Doom I_ interface -- Music  (runtime backend: MUS-synth or CDDA)    */
+/* ================================================================== */
+/* Both backends are compiled in; the public extern "C" I_* wrappers at the end
+   dispatch on sat_music_use_cdda (decided in I_InitSound).  The per-backend impls
+   are static.  mus_step() (above) and mus_PlaySong() call the PUBLIC I_StopSong
+   wrapper -- correct, because they only ever run while sat_music_use_cdda==0. */
 
-extern "C" void I_InitMusic(void)
+/* ---- MUS / SCSP software synth ------------------------------------ */
+
+static void mus_InitMusic(void)
 {
     init_note_table();
     memset(&mus, 0, sizeof(mus));
@@ -603,12 +639,9 @@ extern "C" void I_InitMusic(void)
         chan_vol[i]  = 100;
         chan_wave[i] = WAVE_SAW;
     }
-    printf("I_InitMusic: MUS/SCSP sequencer (%d channels)\n", MUS_N_SLOTS);
 }
 
-extern "C" void I_ShutdownMusic(void) { I_StopSong(); }
-
-extern "C" void I_SetMusicVolume(int volume)
+static void mus_SetMusicVolume(int volume)
 {
     mus_volume = volume < 0 ? 0 : volume > 127 ? 127 : volume;
     for (int i = 0; i < MUS_N_SLOTS; i++)
@@ -621,7 +654,7 @@ extern "C" void I_SetMusicVolume(int volume)
     }
 }
 
-extern "C" void I_PauseSong(void)
+static void mus_PauseSong(void)
 {
     if (!mus.playing || mus.paused) return;
     mus.paused    = true;
@@ -636,14 +669,14 @@ extern "C" void I_PauseSong(void)
     }
 }
 
-extern "C" void I_ResumeSong(void)
+static void mus_ResumeSong(void)
 {
     if (!mus.playing || !mus.paused) return;
     mus.pause_accum += DG_GetTicksMs() - mus.paused_at;
     mus.paused = false;
 }
 
-extern "C" void *I_RegisterSong(void *data, int len)
+static void *mus_RegisterSong(void *data, int len)
 {
     const uint8_t *d = (const uint8_t *)data;
     if (len < 16 || d[0] != 'M' || d[1] != 'U' || d[2] != 'S' || d[3] != 0x1Au)
@@ -654,9 +687,9 @@ extern "C" void *I_RegisterSong(void *data, int len)
     return data;
 }
 
-extern "C" void I_UnRegisterSong(void *handle) { (void)handle; }
+static void mus_UnRegisterSong(void *handle) { (void)handle; }
 
-extern "C" void I_PlaySong(void *handle, boolean looping)
+static void mus_PlaySong(void *handle, boolean looping)
 {
     if (!handle || !sound_ready) return;
     I_StopSong();
@@ -684,7 +717,7 @@ extern "C" void I_PlaySong(void *handle, boolean looping)
     }
 }
 
-extern "C" void I_StopSong(void)
+static void mus_StopSong(void)
 {
     if (!mus.playing) return;
     mus.playing = false;
@@ -699,43 +732,35 @@ extern "C" void I_StopSong(void)
     }
 }
 
-extern "C" boolean I_MusicIsPlaying(void) { return mus.playing; }
+static boolean mus_MusicIsPlaying(void) { return mus.playing; }
 
-#else /* SATURN_CDDA_MUSIC */
 /* ---- CDDA backend via SRL::Sound::Cdda ---------------------------- */
+/* Track assignment (track 01 = the data/WAD track): musicnum 1 (mus_e1m1) -> CD
+   track 02, etc.  The musicnum->track map below is hardcoded (Doom-1 E1 only); a
+   data-driven, per-WAD mapping file is the documented follow-up (see
+   STREAMING_ANALYSIS.md S4d / the music-mapping note). */
 
-/* Track assignment (track 01 = data):
-     musicnum  1 (mus_e1m1)   -> CD track 02
-     musicnum 32 (mus_introa) -> CD track 33 */
-extern "C" int sat_streaming_mode;
+static void cdda_InitMusic(void) { cdda_track = 0; }
 
-extern "C" void I_InitMusic(void)
-{
-    cdda_track = 0;
-    printf("I_InitMusic: CDDA via SRL (%d tracks)\n", NUMMUSIC - 1);
-}
-
-extern "C" void I_ShutdownMusic(void) { I_StopSong(); }
-
-extern "C" void I_SetMusicVolume(int volume)
+static void cdda_SetMusicVolume(int volume)
 {
     /* SRL::Sound::Cdda::SetVolume expects 0-255; Doom passes 0-127. */
     SRL::Sound::Cdda::SetVolume((uint8_t)(volume * 2));
 }
 
-extern "C" void I_PauseSong(void)
+static void cdda_PauseSong(void)
 {
     if (!cdda_track) return;
     SRL::Sound::Cdda::StopPause();
 }
 
-extern "C" void I_ResumeSong(void)
+static void cdda_ResumeSong(void)
 {
-    if (sat_streaming_mode || !cdda_track) return;
+    if (!cdda_track) return;       /* CDDA only runs when !sat_streaming_mode anyway */
     SRL::Sound::Cdda::Resume();
 }
 
-extern "C" void *I_RegisterSong(void *data, int len)
+static void *cdda_RegisterSong(void *data, int len)
 {
     static const uint8_t cdda_track_map[] = {
         0,
@@ -757,27 +782,63 @@ extern "C" void *I_RegisterSong(void *data, int len)
     return NULL;
 }
 
-extern "C" void I_UnRegisterSong(void *handle) { (void)handle; }
+static void cdda_UnRegisterSong(void *handle) { (void)handle; }
 
-extern "C" void I_PlaySong(void *handle, boolean looping)
+static void cdda_PlaySong(void *handle, boolean looping)
 {
-    if (sat_streaming_mode || !handle || !sound_ready) return;
+    if (!handle || !sound_ready) return;
     int track = (int)(intptr_t)handle;
     if (track < 2) return;
     cdda_track = track;
     SRL::Sound::Cdda::PlaySingle((uint16_t)track, looping);
 }
 
-extern "C" void I_StopSong(void)
+static void cdda_StopSong(void)
 {
     if (!cdda_track) return;
     cdda_track = 0;
     SRL::Sound::Cdda::StopPause();
 }
 
-extern "C" boolean I_MusicIsPlaying(void) { return cdda_track > 0; }
+static boolean cdda_MusicIsPlaying(void) { return cdda_track > 0; }
 
-#endif /* SATURN_CDDA_MUSIC */
+/* ---- public dispatch (branch on the runtime backend) ------------- */
+
+extern "C" void I_InitMusic(void)
+{
+    /* Init BOTH: the MUS table init is cheap and touches no HW that conflicts with
+       the CDDA path (the exclusive 68K/SCSP choice was already made in I_InitSound);
+       the CDDA reset is a scalar.  Leaves whichever backend is selected ready. */
+    mus_InitMusic();
+    cdda_InitMusic();
+    printf("I_InitMusic: %s\n", sat_music_use_cdda ? "CDDA (SRL)" : "MUS/SCSP synth");
+}
+
+extern "C" void I_ShutdownMusic(void) { I_StopSong(); }
+
+extern "C" void I_SetMusicVolume(int volume)
+{ if (sat_music_use_cdda) cdda_SetMusicVolume(volume); else mus_SetMusicVolume(volume); }
+
+extern "C" void I_PauseSong(void)
+{ if (sat_music_use_cdda) cdda_PauseSong(); else mus_PauseSong(); }
+
+extern "C" void I_ResumeSong(void)
+{ if (sat_music_use_cdda) cdda_ResumeSong(); else mus_ResumeSong(); }
+
+extern "C" void *I_RegisterSong(void *data, int len)
+{ return sat_music_use_cdda ? cdda_RegisterSong(data, len) : mus_RegisterSong(data, len); }
+
+extern "C" void I_UnRegisterSong(void *handle)
+{ if (sat_music_use_cdda) cdda_UnRegisterSong(handle); else mus_UnRegisterSong(handle); }
+
+extern "C" void I_PlaySong(void *handle, boolean looping)
+{ if (sat_music_use_cdda) cdda_PlaySong(handle, looping); else mus_PlaySong(handle, looping); }
+
+extern "C" void I_StopSong(void)
+{ if (sat_music_use_cdda) cdda_StopSong(); else mus_StopSong(); }
+
+extern "C" boolean I_MusicIsPlaying(void)
+{ return sat_music_use_cdda ? cdda_MusicIsPlaying() : mus_MusicIsPlaying(); }
 
 extern "C" void I_BindSoundVariables(void)
 {

@@ -18,9 +18,13 @@ Saturn GFS).
   ports link — DoomJo leaves it 0, precache unchanged). Graphics stream lazily as
   self-purging PU_CACHE instead of front-loading the level's whole working set.
 - **`MAXVISPLANES` 512→256** (S2 *Change B*, the blunt cut): DONE
-  (`Makefile:90` `-DMAXVISPLANES=256`, made `-D`-overridable in `core/r_plane.c`).
+  (`Makefile` `-DMAXVISPLANES=256`, made `-D`-overridable in `core/r_plane.c`).
   Frees ~166 KB of the 884 KB LWRAM zone. **S2 *Change A* (the `SAT_VISPLANE_POOL`
-  span arena) was NOT done** — still on the table as further headroom.
+  span arena): SHIPPED** — `Makefile` `-DSAT_VISPLANE_POOL=1 -DVP_POOL_PLANES=96`,
+  plumbed `core/r_plane.c:80-89,256-260` (plane pool carved, `VP_SLICE_BYTES` pairs,
+  overflow telemetry `:72`). The pool runs at 96 planes against the 256-plane cap.
+  *RECONCILED 2026-06-24: the prior "Change A was NOT done — still on the table" note
+  was stale; the pool IS on. Marked SHIPPED.*
 - **libc heap 48→88 KB**: DONE (`src/syscalls.c`) — the full Doom II 2919-lump
   directory fits.
 - **Cart guard**: DONE (`src/dg_saturn.cxx`) — refuse to cart-load a WAD bigger than
@@ -34,7 +38,7 @@ Saturn GFS).
   `spanstart_l`/`spanstart`/`spanstop` sized `[256]` not `[224]`. See
   `RENDER_CORRUPTION_ANALYSIS.md §0`.
 
-### CD-read reliability — "W_ReadLump: only read 0 of N" — fix implemented, pending Ymir
+### CD-read reliability — "W_ReadLump: only read 0 of N" — SHIPPED (`a693a4e`)
 Root cause found: `GFS_Load` (under `SRL::Cd::File::LoadBytes`) **requires a
 4-byte-aligned destination** (`GFS_ERR_ALIGN = -21`). `Saturn_Read`'s old tail read
 wrote to `buffer + (2048 - offset%2048)`, which is unaligned whenever `offset%2048`
@@ -43,25 +47,33 @@ to `0` → the "only read 0 of N" failure (missing textures/sounds). Fix
 (`src/w_file_saturn.cxx`): bounce non-aligned reads sector-by-sector through a
 4-byte-aligned buffer (fully-aligned reads keep the one-call fast path), and keep the
 WAD file CLOSED so each `LoadBytes` is a churn-free `GFS_Load` (latent perf win).
-*Implemented + compiles; awaiting Ymir validation before commit.*
+*RECONCILED 2026-06-24: SHIPPED — committed `a693a4e` (the "CD-read retry" in that
+commit). The sector-by-sector alignment bounce through a 4-byte-aligned static
+`sect_buf` plus the `sat_cd_load` LoadBytes retry wrapper are in
+`src/w_file_saturn.cxx:151-222`. Working tree clean.*
 
-### Phase 1 — bounded LRU texture cache — IMPLEMENTED, pending Ymir
+### Phase 1 — bounded LRU texture cache — DONE-UNCOMMITTED (split-screen only), pending Ymir
 - **z_zone multi-zone extensions** (S4 foundation): `Z_MainZone` / `Z_InitZone` /
   `Z_Malloc2` / `Z_Free2` / `Z_LargestFreeBlock` / `Z_ForEachBlock` added to
   `core/z_zone.{c,h}` on the existing `memblock_t` — additive, the classic
   allocator hot path is untouched.
-- **S4(a) bounded LRU composite cache** (`core/r_cache.{c,h}`, new): multi-patch
-  wall composites build into a recency-evicted sub-zone (one PU_STATIC slab
-  carved from leftover zone *after* geometry, adaptive 128KB-margin / 256KB-cap /
-  24KB-min) instead of accumulating in the main zone. Seam = `R_GenerateComposite`
-  / `R_GetColumn` (touch on hit, lifecount 3); aged per view in
-  `R_PostTexCacheFrame` (`R_RenderPlayerView`); per-level carve/teardown in
-  `P_SetupLevel`. Gated `sat_streaming_mode && single-player && !sat_xsplit`, with
-  graceful fallback to the classic main-zone PU_CACHE path → worst case is exactly
-  today's behaviour; DoomJo (`sat_streaming_mode=0`) is byte-identical.
-  Adversarially reviewed (allocator/lifecycle/portability) — clean; the one
-  cross-port action is **adding `core/r_cache.c` to DoomJo's makefile** when it
-  pulls this revision (else 6 undefined-symbol link errors).
+- **S4(a) bounded LRU composite cache** (`core/r_cache.{c,h}`). *RECONCILED
+  2026-06-24: SUPERSEDED in the core working tree (uncommitted, ~50-line
+  `r_cache.c` diff). The original design below (single-player gating + adaptive
+  128KB-margin / 256KB-cap / 24KB-min carve) is now WRONG.* The cache is now
+  **SPLIT-SCREEN ONLY**: `R_SetupTextureCaches()` returns early
+  `if (!sat_streaming_mode || sat_local_players <= 1)` (`core/r_cache.c:110`).
+  **1p streaming runs CACHELESS** — the classic main-zone PU_CACHE path. The
+  adaptive carve is replaced by a **FIXED 96KB slab** (`TEXCACHE_FIXED`,
+  `r_cache.c:34-42,120-127`) with a `largest < FIXED+MARGIN` guard. Reason (in
+  the code comment): a 1p slab STARVED PU_CACHE + fragmented the zone (worse than
+  cacheless); split-screen genuinely needs the contiguous slab to fix the 2p
+  composite-fragmentation OOM. Seam still `R_GenerateComposite` / `R_GetColumn`
+  (touch on hit, lifecount 3); DoomJo (`sat_streaming_mode=0`) byte-identical.
+  **Next action: commit + push core `r_cache.c`, bump core in port.** The one
+  cross-port action is still **adding `core/r_cache.c` to DoomJo's makefile** when
+  it pulls this revision (else undefined-symbol link errors). Ymir/HW validation
+  of the 2p slab path still pending.
 - **S4(b) composite-on-demand `decals[]`** — deferred (heavier structural change);
   the classic `R_GenerateComposite` producer is reused under the LRU instead.
 - **Not yet cached**: single-patch wall lumps, flats, sprite patches (still classic
@@ -218,13 +230,15 @@ which is cold scratch with zero render-perf cost.
 
 ### S3 — Grow the zone within the existing 2 MB (RP_CMD_BUF / HWRAM).
 
-- **B-shrink RP_CMD_BUF:** `RP_CMD_BUF_SIZE = 0x28000` (160 KB, 5120 cmds,
-  `core/r_parallel.h:10`). Walls now go to VDP1 so column-command traffic is
-  lower than when sized. Halve to `0x14000` (80 KB, 2560 cmds) and reduce the
-  subtraction in `DG_ZoneBase` (`src/dg_saturn.cxx:564`) → zone grows to ~944 KB
-  (**+80 KB**). Risk: renderer stall/timeout if a frame needs >2560 column cmds
-  (`rp_timeout_count` is on the overlay — gate the cut on it staying 0 on the
-  busiest scene). Measured-headroom cut, not free.
+- **B-shrink RP_CMD_BUF: SHIPPED.** *RECONCILED 2026-06-24: committed, not merely
+  proposed.* `Makefile` `-DRP_CMD_BUF_SIZE=0x14000` (80 KB, 2560 cmds) overrides
+  the core default `0x28000` (160 KB, `core/r_parallel.h:18`). Walls now go to
+  VDP1 so column-command traffic is lower than when sized. Zone subtraction
+  `src/dg_saturn.cxx:608` `LOW_WORK_RAM_SIZE - RP_CMD_BUF_SIZE` → zone grows to
+  `0x100000-0x14000` = 944 KB (**+80 KB**). Remaining safety gate (not a code
+  gap): keep watching `rp_timeout_count` (overlay `to=` must stay 0,
+  `dg_saturn.cxx:809`) on the busiest scene — a frame needing >2560 column cmds
+  would stall/timeout.
 - **Relocate RP_CMD_BUF to HWRAM:** blocked — HWRAM has only ~41 KB free (the
   88 KB libc heap + code/.bss eat the rest, `src/syscalls.c:43,47-48`); cmd buf
   is hot so cart is out. Not viable; the realistic version is shrink, not move.
@@ -319,6 +333,21 @@ disposable working set, never a whole-level store.
 - OOM-purge-and-retry seam (FastDoom `Z_MallocEmergency`, `z_zone.c:345-357`) but
   purge `PU_CACHE` instead of only sounds — converts the hard 8800-byte crash
   into graceful eviction.
+  *RECONCILED 2026-06-24: implemented (core working tree, UNCOMMITTED, ~18-line
+  diff) — but as a `Z_Malloc` one-shot rover **re-anchor** retry, NOT a PU_CACHE
+  purge (the first scan already purges PU_CACHE). `core/z_zone.c:207,231-236`: on
+  reaching the start sentinel without a fit, if `!z_emergency` re-anchor
+  `mainzone->rover = blocklist.next` and rescan once (`goto z_retry_scan`).
+  Rationale: the rover can sit inside the largest free run, so the scan hits its
+  own start before spanning a straddling run → false OOM ("lg>=size paradox"). The
+  first scan already purged PU_CACHE, so re-anchor recovers the hidden run. Commit
+  + push core pending; Ymir/HW validation under streaming churn pending.*
+- **R_InitColormaps colormap reclaim** (core working tree, UNCOMMITTED, ~4-line
+  diff): `R_InitColormaps` now `W_ReleaseLumpNum(lump)` after `memcpy`'ing the
+  colormap to high-WRAM BSS `saturn_cmap` (`core/r_data.c`) — releases the
+  now-dead PU_STATIC zone copy (→ PU_CACHE reclaimable), ~8.7K that was leaking
+  PU_STATIC every session. Commit + push core pending; verify the DoomJo CMAP256
+  path (it also copies colormap to BSS) tolerates the release.
 - Keep `tintmap` (64 KB) and translucency off (never allocated on Saturn).
 
 ---
@@ -331,12 +360,15 @@ disposable working set, never a whole-level store.
    on `sat_streaming_mode`, or `precache=false`). This removes the load-time peak
    that throws the 8800-byte error. *Expected: Doom II reaches in-level play;
    graphics stream lazily as PU_CACHE.*
-2. **S2: enable `SAT_VISPLANE_POOL=1`** (`core/r_defs.h:432`) and size the arena
-   from the measured coverage peak. *Frees ~150–300 KB resident → headroom for
-   big-map PU_LEVEL geometry.*
-3. If the biggest maps still don't fit geometry-only: add **S3 RP_CMD_BUF shrink
-   to 80 KB** (gated on `rp_timeout_count==0`) and/or **MAXVISPLANES→256** (safe
-   once the pool is on), and **disable f_wipe** (−143 KB).
+2. **S2: `SAT_VISPLANE_POOL=1` — SHIPPED.** *RECONCILED 2026-06-24: no longer a
+   to-do; the span arena is on (`Makefile` `-DSAT_VISPLANE_POOL=1
+   -DVP_POOL_PLANES=96`, plumbed `core/r_plane.c:256-260`), running at 96 planes.
+   Freed ~150–300 KB resident → headroom for big-map PU_LEVEL geometry.*
+3. **S3 RP_CMD_BUF shrink to 80 KB — SHIPPED** (`Makefile -DRP_CMD_BUF_SIZE=0x14000`,
+   +80 KB zone; keep watching `rp_timeout_count==0`) and **MAXVISPLANES→256 —
+   SHIPPED** (safe with the pool on), and **f_wipe disabled in streaming mode**
+   (−143 KB). *RECONCILED 2026-06-24: these are committed, no longer conditional
+   to-dos.*
 
 This combination (S1 + S2, optionally S3) is the minimal path and is overwhelmingly
 likely to make Doom II load and play, because it (a) removes the precache peak and
@@ -419,3 +451,179 @@ maps.
 - External refs: d32xr `saturn-refs/d32xr/{r_cache.c,r_phase9.c,r_main.c:570,r_data.c:936}`;
   SlaveDriver `saturn-refs/SlaveDriver-Engine/{FILE.C,UTIL.C:339,LEVEL.C,PIC.C:250}`;
   FastDoom `saturn-refs/FastDoom/FASTDOOM/{z_zone.h,r_data.c:891}`.
+
+---
+
+## 7. The load model, music, and the cart — why we stream, and the two ways to get music (2026-06-24)
+
+This section answers "can't we load the map once and free the CD for music?" — the recurring
+question once big-WAD streaming works but plays silent. Short answer: **the map's graphics
+don't fit RAM (sprites dominate), so we must stream; streaming keeps the CD head busy, so
+CDDA can't play during a level. Music without a cart = the SCSP MUS synth (no CD). Music with
+the proven CD-free path = a 4 MB cart (load the map once into cart, run cart-resident).**
+
+### 7.1 We do NOT load the whole WAD — and "load just the map's assets once" already failed
+
+The 14.6 MB WAD stays on the CD; only the directory (~47 KB) + touched lumps are resident.
+"Load only the map's required assets once" is exactly what vanilla `R_PrecacheLevel` does — it
+loads **only** the textures/flats/sprites the map references (`texturepresent[]`/`flatpresent[]`/
+`spritepresent[]`), not the whole WAD. **It OOM'd on Doom II** and is disabled in streaming
+mode (`p_setup.c` precache gate, S1). The budget says why:
+
+| | KB |
+|---|---|
+| LWRAM zone | 944 |
+| − PU_STATIC floor (texture dir 157 + HUD 80 + visplane pool 67 + sprites 41 + lumphash 11 + MUS 22–65 + …) | ~450 |
+| − map geometry (PU_LEVEL, loaded once, resident all level) | 92 (MAP01) … 413 (MAP14) |
+| **= RAM left for graphics** | **~80 (big map) … ~400 (small map)** |
+
+A map's **referenced** graphics: flats ~120–200 KB, wall textures ~150–400 KB, and **sprites —
+the killer — several hundred KB to >1 MB** (every frame × angle of every monster/item type
+placed; the full Doom II sprite set is 3.6 MB and a busy map pulls a big slice). So the map's
+required subset is **~0.5–2+ MB against ~80–400 KB available**. It does not fit — by a lot, and
+sprites are the dominant reason. Streaming exists precisely to keep only the **visible** subset
+resident (~100–200 KB) and re-read the rest from CD as the view changes. (Geometry *is* already
+"load once" — it is `PU_LEVEL`, resident for the whole level; only graphics stream.)
+
+### 7.2 Streaming ⇒ the CD head is busy ⇒ CDDA cannot play
+
+The Saturn drive has one laser head: it can read **data** (WAD lumps) or play a **CDDA audio**
+track, not both. During play we re-read sprites/textures on demand, so the head is busy →
+CDDA would have to seek off the music track for every lump read → music stutters and the read
+slows. You cannot cache your way out: CD audio is ~176 KB/s PCM (a 2-min track ≈ 21 MB, can't
+cache), and the big WAD is why we stream in the first place. So **any** on-demand CD read
+during a level is incompatible with CDDA.
+
+### 7.3 Two music architectures (a runtime switch, both backends compiled in)
+
+> **STATUS — SHIPPED 2026-06-24 (runtime backend switch).** Both backends are now
+> compiled in; `src/i_sound_saturn.cxx` dispatches the `I_*Music`/`I_*Song` calls on a
+> runtime flag `sat_music_use_cdda` (defined in `core/s_sound.c`, set in `I_InitSound`).
+> Predicate: `sat_music_use_cdda = !sat_streaming_mode && cdda_has_audio_tracks()` —
+> CDDA only when the WAD is fully resident (CD free) AND the disc has Red Book audio
+> (checked via `SRL::Cd::TableOfContents::GetTable()` → `LastTrack.GetType()==Audio`);
+> otherwise the **MUS/SCSP synth** plays. `I_InitSound` makes the exclusive HW choice
+> (CDDA: 68K running; MUS: 68K halted + waveform upload) from the same flag, decided
+> before the SCSP setup. The MUS-lump tag in `s_sound.c` **stays PU_STATIC for both
+> backends** (the synth reads it every frame so it must be resident; CDDA only runs with
+> the WAD already resident so freeing ~22-65 KB there is pointless, and PU_CACHE would
+> risk a purge-vs-`W_ReleaseLumpNum` crash) — so the once-deferred "free MUS" is **moot**
+> now that the synth, not CDDA, covers streaming. **Consequence: big-WAD no-cart streaming
+> now has music (MUS synth); a cart/small-WAD build with an audio-track disc auto-uses
+> CDDA.** The old `-DSATURN_CDDA_MUSIC` is now a dead no-op. *Pending Ymir validation; the
+> MUS-synth's per-tick CPU cost on the ~7 fps system is the tradeoff to watch.*
+
+Both backends already exist in `src/i_sound_saturn.cxx`, selected today at *compile* time by
+`-DSATURN_CDDA_MUSIC`. The fix is to compile both and select at **runtime**:
+
+- **MUS / SCSP synth** (`#else` branch — currently compiled out). The SCSP synthesizes the
+  tiny in-WAD MUS lump (22–65 KB) with **zero CD access** → coexists with streaming. **This is
+  the baseline music path for no-cart big-WAD streaming.** Cost: 22–65 KB resident + a per-tick
+  CPU cost on the ~7 fps system. (Note: this is why the MUS lump load at `s_sound.c:640` must
+  NOT be freed in streaming mode — the synth reads it continuously; "free MUS" applies only to
+  the CDDA path, where the bytes are ignored.)
+- **CDDA** (current). Hardware Red Book playback, ~0 RAM/CPU, best quality — but needs the
+  drive free, i.e. **only when the level is fully resident** (cart, or a small WAD that fits).
+
+Switch: `sat_streaming_mode && !cart` → MUS-synth; otherwise → CDDA (if the disc has tracks).
+
+### 7.4 Per-level disc repack (S4d) — a STREAMING-SMOOTHNESS win, NOT a music fix
+
+**Important:** repack does **not** free the CD for music. It does not shrink the working set;
+it reorders the map's lumps into one contiguous, sector-aligned, access-ordered blob so reads
+are **fast and seek-light**. Sprites still stream on demand during play → the head stays busy →
+CDDA still cannot play. So repack is orthogonal to music — it makes **streaming smoother**
+(shorter/fewer hitches), and it **combines** with MUS-synth (repack = fewer hitches, MUS-synth
+= music). It is also what makes the cart load (§7.5) fast.
+
+**How it works** (PSX-Doom `MAPTEXxx.IMG`/`MAPSPRxx.IMG` model; PowerSlave one-file-per-level):
+1. **Offline, in `tools/strip_wad.py`:** for each map, compute the referenced lumps — textures
+   (SIDEDEFS), flats (SECTORS floor/ceiling pics), sprites (THINGS → `mobjinfo` spawn frames),
+   the map's own geometry lumps, the map's sounds. Bundle each map's set **contiguously** on the
+   disc in roughly access order, sector-aligned.
+2. **Index relocation** (SlaveDriver `tileBase` / PSX `LEVEL.C:66` trick): repacking changes
+   lump offsets, so the tool rewrites the directory (or emits a per-map offset table) and the
+   loader maps original lump indices → repacked positions, so `W_CacheLumpNum` still works.
+3. **Loader:** read from the per-map region. Today's on-demand reads then seek **within** a small
+   contiguous blob instead of across 14.6 MB → ~one seek/level + sequential reads (vs ~300 ms
+   worst-case scattered seeks now). Optional async prefetch ahead (PowerSlave `GFS_NwCdRead`,
+   `FILE.C:163`) needs verifying SRL exposes the non-blocking `Cd` API; blocking `LoadBytes`
+   already benefits from the sequential layout.
+
+Can it be a **build option?** Yes — the disc can be built as today's single-WAD or as a
+per-level-repacked layout; the loader handles both (a flag/marker lump). But it is a *disc-build
++ loader* change (S4d), independent of the music backend (§7.3) — so "repack **instead of** MUS"
+is a category error: without a cart you still need MUS-synth for music regardless of repack.
+
+### 7.5 The cart enhancement — load once → CD free → CDDA, AND faster than CD streaming
+
+With a 4 MB extended-RAM cart (see the cart HW notes): at level load, copy the map's referenced
+subset (which fits easily in 4 MB) from CD into the cart **once** (one big sequential read — fast
+if the disc is repacked, §7.4). During play the engine sources graphics from the cart, so:
+
+- **The CD is idle during play → CDDA music plays clean.** This is the only proven CD-free path.
+- **It is faster than CD streaming.** A cart access has no seek and no ~150 KB/s CD bottleneck;
+  copying a lump cart→work-RAM is far faster than CD→work-RAM (no ~300 ms seeks). So in-play
+  "misses" are cheap → fewer/no hitches.
+- **Caveat — cart is COLD store, not render-RAM.** Cart RAM is ~4× slower than work RAM (A-bus,
+  16-bit), no burst-write, SCU-DMA cannot write it, code-exec prohibited. Rendering reads texture/
+  sprite pixels many times per frame, so you must **not** render per-pixel directly from the cart
+  (that is why the COLORMAP was copied OUT of A-bus memory). The model is: cart = the per-map cold
+  store (the "disc" replacement); still copy the **visible** subset cart→work-RAM on demand (the
+  existing LRU, source = cart not CD). Render from work-RAM (fast); the cart only shortens the
+  miss path and frees the drive. This is S5 (cart as miss-backing), now with the music payoff.
+- **Driver cost:** SRL's `CartRam` is a stub; a cart read/write driver must be ported (libyaul
+  has one). The game must still run identically with **no** cart (cart is a detected bonus).
+
+### 7.6 The resulting matrix
+
+| Config | Graphics during play | Music | In-play speed | Notes |
+|---|---|---|---|---|
+| **No cart (baseline)** | stream from CD (visible set) | **MUS-synth** (SCSP, no CD) | streaming hitches | + per-level repack (S4d) = fewer hitches |
+| **No cart + repack** | stream from a contiguous per-map blob | MUS-synth | smoother (seek-light) | disc-build option; still no CDDA |
+| **4 MB cart** | copy per-map subset CD→cart once, LRU cart→work-RAM | **CDDA** (CD idle) | fastest (no seeks) | needs cart driver (SRL stub); repack speeds the load |
+| Cart or small WAD fully resident | all resident | CDDA | no streaming | the classic "load once" — only when it fits |
+
+**Bottom line:** streaming is forced by the asset budget (the map's graphics don't fit), so the
+no-cart baseline gets music from **MUS-synth**, not from changing the load model. **Per-level
+repack** is a worthwhile *smoothness* improvement that stacks with MUS-synth (and accelerates the
+cart load) but is not itself a music path. The **cart** is the one way to genuinely free the CD
+for CDDA *and* run faster than streaming — a strong optional enhancement, never a requirement.
+
+### 7.7 Music → CD-track mapping (the CDDA path; for different WADs/maps)
+
+This matters **only for the CDDA backend** — a disc built with Red Book audio tracks, played
+with the WAD fully resident (cart/small WAD). The **MUS-synth path needs no mapping**: it plays
+the in-WAD `d_<name>` MUS lump directly, so any WAD's music "just works" while streaming. For
+CDDA, each Doom music number must map to a physical CD audio track (track 01 is the data/WAD
+track; audio is 02+), and that mapping is **WAD-specific** (Doom 1 `e1m1…`, Doom II `runnin…`,
+PWADs arbitrary).
+
+**Current state (hardcoded):** `cdda_RegisterSong()` in `src/i_sound_saturn.cxx` holds a static
+`cdda_track_map[]` (musicnum → track), populated for Doom-1 episode 1 only (`e1m1→2 … e1m9→10`).
+It matches by `S_music[i].data == data` to recover the musicnum. This is not data-driven — a
+different WAD needs a code edit.
+
+**Proposed data-driven format (the follow-up so builders own it):** a small text file on the
+disc, e.g. `cd/data/CDDAMAP.TXT`, one `name track` pair per line:
+
+```
+# DoomSRL CDDA music map: <music-lump-name-without-d_>  <CD-audio-track>
+# (only needed when the disc carries Red Book audio + the WAD is RAM-resident)
+e1m1   2
+e1m2   3
+runnin 2     # Doom II MAP01
+stalks 3     # Doom II MAP02
+```
+
+- **Engine:** at `I_InitMusic` (CDDA path only), read `CDDAMAP.TXT` via `SRL::Cd::File`, and for
+  each line resolve the name against `S_music[].name` → fill the musicnum→track table (replacing
+  the hardcoded array). Absent/short file → fall back to the built-in default (or, if a name has
+  no track, that song is silent — better than a wrong track). Name-keyed so it is WAD-agnostic.
+- **Disc builder:** add the audio tracks to the `.cue`, drop a matching `CDDAMAP.TXT` in
+  `cd/data/`. Document the track order in the cue ↔ the names here. (A future `tools/strip_wad.py`
+  / disc-build step can emit a default `CDDAMAP.TXT` from the WAD's `S_music` table.)
+
+Status: **format designed + documented (here); the runtime loader is a follow-up.** Until it
+lands, CDDA uses the hardcoded Doom-1-E1 map; every other WAD gets music via the MUS-synth path
+(which is the no-cart baseline anyway, so no one is left silent).

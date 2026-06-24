@@ -600,13 +600,19 @@ visible set < referenced set). Option E ~2.2× that pressure against the same 25
 4. **The real remaining bind is PU_LEVEL geometry (700–900 KB on big maps)** — which this refactor
    does **not** touch. The 157 KB floor is ~16–18 % of the zone / ~40–45 % of the PU_STATIC
    residents, small next to the geometry it competes with.
-5. **Candidate cheap unblock (verify on Ymir first):** `R_SetupTextureCaches` sizes the LRU carve
-   from `Z_LargestFreeBlock` (**pure-free only**, `r_cache.c:99`), while the real reclaimable run
-   is `Z_LargestAllocatable` (**purge-inclusive**, already shown as overlay `ZON mx`). At
-   level-load the zone is full of just-loaded PU_CACHE graphics, so pure-free (`TXC lf`) is tiny
-   while `mx` may be large. If the overlay shows `mx ≫ lf`, switching the carve to size from
-   purge-inclusive space unblocks the LRU **with a ~1-line change and zero shared-core risk**.
-   Tradeoff: it purges freshly-loaded level graphics at carve time (one-off re-read); measure.
+5. **Cheap unblock — SUPERSEDED (was core `4f06d65`):** `R_SetupTextureCaches` sizes the LRU
+   carve from `Z_LargestAllocatable` (**purge-inclusive**) instead of `Z_LargestFreeBlock`
+   (**pure-free only**). *RECONCILED 2026-06-24: SUPERSEDED by the uncommitted `r_cache.c`
+   rework.* The `Z_LargestAllocatable` call survives (`r_cache.c:120`) BUT it now runs **only in
+   split-screen** — 1p early-returns at `r_cache.c:110`
+   (`if (!sat_streaming_mode || sat_local_players <= 1)`), so **1p is CACHELESS by design**. The
+   largest-MARGIN sizing this bullet described is replaced by a **FIXED 96KB slab**
+   (`TEXCACHE_FIXED`) with a `largest < FIXED+MARGIN` guard (`r_cache.c:123`). The original
+   "1p zone is walled by PU_CACHE → pure-free was only ~10 KB → the carve bailed `TXC a0` →
+   purge-inclusive flips it `TXC a0→a1`" story no longer applies: 1p does not carve at all.
+   `Z_LargestAllocatable` is now **only the split-screen FIXED-slab guard.** *Validate on Ymir:*
+   the **2p** slab (does the contiguous 96KB carve succeed; does it cure the 2p composite-
+   fragmentation OOM) and the `z_zone.c` re-anchor retry — NOT a 1p `TXC a0→a1` flip.
 
 ### 9.4 GATE VERDICT — **DEFER the texture-directory refactor (C/D/E).**
 
@@ -614,11 +620,14 @@ Not justified now: the floor is a third of the estimate and under the deprioriti
 (the recommended path) would worsen the pool churn it aims to relieve; the cheap levers already
 shipped; and the dominant zone consumer is PU_LEVEL geometry, untouched by this work.
 
-**Recommended order instead:** (1) validate the pending CD-read-alignment fix + S4(a) LRU on
-Ymir/hardware across all 32 maps, and read `TXC lf` vs `ZON mx` to test §9.3(5); (2) if the carve
-is starved by pure-free accounting, ship the §9.3(5) one-liner; (3) if specific big maps still
-`I_Error` at load, attack **PU_LEVEL geometry** directly (per-level bump arena S4(c), geometry
-trims) — that is where the bytes are; (4) revisit this refactor **only** if, after the above, the
-carve is *still* starved **and** on TNT-class WADs where the floor exceeds 250 KB — and then prefer
-**Option C** (lazy directory, keeps the small `height×mpc` composites) over E for DoomSRL's real
-WADs, since C caps the actual floor *without* the 2.2× slab inflation that E adds.
+**Recommended order instead:** (1) *RECONCILED 2026-06-24:* the §9.3(5) carve fix is SUPERSEDED
+— 1p is now CACHELESS (no carve), and the CD-read-alignment fix already SHIPPED (`a693a4e`). So
+step 1 is: validate the **uncommitted** `r_cache.c` split-only FIXED-96KB slab + the `z_zone.c`
+re-anchor retry on Ymir/hardware — confirm the **2p** slab carves and cures the 2p
+composite-fragmentation OOM, and that no map `I_Error`s (1p OR 2p) across all 32 maps (NOT a 1p
+`TXC a0→a1` flip — 1p no longer carves); (2) if specific big maps still `I_Error` at load, attack
+**PU_LEVEL geometry** directly (per-level bump arena S4(c), geometry trims) — that is where the
+bytes are (700–900 KB vs the 157 KB texture floor); (3) revisit this refactor **only** if, after
+the above, the carve is *still* starved **and** on TNT-class WADs where the floor exceeds 250 KB —
+and then prefer **Option C** (lazy directory, keeps the small `height×mpc` composites) over E for
+DoomSRL's real WADs, since C caps the actual floor *without* the 2.2× slab inflation that E adds.

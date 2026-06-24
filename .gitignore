@@ -39,3 +39,7 @@ sci_probe.log
 
 # Generated HUD preview (regenerate with tools/make_hud2p.py)
 tools/hud2p_preview.png
+
+# Python bytecode cache (tools/)
+__pycache__/
+*.pyc

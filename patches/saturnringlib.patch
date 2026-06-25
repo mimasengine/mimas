@@ -1,0 +1,31 @@
+diff --git a/saturnringlib/shared.mk b/saturnringlib/shared.mk
+index b97f776..871bc07 100644
+--- a/saturnringlib/shared.mk
++++ b/saturnringlib/shared.mk
+@@ -323,7 +323,7 @@ create_bin_cue: create_iso
+ # Usage: convert_audio_to_raw audiofile rawfile [filter_option]
+ define CONVERT_AUDIO_TO_RAW
+ convert_audio_to_raw() { \
+-	@audiofile="$$1"; \
++	audiofile="$$1"; \
+ 	rawfile="$$2"; \
+ 	filter_option="$$3"; \
+ 	if [ ! -f "$$rawfile" ] || [ "$$audiofile" -nt "$$rawfile" ]; then \
+diff --git a/saturnringlib/srl_core.hpp b/saturnringlib/srl_core.hpp
+index 04f6b27..9d6e501 100644
+--- a/saturnringlib/srl_core.hpp
++++ b/saturnringlib/srl_core.hpp
+@@ -104,7 +104,12 @@ namespace SRL
+             SRL::Scene3D::SetDepthDisplayLevel(3);
+ 
+             // Load sound driver
+-#if SRL_USE_SGL_SOUND_DRIVER == 1
++            // SATURN (Mimas): SAT_DEFER_SOUND_INIT skips the boot-time SGL sound init. Its
++            // CDC_CdInit hangs for MINUTES under Ymir (emulated CD re-init), it runs with the
++            // TV blanked (-> black, no overlay), and it is only needed for CDDA music. Mimas
++            // defers it to I_InitSound, run ONLY when CDDA is the active backend; non-CDDA
++            // boots (MUS synth / no-audio / big-WAD streaming) never touch it. Default = on.
++#if SRL_USE_SGL_SOUND_DRIVER == 1 && !defined(SAT_DEFER_SOUND_INIT)
+             SRL::Sound::Hardware::Initialize();
+ #endif
+ 

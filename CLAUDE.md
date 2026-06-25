@@ -37,7 +37,14 @@ standard Saturn-homebrew situation.
 git submodule update --init --recursive   # core + SaturnRingLib
 cd SaturnRingLib
 setup_compiler.bat            # downloads sh2eb-elf-gcc 14.2 toolchain
+cd ..
+git -C SaturnRingLib apply ../patches/saturnringlib.patch   # re-apply local SRL patches (see patches/README.md)
 ```
+
+**Local SRL patches**: `SaturnRingLib` is upstream `ReyeMe/SaturnRingLib` (not
+pushable), so a couple of small but *load-bearing* edits (notably the
+`SAT_DEFER_SOUND_INIT` boot-fix guard) live in `patches/saturnringlib.patch` and
+**must be re-applied after any submodule reset/init**. See `patches/README.md`.
 
 Obtain `doom1.wad` (shareware v1.9) and generate the stripped WAD:
 ```powershell

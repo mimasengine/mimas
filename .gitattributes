@@ -1,0 +1,2 @@
+# Patch files must keep LF (no CRLF conversion) so `git apply` works on any checkout.
+*.patch -text

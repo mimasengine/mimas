@@ -8,7 +8,7 @@
 // Public License (the COPYING file at the repo root, or
 // <https://www.gnu.org/licenses/>) for details.
 //
-﻿/*
+/*
 ** Mimas -- doomgeneric platform layer for the Sega Saturn (SRL build).
 **
 ** Hardware usage:

@@ -116,10 +116,15 @@ $cddaWavs  = @()    # -Cdda multi-file: the WAV tracks referenced separately in 
 
 if ($Cdda) {
     # MULTI-FILE CDDA (-Cdda): build a SMALL data-only .bin (no audio appended -> fast
-    # build, fast Ymir mount) and reference the WAV tracks SEPARATELY in a multi-file
-    # .cue (read on demand).  music/track_NN.wav are already CD-DA (44.1k/16/stereo) so
-    # they go in as WAVE with NO conversion.  Avoids the ~470 MB single-.bin that made
-    # boot take minutes.
+    # build, fast Ymir mount) and reference each music track SEPARATELY in a multi-file
+    # .cue (read on demand).  Each music/track_NN.wav is converted to a headerless, 2352-
+    # byte-sector-aligned raw CD-DA stream (sox, the same recipe SRL's shared.mk uses) and
+    # referenced as a BINARY AUDIO track -- a Saturn CD-DA track is raw 2352-byte sectors,
+    # NOT a RIFF/WAVE container, so a .wav (RIFF + a LIST/INFO metadata chunk, audio payload
+    # starting mid-sector and not a 2352 multiple) left the audio misaligned to the sector
+    # grid and made boot crawl.  Avoids both the ~470 MB single-.bin AND the malformed WAVE.
+    $musicSrcDir  = Join-Path $root "music"
+    $musicSrcMsys = ConvertTo-Msys2Path $musicSrcDir
     if (Test-Path $musicDir) { Remove-Item (Join-Path $musicDir '*') -Recurse -Force -ErrorAction SilentlyContinue }
     $cddaWavs = @(Get-ChildItem -Path (Join-Path $root "music") -Filter "track_*.wav" -ErrorAction SilentlyContinue |
                   Where-Object { $_.BaseName -match '^track_\d+$' } |
@@ -192,22 +197,38 @@ try {
         # TRACK NN = the file's number (track_NN.wav -> CD track NN) so CDDAMAP stays valid.
         # The data .bin stays tiny; Ymir reads each WAV on demand.
         if ($Cdda -and $cddaWavs.Count -gt 0) {
+            # Convert each track to a headerless, 2352-padded raw CD-DA stream (sox; same
+            # recipe as SRL's shared.mk CONVERT_AUDIO_TO_RAW) and reference the .raw as a
+            # BINARY AUDIO track.  A .wav referenced as WAVE put a RIFF/LIST header inside the
+            # audio sectors and a payload that is not a 2352 multiple -> misaligned to the CD
+            # sector grid; raw BINARY is the only correct Saturn CD-DA track format.  sox is
+            # in the same MSYS2/MINGW64 env Invoke-Msys2 uses (/mingw64/bin/sox).
+            $cueDir = Split-Path $cuePath
             $sb = New-Object System.Text.StringBuilder
             [void]$sb.AppendLine('FILE "Mimas.bin" BINARY')
             [void]$sb.AppendLine('  TRACK 01 MODE1/2352')
             [void]$sb.AppendLine('    INDEX 01 00:00:00')
             $firstAudio = $true
             foreach ($w in $cddaWavs) {
-                $nn = [int]($w.BaseName -replace 'track_','')
-                # RELATIVE name only -- Ymir ignores absolute paths and loads each FILE
-                # from the .cue's own directory (CHANGELOG: "Ignore absolute paths...").
-                [void]$sb.AppendLine("FILE `"$($w.Name)`" WAVE")
+                $nn  = [int]($w.BaseName -replace 'track_','')
+                $raw = Join-Path $musicSrcDir "$($w.BaseName).raw"
+                # (re)convert only when the .raw is missing or older than its .wav source
+                if (-not (Test-Path $raw) -or
+                    ((Get-Item $w.FullName).LastWriteTime -gt (Get-Item $raw).LastWriteTime)) {
+                    Write-Host "  sox $($w.Name) -> $($w.BaseName).raw (raw CD-DA, 2352-aligned)"
+                    Invoke-Msys2 "cd '$musicSrcMsys' && sox '$($w.Name)' -t raw -r 44100 -e signed-integer -b 16 -c 2 '$($w.BaseName).raw' && sz=`$(stat -c%s '$($w.BaseName).raw'); pad=`$(( (2352 - sz % 2352) % 2352 )); if [ `$pad -ne 0 ]; then dd if=/dev/zero bs=1 count=`$pad >> '$($w.BaseName).raw' 2>/dev/null; fi; true"
+                }
+                # RELATIVE name only -- Ymir ignores absolute paths and loads each FILE from
+                # the .cue's own directory (CHANGELOG: "Ignore absolute paths...").  Put the
+                # .raw next to the .cue so the fresh build/ disc is self-contained too.
+                Copy-Item $raw (Join-Path $cueDir "$($w.BaseName).raw") -Force
+                [void]$sb.AppendLine("FILE `"$($w.BaseName).raw`" BINARY")
                 [void]$sb.AppendLine(("  TRACK {0:D2} AUDIO" -f $nn))
                 if ($firstAudio) { [void]$sb.AppendLine('    PREGAP 00:02:00'); $firstAudio = $false }
                 [void]$sb.AppendLine('    INDEX 01 00:00:00')
             }
             [System.IO.File]::WriteAllText($cuePath, $sb.ToString())
-            Write-Output "CUE: multi-file -- data .bin + $($cddaWavs.Count) WAV track(s) (relative refs)"
+            Write-Output "CUE: multi-file -- data .bin + $($cddaWavs.Count) raw CD-DA track(s) (2352-aligned BINARY)"
         }
 
         # Stash the finished disc per-IWAD so each WAD's latest build is kept and can be
@@ -219,12 +240,15 @@ try {
             New-Item -ItemType Directory -Path $stashDir -Force | Out-Null
             Copy-Item $binPath (Join-Path $stashDir "Mimas.bin") -Force
             if (Test-Path $cuePath) { Copy-Item $cuePath (Join-Path $stashDir "Mimas.cue") -Force }
-            # -Cdda: the multi-file .cue references the WAVs by relative name, so they must
-            # sit next to it -- copy them into the stash (Ymir reads them on demand).  Stale
-            # track_*.wav from a previous CDDA build are cleared first.
+            # -Cdda: the multi-file .cue references the raw CD-DA tracks by relative name, so
+            # they must sit next to it -- copy them into the stash (Ymir reads them on demand).
+            # Stale track_*.wav/.raw from a previous CDDA build are cleared first.
             if ($Cdda) {
-                Get-ChildItem $stashDir -Filter "track_*.wav" -EA SilentlyContinue | Remove-Item -Force
-                foreach ($w in $cddaWavs) { Copy-Item $w.FullName (Join-Path $stashDir $w.Name) -Force }
+                Get-ChildItem $stashDir -EA SilentlyContinue |
+                    Where-Object { $_.Name -match '^track_\d+\.(wav|raw)$' } | Remove-Item -Force
+                foreach ($w in $cddaWavs) {
+                    Copy-Item (Join-Path $musicSrcDir "$($w.BaseName).raw") (Join-Path $stashDir "$($w.BaseName).raw") -Force
+                }
             }
             Write-Output "Stashed -> build/wads/$wadName/  (launch later: run_ymir.ps1 -Wad $wadName)"
         }

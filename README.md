@@ -139,6 +139,14 @@ learned from:
 
 Built by **Romain Cicolini** ([@N0rt0N85](https://github.com/N0rt0N85)).
 
+## Support
+
+Mimas is free, non-commercial homebrew. If you'd like to support the **work**
+(development time — not a price for the game; you bring your own WAD), thank you:
+
+- ☕ **Ko-fi:** [ko-fi.com/n0rt0n85](https://ko-fi.com/n0rt0n85)
+- 💸 **PayPal:** [paypal.me/N0rt0N85](https://paypal.me/N0rt0N85)
+
 ## Licensing
 
 Mimas is **free software under the GNU General Public License, version 2 or

@@ -16,8 +16,10 @@ Saturn Ring Library (SRL) SDK. SRL is a modern C++ wrapper around SEGA's SGL
 SRL chosen for: modern toolchain, simple Windows install, C++ abstractions over
 SGL, SH-2 slave CPU support built-in, active development.
 
-**License caveat**: SRL has no explicit open-source license (copyright reserved
-by ReyeMe). Contact the author before any public/commercial release.
+**License**: SRL is MIT (granted by ReyeMe 2026-06-25; license file being added
+upstream) → GPL-compatible, fine to link with the GPL Doom engine. The only
+proprietary dependency is SGL (SEGA), which SRL wraps — out of our control, the
+standard Saturn-homebrew situation.
 
 ## Repository layout
 

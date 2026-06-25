@@ -103,10 +103,10 @@ l'autre (FLR `n` varie 584→3823 = vues plus/moins chargées) → le p50/p95 in
 **mélange mode ET spot** ; pour une échelle propre, rester immobile à UN spot plane-heavy et
 cycler pad Z.
 
-**RUN 2 (build b:21:59, garde `RP_REC_SANE` actif → `d0` = ZÉRO frame droppée = PROPRE).** Vues
-INTÉRIEURES (salles bois, `FLR n3` = quasi pas de sol → PAS plane-heavy ; p50/p95 = vues simples,
-pas le pire-cas). Spots ~identiques entre modes (cycle pad-Z immobile). **Toujours streaming** mais
-ces vues n'ont pas stallé (d0).
+**RUN 2 (build b:21:59, garde `RP_REC_SANE` actif → `d0` = ZÉRO frame droppée).** **E1M1 STRIPPÉ
+(`tools/strip_wad.py`) → CART-RÉSIDENT, PAS de streaming** (d'où `d0` : aucune lecture CD). Méthode :
+**parcours COMPLET du niveau, photo en FIN** → **p50/p95/PK agrègent TOUT le niveau (représentatifs)** ;
+seuls `FLR`/`MST`/inst reflètent le spot final (une salle bois `n3`).
 
 | pot | fps i/avg | p50 | p95 | mx | MST | SLVi | Dr | PK Bw | PK Bp | PK P | PK M |
 |---|---|---|---|---|---|---|---|---|---|---|---|
@@ -131,8 +131,9 @@ IRQ off) avant de s'y fier. *(RUN 1 b:20:07, spots différents + non-gardé → 
    - ⇒ **Hypothèse forte à valider HW : potato améliore la MOYENNE (p50 32→18) mais PAS le PIRE
      (Bp~54 partout)** → pour la fluidité, attaquer **Bp** (murs), pas le sol.
 3. **`Dr 93-94 %`** — VDP1 finit ~93% des frames → marge réelle (« always B » périmé). HW à relire.
-4. **`FLR dom% 90-100 % mais n3`** — vues simples (3 visplanes) → **PAS le cas floor-offload** (exige
-   grand sol ouvert, `n` élevé) → re-mesurer au **spot EXTÉRIEUR plane-heavy** (cour/nukage E1M1).
+4. **`FLR` = le SPOT FINAL (n3, salle bois)**, pas le pire sol du niveau (`FLR` est instantané, non
+   fenêtré) → pour le signal floor-offload, **photographier en STATIONNANT** dans la cour/nukage E1M1
+   (grand sol ouvert, `n` élevé), pas en fin de parcours. (Idem `MST`/inst = spot final.)
 5. **MEM rL non fiable Ymir** (swap 1.2↔0.7) → ne rien conclure ; HW + bench durci.
 
 ---

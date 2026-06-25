@@ -4,7 +4,7 @@ Status: **Phase 0 SHIPPED 2026-06-23** (port `99ced62` + core `b3acd9f`) — Doo
 and all >4MB IWADs now load and play from CD with **no cart**, proven playable on
 Doom II MAP01 (Ymir). Phase 1 (robust streaming / bounded LRU cache) is the current
 work. See **§0** for what shipped vs. what remains. Below: the original synthesis of
-6 parallel investigations (Doom core memory model, DoomSRL RAM map,
+6 parallel investigations (Doom core memory model, Mimas RAM map,
 SlaveDriver/PowerSlave, d32xr, FastDoom, web survey of PSX-Doom / RP2040-Doom /
 Saturn GFS).
 
@@ -407,16 +407,16 @@ maps.
 
 ---
 
-## 5. Inspiration table — external technique → DoomSRL applicability
+## 5. Inspiration table — external technique → Mimas applicability
 
-| Engine | Technique | DoomSRL applicability |
+| Engine | Technique | Mimas applicability |
 |---|---|---|
 | **d32xr** (32X, ~208 KB zone) | **No R_PrecacheLevel; bounded per-frame LRU texcache (`r_cache.c`) carved from leftover zone, evict by `lifecount`** | **Direct, highest value.** Pure C, drops into shared `core/`. The keystone for S4(a). Miss = CD read amortized over lifecount. |
 | d32xr | Composite-on-demand via `decals[]` (`r_data.c:936`), not composite-at-precache | Direct → S4(b). Avoids composites for unseen textures. |
 | d32xr | Park math LUTs / setup scratch in framebuffer (`I_TempBuffer`/`I_WorkBuffer`) | Applicable: use off-screen VDP2 / HWRAM scratch instead of zone. Minor. |
-| d32xr | Bank-paged ROM, zero-copy `W_GetLumpData` | Maps to DoomSRL CART path (memory-mapped); not the CD path. |
+| d32xr | Bank-paged ROM, zero-copy `W_GetLumpData` | Maps to Mimas CART path (memory-mapped); not the CD path. |
 | **SlaveDriver / PowerSlave** (2 MB, no cart) | **Per-level bump arena reset wholesale (`UTIL.C:339-405`, `mem_init`/`mem_lock`)** | Direct → S4(c). area0→HWRAM, area1→LWRAM; O(1) level free, zero fragmentation. |
-| SlaveDriver | VDP1 char-VRAM LRU tile cache (`PIC.C` `map()`/`mapPic`, evict min-`lastUse`) | Strong fit — DoomSRL is already a VDP1 wall rasterizer. Future: page textures into VDP1 char RAM, keep only compressed art in LWRAM. |
+| SlaveDriver | VDP1 char-VRAM LRU tile cache (`PIC.C` `map()`/`mapPic`, evict min-`lastUse`) | Strong fit — Mimas is already a VDP1 wall rasterizer. Future: page textures into VDP1 char RAM, keep only compressed art in LWRAM. |
 | SlaveDriver | Async prefetch + per-sector pump + sequential one-file-per-level (`FILE.C`) | Direct → S4(d). Needs SRL async `Cd` API check; blocking `LoadBytes` works for bulk. `whackCD` retry for dirty discs. |
 | SlaveDriver | Keep art *compressed* in arena, expand on page | Doom patches are already sparse-column RLE — composite-on-page, never expand all in RAM. |
 | **PSX-Doom** (2 MB, slow CD) | **Offline per-level asset split (`MAPxx.WAD`/`MAPTEXxx.IMG`/`MAPSPRxx.IMG`), only the subset each map references (~900 KB/level)** | **Direct → S4(d) tooling.** Extend `tools/strip_wad.py`. The proven Doom-on-2 MB recipe. Audio→SCSP RAM (separate), so doesn't tax LWRAM. |
@@ -608,7 +608,7 @@ different WAD needs a code edit.
 disc, e.g. `cd/data/CDDAMAP.TXT`, one `name track` pair per line:
 
 ```
-# DoomSRL CDDA music map: <music-lump-name-without-d_>  <CD-audio-track>
+# Mimas CDDA music map: <music-lump-name-without-d_>  <CD-audio-track>
 # (only needed when the disc carries Red Book audio + the WAD is RAM-resident)
 e1m1   2
 e1m2   3
@@ -690,22 +690,28 @@ folded into the steps below.
   change). **Marker = the `.DRP` itself** (no side file): the Step-3 loader opens `DOOMRP.DRP`,
   validates magic `DRP1` + `dir_crc32` against the loaded WAD, and uses per-map blobs if it
   matches, else falls back to raw streaming — both layouts stay loadable. See §7.11.
-- **Step 3** — `P_SetupLevel` loader (Option B, name-stable directory → no in-engine index
-  relocation): retarget the subset's `lumpinfo[].position/.wad_file`; **decompress per lump on
-  page-in (Option 1)**; out-of-subset reads fall back to the full WAD (miss → today's behaviour,
-  not a crash). Ymir-testable for correctness; smoothness gain = hardware.
+- **Step 3 — DONE (2026-06-24).** `P_SetupLevel` loader (`src/w_drp_saturn.cxx`, Option B,
+  name-stable directory → no in-engine index relocation): on map select, retarget into the map's
+  blob; **decompress per lump on page-in (Option 1)**; out-of-subset reads fall back to the full
+  WAD (miss → today's behaviour, not a crash). Auto-detects the `.DRP` marker; row-21 overlay
+  reports state. Ymir-testable for correctness; smoothness gain = hardware.
 
-**Cart load-once (S5 — after repack; big-WAD; hardware-only validation)**
-- **Step 4a** — generalize the cart write driver into `cart_load_region(cd_sector, len, cart_ofs)`
-  (factor `load_wad`'s whole-file copy).
-- **Step 4b — compressed cart store (Option 1):** at level start, stage the map's **compressed**
-  blob CD→cart once (≤2.57 MB worst → fits 4 MB with headroom), build the cart lump table; the LRU
-  decompresses cart→work-RAM on page-in. CD goes idle → **CDDA on every map**.
-- **Step 4c — hot-cart + CD cold-fallback (Option 2), the codec-free alternative/complement:**
-  if a lump isn't cart-resident, read it from the CD (full WAD) and **fade the music** over the
-  seek. Use as a safety net for Option 1, or standalone if a decoder is undesirable.
-- **Step 4d** — a "CD-free during play" signal (cart-resident OR `!streaming`) so `I_InitSound`'s
-  predicate auto-enables the already-shipped CDDA dispatch + `CDDAMAP.TXT` for big-WAD-from-cart.
+**Cart load-once (S5 — big-WAD; hardware-only validation). DONE (2026-06-24), see §7.12.**
+- **Step 4a — DONE.** Factored `sat_cart_load_region(file, sector, len, cart_ofs)` out of
+  `load_wad`'s whole-file copy (`src/dg_saturn.cxx`): one CD→cart primitive (uncached write window
+  → `cache_purge` → cached alias), reused by the staging path below.
+- **Step 4b — DONE (compressed cart store, Option 1):** at level start, `drp_stage_to_cart`
+  (`src/w_drp_saturn.cxx`) stages the map's **compressed** blob CD→cart **once** (≤3.5 MB worst →
+  fits 4 MB), reusing the Step-3 `.DRP` per-map offset table as the cart lump table; page-ins then
+  LZSS-decode **straight from cart RAM** (no CD, no temp buffer). CD goes idle → **CDDA on every
+  map**. Gated `#define SAT_DRP_CART_STAGE 1` (hardware A/B). Auto-engages only with a 4 MB cart
+  (`sat_cart_usable`); smaller carts / unfit blobs / not-in-`.DRP` maps stay on the CD path.
+- **Step 4c — read-fallback FREE; fade DEFERRED.** The cold-fallback *read* (lump not cart-staged →
+  full-WAD CD read) already falls out of Step 3 — no code needed. The **music fade** over that seek
+  is the *Transition polish* item below (door/level transitions) and is deferred to that work.
+- **Step 4d — DONE.** `sat_cd_free_during_play()` (cart-staged-big-WAD OR `!streaming`) replaces the
+  old `!streaming`-only predicate in `I_InitSound`, so CDDA + `CDDAMAP.TXT` auto-enable for
+  big-WAD-from-cart. `cdda_has_audio_tracks()` still gates on the disc actually carrying audio.
 
 **Transition polish (Option 2's fade — standalone value, any time)**
 - Music fade-out/in on door openings / area transitions / level loads — masks *any* CD access
@@ -777,6 +783,53 @@ The repack is **opt-in**; the default disc is unchanged (raw streaming).
   accident. (A future loader debug flag could force-raw even when a valid `.DRP` is present, for A/B
   perf measurement.)
 
-**Next: Step 3** — the `P_SetupLevel` loader that consumes this (auto-detect per the marker above;
-per-map `lumpinfo` retarget; LZSS page-in; full-WAD fallback). The `.DRP` format and the big-endian
-SH-2 read discipline it must follow are fully specified in the `tools/repack_wad.py` header.
+**Step 3 + Step 4 both landed (2026-06-24)** — the `P_SetupLevel` loader (`src/w_drp_saturn.cxx`)
+that consumes this (auto-detect per the marker above; per-map blob retarget; LZSS page-in; full-WAD
+fallback), then the cart load-once layer on top of it. See §7.12.
+
+### 7.12 Step 4 results — cart load-once / per-map compressed cart store (2026-06-24)
+
+**Goal.** Big WADs (Doom II / Ultimate / Plutonia / TNT, >4 MB) can't raw-load into the 4 MB cart,
+so they stream from CD — which keeps the CD busy and forces the MUS synth (no CDDA). Step 4 makes
+the cart a **per-map compressed store**: at level start, stage that map's LZSS `.DRP` blob CD→cart
+**once**, then page lumps in by decoding **straight from cart RAM**. The CD then sits idle during
+play → **Red Book CDDA on every map**.
+
+**Implementation (platform-only — ZERO core changes).** The Step-3 `.DRP` hooks
+(`sat_drp_select_map`, `sat_drp_read_lump`) were already wired into `core/` under `-DSAT_REPACK`;
+Step 4 only changed the SRL platform files, so `core/` stays byte-identical for DoomJo (no submodule
+bump, no propagation).
+- **4a** `sat_cart_load_region(file, sector, len, cart_ofs)` in `dg_saturn.cxx` — the CD→cart copy
+  primitive (uncached write @0x22400000 → `cache_purge` → cached read @0x02400000), factored from
+  `load_wad`. `sat_cart_usable` (4 MB cart free for staging; 0 in raw-cart mode) + `sat_cart_cached_base`
+  exported.
+- **4b** `drp_stage_to_cart` in `w_drp_saturn.cxx` — reads `blob_size` from the map table, stages the
+  blob from sector `blob_ofs>>11` (blob byte 0 lands at cart offset `sub = blob_ofs & 2047`), with the
+  same 8× CD-read retry as `drp_load`. `sat_drp_read_lump` grows a cart branch: STORED → `memcpy`
+  from cart, LZSS → `drp_lzss_decode` reading the cart cached alias directly (no Z_Malloc temp). The
+  per-map `cache_purge` inside the staging write keeps the cached alias coherent across map changes
+  (same pattern `load_wad` already ships).
+- **4d** `sat_cd_free_during_play()` → `I_InitSound` picks CDDA when the WAD is fully resident OR
+  cart staging is available; `cdda_has_audio_tracks()` still requires the disc to carry audio.
+- Telemetry: row-21 overlay shows `CART<kb>k` (staged) vs `cd` (CD-served) per map.
+
+**Adversarial review (5-dimension workflow, 2-skeptic verify) — fixed before commit:**
+- *32-bit overflow:* an unvalidated `blob_size` could wrap `sub + blob_size` and slip past the
+  fit/short-read guards → OOB cart reads. Now validated before the add (consistent with the existing
+  `n_entries` corrupt-`.DRP` guard).
+- *No retry:* the staging read did a single `LoadBytes`; a transient CD short-read demoted a whole
+  map to CD-under-CDDA. Now retries 8× like the proven `drp_load`.
+- *Stale overlay / stale comment:* `sat_drp_cart_kb` reset on every map select; the now-false
+  "CDDA only runs when !streaming" comment corrected.
+
+**Known residual (the deferred fade, Step 4c).** CDDA is committed once at boot, but a map that
+*can't* stage — genuinely **not in the `.DRP`** (the MAP30 cast / finale static screen) or whose
+blob doesn't fit — reads its lumps from the CD **while CDDA plays the same drive** → audio seek
+glitch. Gameplay subsets are complete (§7.10), so this is confined to static finale screens; the
+**Option-2 music fade** (door/level transitions, `TRANSITIONS_PLAN.md`) is what masks it and is the
+next task.
+
+**Validation status: HARDWARE-ONLY.** Clean SH-2 compile + link. Cart staging + CD-vs-CDDA timing
+do **not** reproduce on Ymir, so the gain (and the residual glitch) must be confirmed on real
+hardware with a 4 MB cart + a big-WAD repacked disc (`build.ps1 -Wad Doom2 -Repack`). Watch row-21
+for `CART<kb>k` per map and listen for CDDA continuity.

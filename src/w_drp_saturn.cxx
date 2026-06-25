@@ -1,5 +1,5 @@
 /*
-** DoomSRL -- per-level repack (.DRP) loader  (STREAMING_ANALYSIS.md §7.4/7.9-7.11).
+** Mimas -- per-level repack (.DRP) loader  (STREAMING_ANALYSIS.md §7.4/7.9-7.11).
 **
 ** Step 3 of per-level repack.  In CD-STREAMING mode (big WADs, no cart) the disc
 ** optionally carries DOOMRP.DRP next to the full WAD: per-map blobs holding that
@@ -31,6 +31,20 @@ extern "C" {
 
 extern "C" unsigned char *sat_wad_base;     /* cart base (NULL in CD-streaming mode) */
 extern "C" int            sat_streaming_mode;
+
+/* Step 4b cart staging (STREAMING_ANALYSIS §7.9 "Cart load-once") -- provided by
+   dg_saturn.cxx.  In big-WAD CD-streaming mode with a 4MB cart, the map's compressed
+   blob is staged CD->cart once per level, so page-ins decode from cart (CD idle ->
+   CDDA on every map).  sat_cart_usable = cart bytes free (0 = none / cart holds raw
+   WAD); sat_cart_cached_base = the cart's cached read alias. */
+extern "C" unsigned int    sat_cart_usable;
+extern "C" unsigned char  *sat_cart_cached_base;
+extern int sat_cart_load_region(SRL::Cd::File &f, size_t sector, int len, unsigned int cart_ofs);
+
+/* Compile-time A/B (hardware): 1 = stage the map blob into cart (Step 4b); 0 =
+   always read the blob from CD (Step 3 behaviour).  Lets the cart path be toggled
+   off without code surgery if hardware shows it regresses. */
+#define SAT_DRP_CART_STAGE 1
 
 /* ------------------------------------------------------------------ */
 /* little-endian byte assembly (endian-safe on the big-endian SH-2)    */
@@ -126,6 +140,8 @@ static SRL::Cd::File *drp_file  = nullptr;
 extern "C" int sat_drp_state;    int sat_drp_state   = 0;
 extern "C" int sat_drp_n_maps;   int sat_drp_n_maps  = 0;   /* maps in the .DRP */
 extern "C" int sat_drp_served;   int sat_drp_served  = 0;   /* lumps served from a blob */
+extern "C" int sat_drp_cart;     int sat_drp_cart    = 0;   /* 1 = current map staged in cart */
+extern "C" int sat_drp_cart_kb;  int sat_drp_cart_kb = 0;   /* staged blob size (KB) */
 
 static uint32_t       drp_n_maps      = 0;
 static unsigned char *drp_map_tab     = nullptr;  /* n_maps * 24, PU_STATIC */
@@ -134,6 +150,10 @@ static unsigned char *drp_map_tab     = nullptr;  /* n_maps * 24, PU_STATIC */
 static unsigned char *drp_entries     = nullptr;  /* n_entries * 16, PU_STATIC */
 static int            drp_n_entries   = 0;
 static uint32_t       drp_blob_ofs    = 0;
+
+/* Step 4b: current map's blob staged in cart RAM */
+static int            drp_cart_staged = 0;        /* 1 = serve this map from cart */
+static unsigned char *drp_cart_blob   = nullptr;  /* cached-cart pointer to blob byte 0 */
 
 extern "C" int sat_drp_read_retries;
 int sat_drp_read_retries = 0;
@@ -246,6 +266,51 @@ static int name8_ieq(const char *want, const unsigned char *stored)
     return 1;
 }
 
+/* Step 4b: stage the current map's compressed blob CD->cart RAM once, so its lumps
+** page in from cart (CD idle during play -> CDDA on every map).  Needs a 4MB cart
+** (sat_cart_usable) and the blob to fit; otherwise leaves drp_cart_staged=0 and the
+** lump reads keep coming from CD (drp_read), exactly as Step 3.  GFS reads from
+** sector starts, so the blob's first byte lands at cart offset `sub` -- drp_cart_blob
+** points there; data_ofs (entry-relative) is then added per lump. */
+static void drp_stage_to_cart(uint32_t blob_ofs, uint32_t blob_size)
+{
+    drp_cart_staged = 0;
+    drp_cart_blob   = nullptr;
+    sat_drp_cart    = 0;
+#if SAT_DRP_CART_STAGE
+    if (!drp_file || sat_cart_cached_base == nullptr ||
+        sat_cart_usable < 0x400000u || blob_size == 0)
+        return;
+
+    if (blob_size > sat_cart_usable) return;            /* validate BEFORE the add: a corrupt
+                                                           blob_size could else wrap sub+blob_size
+                                                           and slip past the fit/short-read guards */
+    size_t   sector = (size_t)(blob_ofs >> 11);
+    unsigned sub    = (unsigned)(blob_ofs & 2047);
+    unsigned total  = sub + blob_size;                  /* leading partial sector + blob (can't wrap now:
+                                                           sub<=2047, blob_size<=sat_cart_usable<=4MB) */
+    if (total > sat_cart_usable) return;                /* doesn't fit -> stay on CD */
+
+    /* Same CD-read retry discipline as drp_load (Saturn LoadBytes can short-read; CD
+       reliability is an open HW issue): re-read into the same uncached window + re-purge
+       (idempotent) before giving up, so one glitch doesn't cost the whole map its cart. */
+    int got = sat_cart_load_region(*drp_file, sector, (int)total, 0);
+    for (int a = 1; got < (int)total && a < DRP_READ_RETRIES; ++a)
+    {
+        sat_drp_read_retries++;
+        got = sat_cart_load_region(*drp_file, sector, (int)total, 0);
+    }
+    if (got < (int)total) return;                       /* short read -> stay on CD */
+
+    drp_cart_blob   = sat_cart_cached_base + sub;
+    drp_cart_staged = 1;
+    sat_drp_cart    = 1;
+    sat_drp_cart_kb = (int)(blob_size >> 10);
+#else
+    (void)blob_ofs; (void)blob_size;
+#endif
+}
+
 /* ------------------------------------------------------------------ */
 /* core hooks (declared extern "C" in core, gated by -DSAT_REPACK)      */
 /* ------------------------------------------------------------------ */
@@ -256,10 +321,11 @@ extern "C" void sat_drp_select_map(const char *lumpname)
 {
     if (sat_drp_state == 0) drp_probe();
 
-    /* release the previous map's entry table */
+    /* release the previous map's entry table + cart staging */
     if (drp_entries) { Z_Free(drp_entries); drp_entries = nullptr; }
     drp_n_entries = 0;
     drp_blob_ofs  = 0;
+    drp_cart_staged = 0; drp_cart_blob = nullptr; sat_drp_cart = 0; sat_drp_cart_kb = 0;
     if (sat_drp_state != 1) return;
 
     for (uint32_t m = 0; m < drp_n_maps; m++)
@@ -270,6 +336,7 @@ extern "C" void sat_drp_select_map(const char *lumpname)
         uint32_t n_entries   = rd32(rec + 8);
         uint32_t entries_ofs = rd32(rec + 12);
         uint32_t blob_ofs    = rd32(rec + 16);
+        uint32_t blob_size   = rd32(rec + 20);
         if (n_entries == 0 || n_entries > numlumps) return;   /* corrupt -> raw for this map */
 
         int bytes = (int)(n_entries * DRP_ENT_SZ);
@@ -281,6 +348,7 @@ extern "C" void sat_drp_select_map(const char *lumpname)
         }
         drp_n_entries = (int)n_entries;
         drp_blob_ofs  = blob_ofs;
+        drp_stage_to_cart(blob_ofs, blob_size);   /* Step 4b: CD->cart once (no-op if no cart) */
         return;
     }
     /* map not in the .DRP -> this map streams from the full WAD (e.g. the finale) */
@@ -311,7 +379,18 @@ extern "C" int sat_drp_read_lump(unsigned int lump, void *dest, int size)
     uint32_t usize    = rd32(e + 12);
     if ((int)usize != size) return 0;            /* defensive: directory mismatch -> fallback */
 
-    uint32_t at = drp_blob_ofs + data_ofs;
+    if (drp_cart_staged)                         /* Step 4b: decode straight from cart RAM, no CD */
+    {
+        const unsigned char *blob = drp_cart_blob + data_ofs;
+        if (csize == usize)
+            memcpy(dest, blob, usize);           /* STORED */
+        else
+            drp_lzss_decode(blob, (unsigned char *)dest, (int)usize);   /* LZSS */
+        sat_drp_served++;
+        return 1;
+    }
+
+    uint32_t at = drp_blob_ofs + data_ofs;       /* Step 3 CD path */
 
     if (csize == usize)                          /* STORED: read raw straight into dest */
     {
@@ -327,4 +406,22 @@ extern "C" int sat_drp_read_lump(unsigned int lump, void *dest, int size)
     Z_Free(tmp);
     sat_drp_served++;
     return 1;
+}
+
+/* Step 4d (STREAMING_ANALYSIS §7.9): will the CD be idle during play?  True when the
+** WAD is fully resident (cart raw / small WAD, !streaming), OR per-map cart staging
+** is available (streaming + 4MB cart + a valid .DRP) so each map's gameplay lumps
+** come from cart instead of the CD.  I_InitSound calls this once to pick CDDA vs the
+** MUS synth (the WAD directory is populated well before I_InitSound, so probing the
+** .DRP here is safe).  Out-of-subset cold misses (e.g. the MAP30 cast) still touch
+** the CD -- masked by the Option-2 music fade (transitions, deferred). */
+extern "C" int sat_cd_free_during_play(void)
+{
+    if (!sat_streaming_mode) return 1;
+#if SAT_DRP_CART_STAGE
+    if (sat_drp_state == 0) drp_probe();
+    return (sat_drp_state == 1 && sat_cart_usable >= 0x400000u) ? 1 : 0;
+#else
+    return 0;
+#endif
 }

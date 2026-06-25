@@ -1,5 +1,5 @@
 ﻿/*
-** DoomSRL -- doomgeneric platform layer for the Sega Saturn (SRL build).
+** Mimas -- doomgeneric platform layer for the Sega Saturn (SRL build).
 **
 ** Hardware usage:
 **   VDP2 NBG1   : 512x256 8bpp bitmap in VRAM bank B0 = Doom framebuffer
@@ -183,6 +183,14 @@ static int wtex_bakes = 0;
 extern "C" unsigned char  *sat_wad_base    = nullptr;
 extern "C" unsigned int    sat_wad_size     = 0;
 extern "C" int             sat_streaming_mode;   /* defined in core/p_setup.c; set to 1 below in CD-streaming mode */
+
+/* Step 4b (STREAMING_ANALYSIS §7.9 "Cart load-once"): when a big WAD streams from
+   CD (can't raw-load into the cart) but a 4MB cart is present, the .DRP loader
+   stages each map's compressed blob into it once per level (CD then idle -> CDDA).
+   sat_cart_usable = cart bytes free for that staging (0 = none / cart holds the
+   raw WAD); sat_cart_cached_base = the cart's cached read alias (set in DG_Init).  */
+extern "C" unsigned int    sat_cart_usable  = 0;
+extern "C" unsigned char  *sat_cart_cached_base = nullptr;
 extern "C" int W_SaturnCDInit(void);
 
 /* ------------------------------------------------------------------ */
@@ -331,7 +339,7 @@ void sat_walls_kick(void);                /* platform: flush + kick the VDP1 wal
    (core flag, default 0 -> DoomJo/1p unaffected). */
 #define POTATO_LEVEL 0
 static int potato_level = POTATO_LEVEL;    /* 0..5, index into potato_modes */
-static int wall_potato_mode = 0;           /* DoomSRL VDP1 wall mode: 0=textured 1=banded 2=flat */
+static int wall_potato_mode = 0;           /* Mimas VDP1 wall mode: 0=textured 1=banded 2=flat */
 /* the modes: floors flat?, wall mode (0=tex 1=banded 2=flat), low-detail?, floor-low-detail?,
    display name.  pot0.5 = textured floors drawn at HALF-rate fill (1 texel / 2 screen px) with
    FULL VDP1 walls -- the floor-only low-detail the global +ld can't give (global +ld halves the
@@ -384,7 +392,7 @@ static void sat_apply_potato(void)
     sat_potato_floors   = potato_modes[L].floors;
     sat_potato_walls    = (potato_modes[L].wmode == 2);  /* DoomJo software-wall flat parity; also
                                                             gates the pot2-fl CPU-fallback skip */
-    wall_potato_mode    = potato_modes[L].wmode;         /* DoomSRL VDP1 3-way (tex/banded/flat) */
+    wall_potato_mode    = potato_modes[L].wmode;         /* Mimas VDP1 3-way (tex/banded/flat) */
     sat_split_lowdetail = potato_modes[L].ld;
     sat_floor_ld        = potato_modes[L].fld;           /* pot0.5: textured floors at half-rate fill */
 }
@@ -663,6 +671,23 @@ static void cache_purge(void)
     *ccr = (unsigned char)(*ccr | 0x10);
 }
 
+/* Step 4a (STREAMING_ANALYSIS §7.9): copy `len` bytes starting at CD `sector` of
+   the open file `f` into cart RAM at byte offset `cart_ofs`, via the uncached
+   write window, then purge the cache so the cached alias sees the new bytes.
+   Returns bytes copied, 0 on failure / out-of-range.  Factored from load_wad's
+   whole-file copy and reused by the per-map .DRP blob staging (w_drp_saturn.cxx).
+   C++ linkage (both callers compile as C++); declared `extern` where used. */
+int sat_cart_load_region(SRL::Cd::File &f, size_t sector, int len, unsigned int cart_ofs)
+{
+    if (len <= 0 || cart_ofs >= (unsigned int)CART_RAM_SIZE ||
+        (unsigned int)len > (unsigned int)CART_RAM_SIZE - cart_ofs)
+        return 0;
+    int got = f.LoadBytes(sector, len, (void *)(CART_RAM_UNCACHED + cart_ofs));
+    if (got <= 0) return 0;
+    cache_purge();
+    return got;
+}
+
 /* Load DOOM1.WAD from CD into cart RAM using SRL::Cd::File. */
 static int load_wad(void)
 {
@@ -697,7 +722,7 @@ static int load_wad(void)
         }
     }
 
-    int len = wad.LoadBytes(0, (int)CART_RAM_SIZE, (void *)CART_RAM_UNCACHED);
+    int len = sat_cart_load_region(wad, 0, (int)CART_RAM_SIZE, 0);   /* Step 4a */
     wad.Close();
 
     if (len <= 12)
@@ -705,7 +730,7 @@ static int load_wad(void)
         printf("CD read failed (len=%d)\n", len);
         return 0;
     }
-    cache_purge();
+    /* cache already purged by sat_cart_load_region */
     sat_wad_base = CART_RAM_CACHED;
     sat_wad_size = (unsigned int)len;
     printf("WAD: %d bytes [%c%c%c%c]\n", len,
@@ -819,11 +844,19 @@ static inline unsigned int dg_mem_frt(void)
 }
 static unsigned int dg_mem_bench(volatile unsigned int *base)
 {
-    volatile unsigned int sink = 0;
-    unsigned int t0 = dg_mem_frt();
-    for (int i = 0; i < 8192; i++) sink += base[i];   /* 32 KB cold read */
-    (void)sink;
-    return (unsigned short)(dg_mem_frt() - t0);        /* < 65536 ticks -> no wrap */
+    /* MIN-of-N: a VBlank IRQ (every ~16ms) landing inside a ~2.5ms read inflates it --
+       that made the Ymir ratio swing 0.7<->1.2 (lw/hw swapped, total ~constant = the IRQ
+       in one bench or the other).  The MIN over N reads = the IRQ-free run = true latency. */
+    unsigned int best = 0xffffffffu;
+    for (int rep = 0; rep < 8; rep++) {
+        volatile unsigned int sink = 0;
+        unsigned int t0 = dg_mem_frt();
+        for (int i = 0; i < 8192; i++) sink += base[i];   /* 32 KB read (>> the 4 KB cache) */
+        (void)sink;
+        unsigned int dt = (unsigned short)(dg_mem_frt() - t0);   /* < 65536 -> no wrap */
+        if (dt < best) best = dt;
+    }
+    return best;
 }
 static void dg_mem_calibrate(void)
 {
@@ -1003,12 +1036,16 @@ static void fps_update(void)
             /* row 21: per-level repack (.DRP) status (STREAMING_ANALYSIS.md §7.9-7.11).
                ON => DOOMRP.DRP validated for streaming; s = lumps served from the blob
                this session (grows as you play => the loader is working); r = .DRP read
-               retries.  off code: -1 cart/not-stream, -2 no file, -3 hdr, -4 CRC, -5 tbl. */
+               retries.  Step 4b: "CART<kb>k" = this map's blob staged in cart RAM (CD
+               idle -> CDDA); "cd" = served from CD (no 4MB cart / blob too big / map not
+               in .DRP).  off code: -1 cart/not-stream, -2 no file, -3 hdr, -4 CRC, -5 tbl. */
             extern int sat_drp_state, sat_drp_n_maps, sat_drp_served, sat_drp_read_retries;
+            extern int sat_drp_cart, sat_drp_cart_kb;   /* Step 4b: cart-staging status */
             static char r21[45];
             if (sat_drp_state == 1)
-                snprintf(r21, sizeof r21, "DRP ON m%d s%d r%d",
-                         sat_drp_n_maps, sat_drp_served, sat_drp_read_retries);
+                snprintf(r21, sizeof r21, "DRP ON m%d s%d r%d %s%dk",
+                         sat_drp_n_maps, sat_drp_served, sat_drp_read_retries,
+                         sat_drp_cart ? "CART" : "cd", sat_drp_cart_kb);
             else
                 snprintf(r21, sizeof r21, "DRP off (%d)         ", sat_drp_state);
             SRL::Debug::Print(0, 21, r21);
@@ -1198,7 +1235,7 @@ extern "C" void DG_Init(void)
        fps line.  Removing the 60-vblank busy-loop also shaves ~1s off boot. */
 
     printf("build: " __DATE__ " " __TIME__ "\n");
-    printf("DoomSRL platform init\n");
+    printf("Mimas platform init\n");
     printf("video: %s\n", (TVSTAT & 1) ? "PAL" : "NTSC");
 
     SRL::Debug::Print(0, 1, "INIT CD...");
@@ -1208,6 +1245,7 @@ extern "C" void DG_Init(void)
 
     SRL::Debug::Print(0, 1, "INIT CART...");
     cart_enable();
+    sat_cart_cached_base = CART_RAM_CACHED;       /* Step 4b: cart read alias for blob staging */
     unsigned int cart_sz = cart_probe_size();
     {
         static char cid[45];
@@ -1250,6 +1288,11 @@ extern "C" void DG_Init(void)
         else
             printf("No usable RAM cart -- CD streaming mode\n");
         sat_streaming_mode = 1;
+        /* Step 4b: a >=4MB cart that couldn't raw-load the (too-big) WAD is still
+           usable as a per-map compressed-blob store -- the .DRP loader stages this
+           map's blob into it at level start (worst blob ~3.5MB fits 4MB).  Smaller
+           carts can't hold the worst case, so only the full 4MB enables staging. */
+        sat_cart_usable = (cart_sz >= 0x400000u) ? cart_sz : 0;
         SRL::Debug::Print(0, 1, cart_sz ? "CART -> CD STREAM..."
                                         : "NO CART -> CD STREAM...");
         if (!W_SaturnCDInit())

@@ -1,5 +1,5 @@
 /*
-** DoomSRL -- SCSP sound + music backend (SRL build).
+** Mimas -- SCSP sound + music backend (SRL build).
 **
 ** SFX  -- Doom's 8-bit unsigned DMX samples converted to signed PCM and
 **         cached into 512 KB sound RAM on first use; played on SCSP slots 0-7.
@@ -36,6 +36,9 @@ extern "C" {
    sat_music_use_cdda is DEFINED in core/s_sound.c so the shared core links it. */
 extern "C" int sat_streaming_mode;
 extern "C" int sat_music_use_cdda;
+/* Step 4d: "will the CD be idle during play?" -- !streaming, or big-WAD per-map cart
+   staging available (provided by w_drp_saturn.cxx).  Picks CDDA vs the MUS synth. */
+extern "C" int sat_cd_free_during_play(void);
 
 static int cdda_track = 0;   /* CDDA: current audio track, 0 = stopped */
 
@@ -461,10 +464,13 @@ extern "C" void I_InitSound(boolean use_sfx_prefix)
     /* Decide the music backend NOW, before the SCSP/68K setup (which differs per
      * backend and is mutually exclusive -- CDDA keeps the 68K running for CD-DA
      * mixing, MUS halts it and uploads waveforms).  CDDA only when the CD is free
-     * during play (WAD fully resident, not streaming) AND the disc has audio
-     * tracks; otherwise the MUS/SCSP synth.  sat_streaming_mode is final by now
-     * (set in DG_Init, before doom_start calls I_InitSound). */
-    sat_music_use_cdda = (!sat_streaming_mode) && cdda_has_audio_tracks();
+     * during play AND the disc has audio tracks; otherwise the MUS/SCSP synth.
+     * "CD free" = WAD fully resident (cart raw / small WAD) OR -- Step 4d -- big-WAD
+     * per-map cart staging (streaming + 4MB cart + valid .DRP; the map's lumps come
+     * from cart, not the CD).  sat_streaming_mode is final by now (set in DG_Init,
+     * before doom_start calls I_InitSound), and the WAD directory is loaded, so the
+     * .DRP probe inside sat_cd_free_during_play is safe here. */
+    sat_music_use_cdda = sat_cd_free_during_play() && cdda_has_audio_tracks();
 
     if (sat_music_use_cdda)
     {
@@ -751,8 +757,14 @@ static void cdda_InitMusic(void)
 
 static void cdda_SetMusicVolume(int volume)
 {
-    /* SRL::Sound::Cdda::SetVolume expects 0-255; Doom passes 0-127. */
-    SRL::Sound::Cdda::SetVolume((uint8_t)(volume * 2));
+    /* SGL CD-DA level is 0-7 (SND_SetCdDaLev; 7 = max), NOT 0-127/0-255.  Doom's music
+       volume arrives 0-127 (the menu sends musicVolume*8 = 0..120).  The old `volume*2`
+       fed up to 254 into a 3-bit field -> low bits 0 at most settings -> SILENT.  Map
+       0-127 -> 0-7, and floor a non-zero request to 1 so it never falls to silence. */
+    int v = (volume * 7) / 127;
+    if (v == 0 && volume > 0) v = 1;
+    if (v > 7) v = 7;
+    SRL::Sound::Cdda::SetVolume((uint8_t)v);
 }
 
 static void cdda_PauseSong(void)
@@ -763,7 +775,7 @@ static void cdda_PauseSong(void)
 
 static void cdda_ResumeSong(void)
 {
-    if (!cdda_track) return;       /* CDDA only runs when !sat_streaming_mode anyway */
+    if (!cdda_track) return;       /* no-op when CDDA isn't the active backend (cdda_track==0) */
     SRL::Sound::Cdda::Resume();
 }
 

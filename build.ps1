@@ -1,4 +1,4 @@
-# DoomSRL build script.
+# Mimas build script.
 # Runs SRL's make build via MSYS2 MINGW64.
 #
 # Usage:
@@ -6,6 +6,8 @@
 #   powershell -ExecutionPolicy Bypass -File build.ps1 -Clean          # full rebuild
 #   powershell -ExecutionPolicy Bypass -File build.ps1 -Wad Doom2.wad  # swap the IWAD
 #   powershell -ExecutionPolicy Bypass -File build.ps1 -Repack         # + per-level repack
+#   powershell -ExecutionPolicy Bypass -File build.ps1 -Cdda           # multi-file CDDA disc
+#   powershell -ExecutionPolicy Bypass -File build.ps1 -WarpMap "1 8"  # boot straight into E1M8
 #
 # -Wad <name> : pick an IWAD from wads_temoins/ and copy it to cd/data/DOOM1.WAD
 #   (the fixed filename the Saturn loads from CD) before building. Accepts a bare
@@ -28,7 +30,10 @@
 param(
     [switch]$Clean,
     [string]$Wad,
-    [switch]$Repack
+    [switch]$Repack,
+    [switch]$Cdda,
+    [string]$WarpMap = "",
+    [string]$WarpSkill = "4"
 )
 
 $ErrorActionPreference = "Stop"
@@ -67,6 +72,8 @@ if ($Wad) {
     $dst = Join-Path $root "cd\data\DOOM1.WAD"
     Copy-Item $src $dst -Force
     Write-Host "IWAD: $([System.IO.Path]::GetFileName($src)) -> cd/data/DOOM1.WAD ($('{0:N0}' -f (Get-Item $dst).Length) bytes)"
+    # remember which IWAD this is so the finished disc can be stashed per-WAD below
+    $wadName = [System.IO.Path]::GetFileNameWithoutExtension($src)
 }
 
 # Per-level repack: emit cd/data/DOOMRP.DRP before the ISO step (runs after any -Wad
@@ -105,26 +112,44 @@ function Invoke-Msys2([string]$cmd) {
 # Detect CDDA music files
 $musicDir  = Join-Path $root "cd\music"
 $trackList = Join-Path $musicDir "tracklist"
-$cdda      = (Test-Path $trackList) -or
-             ((Test-Path $musicDir) -and (Get-ChildItem $musicDir -Include "*.wav","*.mp3","*.flac","*.ogg" -Recurse -ErrorAction SilentlyContinue).Count -gt 0)
+$cddaWavs  = @()    # -Cdda multi-file: the WAV tracks referenced separately in the .cue
 
-# Handle optional external music/ directory (compatibility with SaturnDoom layout)
-$extMusic = Join-Path $root "music"
-if (-not $cdda -and (Test-Path $extMusic)) {
-    $wavs = Get-ChildItem -Path $extMusic -Filter "track_*.wav" |
-            Where-Object { $_.BaseName -match '^track_\d+$' } |
-            Sort-Object { [int]($_.BaseName -replace 'track_','') }
-    if ($wavs.Count -gt 0) {
-        Write-Host "Copying $($wavs.Count) WAV tracks to cd/music/..."
-        New-Item -ItemType Directory -Path $musicDir -Force | Out-Null
-        $lines = @()
-        foreach ($w in $wavs) {
-            Copy-Item $w.FullName (Join-Path $musicDir $w.Name) -Force
-            $lines += $w.Name
+if ($Cdda) {
+    # MULTI-FILE CDDA (-Cdda): build a SMALL data-only .bin (no audio appended -> fast
+    # build, fast Ymir mount) and reference the WAV tracks SEPARATELY in a multi-file
+    # .cue (read on demand).  music/track_NN.wav are already CD-DA (44.1k/16/stereo) so
+    # they go in as WAVE with NO conversion.  Avoids the ~470 MB single-.bin that made
+    # boot take minutes.
+    if (Test-Path $musicDir) { Remove-Item (Join-Path $musicDir '*') -Recurse -Force -ErrorAction SilentlyContinue }
+    $cddaWavs = @(Get-ChildItem -Path (Join-Path $root "music") -Filter "track_*.wav" -ErrorAction SilentlyContinue |
+                  Where-Object { $_.BaseName -match '^track_\d+$' } |
+                  Sort-Object { [int]($_.BaseName -replace 'track_','') })
+    if ($cddaWavs.Count -eq 0) { Write-Warning "-Cdda: no music/track_*.wav found -> data-only (no CDDA)." }
+    else { Write-Host "CDDA (multi-file): $($cddaWavs.Count) track(s) referenced separately (no big .bin)." }
+    $cddaAppend = $false   # keep cd/music empty so shared.mk appends nothing -> small data .bin
+}
+else {
+    $cddaAppend = (Test-Path $trackList) -or
+            ((Test-Path $musicDir) -and (Get-ChildItem $musicDir -Include "*.wav","*.mp3","*.flac","*.ogg" -Recurse -ErrorAction SilentlyContinue).Count -gt 0)
+
+    # Handle optional external music/ directory (compatibility with SaturnDoom layout)
+    $extMusic = Join-Path $root "music"
+    if (-not $cddaAppend -and (Test-Path $extMusic)) {
+        $wavs = Get-ChildItem -Path $extMusic -Filter "track_*.wav" |
+                Where-Object { $_.BaseName -match '^track_\d+$' } |
+                Sort-Object { [int]($_.BaseName -replace 'track_','') }
+        if ($wavs.Count -gt 0) {
+            Write-Host "Copying $($wavs.Count) WAV tracks to cd/music/..."
+            New-Item -ItemType Directory -Path $musicDir -Force | Out-Null
+            $lines = @()
+            foreach ($w in $wavs) {
+                Copy-Item $w.FullName (Join-Path $musicDir $w.Name) -Force
+                $lines += $w.Name
+            }
+            $lines | Out-File -FilePath $trackList -Encoding ascii -NoNewline
+            Add-Content $trackList ""
+            $cddaAppend = $true
         }
-        $lines | Out-File -FilePath $trackList -Encoding ascii -NoNewline
-        Add-Content $trackList ""
-        $cdda = $true
     }
 }
 
@@ -139,24 +164,72 @@ try {
 
     $makeTarget = "build"
     $makeArgs   = ""
-    if ($cdda) { $makeArgs = "CDDA_MUSIC=1" }
+    if ($cddaAppend) { $makeArgs = "CDDA_MUSIC=1" }
+    # Benchmark warp: boot straight into a map (Makefile SAT_WARP_MAP -> core -warp),
+    # skipping the title menu for reproducible captures.  Doom1: -WarpMap "1 8" (episode
+    # map, two single digits); Doom2: -WarpMap 15.  Single quotes keep the space in
+    # "1 8" as ONE make-var value through the bash -c.  (dg_saturn.cxx is touched every
+    # build, so toggling warp on/off always recompiles it -- no stale-warp.)
+    if ($WarpMap -ne "") { $makeArgs += " SAT_WARP_MAP='$WarpMap' SAT_WARP_SKILL='$WarpSkill'" }
 
-    Write-Host "Building DoomSRL$(if ($cdda) {' (CDDA)'})..."
+    Write-Host "Building Mimas$(if ($cddaAppend) {' (CDDA)'})..."
     # Touch the file carrying the on-screen build stamp (dg_saturn.cxx -> row 18
     # "b:<__TIME__>") so every build recompiles it with a fresh timestamp -- lets
     # you confirm on hardware that you flashed THIS build even when only core/
     # files changed (which otherwise leaves dg_saturn.o, and its __TIME__, stale).
     Invoke-Msys2 "cd '$rootMsys' && touch src/dg_saturn.cxx && make $makeTarget $makeArgs"
 
-    # SRL outputs to build/DoomSRL.bin + build/DoomSRL.cue
-    $binPath = Join-Path $root "build\DoomSRL.bin"
-    $cuePath = Join-Path $root "build\DoomSRL.cue"
+    # SRL outputs to build/Mimas.bin + build/Mimas.cue
+    $binPath = Join-Path $root "build\Mimas.bin"
+    $cuePath = Join-Path $root "build\Mimas.cue"
     if (Test-Path $binPath) {
         $bin = Get-Item $binPath
         Write-Output "OK  bin=$([string]::Format('{0:N0}', $bin.Length)) bytes"
         if (Test-Path $cuePath) { Write-Output "CUE: $cuePath" }
+
+        # -Cdda: rewrite the single-track .cue as a MULTI-FILE .cue -- data .bin (track 01)
+        # + each WAV as its own AUDIO track (WAVE, absolute path -> shared, not copied).
+        # TRACK NN = the file's number (track_NN.wav -> CD track NN) so CDDAMAP stays valid.
+        # The data .bin stays tiny; Ymir reads each WAV on demand.
+        if ($Cdda -and $cddaWavs.Count -gt 0) {
+            $sb = New-Object System.Text.StringBuilder
+            [void]$sb.AppendLine('FILE "Mimas.bin" BINARY')
+            [void]$sb.AppendLine('  TRACK 01 MODE1/2352')
+            [void]$sb.AppendLine('    INDEX 01 00:00:00')
+            $firstAudio = $true
+            foreach ($w in $cddaWavs) {
+                $nn = [int]($w.BaseName -replace 'track_','')
+                # RELATIVE name only -- Ymir ignores absolute paths and loads each FILE
+                # from the .cue's own directory (CHANGELOG: "Ignore absolute paths...").
+                [void]$sb.AppendLine("FILE `"$($w.Name)`" WAVE")
+                [void]$sb.AppendLine(("  TRACK {0:D2} AUDIO" -f $nn))
+                if ($firstAudio) { [void]$sb.AppendLine('    PREGAP 00:02:00'); $firstAudio = $false }
+                [void]$sb.AppendLine('    INDEX 01 00:00:00')
+            }
+            [System.IO.File]::WriteAllText($cuePath, $sb.ToString())
+            Write-Output "CUE: multi-file -- data .bin + $($cddaWavs.Count) WAV track(s) (relative refs)"
+        }
+
+        # Stash the finished disc per-IWAD so each WAD's latest build is kept and can be
+        # launched instantly later (no rebuild/repack): run_ymir.ps1 -Wad <name>.  The
+        # .cue references Mimas.bin by relative name, so copying both into the folder
+        # keeps it self-contained.  Only when -Wad gave us a name.
+        if ($wadName) {
+            $stashDir = Join-Path $root "build\wads\$wadName"
+            New-Item -ItemType Directory -Path $stashDir -Force | Out-Null
+            Copy-Item $binPath (Join-Path $stashDir "Mimas.bin") -Force
+            if (Test-Path $cuePath) { Copy-Item $cuePath (Join-Path $stashDir "Mimas.cue") -Force }
+            # -Cdda: the multi-file .cue references the WAVs by relative name, so they must
+            # sit next to it -- copy them into the stash (Ymir reads them on demand).  Stale
+            # track_*.wav from a previous CDDA build are cleared first.
+            if ($Cdda) {
+                Get-ChildItem $stashDir -Filter "track_*.wav" -EA SilentlyContinue | Remove-Item -Force
+                foreach ($w in $cddaWavs) { Copy-Item $w.FullName (Join-Path $stashDir $w.Name) -Force }
+            }
+            Write-Output "Stashed -> build/wads/$wadName/  (launch later: run_ymir.ps1 -Wad $wadName)"
+        }
     } else {
-        Write-Warning "build/DoomSRL.bin not found -- check make output above"
+        Write-Warning "build/Mimas.bin not found -- check make output above"
     }
 }
 finally { Pop-Location }

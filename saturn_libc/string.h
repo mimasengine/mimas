@@ -1,5 +1,5 @@
 /*
-** saturn_libc/string.h -- full string declarations for DoomSRL.
+** saturn_libc/string.h -- full string declarations for Mimas.
 **
 ** SGL's modules/sgl/INC/string.h is a minimal stub (no strdup, strtok, etc.).
 ** This header shadows it via -Isaturn_libc appearing first in the -I list.

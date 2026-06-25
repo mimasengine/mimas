@@ -377,7 +377,7 @@ namespace SRL::Slave {
 }
 ```
 
-**Usage for DoomSRL column renderer**:
+**Usage for Mimas column renderer**:
 ```cpp
 class ColumnTask : public SRL::Slave::ITask {
     volatile bool done = false;
@@ -521,7 +521,7 @@ class SRL::TV {
 
 ## Sample Projects (46 total)
 
-Key examples relevant to DoomSRL:
+Key examples relevant to Mimas:
 
 | Sample | Covers |
 |--------|--------|

@@ -1,11 +1,11 @@
-# Renderer Audit — DoomSRL vs d32xr vs FastDoom vs SlaveDriver
+# Renderer Audit — Mimas vs d32xr vs FastDoom vs SlaveDriver
 
-Code-level audit of four renderers to decide DoomSRL's next moves. Each finding
+Code-level audit of four renderers to decide Mimas's next moves. Each finding
 is tied to actual source. Action items at the end are split into **implement
 directly** (high confidence) vs **A/B test** (measure first), continuing the
 `SATURN PERF x.y` numbering from `core/r_parallel.c` / the perf notes.
 
-> **⚠️ §4 ("should we go hardware?") is DECIDED as of 2026-06-19.** DoomSRL took
+> **⚠️ §4 ("should we go hardware?") is DECIDED as of 2026-06-19.** Mimas took
 > **Track B**: VDP1 now renders all walls (hybrid — VDP1 walls below software NBG1).
 > The current VDP1 hardware model, costs, and convictions are in
 > [`VDP1_ARCHITECTURE.md`](VDP1_ARCHITECTURE.md). The §1–§3 *software-renderer*
@@ -13,14 +13,14 @@ directly** (high confidence) vs **A/B test** (measure first), continuing the
 > still relevant — VDP1 offloads EX/fill, not REC, which is still the frame's bulk.
 
 Repos audited (cloned in `../saturn-refs/`):
-- **d32xr** — Doom 32X: Resurrection. Same architecture as DoomSRL (2× SH-2,
+- **d32xr** — Doom 32X: Resurrection. Same architecture as Mimas (2× SH-2,
   software, no TMU). MIT/Jaguar-Doom license. The closest cousin.
 - **FastDoom** — DOS 386/486 Doom, GPL. Pure algorithmic/asm optimization.
 - **SlaveDriver-Engine** — Lobotomy (PowerSlave/Duke/Quake Saturn), GPL. The
   VDP1 hardware path.
-- **DoomSRL** — us. `core/r_parallel.c` + `src/dg_saturn.cxx`.
+- **Mimas** — us. `core/r_parallel.c` + `src/dg_saturn.cxx`.
 
-> **Reality check (from the perf notes):** DoomSRL's parallel renderer has been
+> **Reality check (from the perf notes):** Mimas's parallel renderer has been
 > **disabling itself near frame 1** (slave timeout → `rp_disabled` permanent), so
 > the ~8.6 fps baseline is **serial master-only** rendering. We are nowhere near
 > the software ceiling — the second SH-2 is effectively idle. This reframes the
@@ -40,7 +40,7 @@ Repos audited (cloned in `../saturn-refs/`):
 
 ## 1. The dual-SH2 split — the decisive difference
 
-### DoomSRL (today)
+### Mimas (today)
 - The slave is a **draw-only** consumer. `rp_slave_body` (`core/r_parallel.c`)
   loops over the command buffer and runs `rp_exec` on the **odd** columns
   (parity 1); the master draws **even** columns. Fixed 50/50 split by `dc_x & 1`.
@@ -79,7 +79,7 @@ Repos audited (cloned in `../saturn-refs/`):
 - Result (author-reported): **2–4× faster** than the original 32X port.
 
 **Takeaway:** d32xr's second CPU does *phases* (prep, planes, sprites, even
-sights), driven by a robust register-mailbox loop. DoomSRL's slave does *half the
+sights), driven by a robust register-mailbox loop. Mimas's slave does *half the
 columns* via a fragile per-frame relaunch — and right now it isn't running at
 all. **This is both the biggest perf gap and a reliability fix.**
 
@@ -94,7 +94,7 @@ all. **This is both the biggest perf gap and a reliability fix.**
 
 ## 2. The column/span inner loops
 
-### DoomSRL `rp_exec_col` (`core/r_parallel.c`)
+### Mimas `rp_exec_col` (`core/r_parallel.c`)
 - C, unrolled ×8. **Copies the source column into a 128-byte local first:**
   `memcpy(col_cache, src, 128)` *per column*, then indexes with `& 127`.
   → For a 10-pixel column that's 128 bytes copied to draw 10 — pure overhead, and
@@ -121,7 +121,7 @@ all. **This is both the biggest perf gap and a reliability fix.**
 > ⚠️ **Caution for Saturn:** FastDoom's fully-unrolled + self-modifying approach
 > is an *x86-with-big-cache* trick. A 200-tall unrolled column blows the SH-2's
 > 4KB I-cache — which is exactly why **d32xr keeps a tight loop**, and matches
-> DoomSRL's own finding that `-O3` *slowed* the slave via I-cache bloat. Do **not**
+> Mimas's own finding that `-O3` *slowed* the slave via I-cache bloat. Do **not**
 > copy the unrolled/SMC pattern wholesale; the *tight hand-asm loop* (d32xr) is the
 > right reference for SH-2.
 
@@ -136,7 +136,7 @@ Both software ports independently converged on the same big lever:
 
 Floor/ceiling **spans are the most expensive fill** (full-width, perspective).
 Flat-shading them (or dropping to quarter-width) is where both projects buy the
-most fps. DoomSRL currently renders full spans (`rp_exec_span`) **and disables the
+most fps. Mimas currently renders full spans (`rp_exec_span`) **and disables the
 parallel renderer entirely when `detailshift != 0`** (`RP_BeginFrame`) — so it has
 no working low-detail mode at all. Big, cheap, untapped.
 
@@ -224,5 +224,5 @@ parallel renderer is confirmed live again — today's numbers are serial.
 
 ## Sources
 Code: `../saturn-refs/{d32xr,FastDoom,SlaveDriver-Engine}` ·
-DoomSRL `core/r_parallel.c`, `src/dg_saturn.cxx`.
+Mimas `core/r_parallel.c`, `src/dg_saturn.cxx`.
 Background + links: `docs/PERF_REFERENCES.md`.

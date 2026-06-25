@@ -1,4 +1,4 @@
-# VDP2 — architecture, limits, and what DoomSRL should put on it
+# VDP2 — architecture, limits, and what Mimas should put on it
 
 Written 2026-06-19 after Romain reported the VDP2 path **broken on real Saturn**:
 sky dead (blue / not displayed) + **"snow"** (white pixel bands of varying length
@@ -7,7 +7,7 @@ bandwidth) and the software level (SGL register commit) — and ends with **conv
 + a capacity budget** for what VDP2 should carry in this port.
 
 TL;DR — two independent defects stack:
-1. **Commit gap.** DoomSRL never runs `slSynch`, so the VRAM **cycle pattern** and
+1. **Commit gap.** Mimas never runs `slSynch`, so the VRAM **cycle pattern** and
    **RAMCTL** that the RBG0 floor needs never reach the chip. Ymir reads SGL's *shadow*
    registers and hides it; the real VDP2 reads the actual registers → the bitmap layers
    starve → snow + dead sky. Same emulator-vs-hardware trap as the SCU-DMA cache bug.
@@ -76,7 +76,7 @@ are **10 access types**; the first ones are schedulable per-bank via the cycle p
 RAMCTL controls the rest of the structure:
 
 - **bank split** (`VRAMD`/`VRBMD` bits 8-9): whether VRAM-A is one 256 KB bank or two
-  128 KB banks A0/A1 (same for B). DoomSRL/Jo/SRL all run **4-bank** mode.
+  128 KB banks A0/A1 (same for B). Mimas/Jo/SRL all run **4-bank** mode.
 - **colour-RAM mode** (`CRMD`, bits 12-13).
 - **rotation-data bank select / RDBS** (the per-bank 2-bit `a0/a1/b0/b1` fields): which
   banks feed the **rotation** engine. `CRKTE` (bit 15) = put the coefficient table in
@@ -119,7 +119,7 @@ the bank(s) holding its data. Costs (normal res, no reduction):
 | **Cell NBG, 256-col** | 1 pattern-name + 2 char reads (+1 if vertical cell-scroll) |
 | Reduction ×1/2, ×1/4 | **multiplies** the pattern-name reads (×2, ×4) |
 
-DoomSRL's two bitmaps are **8bpp** → **2 char reads each**. Two of them, each alone in
+Mimas's two bitmaps are **8bpp** → **2 char reads each**. Two of them, each alone in
 its bank, is comfortable (2 of 8 slots used per bank).
 
 ### RBG0 is the expensive one
@@ -153,7 +153,7 @@ SGL programs VDP2 through **shadow registers** in work RAM and flushes them to t
 actual chip **inside `slSynch()`** (its frame sync). RAMCTL (bank split, RDBS) and the
 CYC cycle-pattern registers are part of that flush.
 
-DoomSRL **deliberately dropped per-frame `slSynch`** ([[doomsrl-known-bugs]]: it
+Mimas **deliberately dropped per-frame `slSynch`** ([[doomsrl-known-bugs]]: it
 vblank-caps fps to ~7-12 and its SGL sound-driver tick silenced direct-SCSP SFX; the
 freeze is instead handled by `rp_sgl_workptr_reset`). Consequence: **the RBG0 cycle
 pattern + RAMCTL are set in the shadows but never written to the chip.** On the real
@@ -174,7 +174,7 @@ end-to-end" claim in older notes — **treat that claim as unverified**; the com
 
 **Jo Engine, by contrast, calls `slSynch()` every frame** (`core.c:560/629`,
 `console.c:307`) — which is why Jo's RBG0 floor works: Jo's whole frame is built around
-`slSynch`, so its shadow registers always reach the chip. DoomSRL is not.
+`slSynch`, so its shadow registers always reach the chip. Mimas is not.
 
 **`slSynch` is NOT an option for us — even one-shot.** It was tried on hardware
 (`rbg0_commit_pattern()` = `slScrAutoDisp(maximal) + slSynch()`, once at init): it made
@@ -187,7 +187,7 @@ The only viable commit path is therefore **direct VDP2 register programming**: w
 `RAMCTL` (bank split + RDBS) and `CYCA0/A1/B0/B1` to the actual chip registers ourselves
 (Jo's NOSGL `RAMCTL=0x1327` / `CYCxx` constants are the known-good reference values),
 bypassing SGL's shadow→`slSynch` path entirely. More work, but it's the one mechanism
-compatible with DoomSRL's no-`slSynch` architecture. **Caveat: SGL `slScrCycleSet` also
+compatible with Mimas's no-`slSynch` architecture. **Caveat: SGL `slScrCycleSet` also
 writes only the shadow** (still needs `slSynch` to flush) — so "manual" here means poking
 the memory-mapped registers at `0x25F8000E` (RAMCTL) / the CYC registers directly, not
 the SGL helper.
@@ -242,7 +242,7 @@ Two readings jump out:
 
 ---
 
-## 6. Convictions — what belongs on VDP2 in DoomSRL
+## 6. Convictions — what belongs on VDP2 in Mimas
 
 Principle: **put on VDP2 the surfaces that are large, move coherently, and don't need
 the framebuffer's arbitrary per-pixel freedom** — and spend the scarce VRAM banks on
@@ -412,7 +412,7 @@ These are **register/colour-math** features — no VRAM bank, usable in *any* co
 - Jo Engine `joengine/jo_engine/vdp2.c` + `jo/sega_saturn.h`: working SGL RBG0 path
   (cells / map / K-table / R-table in **separate** banks; `KTBL0_RAM = VDP2_VRAM_A1`)
   and per-frame `slSynch()` commit (`core.c:560/629`).
-- DoomSRL `src/dg_saturn.cxx`; `docs/RBG0_FLOOR_PLAN.md`; memories
+- Mimas `src/dg_saturn.cxx`; `docs/RBG0_FLOOR_PLAN.md`; memories
   [[doomsrl-rbg0-floor]], [[doomsrl-sky-vdp2]], [[doomsrl-known-bugs]],
   [[saturn-memory-map]].
 </content>

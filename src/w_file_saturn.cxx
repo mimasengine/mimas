@@ -1,5 +1,5 @@
 /*
-** DoomSRL -- WAD file backend (SRL build).
+** Mimas -- WAD file backend (SRL build).
 **
 ** Two modes selected at runtime by DG_Init:
 **

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the DoomSRL 2-player compact HUD panel (160x64) by RECOMPOSING the
+"""Generate the Mimas 2-player compact HUD panel (160x64) by RECOMPOSING the
 original STBAR -- authentic wells + engraved labels, MOVED into two rows.
 
 Framing uses STBAR's OWN pixels (plain column x=51 tiled), never synthetic

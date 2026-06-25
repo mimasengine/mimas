@@ -1,4 +1,4 @@
-# DoomSRL — Doom II first-frame render: master-stack corruption root-cause analysis
+# Mimas — Doom II first-frame render: master-stack corruption root-cause analysis
 
 ## 0. RESOLUTION (shipped 2026-06-23, core `b3acd9f`) — root cause was Rank 4, not #1
 
@@ -26,7 +26,7 @@ Rank 4.
 
 ---
 
-Branch: feat/multiplayer-xsplit. Build: build/DoomSRL2.elf + build/DoomSRL2.map.
+Branch: feat/multiplayer-xsplit. Build: build/Mimas2.elf + build/Mimas2.map.
 Constants in this build: `SCREENWIDTH=320`, `SCREENHEIGHT=224` (core/i_video.h:27-28),
 `MAXVISPLANES=256` (Makefile:90, overrides core default 512), `MAXDRAWSEGS=256`
 (core/r_defs.h:51), `MAXOPENINGS = SCREENWIDTH*64 = 20480` (core/r_plane.c:148-149),
@@ -88,7 +88,7 @@ and stomps the zone heap; guarded by skipping such planes) and core/d_main.c:215
   (Boom/PrBoom) fixed it by growing `openings` dynamically — doomgeneric/Chocolate-Doom
   here keeps the **fixed vanilla `SCREENWIDTH*64`** array (no dynamic growth).
 - **How it reaches the master stack/return address:** the overflow is a *bulk forward
-  write* (two `memcpy`s) past `openings[20479]` into adjacent BSS. From DoomSRL2.map the
+  write* (two `memcpy`s) past `openings[20479]` into adjacent BSS. From Mimas2.map the
   three pointers `ceilingplane`/`floorplane`/`lastvisplane` sit at **0x060c0420/24/28,
   immediately after `openings` (0x060b6420 → 0x060c0420)**. Overrunning `openings` first
   stomps `lastvisplane`; `R_DrawPlanes`/`R_FindPlane` then iterate / bump-allocate from a
@@ -348,7 +348,7 @@ grow `openings` dynamically (PrBoom approach) — heavier and unwarranted; only 
   behaviour is unchanged; it merely gains the same anti-corruption backstop.
 - `screenheightarray`/`negonearray` and `MAXOPENINGS` exist identically in both ports
   (shared core), so the fallback compiles and links in DoomJo without new symbols.
-- Follow the shared-core workflow: commit in `core/`, push, bump `core` in DoomSRL, then
+- Follow the shared-core workflow: commit in `core/`, push, bump `core` in Mimas, then
   pull into DoomJo (CLAUDE.md "Shared core" section).
 
 ### Files cited
@@ -359,7 +359,7 @@ core/r_bsp.c (49, 89, 93, 126, 179-185), core/r_things.c (300, 337-346, 1008, 10
 1067-1073, 1085-1086), core/r_draw.c (63-64, 116-119), core/r_defs.h (51, 327-329,
 432-461), core/r_main.c (94-95, 597-598), core/d_main.c (215-222), core/doomdef.h (42),
 core/i_video.h (27-28), src/dg_saturn.cxx (388), src/main.cxx (52-53),
-SaturnRingLib/modules/sgl/SRC/workarea.c (26-28), build/DoomSRL2.map
+SaturnRingLib/modules/sgl/SRC/workarea.c (26-28), build/Mimas2.map
 (openings=0x060b6420, ceilingplane/floorplane/lastvisplane=0x060c0420/24/28,
 drawsegs=0x060a3e84, vissprites=0x060c3d78, framebuffer/I_VideoBuffer≈0x060d52f0,
 MasterStack=0x060ffc00), Makefile (90).

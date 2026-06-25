@@ -67,7 +67,7 @@ stays). Sharing a TU-defined global needs a source-level `extern` under the slav
 **Key numbers:** per-CPU cost ≈ **24 bytes (GBR-TLS) + ~1 KB stack scratch** — vs the **117 KB** of the
 duplication model. THAT is why it fits.
 
-## 3. Options for DoomSRL (pros / cons)
+## 3. Options for Mimas (pros / cons)
 
 | # | Option | Fits? | Gain | Cost / risk |
 |---|--------|-------|------|-------------|
@@ -93,7 +93,7 @@ duplication model. THAT is why it fits.
 - **Reusable from the x-split work:** the dispatch infra (`slSlaveFunc` + `rp_sgl_workptr_reset` + a big
   slave stack) and the x-range clip (`sat_view_x0/x1`, r_bsp.c) — the clip = the "screen half" for the
   draw-phase split. The **dual-compile (duplication) is discarded.**
-- **DoomSRL vs d32xr:** d32xr refactored Doom's globals into the `vd` struct; DoomSRL kept globals —
+- **Mimas vs d32xr:** d32xr refactored Doom's globals into the `vd` struct; Mimas kept globals —
   but globals are ALREADY shared (same RAM), so the adaptation = move only the SMALL mutable state
   (`dc_*`, `fuzzpos`, `validcount`, the `rw_*`/seg temporaries during wall-prep) to GBR-TLS / stack,
   not a full struct refactor.

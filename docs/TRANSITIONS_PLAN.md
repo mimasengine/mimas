@@ -51,7 +51,7 @@ the melt, byte-identical.
 So any replacement transition must:
 
 1. **Use NO large contiguous zone buffer** (the 70 KB run isn't reliably there).
-2. **Commit WITHOUT `slSynch`.** DoomSRL runs a no-`slSynch` VDP2 architecture;
+2. **Commit WITHOUT `slSynch`.** Mimas runs a no-`slSynch` VDP2 architecture;
    the RBG0-floor experiment proved RAMCTL/cycle-pattern register changes are
    *never committed* without `slSynch`, and a one-shot `slSynch` made HW worse
    (see `docs/VDP2_ARCHITECTURE.md` / the rbg0-floor memory). The CRAM palette,

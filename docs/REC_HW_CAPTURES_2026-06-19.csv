@@ -1,4 +1,4 @@
-# DoomSRL hardware captures 2026-06-19 (real Saturn, NBG3 debug overlay on).
+# Mimas hardware captures 2026-06-19 (real Saturn, NBG3 debug overlay on).
 # CONFIG axes: sol (software floor on/off), pot (Potato level), blit (dual-CPU copy split).
 #   sol=yes -> CPU draws the floor (the real cost). sol=no -> floor removed to SIMULATE the
 #   VDP2/RBG0 hardware floor (CPU floor cost taken out). Tell = EX: ~15.6ms+slave-busy with

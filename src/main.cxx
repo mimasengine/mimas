@@ -1,5 +1,5 @@
 /*
-** DoomSRL -- entry point for the Sega Saturn (Saturn Ring Library / SGL).
+** Mimas -- entry point for the Sega Saturn (Saturn Ring Library / SGL).
 **
 ** SRL::Core::Initialize() calls slInitSystem,
 ** sets up the VBlank IRQ chain, and initializes CD/sound.  No SGL work-area

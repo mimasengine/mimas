@@ -1,7 +1,7 @@
-# Copie les fichiers .bin et .cue de DoomSRL vers D:\366 (écrase sans confirmation)
+# Copie les fichiers .bin et .cue de Mimas vers D:\366 (écrase sans confirmation)
 $ErrorActionPreference = 'Stop'
 
-$src = 'C:\Users\pcico\Projects\DoomSRL\build'
+$src = 'C:\Users\pcico\Projects\Mimas\build'
 $dst = 'D:\366'
 
 if (-not (Test-Path -LiteralPath $dst)) {

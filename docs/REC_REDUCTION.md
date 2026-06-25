@@ -107,7 +107,7 @@ Gain = rough fraction of the targeted phase, to be confirmed on hardware. Risk: 
   via the runtime toggle `sat_visplane_hash`, core ea452d8).
 - **d32xr — compact `VINT`/16-bit fields + cache-aligned hot functions.** Less memory
   traffic on a memory-bound path. Our shared core uses 32-bit everywhere; the one
-  DoomSRL-ownable compaction is the command record (L3).
+  Mimas-ownable compaction is the command record (L3).
 - **d32xr — deferred wall-prep (phase1 records `viswall_t`, phase2 preps).** Better
   cache locality than vanilla's inline R_StoreWallRange, *and* it is what enables their
   producer/consumer. Big restructure; out of scope (REC parallelisation rejected).

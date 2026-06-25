@@ -1,4 +1,4 @@
-# DoomSRL
+# Mimas
 
 Doom (shareware IWAD) for the **Sega Saturn**, built on the **Saturn Ring
 Library** (SRL — a modern C++ wrapper over SEGA's SGL, GCC 14.2 sh2eb-elf).
@@ -10,7 +10,7 @@ This is one of two ports that share a common core; the other is **DoomJo**
 
 | Submodule | Path | What |
 |-----------|------|------|
-| [doom-saturn-core](https://github.com/N0rt0N85/doom-saturn-core) | `core/` | Shared Doom game sources + the dual-SH2 renderer (`r_parallel.c`). Compiled verbatim by both DoomSRL and DoomJo. |
+| [doom-saturn-core](https://github.com/N0rt0N85/doom-saturn-core) | `core/` | Shared Doom game sources + the dual-SH2 renderer (`r_parallel.c`). Compiled verbatim by both Mimas and DoomJo. |
 | SaturnRingLib | `SaturnRingLib/` | The SRL SDK + the `sh2eb-elf` GCC 14.2 toolchain (installed by `setup_compiler.bat`). |
 
 Also required on the host: **MSYS2** (for `make`; build.ps1 calls
@@ -19,8 +19,8 @@ Also required on the host: **MSYS2** (for `make`; build.ps1 calls
 ## Install (fresh clone)
 
 ```powershell
-git clone --recursive https://github.com/N0rt0N85/DoomSRL.git
-cd DoomSRL
+git clone --recursive https://github.com/mimasengine/mimas.git
+cd Mimas
 # if you forgot --recursive:
 git submodule update --init --recursive
 
@@ -38,7 +38,7 @@ powershell -ExecutionPolicy Bypass -File build.ps1          # incremental
 powershell -ExecutionPolicy Bypass -File build.ps1 -Clean   # full rebuild
 ```
 
-Outputs `build/DoomSRL.iso` + `.cue` (and a MODE1/2352 `.bin`).
+Outputs `build/Mimas.iso` + `.cue` (and a MODE1/2352 `.bin`).
 
 ## Run
 
@@ -46,7 +46,7 @@ Outputs `build/DoomSRL.iso` + `.cue` (and a MODE1/2352 `.bin`).
 powershell -ExecutionPolicy Bypass -File run_ymir.ps1       # Ymir emulator
 ```
 
-Or burn `build/DoomSRL.cue` to CD-R, or load the `.cue`/`.bin` in any Saturn
+Or burn `build/Mimas.cue` to CD-R, or load the `.cue`/`.bin` in any Saturn
 emulator (Ymir, Kronos, Mednafen).
 
 > **Hardware note:** the fast SCU-DMA framebuffer blit currently hangs the

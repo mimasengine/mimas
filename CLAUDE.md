@@ -1,4 +1,4 @@
-# DoomSRL
+# Mimas
 
 Doom (shareware IWAD, doomgeneric core) ported to the Sega Saturn using the
 Saturn Ring Library (SRL) SDK. SRL is a modern C++ wrapper around SEGA's SGL
@@ -57,7 +57,7 @@ git add core && git commit -m "bump core"
 ```
 
 `core/r_parallel.c` must stay **pure C** (no C++): DoomJo compiles it with
-GCC 9.3 which errors on C++isms (e.g. unnamed parameters) that DoomSRL's GCC 14
+GCC 9.3 which errors on C++isms (e.g. unnamed parameters) that Mimas's GCC 14
 would only warn about. Its only platform hooks are `slSlaveFunc` (SGL, both
 ports) and an `extern dbg_print` debug shim (each port implements it).
 
@@ -83,7 +83,7 @@ Doom sources (`core/`) are C. Platform files in `src/` (`dg_saturn.cxx`,
 | SCU DMA | Via SRL VDP2 sync (SRL::Core::Synchronize) |
 | CD | SRL::Cd::File for DOOM1.WAD; SRL::Sound::Cdda for music tracks |
 
-## Key SRL entry points for DoomSRL
+## Key SRL entry points for Mimas
 
 ### Startup (main.cpp)
 ```cpp
@@ -148,7 +148,7 @@ SRL::Debug::PrintClearScreen();
 ## Build
 
 ```powershell
-# From DoomSRL root:
+# From Mimas root:
 powershell -ExecutionPolicy Bypass -File build.ps1
 # Or directly via make (MSYS2 / Linux):
 make all
@@ -167,6 +167,6 @@ Uses SRL's `shared.mk` build system. Outputs `game.iso` + `game.cue`.
 ## SRL documentation
 
 See `docs/SRL_API.md` for the full SRL API reference.
-See `docs/SRL_NOTES.md` for DoomSRL-specific integration notes.
+See `docs/SRL_NOTES.md` for Mimas-specific integration notes.
 Online: https://srl.reye.me/
 GitHub: https://github.com/ReyeMe/SaturnRingLib

@@ -1,5 +1,5 @@
 /*
-** DoomSRL -- newlib syscall stubs.
+** Mimas -- newlib syscall stubs.
 ** stdout/stderr go to the on-screen debug console; there is no real
 ** filesystem (config/savegames silently fail); sbrk serves a static
 ** heap in high work RAM.

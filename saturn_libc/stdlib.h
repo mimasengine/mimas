@@ -1,5 +1,5 @@
 /*
-** saturn_libc/stdlib.h -- full stdlib declarations for DoomSRL.
+** saturn_libc/stdlib.h -- full stdlib declarations for Mimas.
 **
 ** SGL's modules/sgl/INC/stdlib.h is a minimal stub (no malloc/free/strdup).
 ** This header shadows it by being found first via -Isaturn_libc.

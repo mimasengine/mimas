@@ -1,5 +1,5 @@
 /*
-** DoomSRL -- local multiplayer pad input (docs/MULTIPLAYER_PLAN.md, Iter 1).
+** Mimas -- local multiplayer pad input (docs/MULTIPLAYER_PLAN.md, Iter 1).
 **
 ** Builds player p's ticcmd straight from Smpc_Peripheral[p] (the port-1 multitap pads,
 ** index 0 = player 1 ... index 3 = player 4), using the SAME button mapping as player 1's

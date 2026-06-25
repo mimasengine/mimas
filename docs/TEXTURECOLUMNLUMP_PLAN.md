@@ -170,7 +170,7 @@ return texturecomposite[tex] + ofs;    // :423  into the composite block
 
 ### 2.4 The LRU pool contract (`core/r_cache.c`) — the d32xr half already ported
 
-DoomSRL already ported d32xr's **pool/LRU** (`core/r_cache.h:7-8`: "Ported from d32xr's
+Mimas already ported d32xr's **pool/LRU** (`core/r_cache.h:7-8`: "Ported from d32xr's
 r_cache.c, adapted to this core's classic composite model") but **kept the classic column
 model**. The pool's eviction model uses a back-pointer: `texcache_hdr_t.userp =
 &texturecomposite[tex]` (`r_cache.c:40,64-65,124-125,159`). On evict it NULLs `*userp`, so
@@ -184,7 +184,7 @@ the `sat_xsplit` guard (`r_cache.c:138,169`) forbids touching the pool during a 
 
 ---
 
-## 3. THE KEY DoomSRL INSIGHT — do VDP1 walls use the composite tables?
+## 3. THE KEY Mimas INSIGHT — do VDP1 walls use the composite tables?
 
 **Yes. Fully, transitively, through `R_GetColumn`. The VDP1 path does NOT bypass the
 composite system and does NOT read patch lumps directly.** This is the load-bearing finding
@@ -285,9 +285,9 @@ typedef struct {
   9 (`R_TouchIfInTexCache`, `r_cache.c:102-118`), not on every column fetch. The draw loop
   just dereferences `tex->data`.
 
-### Permanent allocation, d32xr vs DoomSRL
+### Permanent allocation, d32xr vs Mimas
 
-| Concern | d32xr | DoomSRL today |
+| Concern | d32xr | Mimas today |
 |---|---|---|
 | Pixel pool + LRU evict | `r_cache.c` | **already ported** → `core/r_cache.c` |
 | Per-texture column directory | **none** (arithmetic `col*height`) | `texturecolumnlump`/`ofs` PU_STATIC (**~400–600 KB Doom II**) |
@@ -295,7 +295,7 @@ typedef struct {
 | Recency touch | batched phase-9 per visible texture | inline in `R_GetColumn` per fetch (`r_data.c:420`) |
 
 **The missing piece is exactly the on-demand/arithmetic column model** (`texture_t.data[]` +
-`decals[]` + the column-major raw slab), not the cache — DoomSRL already has the cache.
+`decals[]` + the column-major raw slab), not the cache — Mimas already has the cache.
 
 **Correctness caveat (must flag):** d32xr caps `numdecals` at 3 (`& 0x3`, `r_data.c:940`).
 Textures with >3 overlapping patches are not representable. Fine for the Jaguar/32X asset
@@ -395,9 +395,9 @@ path for >3-patch textures.
   regenerated; the CD-read path and `W_CacheLumpNum` semantics for textures change. (2) The
   `numdecals ≤ 3` cap is a **correctness bug** for Doom II/PWADs with >3 overlapping
   patches — must widen the field or keep a post-based fallback for over-cap textures. (3)
-  Single-patch textures point `data[]` straight at the lump — but DoomSRL streams lumps from
+  Single-patch textures point `data[]` straight at the lump — but Mimas streams lumps from
   CD as **purgable PU_CACHE**; a single-patch `data[]` pointer into a purged lump dangles.
-  d32xr keeps everything in ROM (never purged); DoomSRL must either cache single-patch slabs
+  d32xr keeps everything in ROM (never purged); Mimas must either cache single-patch slabs
   in the pool too or pin them. (4) The VDP1 bake (`src/dg_saturn.cxx:1686`) and every segs
   consumer change shape — `R_GetColumn` is no longer "lump-or-composite", it's "slab+offset".
 - **Effort.** Very high — touches the WAD tool, `r_data.c`, `r_cache.c` contract, `r_segs.c`,
@@ -412,10 +412,10 @@ path for >3-patch textures.
   memory win), CD-read pattern with the new format, eviction churn.
 - **Verdict.** The **complete** solution — removes the floor *and* may speed the column fetch.
   But it is a WAD-format + shared-`texture_t` change with a real correctness cap and a
-  single-patch-residency hazard unique to DoomSRL's streaming (d32xr never purges). **The
+  single-patch-residency hazard unique to Mimas's streaming (d32xr never purges). **The
   right end-state, too big as a first step.**
 
-### Option E — Hybrid: keep post-based storage, build per-texture column-major slab into the LRU on demand (AMBITIOUS, DoomSRL-shaped)
+### Option E — Hybrid: keep post-based storage, build per-texture column-major slab into the LRU on demand (AMBITIOUS, Mimas-shaped)
 
 - **Change.** A middle path that avoids the WAD-format change. Keep Doom's post-based lumps on
   disc. On first `R_GetColumn(tex,…)` for a multi-patch texture, build a **column-major
@@ -446,7 +446,7 @@ path for >3-patch textures.
 - **HW/Ymir validation.** Ymir: visual identity (esp. single-patch columns now drawn from the
   slab), pool hit-rate vs today. Hardware: fps (one less table lookup per column = possible
   win; bigger slabs = more CD reads on miss — net unclear, **must measure**).
-- **Verdict.** **The DoomSRL-shaped sweet spot:** removes the full static floor, avoids the
+- **Verdict.** **The Mimas-shaped sweet spot:** removes the full static floor, avoids the
   WAD-format change *and* the `numdecals≤3` cap, reuses the existing composite producer and
   LRU pool, and simplifies `R_GetColumn`. The cost moves from a **static floor** to **bounded
   pool pressure** (the thing already being managed). The open question is slab size vs pool
@@ -467,7 +467,7 @@ path for >3-patch textures.
 3. **Eviction races (C/D/E).** A directory or slab evicted while the slave holds a `dc_source`
    into it = corruption. The `sat_xsplit` guard (`r_cache.c:138,169`) must cover whatever new
    thing the pool now owns. This is the class that only manifests on hardware under churn.
-4. **Single-patch slab residency (D, partly E).** d32xr never purges (ROM); DoomSRL streams
+4. **Single-patch slab residency (D, partly E).** d32xr never purges (ROM); Mimas streams
    purgable lumps. A `data[]` pointer into a purged single-patch lump dangles. E sidesteps by
    keeping the direct-lump fast path for single-patch textures; D must pin or pool them.
 5. **`numdecals ≤ 3` correctness cap (D only).** Doom II/PWADs can exceed 3 overlapping
@@ -484,7 +484,7 @@ path for >3-patch textures.
 
 The cut-depth finding (§3) is decisive: **the directories cannot be freed, only made
 unnecessary or on-demand.** Two viable end-states (C lazy-directory, E hybrid-slab); D is the
-purist target but carries a WAD-format change + correctness cap not worth it for DoomSRL.
+purist target but carries a WAD-format change + correctness cap not worth it for Mimas.
 
 **Phase 0 — Measure (no code).**
 - Instrument `R_InitTextures` to print real `numtextures`, `Σ width`, multi-patch fraction,
@@ -532,7 +532,7 @@ D (WAD-format + correctness cap + residency hazard as a *first* move).
 - d32xr reference: `c:/Users/pcico/Projects/saturn-refs/d32xr/` —
   `r_local.h:155-182`, `r_data.c:119-124,936-1035`, `r_phase6.c:126-147`,
   `r_phase9.c:13-247`, `r_cache.c:102-250`.
-- Key DoomSRL file:line anchors: `core/r_data.c:150-156,315-395,403-424,230-308,654-659,
+- Key Mimas file:line anchors: `core/r_data.c:150-156,315-395,403-424,230-308,654-659,
   726-727,527`; `core/r_cache.c:40,124,138,159,169`; `core/r_segs.c:180,595,623,658`;
   `core/r_plane.c:1044`; `core/r_things.c:427,464,1111,1124`; `src/dg_saturn.cxx:1323,1649,
   1659-1660,1686-1687`.
@@ -630,4 +630,4 @@ composite-fragmentation OOM, and that no map `I_Error`s (1p OR 2p) across all 32
 bytes are (700–900 KB vs the 157 KB texture floor); (3) revisit this refactor **only** if, after
 the above, the carve is *still* starved **and** on TNT-class WADs where the floor exceeds 250 KB —
 and then prefer **Option C** (lazy directory, keeps the small `height×mpc` composites) over E for
-DoomSRL's real WADs, since C caps the actual floor *without* the 2.2× slab inflation that E adds.
+Mimas's real WADs, since C caps the actual floor *without* the 2.2× slab inflation that E adds.

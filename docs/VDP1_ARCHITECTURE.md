@@ -1,7 +1,7 @@
-# VDP1 — architecture, limits, and what DoomSRL should put on it
+# VDP1 — architecture, limits, and what Mimas should put on it
 
 Written 2026-06-19 as the companion to [`VDP2_ARCHITECTURE.md`](VDP2_ARCHITECTURE.md).
-DoomSRL now renders **all walls** on VDP1 (the hybrid renderer: VDP1 walls *below*
+Mimas now renders **all walls** on VDP1 (the hybrid renderer: VDP1 walls *below*
 software NBG1 floors/sprites — the "layer inversion"). This doc is the hardware-level
 account of *what VDP1 is*, *what it costs*, *what we do well / badly on it*, and ends
 with **convictions + a capacity budget** — including the **2/4-player multiplayer**
@@ -42,7 +42,7 @@ made false — see §5.
 VDP1 is the Saturn's **framebuffer rasterizer** — the "sprite/polygon" processor. It is
 the *opposite* of VDP2: VDP2 streams fixed background planes per-dot with zero CPU cost;
 VDP1 **draws arbitrary textured quads into a framebuffer** that VDP2 then composites.
-Everything DoomSRL puts on VDP1 is paid for in VDP1's own silicon time, fed by SH-2
+Everything Mimas puts on VDP1 is paid for in VDP1's own silicon time, fed by SH-2
 command lists.
 
 | Property | Value | Consequence for us |
@@ -72,7 +72,7 @@ contiguous commands auto-advance, a link field can JUMP. It fetches a command ta
 When it hits an `end` command it sets `EDSR.CEF` (draw-complete) and stops until the
 next plot trigger (`PTMR`).
 
-DoomSRL drives this **asynchronously, without `slSynch`** (see
+Mimas drives this **asynchronously, without `slSynch`** (see
 [[doomsrl-vdp1-async]]): the SH-2 builds a list, pokes `PTMR`, and **returns**; VDP1
 rasterizes in parallel; a manual framebuffer change at vblank (`FBCR=0x0003`, gated on
 `EDSR.CEF`) presents the finished frame without tearing and without an fps tax. The
@@ -144,7 +144,7 @@ fill-rate tuning:
 ## 4. Memory — VRAM ledger (512 KB) + framebuffers
 
 VDP1's **512 KB VRAM** holds **commands *and* textures *and* CLUTs** — they compete.
-Current DoomSRL layout (`src/dg_saturn.cxx`):
+Current Mimas layout (`src/dg_saturn.cxx`):
 
 | Region | Addr | Size | Use |
 |---|---|---|---|
@@ -189,7 +189,7 @@ capacity.
 
 ---
 
-## 6. What DoomSRL does well / badly on VDP1 — and the IN/OUT convictions
+## 6. What Mimas does well / badly on VDP1 — and the IN/OUT convictions
 
 ### What we do WELL (keep)
 
@@ -393,7 +393,7 @@ VDP1 because flat is the cheap primitive.
   `WALLS.C` (frustum near-clip always on = bounded fill), `SPR.C` (command-area cap with
   truncation, double-buffered banks). Local: `C:\Users\pcico\Projects\saturn-refs\SlaveDriver-Engine`.
   See [[slavedriver-vdp1-reference]].
-- **DoomSRL** `src/dg_saturn.cxx` (the VDP1 driver, wall cache, flush, light-banks);
+- **Mimas** `src/dg_saturn.cxx` (the VDP1 driver, wall cache, flush, light-banks);
   `core/r_segs.c` (the wall hooks, close-wall CPU fallback); memories
   [[doomsrl-vdp1-async]], [[doomsrl-vdp1-world-renderer]], [[doomsrl-vdp2-capacity]],
   [[doomsrl-perf]]; companion [`VDP2_ARCHITECTURE.md`](VDP2_ARCHITECTURE.md).

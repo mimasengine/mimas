@@ -1,9 +1,9 @@
-# DoomSRL -- Doom for the Sega Saturn (Saturn Ring Library build)
+# Mimas -- Doom for the Sega Saturn (Saturn Ring Library build)
 #
 # Based on the SRL sample Makefile pattern.
 # Run via build.ps1 (MSYS2 MINGW64), or directly: make build
 #
-# Output: build/DoomSRL.bin + build/DoomSRL.cue
+# Output: build/Mimas.bin + build/Mimas.cue
 
 # -----------------------------------------------------------------------
 # SRL configuration
@@ -32,7 +32,7 @@ SGL_MAX_WORKS             = 4
 # -----------------------------------------------------------------------
 # Project settings
 # -----------------------------------------------------------------------
-CD_NAME    = DoomSRL
+CD_NAME    = Mimas
 BUILD_DROP = ./build
 
 # SRL location (git submodule)
@@ -44,7 +44,7 @@ SDK_ROOT = $(SRL_INSTALL_ROOT)/saturnringlib
 # Files not listed here (gusconf.c, etc.) are unused on Saturn.
 # -----------------------------------------------------------------------
 # Shared Doom sources + dual-SH2 renderer live in the core/ submodule
-# (doom-saturn-core), compiled verbatim by both DoomSRL and DoomJo.
+# (doom-saturn-core), compiled verbatim by both Mimas and DoomJo.
 DOOM_CORE_C = \
 	dummy.c am_map.c doomdef.c doomstat.c dstrings.c \
 	d_event.c d_items.c d_iwad.c d_loop.c d_main.c \

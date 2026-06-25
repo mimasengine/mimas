@@ -1,4 +1,4 @@
-# DoomSRL — Local multiplayer (multitap) plan
+# Mimas — Local multiplayer (multitap) plan
 
 **Status:** **2-player vertical split + per-viewport compact HUD SHIPPED** (Iter 1 plumbing,
 the 2-view sequential render, Iter 4's HUD). Still TODO: 4-player HUD, DM polish, auto/forced
@@ -74,7 +74,7 @@ This file is the resume point. Iterations are independently testable; do them in
    section, resolve+lock every flat and pre-generate every composite **both tasks need** (a per-task
    visibility pre-pass), so the parallel render is allocator-free. On-cart flats are free pointers;
    off-cart (CD/1MB) and composites always allocate → **the gate must work without assuming the cart.**
-   This is heavy DoomJo-core divergence → gate the whole parallel path DoomSRL-only.
+   This is heavy DoomJo-core divergence → gate the whole parallel path Mimas-only.
 
    > **RECONCILED 2026-06-24.** This mandatory pre-cache gate (B4) was **never built as a general
    > gate** and is now **only needed if the rejected concurrent 2nd-renderer is revived**

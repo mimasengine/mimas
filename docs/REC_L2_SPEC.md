@@ -28,7 +28,7 @@ d'équilibre du work-steal 2.5 (et du blit dual-CPU) peut bouger** → re-mesure
 | Overflow valve : `if (rec_count==RP_MAX) rp_flush();` (drain mi-frame, pas de corruption) | [core/r_parallel.c:1059](../core/r_parallel.c#L1059) |
 | Zone heap = `LOW_WORK_RAM_SIZE - RP_CMD_BUF_SIZE` (buffer carvé en haut de LWRAM) | [src/dg_saturn.cxx:399-403](../src/dg_saturn.cxx#L399-L403) |
 | Pointe `c` observée ~1068 (pot0), 116-390 (pot1/2) | docs/REC_BENCHMARKS.md |
-| HWRAM : `_end 0x060da9e0` → `__heap_end 0x060fa000` = réserve heap C ~125 KB | build/DoomSRL.map |
+| HWRAM : `_end 0x060da9e0` → `__heap_end 0x060fa000` = réserve heap C ~125 KB | build/Mimas.map |
 
 ## 3. Le changement (4 edits, gatés pour A/B HW)
 
@@ -67,7 +67,7 @@ rp_cmd_t rp_cmd_buf[RP_MAX];          /* BSS; +64KB high-WRAM, shared by both po
 (`RP_MAX` reste `RP_CMD_BUF_SIZE/sizeof(rp_cmd_t)` ; déplacer sa def ou `rp_cmd_buf`
 après pour l'ordre de déclaration.)
 
-### 3c. `src/dg_saturn.cxx` `DG_ZoneBase` (DoomSRL)
+### 3c. `src/dg_saturn.cxx` `DG_ZoneBase` (Mimas)
 ```c
 #if RP_CMD_BUF_IN_HWRAM
     *size = LOW_WORK_RAM_SIZE;                 /* buffer no longer in LWRAM -> reclaim full 1MB */
@@ -101,7 +101,7 @@ HWRAM ; n doit rester 0 comme aujourd'hui.
 
 ## 6. Budget
 
-- **DoomSRL** : *(RECONCILED 2026-06-24 : pour la taille SHIPPÉE 80 KB, +80 KB BSS pousse
+- **Mimas** : *(RECONCILED 2026-06-24 : pour la taille SHIPPÉE 80 KB, +80 KB BSS pousse
   `_end` 0x060da9e0 → ~0x060eea9e0, laisse **~45 KB** de heap C — re-vérifier le build.map
   avant de committer le RELOCATE.)* Chiffres spec d'origine (64 KB) : +64 KB BSS pousse
   `_end` 0x060da9e0 → 0x060ea9e0, laisse **~61 KB** de

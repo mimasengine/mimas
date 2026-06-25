@@ -484,10 +484,14 @@ extern "C" void I_InitSound(boolean use_sfx_prefix)
 
     if (sat_music_use_cdda)
     {
-        /* CDDA: SRL already initialised sound (SRL::Core::Initialize ->
-           Sound::Hardware::Initialize); the 68K stays running.  Reserve the SRL
-           driver area, clear only SFX slots 0-7, and force MVOL=15 (SGL leaves it
-           0 -> muted SFX) preserving MEM4MB/DAC18B. */
+        /* CDDA: load the SGL sound driver NOW (deferred from Core::Initialize via
+           SAT_DEFER_SOUND_INIT -- its CDC_CdInit hangs for MINUTES under Ymir at boot,
+           with the TV blanked).  Done here instead: the screen is up, and ONLY for an
+           audio-track disc (non-CDDA boots skip it entirely -> instant).  Runs
+           slInitSound + CDC_CdInit (CD-DA routing: CDC_CdPlay is silent without it) +
+           SND_SetCdDaLev, leaving the 68K running.  Then reserve the SRL driver area,
+           clear only SFX slots 0-7, and force MVOL=15 (SGL leaves it 0 -> muted SFX). */
+        SRL::Sound::Hardware::Initialize();
         sram_alloc = 0x1000;
         for (int s = 0; s < 8; ++s)
         {

@@ -492,7 +492,14 @@ extern "C" void I_InitSound(boolean use_sfx_prefix)
            SND_SetCdDaLev, leaving the 68K running.  Then reserve the SRL driver area,
            clear only SFX slots 0-7, and force MVOL=15 (SGL leaves it 0 -> muted SFX). */
         SRL::Sound::Hardware::Initialize();
-        sram_alloc = 0x1000;
+        /* SFX bump-allocator must start PAST the 68K SGL driver binary: slInitSound loads
+           SDDRVS.TSK at sound-RAM offset 0, so the old fixed 0x1000 sat INSIDE the ~26 KB
+           driver -- SFX uploads overwrote its code, corrupting playback (the high-pitched
+           beep on every SFX in CDDA mode).  SDDRVS.TSK is a fixed ~26 KB, so a 32 KB
+           constant clears it with margin -- and we do NOT probe its size here on purpose:
+           a SRL::Cd::File open-probe at this point (right after the sound init's CDC_CdInit
+           churns the CD drive) stalls I_InitSound for a long time under Ymir. */
+        sram_alloc = 0x8000;
         for (int s = 0; s < 8; ++s)
         {
             volatile unsigned short *slot = SCSP_SLOT(s);

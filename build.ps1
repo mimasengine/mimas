@@ -2,8 +2,9 @@
 # Runs SRL's make build via MSYS2 MINGW64.
 #
 # Usage:
-#   powershell -ExecutionPolicy Bypass -File build.ps1                 # incremental
+#   powershell -ExecutionPolicy Bypass -File build.ps1                 # incremental (MUS synth = DEFAULT until CDDA fixed)
 #   powershell -ExecutionPolicy Bypass -File build.ps1 -Clean          # full rebuild
+#   powershell -ExecutionPolicy Bypass -File build.ps1 -Mus            # data-only MUS synth disc (= the default)
 #   powershell -ExecutionPolicy Bypass -File build.ps1 -Wad Doom2.wad  # swap the IWAD
 #   powershell -ExecutionPolicy Bypass -File build.ps1 -Repack         # + per-level repack
 #   powershell -ExecutionPolicy Bypass -File build.ps1 -Cdda           # multi-file CDDA disc
@@ -44,6 +45,13 @@ $bash  = "$msys2\usr\bin\bash.exe"
 
 if (-not (Test-Path $bash)) {
     throw "MSYS2 not found at $msys2. Run SaturnRingLib\setup_compiler.bat first."
+}
+
+# MUS is the DEFAULT build until the CDDA path is fixed: a bare `build.ps1` produces the
+# data-only MUS-synth disc.  Pass -Cdda to force a CDDA disc (-Mus is then redundant = the default).
+if (-not $Cdda -and -not $Mus) {
+    $Mus = $true
+    Write-Host "Default build = -Mus (data-only MUS synth, CDDA path parked); pass -Cdda for a CDDA disc."
 }
 
 # Optional IWAD swap: copy the chosen WAD from wads_temoins/ onto the fixed

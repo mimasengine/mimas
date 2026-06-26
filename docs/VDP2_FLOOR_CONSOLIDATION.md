@@ -7,34 +7,36 @@
 > **État shippé courant** : `VDP2_RBG0_TEST=0` (sol RBG0 compilé OUT),
 > `VDP2_HW_SKY=1` (ciel NBG0 ON), sol logiciel. C'est le build known-good.
 
-## 0. Ce qui est CÂBLÉ dans le build (prep 2026-06-25, compile-validé 2 configs)
+## 0. État réel de la prep (⚠️ REVERTÉE de l'arbre 2026-06-26)
 
-Trois ajouts prêts à flasher ce soir (build par défaut = known-good inchangé) :
+> **⚠️ Ces 3 ajouts ont été CONÇUS et compile-validés (2026-06-25) puis RETIRÉS
+> chirurgicalement de l'arbre (2026-06-26)** à la demande de Romain, pour ne pas
+> entrer en conflit avec un autre dev en cours. **Ils ne sont PLUS dans le code**
+> (vérifié par grep : aucun `rbg0_commit_cyc`, `sat_sky_px`, `sat_floor_px`,
+> `RBG0_CYC_*`). Le build courant = known-good (`VDP2_RBG0_TEST=0`,
+> `VDP2_HW_SKY=1`). Cette section est donc une **spec à réappliquer**, pas un état
+> du code. La session HW du 2026-06-25 a montré que cette approche bute sur un mur
+> dur — voir `docs/VDP2_LAYER_BUDGET.md` (l'overlay NBG3 et le sol RBG0 se
+> disputent la banque B1, impossible de déboguer à l'aveugle). **Ne pas
+> réappliquer tel quel sans relire VDP2_LAYER_BUDGET.md.**
 
-1. **Poke CYCxx direct** — `rbg0_commit_cyc()` ([dg_saturn.cxx](../src/dg_saturn.cxx),
-   sous `#if VDP2_RBG0_TEST`) écrit `CYCA0/A1/B0/B1 @0x25F80010` **directement à la
-   puce**, juste après `rbg0_commit_ramctl()`. Les banques de rotation A0/A1/B1 →
-   `0xFFFFFFFF` (idle, la rotation les possède via RDBS) ; B0 (framebuffer NBG1
-   vivant) **laissé intact** par défaut (`RBG0_CYC_POKE_B0=0`, bench-tunable). C'est
-   **le geste qui manquait** = le fix présumé de la snow (§2 Option 2).
-   → **Activer** : `VDP2_RBG0_TEST=1` + `VDP2_HW_SKY=0`. **Lire** : **row 13** =
-   `CYb` (cycle-pattern AVANT, ce que SRL a laissé), **row 15** = `CYa` (APRÈS —
-   A0/A1/B1 doivent lire `FFFFFFFF` ; si `CYa==CYb`, l'ISR SGL clobber → poke
-   par-frame = Étape 4b), **row 14** = `RAMCTL` (inchangé).
-2. **Classifieur ciel/sol §4** — `sat_sky_px` / `sat_floor_px`
-   ([core/r_plane.c](../core/r_plane.c), toujours compilés) comptent les pixels
-   couverts par le ciel vs le sol dominant **par frame**. → **Lire** : **row 19** =
-   `CLS sky{n} flr{n} {S|F}` (S = ciel-dominant → favoriser ciel HW ; F =
-   sol-dominant → favoriser sol VDP2). `flr` ≠ 0 seulement en mode floor-on.
-3. **Vp go/no-go (déjà là)** — `RP_PROF=1` par défaut → **row 17** =
-   `FLR Vs{} Vp{} d{}% n{}`. **`Vp` (= pic candidat-quad sol VDP1) est sur la
-   row 17**, PAS row 13 (la string `FLAT` row 13 est cachée en split ; la valeur
-   visible est mirroir-ée sur row 17). C'est le nombre qui débloque le sol VDP1.
+Spec des 3 ajouts (à réappliquer si on relance le sol RBG0 texturé) :
 
-> Build vérifié : config défaut **et** config floor-test (`RBG0_TEST=1`/`HW_SKY=0`)
-> compilent et lient proprement (`OK bin=…`). Le core (`r_plane.c`) est modifié →
-> à committer dans le submodule + propager à DoomJo quand tu valides (pas encore
-> fait, working-tree only).
+1. **Poke CYCxx direct** — `rbg0_commit_cyc()` (sous `#if VDP2_RBG0_TEST`) écrirait
+   `CYCA0/A1/B0/B1 @0x25F80010` directement à la puce, après `rbg0_commit_ramctl()`.
+   Banques rotation A0/A1/B1 → `0xFFFFFFFF` (idle). **Résultat HW 2026-06-25 : barres
+   verticales puis écran noir** — le poke B1=idle affame NBG3 (overlay), qui vit dans
+   B1. Les valeurs CYC restent **non validées** (impossible à lire : l'overlay meurt
+   dès que RBG0 est commité). Readback prévu rows 13/15/14.
+2. **Classifieur ciel/sol §4** — `sat_sky_px` / `sat_floor_px` (core/r_plane.c)
+   compteraient les pixels ciel vs sol dominant par frame, affichés row 19.
+3. **Vp go/no-go (lui, bien dans l'arbre)** — `RP_PROF=1` par défaut → **row 17** =
+   `FLR Vs{} Vp{} d{}% n{}`. `Vp` est sur **row 17**, PAS row 13. (Toujours valide.)
+
+> **Mesures HW capturées 2026-06-25** (build known-good, row 17) : E1M1 nukage
+> `d48% n20`, E1M1 ext `d95% n21`. Confirme que le flat dominant possède quasi tout
+> le sol en extérieur (95%) — cas idéal pour un sol déporté — mais fragmenté en
+> zone mixte (48%).
 
 ---
 

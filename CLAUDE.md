@@ -4,6 +4,14 @@ Doom (shareware IWAD, doomgeneric core) ported to the Sega Saturn using the
 Saturn Ring Library (SRL) SDK. SRL is a modern C++ wrapper around SEGA's SGL
 (Saturn Graphics Library), released publicly in March 2025 by ReyeMe.
 
+> **⚠️ Naming — this project was renamed `DoomSRL` → `Mimas`.** They are the **same
+> project**. The rename did not reach everything: the Claude **memory namespace** is still
+> `~/.claude/projects/c--Users-pcico-Projects-DoomSRL/` with files named `doomsrl-*` (their
+> content is about this project), and a few historical artifacts/commit notes still say
+> "DoomSRL". **Always say "Mimas" in new code, docs, commits, and memory** — do not introduce
+> new `doomsrl-*` names. When you read a recalled `doomsrl-*` memory, treat it as a Mimas
+> memory. (Sibling port = **DoomJo**, the Jo Engine build at `../DoomJo`, which shares `core/`.)
+
 ## Why SRL
 
 | SDK | Status | Toolchain | Windows setup |

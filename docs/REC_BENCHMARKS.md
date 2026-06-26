@@ -173,16 +173,158 @@ HW ≈ 2–4× les chiffres Ymir (et Bw/P encore plus, memory-bound).
 > (`SAT_VISPLANE_POOL=1`, `VP_POOL_PLANES=96`) sont **SHIPPED dans le build** (Makefile/core),
 > blit recalibré ~5.5 ms. **QW1 et L2-SHRINK** (cmd buffer **80 KB** via
 > `-DRP_CMD_BUF_SIZE=0x14000`) sont **SHIPPÉS** aussi ; L2-RELOCATE→HWRAM reste non codé.
-> Cette section C reste **vide** → **la capture HW post-QW est la
-> mesure #1 en suspens** de tout le projet perf.
 
-| Spot | pot | REC | Bw | Bp (s/l) | P (a/m/o) | M | EX | c | SLV i% | inst | bl/f | Build |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| _(à capturer)_ | | | | | | | | | | | | |
+### C.1 — Hardware E1M1 STRIPPÉ, build `b:19:25:29` (2026-06-25, 36 photos, Romain)
+
+**Premier set HW post-QW/L1/L2.** Doom shareware **strippé** (`tools/strip_wad.py`) →
+**cart-résident 4 MB, ZÉRO streaming**. 1 joueur : 4 pots (`pot0`/`pot0.5`/`pot1`/`pot2-fl`,
+h1) × 6 spots E1M1. 2 joueurs : `pot0` × {`h0`,`h1`} × 6 spots. Lecture photo (angle/flou →
+voir « à relire » plus bas).
+
+**⚠️ Limite de méthode (la leçon #1 de ce set).** Les 6 spots ont des **vues différentes**,
+et le profiler fenêtré (p50/p95/PK) **se reset au changement de pot** (config change) → chaque
+photo agrège une fenêtre **différente en durée ET en contenu**. Donc **ni `inst` ni p50/p95/PK
+ne sont comparables d'un pot à l'autre** ici (ils mélangent vue + pot). **Pour un A/B potato
+propre : rester IMMOBILE à UN spot plane-heavy (cour/nukage E1M1) et cycler pad-Z** (la fenêtre
+se reset au même endroit) — c'est le protocole à appliquer au prochain run.
+
+**Findings HW SOLIDES (haute confiance, lisibles sur tout le set) :**
+
+1. **MEM `rL ≈ 2.1` STABLE** (`lw≈1496`, `hw≈691` ticks, ~constant sur les 36 photos).
+   → **C'EST le killer Ymir.** Ymir lisait `rL` 0.7↔1.2 (swap = bruit, §A.ter). Sur HW c'est
+   **stable 2.1 = LWRAM 2.1× plus lente que HWRAM**. Confirme (a) la **loi de mesure** (Ymir ne
+   modélise PAS le gap de banque), (b) l'**upside L2-RELOCATE→HWRAM** (déplacer cmd-buf +
+   visplanes de LWRAM vers HWRAM = ~2× sur ces accès). **C'est la justification chiffrée de
+   coder L2-RELOCATE.**
+2. **`Dr` (VDP1 done-rate) — SÉMANTIQUE VÉRIFIÉE DANS LE CODE (2 erreurs corrigées, voir §C.2 D).**
+   `dg_saturn.cxx:833`/`:2536` : `Dr = % de world-frames où VDP1 a FINI sa passe` (EDSR CEF) ; le
+   commentaire est explicite « **'D'one = VDP1 had headroom, 'B'usy = it overran the frame** » et
+   « high Dr => spare VDP1 budget ». Donc **`Dr` HAUT = headroom, `Dr` BAS = VDP1 déborde la frame.**
+   Les murs sont des quads **texturés sur VDP1** (`vdp1_last_cmds`, ~142 au pot0). ⇒ **pot0 `Dr`
+   ~25–42 % = VDP1 DÉBORDE déjà ~60–75 % des frames rien qu'avec les murs** = VDP1 **tendu au pot0**
+   (≠ idle). pot2-fl `Dr` 82–91 % = murs **plats** (~33 cmds) → VDP1 finit. **Conséquence pour
+   `VDP1_WORLD_PLAN`** : ajouter ~158 quads sol par-dessus des murs qui débordent déjà = VDP1 devient
+   le **goulot unique** au pot0, sauf si (a) les quads sol sont très bon marché ET (b) retirer le
+   span-fill soft libère assez de bus pour accélérer VDP1. ⇒ **le sol dominant a meilleur compte sur
+   VDP2/RBG0** (3ᵉ unité, ne charge ni master ni VDP1). Le `<80 %` du plan §7.4 est un **plancher de
+   confort** : pot0 est dessous.
+3. **Magnitudes HW > Ymir** (loi confirmée) : PK `Bp` HW ~74–77 ms (Ymir ~54) ; PK `P` HW jusqu'à
+   ~83 ms au pot0 (Ymir ~44). Memory-bound → les phases DRAM (Bw/P/Bp-loop) sont **plus chères sur
+   HW**, comme prédit.
+4. **`TEX nt125 w10776 d42K mp91` constant** sur tout le set → **le plancher columnlump ~42 KB est
+   confirmé sur HW** (sanity check de cohérence des lectures OK).
+5. **FLR `Vp` (pic candidat-quad sol VDP1) ≈ 150–170** (`d%` ~49–76 %, `n` ~16–34) — **À CONFIRMER
+   relecture**. ⚠️ **CORRECTION** : ce n'est **PAS** un NO-GO. Le seuil `≤120` venait du plan
+   **SUPERSEDED** `VDP1_FLOOR_PLAN.md` (sol partageant la banque mur). Le plan **autoritatif**
+   `VDP1_WORLD_PLAN.md` (§0.2/§7.1/§7.3) dimensionne une **banque F dédiée (cap 248)** pile pour
+   **`Vp ≈ 158`** → la lecture HW ~150–170 **TOMBE SUR LE POINT DE DESIGN du plan**, elle ne l'infirme
+   pas. `d%` HW (~49–76 %) **confirme** le « un seul flat » (→ RBG0). Donc côté commandes le sol VDP1
+   **tient** ; le vrai gate du plan est **`Dr%`** (finding #2), pas `Vp`.
+6. **Anomalie : une photo montre PK `Bp ≈ 306` ms** (spot tech lumineux, 24 fps) = le **leak <300 ms
+   qui survit au garde `RP_REC_SANE`** (déjà signalé §A.ter). → **durcir le profiler** (clamp <120 ms
+   ou re-stamp FRT par phase) avant de se fier aux PK absolus.
+
+**Table provisoire (inst fps lisibles ; le reste À RELIRE — ne pas traiter comme acquis) :**
+
+| set | pot | h | inst fps (spots, lus) | PK Bp (lu) | PK P (lu) | Dr | rL |
+|---|---|---|---|---|---|---|---|
+| 1j | pot0    | 1 | 6.0 / 7.7 / 9.0 / 9.4 / 11.3 / 11.8 / 24.0* | 50–77 (*306 anomalie) | 66–84 | 26–41 % (B) | 2.1 |
+| 1j | pot0.5  | 1 | _(à isoler — relire pot/spot)_ | ~77 | ~40 | _?_ | 2.1 |
+| 1j | pot1    | 1 | 12.0 / 12.8 / 31.0* | ~75 | ~21–28 | ~80 % | 2.1 |
+| 1j | pot2-fl | 1 | 14.3* | ~20 | ~25 | ~52 % | 2.1 |
+| 2j | pot0    | 0 | _(à isoler par statut split + h0)_ | | | | 2.1 |
+| 2j | pot0    | 1 | _(idem h1)_ | | | | 2.1 |
+
+\* = assignation pot incertaine (lue via Bw/Bp/P/Dr, pas via la ligne `pot`). **Le verdict L1
+(h0 vs h1 sur HW) et le coût split 2j attendent l'isolation propre des photos 2j.**
 
 **Protocole** (Romain, hardware) : aux 6 spots de référence, lire rows 19/20/11/12/18/17
 + row 2 (pot, blit). A/B QW2 via `SAT_POTATO_INLINE_SPANS 0`. Attendus : QW1 → Bp↓ à
 pot1/2 ; QW2 → P↓ + `c`↓ fort ; surveiller tout tear/garbage dans les sols (aucun attendu).
+
+### C.2 — Hardware E1M1 STRIPPÉ, **protocole propre 2-spots immobile** (2026-06-25 PM, 18 photos, Romain)
+
+**Le run que §C.1 demandait** : IMMOBILE à 2 spots, cycle pad-Z (pot) + pad-Y (h) sur place, la
+fenêtre p50/p95 se reset au même endroit → **A/B enfin valides**. Spot A = **nukage** (intérieur
+sombre, `sky2252`, `FLR Vs131 Vp156 d48% n20`, joueur 26/61/0). Spot B = **cour** (extérieur,
+montagnes, `sky23813`, `FLR Vs17 Vp156 d95% n21`, joueur 76/83/198). Lecture haute confiance
+(immobile = net).
+
+**Échelle potato (avg fps / `P` ms = remplissage sol-plan, le bucket dominant) :**
+
+| pot | A nukage avg / P / Dr | B cour avg / P / Dr | MST | SLVidle |
+|---|---|---|---|---|
+| **pot0**    | 7.5–7.9 / ~62 / 25–42 % | 8.3–9.0 / ~53 / 6–33 % | 119–131 ms | 29–33 % |
+| **pot0.5**  | 8.1 / 50 / 37 %         | 8.9–9.1 / 41 / 40–43 % | 105–119 ms | 33–38 % |
+| **pot1**    | 11.6 / 17 / 41 %        | 11.6–11.9 / 19 / 38–46 % | 78–79 ms | 54–55 % |
+| **pot2-fl** | 13.4 / 11 / **84 %**    | 13.4 / 12–13 / **82–91 %** | 72 ms | 62–63 % |
+
+**Findings (haute confiance) :**
+
+- **A. `fps = 1000/MST` exact** (129ms→7.7, 72ms→13.8). **Tout est master-bound** : la frame EST le
+  temps maître.
+- **B. `P` (remplissage sol) = LE levier dominant.** ~60 ms d'une frame pot0 de ~130 ms ≈ **46–48 %**.
+  pot0→pot1 (sols off) : `P` 60→17 ms (**−70 %**) → fps **+50–65 %** (7.6→11.6, 8.5→11.8). La gamme
+  complète pot0→pot2-fl : avg **7.6→13.4 (+76 %, ~×1.8)**. **Valide le pari sol-offload** : les sols
+  sont la moitié de la frame, content-stable aux 2 spots.
+- **C. `h0` vs `h1` (L1 visplane-hash) = NUL.** Au pot0 nukage : h1 avg7.6/P61.7 vs h0 avg7.5–7.9/
+  P61.3–62.0 — **identique**. Cour pot1 : h0 11.9/P18.9 vs h1 11.6/P18.9 — **identique**. À `n≈20`
+  visplanes, `R_FindPlane` O(n²) ≈ 400 cmp/frame = négligeable vs ~130 ms. **L1 ne donne AUCUN gain
+  mesurable aux comptes visplane d'E1M1** (vanilla Doom reste `n<40` ; l'O(n²) ne mord qu'à `n>100`,
+  WADs custom). → **toggle mort.**
+- **D. `Dr%` = VDP1 DONE-RATE (vérifié `dg_saturn.cxx:833`/`:2536`) — `Dr` HAUT = headroom, BAS =
+  VDP1 déborde.** *(2 fois lu à l'envers avant de lire le code — corrigé.)* Les murs sont des quads
+  **texturés VDP1** (`vdp1_last_cmds` ~142 au pot0), pas du soft. ⇒ **pot0 `Dr` 25–42 % = VDP1
+  DÉBORDE la frame ~60–75 % du temps rien qu'avec les murs = tendu** ; pot1 38–46 % (sols hors-master
+  → moins de contention bus → VDP1 finit un peu plus, même charge mur) ; `pot2-fl` **82–91 %** = murs
+  plats (~33 cmds) → VDP1 finit large. **Implication plan** : VDP1 déborde DÉJÀ les murs au pot0 ;
+  empiler ~158 quads sol texturés → VDP1 = goulot unique, sauf quads très bon marché + gain bus du
+  span-fill retiré. C'est ÇA « léger en capacité restante » — et ça **favorise le sol dominant sur
+  VDP2/RBG0** (n'ajoute rien au master NI au VDP1) ; VDP1-world ne reste que pour les **petits
+  visplanes résiduels** que RBG0 (mono-matrice, 1 flat) ne peut pas servir.
+- **E. `SLVidle ≥ 29 %` dans TOUS les modes** (29 % pot0 → 62 % pot2-fl). **L'esclave a toujours du
+  slack ; le maître est partout le long pole.** ⇒ **tout ce qui n'accélère QUE l'esclave ne peut
+  PAS monter le fps** — conséquence directe pour L2 (ci-dessous).
+- **F. `rL = 2.1` stable** (`lw1497 hw692`, chaque photo, 2 spots) — re-confirmé.
+- **G. blit `b ≈ 5.3–5.9 ms` stable** (~4 % de la frame) — non-goulot, **réglé** (Romain : toggles
+  blit « plus utiles » → OK, geler).
+- **H. QW2 (`SAT_POTATO_INLINE_SPANS`) A/B = NÉGLIGEABLE sur HW** (build QW2=0 MUS `b:00:46:28`,
+  mêmes 2 spots, pot1+pot2 où QW2 agit). ΔP (off−on) : nukage pot1 **+0.7**, pot2-fl **+1.3** ; cour
+  pot1 **−0.1**, pot2-fl **+0.8** → **~0–1.3 ms**, dans le bruit de vue ; `avg` fps inchangé. Direction
+  correcte (inline memset un poil moins cher) mais magnitude négligeable. Sanity OK : **pot0 P identique
+  on/off** (cour ~53 → byte-identité confirmée). ⇒ **comme L1, micro-opt qui ne rentabilise pas sa
+  complexité à E1M1** ; QW2 reste build-overridable (`make SAT_POTATO_INLINE_SPANS=0`) — à garder
+  (inoffensif, peut aider sur WAD visplane-lourd) ou retirer pour simplifier. **Bonus** : une frame pot0
+  nukage lit **`w5.7`** (master en attente du slave à la barrière plane) = l'**imbalance du split sol**
+  ciblée par [`CRITICAL_PATH.md`](CRITICAL_PATH.md) §3 RANK 1 (~3–8 ms récupérables en équilibrant par
+  pixels — meilleur levier que QW2). Les autres frames sont `w0.0` (P petit = équilibré) → l'imbalance
+  mord surtout au pot0 / en mouvement.
+
+**Verdict L2-RELOCATE (cmd-buf + visplanes LWRAM→HWRAM) — NE PAS coder maintenant.** Le cmd-buf
+(`RP_CMD_BUF_ADDR = 0x300000 − SIZE`, haut de LWRAM) est **la file de colonnes de l'ESCLAVE** (et
+trafic explicitement bas en Mimas, murs→VDP1) ; or finding E : **l'esclave n'est jamais le goulot**
+→ accélérer ses lectures = **0 fps**. Le pool visplane est une structure maître **minuscule**
+(`n≈20`) ; le coût maître réel est le FILL `P` (écrit le framebuffer en **HWRAM = déjà rapide**,
+lit les flats). ⇒ **`rL=2.1` est réel mais L2 déplacerait de la mémoire HORS du chemin critique
+maître → gain fps prédit ≈ 0** à E1M1. La justification §C.1 finding #1 (« rL=2.1 justifie L2 »)
+était **nécessaire mais incomplète** : il manquait E (esclave idle, master-bound). **L2 ne
+redevient intéressant qu'en ENABLER du plan VDP1-world** (si le trafic cmd grossit quand les sols
+passent VDP1) — à revoir avec le plan. *(Nail-it-shut optionnel : 1 build pointant `RP_CMD_BUF_ADDR`
++ `plane_pool` en HWRAM, mesurer MST au nukage → delta ≈ 0 attendu.)*
+
+**Raffinements vérifiés dans le code (2026-06-26, workflow 4 lecteurs + 5 vérif. adverses) → voir
+[`CRITICAL_PATH.md`](CRITICAL_PATH.md) :**
+- **`P` n'est PAS « la moitié-master du sol »** : `P = p3_t_planes − p3_t_bsp` = wall-clock de TOUTE
+  la phase plane **y compris l'attente master du slave** (`RP_WaitPlanes`, code : « P = master half +
+  the wait for the slave half », `r_parallel.c:1483`). `w≈0` (slave équilibré) → le sol est **déjà
+  splitté sur les 2 SH-2**, ~62 ms chacun ⇒ retirer les sols libère ~62 ms **master ET slave**.
+- **Le master n'attend JAMAIS VDP1** (build shippé : `VDP1_MANUAL_CHANGE 0` → `FBCR=0x0000` 1-cycle
+  auto, kick fire-and-forget). ⇒ **`Dr` bas = DÉCHIRURE de la couche murs, jamais un stall fps.** Donc
+  sortir les sols vers VDP1 **encaisse bien le gain fps** (master perd le fill) ; le coût est **la
+  qualité (tearing), pas le fps** — gradué par le `Dr` post-sol. (Corrige mon « present gated EDSR ».)
+- **`Dr` confirmé** (3ᵉ lecture, verdict *confirmed*) : haut = headroom, bas = overrun. Chemin
+  critique post-sol = **`Bp` wall-prep ~21 ms** (offloadable au slave, scaffold gated off) puis le
+  BSP `Bw` ~7-8 ms (sériel, plancher dur).
 
 ---
 

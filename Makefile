@@ -96,6 +96,17 @@ ifneq ($(SAT_WARP_MAP),)
   WARP_FLAG = -DSAT_WARP_MAP='"$(SAT_WARP_MAP)"' -DSAT_WARP_SKILL='"$(SAT_WARP_SKILL)"'
 endif
 
+# QW2 (core/r_plane.c SAT_POTATO_INLINE_SPANS): potato solid-colour floors via inline
+# memset instead of the record+execute span path (core source default = 1 = ON).  Only
+# active when sat_potato_floors is set (pot1/pot2); pot0/pot0.5 are byte-identical either
+# way.  Build-overridable for an A/B:  make SAT_POTATO_INLINE_SPANS=0  reverts to the span
+# path so the HW value of QW2 can be measured (read row-Bw 'P' + avg fps at pot1/pot2).
+# Empty (default) = leave the source #ifndef default (1) in place -> no behaviour change.
+SAT_POTATO_INLINE_SPANS ?=
+ifneq ($(SAT_POTATO_INLINE_SPANS),)
+  POTATO_SPANS_FLAG = -DSAT_POTATO_INLINE_SPANS=$(SAT_POTATO_INLINE_SPANS)
+endif
+
 # SRL puts modules/dummy/ in the path which stubs out stdio.h (no FILE type).
 # Put the compiler's real newlib headers first so Doom's uses of FILE* work.
 # -Isrc: Doom sources include each other with relative paths.
@@ -112,7 +123,8 @@ SRL_CUSTOM_CCFLAGS = -w -fsigned-char \
     -Isrc \
     -Icore \
     $(CDDA_FLAG) \
-    $(WARP_FLAG)
+    $(WARP_FLAG) \
+    $(POTATO_SPANS_FLAG)
 
 # -----------------------------------------------------------------------
 # Include SRL shared makefile

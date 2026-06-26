@@ -36,7 +36,9 @@ FrameRateOSDPosition = 'TopRight'
 OverrideUIScale = false
 RememberWindowGeometry = true
 ShowFrameRateOSD = false
+ShowGameNameOnTitleBar = true
 ShowMessages = true
+ShowPerformanceOnTitleBar = true
 ShowSpeedIndicatorForAllSpeeds = false
 UIScale = 1.0
 
@@ -53,6 +55,7 @@ PreloadDiscImagesToRAM = false
 RememberLastLoadedDisc = false
 RewindCompressionLevel = 12
 ScreenshotScale = 2
+StartPaused = false
 UseAltSpeed = false
 
     [General.PathOverrides]
@@ -90,6 +93,7 @@ ReverseFrameStep = [ 'LeftBracket' ]
 Rewind = [ 'Backspace' ]
 RotateScreenClockwise = [ 'Ctrl+Apostrophe' ]
 RotateScreenCounterclockwise = [ 'Ctrl+Shift+Apostrophe' ]
+ShowMessageHistory = [ 'F1' ]
 SoftReset = [ 'Ctrl+Shift+R' ]
 TakeScreenshot = [ 'F12' ]
 ToggleAlternateSpeed = [ 'Shift+Slash' ]
@@ -414,6 +418,7 @@ EmulateSH2Cache = false
 InternalBackupRAMImagePath = 'bup-int.bin'
 InternalBackupRAMPerGame = false
 PreferredRegionOrder = [ 'NorthAmerica', 'Japan' ]
+SH2ClockFactor = 100
 VideoStandard = 'NTSC'
 
     [System.IPL]
@@ -436,7 +441,6 @@ ForceAspectRatio = true
 ForceIntegerScaling = false
 ForcedAspect = 1.3333333333333333
 FullScreen = false
-GraphicsBackend = 'Default'
 ReduceLatency = true
 Rotation = 'Normal'
 SyncInFullscreenMode = true

@@ -32,6 +32,7 @@ param(
     [string]$Wad,
     [switch]$Repack,
     [switch]$Cdda,
+    [switch]$Mus,
     [string]$WarpMap = "",
     [string]$WarpSkill = "4"
 )
@@ -114,6 +115,24 @@ $musicDir  = Join-Path $root "cd\music"
 $trackList = Join-Path $musicDir "tracklist"
 $cddaWavs  = @()    # -Cdda multi-file: the WAV tracks referenced separately in the .cue
 
+# -Mus: force a DATA-ONLY (MUS synth) disc. shared.mk appends whatever sits in cd/music/, so
+# the only robust way to guarantee no CDDA track is to move cd/music aside (and drop the
+# CDAUDIO.TXT marker so the runtime stays on the MUS synth) for this build, then restore it in
+# the finally below -- non-destructive, so the CDDA setup is never lost. Overrides -Cdda.
+$musStash = $null
+if ($Mus) {
+    if ($Cdda) { Write-Warning "-Mus overrides -Cdda (building data-only)."; $Cdda = $false }
+    $musStash = Join-Path ([System.IO.Path]::GetTempPath()) "mimas_mus_stash_$PID"
+    New-Item -ItemType Directory -Path $musStash -Force | Out-Null
+    if (Test-Path $musicDir) {
+        Get-ChildItem $musicDir -File -ErrorAction SilentlyContinue |
+            ForEach-Object { Move-Item $_.FullName $musStash -Force }
+    }
+    $musMarker = Join-Path $root "cd\data\CDAUDIO.TXT"
+    if (Test-Path $musMarker) { Move-Item $musMarker (Join-Path $musStash "CDAUDIO.TXT") -Force }
+    Write-Host "MUS: cd/music cleared + CDAUDIO.TXT removed (data-only disc); restored after build."
+}
+
 if ($Cdda) {
     # MULTI-FILE CDDA (-Cdda): build a SMALL data-only .bin (no audio appended -> fast
     # build, fast Ymir mount) and reference each music track SEPARATELY in a multi-file
@@ -139,7 +158,7 @@ else {
 
     # Handle optional external music/ directory (compatibility with SaturnDoom layout)
     $extMusic = Join-Path $root "music"
-    if (-not $cddaAppend -and (Test-Path $extMusic)) {
+    if (-not $Mus -and -not $cddaAppend -and (Test-Path $extMusic)) {
         $wavs = Get-ChildItem -Path $extMusic -Filter "track_*.wav" |
                 Where-Object { $_.BaseName -match '^track_\d+$' } |
                 Sort-Object { [int]($_.BaseName -replace 'track_','') }
@@ -156,6 +175,19 @@ else {
             $cddaAppend = $true
         }
     }
+}
+
+# CDDA marker: the runtime detects CDDA via this GFS data file, NOT a raw CDC_TgetToc TOC
+# probe -- that probe HANGS ~10 min under Ymir now that the boot-time CDC_CdInit is deferred
+# (SAT_DEFER_SOUND_INIT).  Present iff the disc actually carries audio (multi-file -Cdda OR the
+# shared.mk append); absent -> the runtime stays on the MUS synth and issues no CD command at boot.
+$cddaMarker = Join-Path $root "cd\data\CDAUDIO.TXT"
+if (($Cdda -and $cddaWavs.Count -gt 0) -or $cddaAppend) {
+    Set-Content -Path $cddaMarker -Value "cdda" -Encoding ascii -NoNewline
+    Write-Host "CDDA marker: cd/data/CDAUDIO.TXT (runtime CDDA music ON)"
+} else {
+    Remove-Item $cddaMarker -Force -ErrorAction SilentlyContinue
+    Write-Host "CDDA marker: removed (MUS synth, no CD-block probe at boot)"
 }
 
 $rootMsys = ConvertTo-Msys2Path $root
@@ -256,4 +288,14 @@ try {
         Write-Warning "build/Mimas.bin not found -- check make output above"
     }
 }
-finally { Pop-Location }
+finally {
+    Pop-Location
+    # -Mus: restore the stashed cd/music tracks + CDAUDIO.TXT marker so the CDDA setup is intact.
+    if ($musStash -and (Test-Path $musStash)) {
+        $musMarker = Join-Path $musStash "CDAUDIO.TXT"
+        if (Test-Path $musMarker) { Move-Item $musMarker (Join-Path $root "cd\data\CDAUDIO.TXT") -Force }
+        Get-ChildItem $musStash -File -ErrorAction SilentlyContinue |
+            ForEach-Object { Move-Item $_.FullName $musicDir -Force }
+        Remove-Item $musStash -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}

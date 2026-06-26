@@ -453,18 +453,18 @@ static void mus_step(uint32_t now_ms)
 /* Doom I_ interface -- SFX                                            */
 /* ================================================================== */
 
-/* Does the disc have CDDA audio tracks (a track of type Audio after the data
- * track)?  A data-only disc -- the big-WAD streaming disc, or a small-WAD build
- * pressed without Red Book audio -- returns false, so the runtime music backend
- * falls back to the MUS/SCSP synth instead of playing silence.  Checks the
- * well-defined LastTrack (audio tracks follow the data track, so the last track is
- * Audio iff the disc has any); defensive -- any TOC anomaly reads as no-audio
- * (-> MUS).  Safe here: SRL::Cd::Initialize ran in DG_Init before I_InitSound. */
+/* Does the disc carry CDDA music?  We must NOT probe the Red-Book TOC here:
+ * SRL::Cd::TableOfContents::GetTable() issues the RAW CD-block command CDC_TgetToc,
+ * and since SAT_DEFER_SOUND_INIT skips the boot-time CDC_CdInit, the CD block is
+ * GFS-owned and never set up for raw CDC -- so that probe HANGS for ~10 MINUTES
+ * under Ymir, for EVERY disc (the probe runs to decide the backend, MUS included).
+ * Instead the disc build drops a tiny marker file (CDAUDIO.TXT) into the data track
+ * ONLY for a CDDA build; detection is a GFS lookup (no raw CDC) -> instant and safe.
+ * A MUS / data-only disc has no marker -> MUS synth, zero CD-block command at boot. */
 static bool cdda_has_audio_tracks(void)
 {
-    SRL::Cd::TableOfContents toc = SRL::Cd::TableOfContents::GetTable();
-    return toc.LastTrack.Number >= 2 &&
-           toc.LastTrack.GetType() == SRL::Cd::TableOfContents::TrackType::Audio;
+    SRL::Cd::File marker("CDAUDIO.TXT");
+    return marker.Exists();
 }
 
 extern "C" void I_InitSound(boolean use_sfx_prefix)
@@ -480,10 +480,13 @@ extern "C" void I_InitSound(boolean use_sfx_prefix)
      * from cart, not the CD).  sat_streaming_mode is final by now (set in DG_Init,
      * before doom_start calls I_InitSound), and the WAD directory is loaded, so the
      * .DRP probe inside sat_cd_free_during_play is safe here. */
+    printf("SND0: deciding backend (cd_free + marker)...\n");
     sat_music_use_cdda = sat_cd_free_during_play() && cdda_has_audio_tracks();
+    printf("SND1: use_cdda=%d\n", sat_music_use_cdda);
 
     if (sat_music_use_cdda)
     {
+        printf("SND2: -> Sound::Hardware::Initialize\n");
         /* CDDA: load the SGL sound driver NOW (deferred from Core::Initialize via
            SAT_DEFER_SOUND_INIT -- its CDC_CdInit hangs for MINUTES under Ymir at boot,
            with the TV blanked).  Done here instead: the screen is up, and ONLY for an

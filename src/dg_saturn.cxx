@@ -82,6 +82,15 @@ extern "C" char *gamedescription;
    without a rebuild; row-2 'bl' shows the active config + ratio. */
 #define DUAL_CPU_BLIT  1
 
+/* Diagnostic slave-offload pad toggles (work-steal plane split = pad Y 'ws'; slave wall-prep =
+   pad L+R 'wp').  Both are HW-CONFIRMED DEAD-ENDS (docs/RANK3_WALLPREP.md + REC_BENCHMARKS §C.2 H):
+   the work-steal regresses at E1M1, and slave wall-prep is +5.8ms (cold cache the slave can't keep
+   warm -- it's multiplexed across plane/masked).  Set to 0: the core implementations stay compiled
+   but DORMANT (sat_plane_steal / sat_wallprep_slave default 0 = static split + inline wall-prep, the
+   known-good), the pad bindings + 'ws'/'wp' overlay are compiled out, and Y + L+R are free.  Flip to
+   1 to revive the live A/B (the modes are kept "sous la main"). */
+#define SAT_DIAG_SLAVE_TOGGLES 0
+
 /* SATURN PHASE-0 VDP2-ZOOM TEST.  Validate that an NBG1 *bitmap* can be hardware-
    scaled by VDP2 BEFORE building the real 160-wide render (Phase 1).  With the
    full 320-wide render unchanged, slScrScaleNbg1(2.0) enlarges NBG1 x2 horizontally
@@ -391,9 +400,19 @@ static inline int blit_split(void) { return (blit_cfg[blit_mode].mpct * 224) / 1
    decides dual-CPU blit GO/DROP -- fps/MST are too coarse (~12ms of a ~100ms frame).
    Read it on row 2 as 'b<ms.tenth>'; compare config 0 (single) vs 4 (75/25), same scene. */
 static unsigned int sat_blit_ms10 = 0;
-/* core/r_plane.c L1 toggle (1 = visplane hash, 0 = vanilla linear scan); pad Y A/Bs it
-   live on hardware -> read the REC profiler's Bw bucket ON (h1) vs OFF (h0). */
+/* core/r_plane.c L1 toggle (1 = visplane hash, 0 = vanilla linear scan); frozen at 1 (HW: NULL
+   at E1M1, REC §C.2) -- kept extern for the row-1 stamp only, no longer pad-toggled. */
 extern "C" int sat_visplane_hash;
+/* core/r_parallel.c visplane-split A/B (0 = static half-split [default, good], 1 = two-pointer
+   work-steal); pad Y toggles it live -> read row-3 'w' (master wait at the barrier) + 'P' + fps.
+   Row 1 shows ws<state>; the profiler window auto-resets on the flip. */
+extern "C" int sat_plane_steal;
+/* RANK 3 inc-1 (docs/RANK3_WALLPREP.md): run the deferred wall-prep flush on the SLAVE (1) vs the
+   master (0).  Pad L+R toggles it live; ON also enables sat_wallprep_defer (walls queued, not
+   inline).  inc-1 is NON-overlapped -> expect byte-identical render + Bp off the master + w up
+   ~21ms + fps UNCHANGED (the win is inc-2).  Row 1 shows wp<state>. */
+extern "C" int sat_wallprep_slave;
+extern "C" int sat_wallprep_defer;
 static void sat_apply_potato(void)
 {
     extern int sat_split_lowdetail;            /* core flag (only acts in the split block) */
@@ -714,7 +733,9 @@ static int load_wad(void)
        to the cart.  The lump directory sits at the END of the WAD
        (infotableofs + numlumps*16); a WAD bigger than the 4MB cart would load
        directory-less (truncated) -> black screen.  Refuse here so the caller
-       falls back to CD streaming (same guard already used for 1M/2M carts). */
+       falls back to CD streaming (same guard already used for 1M/2M carts).
+       The true size also drives an accurate load percentage below. */
+    unsigned int total = (unsigned int)CART_RAM_SIZE;
     {
         unsigned char hdr[12];
         if (wad.LoadBytes(0, 12, hdr) >= 12)
@@ -729,10 +750,38 @@ static int load_wad(void)
                 wad.Close();
                 return 0;
             }
+            if (true_sz >= 12)
+                total = true_sz;   /* exact size -> accurate %, and no over-read past EOF */
         }
     }
 
-    int len = sat_cart_load_region(wad, 0, (int)CART_RAM_SIZE, 0);   /* Step 4a */
+    /* Load in chunks so a live percentage shows on the boot screen -- the multi-MB
+       CD read is the long wait before the menu.  Each sat_cart_load_region purges
+       the cache for its range; the per-chunk purge over ~16 chunks is negligible
+       next to the CD transfer itself.
+
+       NB: sat_cart_load_region's first arg is a CD SECTOR (2048 bytes), not a byte
+       offset.  CHUNK must stay a multiple of 2048 so `done` is always sector-aligned
+       at the start of each read (we also break on any short read), letting done/2048
+       give the exact start sector. */
+    const unsigned int SECTOR = 2048u;
+    int len = 0;
+    {
+        const unsigned int CHUNK = 128u * SECTOR;   /* 256 KB, sector-aligned */
+        unsigned int done = 0;
+        SRL::Debug::Print(0, 2, "LOADING WAD:   0%");
+        while (done < total)
+        {
+            unsigned int want = total - done;
+            if (want > CHUNK) want = CHUNK;
+            int got = sat_cart_load_region(wad, (size_t)(done / SECTOR), (int)want, done);
+            if (got <= 0) break;
+            done += (unsigned int)got;
+            SRL::Debug::Print(0, 2, "LOADING WAD: %3d%%", (int)(done * 100u / total));
+            if ((unsigned int)got < want) break;   /* short read = EOF (WAD < cart) */
+        }
+        len = (int)done;
+    }
     wad.Close();
 
     if (len <= 12)
@@ -834,6 +883,7 @@ extern "C" int sat_prof_rec_max;                                 /* window max (
 extern "C" int sat_prof_pk_bw, sat_prof_pk_bp, sat_prof_pk_p, sat_prof_pk_m;  /* per-phase peaks */
 extern "C" int sat_prof_mx_map, sat_prof_mx_x, sat_prof_mx_y, sat_prof_mx_ang, sat_prof_mx_t;
 extern "C" int sat_prof_dom_pct, sat_prof_plane_n;               /* RBG0-floor sizer */
+extern "C" int sat_prof_ss_n, sat_prof_ss_q, sat_prof_ss_qpk, sat_prof_ss_q4pct;  /* pari A sizing */
 extern "C" int sat_prof_dropped;                                 /* glitch frames excluded from the window */
 extern "C" int RP_ProfPercentile(int pct);                       /* windowed REC percentile, tenths-ms */
 extern "C" void RP_ProfReset(void);
@@ -900,13 +950,21 @@ static void fps_update(void)
            so each A/B run starts a clean min/avg/max window -- no manual button needed
            (the pad is already saturated: Y=hash X=split Z=potato L+R=blit). */
         {
-            static int l_map=-1, l_pot=-1, l_hash=-1, l_blit=-1;
-            if (gamemap != l_map || (int)potato_level != l_pot ||
-                sat_visplane_hash != l_hash || blit_mode != l_blit) {
+            static int l_map=-1, l_pot=-1, l_blit=-1;
+#if SAT_DIAG_SLAVE_TOGGLES
+            static int l_steal=-1, l_wp=-1;
+#endif
+            if (gamemap != l_map || (int)potato_level != l_pot || blit_mode != l_blit
+#if SAT_DIAG_SLAVE_TOGGLES
+                || sat_plane_steal != l_steal || sat_wallprep_slave != l_wp
+#endif
+               ) {
                 RP_ProfReset();
                 vd1_win_done = vd1_win_tot = 0;
-                l_map=gamemap; l_pot=(int)potato_level;
-                l_hash=sat_visplane_hash; l_blit=blit_mode;
+                l_map=gamemap; l_pot=(int)potato_level; l_blit=blit_mode;
+#if SAT_DIAG_SLAVE_TOGGLES
+                l_steal=sat_plane_steal; l_wp=sat_wallprep_slave;
+#endif
             }
         }
         /* OVERLAY 2026-06-24 (audited): useful values packed onto the top rows; cut the
@@ -924,9 +982,19 @@ static void fps_update(void)
            potato mode (pad Z), blit config bl + measured blit ms b (pad L+R, dual-CPU
            GO/DROP), visplane-hash h (pad Y). */
         static char r1[45];
-        sprintf(r1, "vp%3d %-7s bl%d b%u.%u h%d", r_visplane_peak,
+        /* cc = SH-2 master CCR @0xFFFFFE92 low nibble (CP bit4 reads 0): bit0 CE=cache enable,
+           bit1 ID, bit2 OD, bit3 TW (0=4-way / 1=2-way+2KB-RAM).  Expect 01 = enabled 4-way; if
+           it's 00 (disabled) or 09 (2-way) the warm-cache work is moot / a separate free win. */
+        unsigned ccr = (unsigned)(*(volatile unsigned char *)0xFFFFFE92) & 0x0Fu;
+#if SAT_DIAG_SLAVE_TOGGLES
+        sprintf(r1, "vp%3d %-7s bl%d b%u.%u ws%d wp%d cc%02x", r_visplane_peak,
                 potato_modes[potato_level].name, blit_mode,
-                sat_blit_ms10 / 10, sat_blit_ms10 % 10, sat_visplane_hash);
+                sat_blit_ms10 / 10, sat_blit_ms10 % 10, sat_plane_steal, sat_wallprep_slave, ccr);
+#else
+        sprintf(r1, "vp%3d %-7s bl%d b%u.%u cc%02x", r_visplane_peak,
+                potato_modes[potato_level].name, blit_mode,
+                sat_blit_ms10 / 10, sat_blit_ms10 % 10, ccr);
+#endif
         SRL::Debug::Print(0, 1, r1);
         {
             /* SATURN VALIDATION row: RAM-lever sizing (all high-water, Ymir-honest).
@@ -1020,6 +1088,14 @@ static void fps_update(void)
             snprintf(r17, sizeof r17, "FLR Vs%d Vp%d d%d%% n%d        ",
                     sat_floor_vq_cur, sat_floor_vq_peak, sat_prof_dom_pct, sat_prof_plane_n);
             SRL::Debug::Print(0, 17, r17);
+            /* row 20 (pari A sizing): "all floors+ceilings as VDP1 quads" (PowerSlave model).
+               ss = visible subsectors, Q = geometry quad count this frame (fan pieces,
+               UNtextured -> texture tiling would multiply), Qp = window peak, q4 = % of
+               surfaces from <=4-sided (pure-quad) subsectors. */
+            static char r20[45];
+            snprintf(r20, sizeof r20, "PAR ss%d Q%d Qp%d q4%d%%      ",
+                    sat_prof_ss_n, sat_prof_ss_q, sat_prof_ss_qpk, sat_prof_ss_q4pct);
+            SRL::Debug::Print(0, 20, r20);
             /* row 18: memory-latency calibration (one-shot cold 32 KB read per bank, FRT
                ticks).  rL = LWRAM/HWRAM ratio -- >1.0 means LWRAM (cmd buf + visplanes) is
                the slow bank, = the memory-bound penalty + the L2-relocate upside, measured
@@ -1264,8 +1340,16 @@ extern "C" void DG_Init(void)
                 cart_sz / 1024u);
         SRL::Debug::Print(0, 1, cid);
         printf("cart usable size: %u bytes (%u KB)\n", cart_sz, cart_sz / 1024u);
-        unsigned int t = vbl_count;
-        while (vbl_count - t < 180) ;   /* 3s pause so the size is readable */
+        /* 3s readability pause shown as a live countdown on row 2, so this
+           pre-menu screen isn't a frozen still (boot-screen feedback 2026-06-26).
+           Row 2 is reused by the WAD-load % right after, so clear it on the way out. */
+        for (int s = 3; s > 0; --s)
+        {
+            SRL::Debug::Print(0, 2, "STARTING IN %d...", s);
+            unsigned int t = vbl_count;
+            while (vbl_count - t < 60) ;
+        }
+        SRL::Debug::Print(0, 2, "                 ");
     }
 #if FORCE_CD_STREAM
     cart_sz = 0;   /* test override: ignore the cart, force CD streaming */
@@ -2888,9 +2972,12 @@ static unsigned char keyq_encode(unsigned char key)
 }
 
 /* Local-multiplayer opt-in (docs/MULTIPLAYER_PLAN.md, Iter 1): the platform owns the title-screen
-   gesture; the count flows through the core sat_local_players global (read lazily by G_DoNewGame). */
+   gesture.  The title arms sat_armed_players (applied to the live sat_local_players by G_DoNewGame);
+   in-game, START on pad 2 cycles the live sat_local_players directly via the sat_dropin_want hook. */
 extern "C" {
-    extern int sat_local_players;       /* core: 1 = single player (default) */
+    extern int sat_local_players;       /* core: LIVE count (1 = single player) */
+    extern int sat_armed_players;       /* core: title-armed count for the NEXT new game */
+    extern int sat_dropin_want;         /* core: in-game drop-in request (G_SatDropInService) */
     extern int sat_split_vdp1;          /* core: split-screen keeps walls on VDP1 per-view (vs software) */
     extern int usergame;                /* core: true only during a real player-started game */
     int sat_count_local_pads(void);     /* mp_input.cxx: connected local pads, 1..4 */
@@ -2927,29 +3014,33 @@ static void poll_pad(void)
        harmless, like the potato Z / blit L+R live toggles.) */
     if ((changed & PER_DGT_TY) && !(cur & PER_DGT_TY))
         rbg0_mode = (rbg0_mode + 1) % 3;
-#else
-    /* Pad Y is free here (VDP2_RBG0_TEST off, so Y only taps a harmless 'y' to Doom):
-       toggle the visplane hash (SATURN PERF L1) live to A/B its hardware effect -- read the
-       REC profiler's Bw bucket ON (h1) vs OFF (h0) on the same scene, no rebuild.  Like the
-       Z=potato / L+R=blit live toggles; row 2 shows h<state>. */
+#elif SAT_DIAG_SLAVE_TOGGLES
+    /* Pad Y: diagnostic A/B of the visplane split.  ws0 = static half-split (default, good);
+       ws1 = two-pointer work-steal.  DEAD-END on HW (the steal regresses at E1M1; REC_BENCHMARKS
+       §C.2 H) -- kept revivable behind SAT_DIAG_SLAVE_TOGGLES.  Row 1 shows ws<state>; the window
+       auto-resets on the flip. */
     if ((changed & PER_DGT_TY) && !(cur & PER_DGT_TY))
-        sat_visplane_hash = !sat_visplane_hash;   /* L1 A/B (row 1 h<state>); the VDP1-floor
-                                                     toggle that shared Y was retired -- parked. */
+        sat_plane_steal = !sat_plane_steal;
+#else
+    /* Pad Y free (the ws diagnostic is parked, SAT_DIAG_SLAVE_TOGGLES=0) -- only taps 'y' to Doom. */
 #endif
 
-#if DUAL_CPU_BLIT
-    /* Pad L+R held together cycles the blit config live (one press = next entry of
-       blit_cfg[]: single -> 50/50 -> 60/40 -> 66/34 -> 75/25 -> wrap), to A/B the
-       ratios on the same scene without a rebuild.  Buttons are active-low, so both
-       held == (cur & (L|R)) == 0; fire once on the rising edge of that chord.
-       (L/R also emit ','/'.' to Doom -- harmless taps, the real strafe is 0xa0/a1.) */
+#if DUAL_CPU_BLIT && SAT_DIAG_SLAVE_TOGGLES
+    /* Pad L+R (chord): diagnostic A/B of the deferred wall-prep flush onto the SLAVE (RANK3_WALLPREP).
+       wp 0 master inline / 1 slave+purge / 2 slave+warm.  ON ties sat_wallprep_defer (walls queued).
+       DEAD-END on HW (slave +5.8ms, cold cache it can't keep warm) -- kept revivable behind
+       SAT_DIAG_SLAVE_TOGGLES.  Both held = active-low = (cur & (L|R)) == 0; fire once on the edge. */
     {
         const unsigned short lr = (unsigned short)(PER_DGT_TL | PER_DGT_TR);
         static int lr_was = 0;
         int lr_now = ((cur & lr) == 0);
-        if (lr_now && !lr_was) blit_mode = (blit_mode + 1) % BLIT_CFG_N;
+        if (lr_now && !lr_was) {
+            sat_wallprep_slave = (sat_wallprep_slave + 1) % 3;  /* 0 master / 1 slave+purge / 2 slave+WARM */
+            sat_wallprep_defer = (sat_wallprep_slave != 0);     /* queue walls iff the slave will flush them */
+        }
         lr_was = lr_now;
     }
+    /* (SAT_DIAG_SLAVE_TOGGLES=0: L+R free -- only tap ','/'.' to Doom.) */
 #endif
 
     /* Split-screen wall-path A/B (live, mid-game): in local multiplayer, pad-1 X toggles the
@@ -2968,17 +3059,27 @@ static void poll_pad(void)
     {
         static int p2s_was = 0, shown = -2;
         int p2s_now = sat_mp_pad2_start();
-        if (p2s_now && !p2s_was && !usergame)   /* attract loop only -> never changes mid-game */
-            /* cycle 1 -> 2 -> 3 -> 4 -> 1 so 3/4-player can be forced for testing even when
-               the emulator only exposes 2 pads (J3/J4 mirror J1/J2 -- see mp_input.cxx). */
-            sat_local_players = (sat_local_players >= 4) ? 1 : sat_local_players + 1;
+        if (p2s_now && !p2s_was)
+        {
+            if (!usergame)
+                /* Attract loop: ARM the count for the next New Game (separate from the live
+                   in-game count, so a prior drop-in never leaks here).  Cycle 1 -> 2 -> 3 -> 4 -> 1
+                   so 3/4-player can be forced for testing even when the emulator only exposes 2 pads
+                   (J3/J4 mirror J1/J2 -- see mp_input.cxx). */
+                sat_armed_players = (sat_armed_players >= 4) ? 1 : sat_armed_players + 1;
+            else if (gamestate == GS_LEVEL)
+                /* In-game drop-in: cycle the LIVE count 1 -> 2 -> 3 -> 4 -> 1.  G_SatDropInService
+                   (top of G_Ticker) spawns the new marines at their co-op starts, or despawns them
+                   on the 4 -> 1 wrap (refs cleared first).  Serviced next tic. */
+                sat_dropin_want = (sat_local_players >= 4) ? 1 : sat_local_players + 1;
+        }
         p2s_was = p2s_now;
 
-        /* Attract-loop feedback so the gesture is visibly confirmed before starting a game;
-           cleared once a real game is running so it never lingers over the 3D view. */
+        /* Attract-loop feedback (the armed count) so the gesture is visibly confirmed before
+           starting a game; cleared once a real game is running so it never lingers over the view. */
         if (!usergame)
         {
-            int n = sat_local_players;
+            int n = sat_armed_players;
             if (n != shown) { SRL::Debug::Print(0, 23, "PLAYERS: %d  (START on pad 2 cycles)", n); shown = n; }
         }
         else if (shown != -2) { SRL::Debug::Print(0, 23, "                                "); shown = -2; }

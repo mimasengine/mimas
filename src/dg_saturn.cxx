@@ -269,6 +269,10 @@ extern "C" int W_SaturnCDInit(void);
    If the "snow" DISAPPEARS with RBG0 off -> the rotation layer is the source.  If it PERSISTS ->
    it's NOT RBG0 (back-screen reading garbage, or another layer).  1 = normal (RBG0 shown). */
 #define RBG0_DISPLAY     1
+/* RBG0_NBG3: re-enable the NBG3 debug text overlay (B1) now that the bitmap floor freed B1 of
+   its cell map.  NBG3's font/page/map live in B1 (SRL default) away from the RPT (B1+0x1ff00);
+   when on, we let slScrAutoDisp schedule NBG3's B1 cycle (DON'T scrub CYCB1).  0 = off. */
+#define RBG0_NBG3        1
 /* RBG0 per-frame ROTATION-PARAMETER-TABLE transfer (the real root cause, proven by LIBSGL.A disasm,
    docs/RBG0_STRUCTURED_GARBAGE.md): slScrMatSet only fills SGL's CACHED RAM buffer (_RotScrParA) +
    sets a dirty flag; the RAM->VRAM DMA of the RPT is done ONLY by the _BlankIn ISR, armed ONLY by
@@ -309,6 +313,8 @@ extern "C" int W_SaturnCDInit(void);
    Modes 1 vs 2 (read REC/EX/P/FLAT in both) isolate the software-floor cost = the saving
    the VDP2 floor buys.  Boot = 0. */
 static int rbg0_mode = 0;
+static int nbg3_show = 0;   /* NBG3 debug overlay display, toggled live by the pad L+R chord (default OFF).
+                               Its B1 cycle is reserved at init (RBG0_NBG3), so this only flips BGON. */
 /* RBG0_TUNE_PAD gates the live floor-tuning pad toggles (orientation / texel offset / plane
    pitch+level) AND the d-pad-from-Doom gate.  0 = PARKED: the found values below are the baked
    defaults and player movement is normal.  Flip to 1 to re-tune on the pad. */
@@ -1457,7 +1463,11 @@ static void rbg0_commit_cyc(void)
        exactly like SlaveDriver's cycle[] table; B1 = normal (RPT). */
     VDP2_CYCA0L = 0xEEEE; VDP2_CYCA0U = 0xEEEE;
     VDP2_CYCA1L = 0xEEEE; VDP2_CYCA1U = 0xEEEE;
-    VDP2_CYCB1L = 0xFEEE; VDP2_CYCB1U = 0xEEEE;
+#if RBG0_NBG3
+    /* NBG3 on: leave CYCB1 as slScrAutoDisp(NBG3ON) built it (NBG3 font+map reads live in B1). */
+#else
+    VDP2_CYCB1L = 0xFEEE; VDP2_CYCB1U = 0xEEEE;   /* NBG3 off: scrub the stale NBG3 read SGL left */
+#endif
 #else
     /* first correct the stale NBG3 reads SGL left in CYCB1's shadow (B1 is now the RBG0 map) */
     VDP2_CYCB1L = 0xFEEE; VDP2_CYCB1U = 0xEEEE;
@@ -1719,7 +1729,7 @@ extern "C" void DG_Init(void)
 #if VDP2_HW_SKY
     slScrAutoDisp(NBG0ON | NBG1ON | NBG3ON | RBG0ON);   /* sky(NBG0) + floor(RBG0) both on */
 #else
-    slScrAutoDisp(NBG1ON | (RBG0_DISPLAY ? RBG0ON : 0));  /* sw sky; floor(RBG0).  NBG3 debug OFF (user directive) */
+    slScrAutoDisp(NBG1ON | (RBG0_DISPLAY ? RBG0ON : 0) | (RBG0_NBG3 ? NBG3ON : 0));  /* sw sky; floor(RBG0) + NBG3 debug (lets slScrAutoDisp build NBG3's B1 cycle) */
 #endif
 #else
     slScrAutoDisp(NBG0ON | NBG1ON | NBG3ON);
@@ -2947,7 +2957,7 @@ extern "C" void DG_DrawFrame(void)
         sat_vdp2_floor    = (rbg0_mode == 1) ? 0 : 1;        /* mode 1 draws the sw floor; 0,2 skip it */
         uint16_t sky_bit  = (VDP2_HW_SKY && show_sky) ? NBG0ON : 0;   /* no NBG0 when sky is software */
         uint16_t rbg0_bit = (RBG0_DISPLAY && rbg0_mode == 0) ? RBG0ON : 0;   /* HW floor only in mode 0 (off if isolating) */
-        uint16_t nbg3_bit = 0;                               /* NBG3 debug COMPLETELY off (user directive) */
+        uint16_t nbg3_bit = (RBG0_NBG3 && nbg3_show) ? NBG3ON : 0;  /* NBG3 overlay: display = pad L+R (default off); B1 cycle reserved at init */
         slScrAutoDisp((uint16_t)(sky_bit | NBG1ON | nbg3_bit | rbg0_bit));
 #else
         slScrAutoDisp((uint16_t)(show_sky ? (NBG0ON | NBG1ON | NBG3ON)
@@ -3302,6 +3312,18 @@ static void poll_pad(void)
        that matter for the side-by-side.  (Y also taps 'y' to Doom -- harmless.) */
     if ((changed & PER_DGT_TY) && !(cur & PER_DGT_TY))
         rbg0_mode = (rbg0_mode + 1) % 2;
+#if RBG0_NBG3
+    /* Pad L+R (chord) toggles the NBG3 debug overlay (default OFF).  The B1 cycle is reserved at
+       init (slScrAutoDisp(NBG3ON) + no scrub), so this only flips BGON.  (L/R also tap ','/'.' to
+       Doom -- harmless; L+R is free since SAT_DIAG_SLAVE_TOGGLES=0.) */
+    {
+        const unsigned short lr = (unsigned short)(PER_DGT_TL | PER_DGT_TR);
+        static int lr_was = 0;
+        int lr_now = ((cur & lr) == 0);          /* both held (active-low) */
+        if (lr_now && !lr_was) nbg3_show = !nbg3_show;
+        lr_was = lr_now;
+    }
+#endif
 #if RBG0_TUNE_PAD
     /* PARKED live floor tuning (RBG0_TUNE_PAD) -- the found values are baked as defaults:
        L + C     = cycle the TEXTURE orientation over the 8 D4 symmetries (rotation + mirror).

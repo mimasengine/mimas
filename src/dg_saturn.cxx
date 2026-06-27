@@ -245,7 +245,7 @@ extern "C" int W_SaturnCDInit(void);
    no RBG0, no RAMCTL poke (set VDP2_HW_SKY=1 with this).  1 = RBG0 Mode-7 floor test
    (needs VDP2_HW_SKY=0; still snows on HW -- the cycle-pattern commit is unsolved, see
    docs/VDP2_ARCHITECTURE.md).  Code is kept under #if either way. */
-#define VDP2_RBG0_TEST   0
+#define VDP2_RBG0_TEST   1
 /* DEBUG: force RBG0 above the game (priority 6, NBG1 dropped to 5) so its content is
    visible regardless of the index-0 window -- a definitive "does RBG0 render my grid?"
    check.  Set 0 for the real layering (RBG0 priority 5, shows only through index-0). */
@@ -258,7 +258,7 @@ extern "C" int W_SaturnCDInit(void);
    makes it worse), so this is a BUILD choice, not a pad-mode toggle.  Software sky costs
    a little REC back, but it lands on the slave the floor offload frees (slave 46->0%
    busy).  See docs/VDP2_ARCHITECTURE.md.  PAUSED config = 1 (hardware sky, RBG0 off). */
-#define VDP2_HW_SKY      1
+#define VDP2_HW_SKY      0
 /* RBG0 register-commit method (re-examining the "slSynch is poison" conviction, 2026-06-26):
    1 = ONE-SHOT slSynch at init -> SGL flushes its FULL VDP2 register shadow to the chip (commits
        every RBG0 register correctly), ZERO per-frame cost.  Tests whether slSynch one-shot is the
@@ -276,15 +276,24 @@ extern "C" int W_SaturnCDInit(void);
    0 = none (broken)  ;  1 = per-frame slSynch (Test A: confirms, but caps fps + mutes SCSP SFX)
    2 = manual RPT memcpy reproducing _BlankIn, NO slSynch (Test B: the real shipping fix). */
 #define RBG0_RPT_TRANSFER 2
-#define RBG0_CEL_VRAM    ((void *)0x25E20000)  /* VDP2 VRAM A1: cell (char) data    */
-/* A rotation BG's pattern-name map must live in a VRAM B-bank.  An A-bank (map in A0/A1,
-   tried to keep the NBG3 debug text) gives slScrAutoDisp ok=0 -> RBG0 reads starve ->
-   squished bands.  B0 = the game framebuffer (non-negotiable), so the map goes in B1 and
-   EVICTS the NBG3 debug-text layer (cycle-pattern conflict) -- this is the reliable-floor
-   config.  Bank layout (VDP2_HW_SKY=0): B0 framebuffer / A1 cells / B1 map / A0 K-table
-   (A0 freed by the software sky).  Debug overlay is OFF while the floor is on. */
-#define RBG0_MAP_VRAM    ((void *)0x25E70000)  /* VDP2 VRAM B1: pattern name table */
-#if VDP2_HW_SKY
+/* RBG0_BITMAP: 1 = floor is a 512x256 8bpp BITMAP (no pattern-name map).  Dropping the map
+   removes the B1 rotation read -> B1 is FREED (NBG3 debug overlay coexists) and the floor
+   drops from 3 banks to 2.  Bank layout (needs VDP2_HW_SKY=0): A0 bitmap / A1 K-table /
+   B0 framebuffer / B1 free->NBG3.  The bitmap MUST be in A0, NOT A1: SGL hardcodes its
+   rotation anchors in A1 (sl_def.h KTBL0_RAM=A1, RBG_PARA_ADR=A1+0x1ff00); writing the 128KB
+   bitmap over them faults the rotation engine.  The coefficient table then sits in A1 =
+   KTBL0_RAM, where SGL expects it.  0 = legacy cell+map floor (map in B1, 3 banks, evicts
+   NBG3 -- the dead-end). */
+#define RBG0_BITMAP      1
+#define RBG0_CEL_VRAM    ((void *)0x25E20000)  /* VDP2 VRAM A1: cell (char) data (cell path)   */
+#define RBG0_MAP_VRAM    ((void *)0x25E70000)  /* VDP2 VRAM B1: pattern name table (cell path) */
+#if RBG0_BITMAP
+/* SlaveDriver layout (PLAX.C initPlax, ships rotation bitmap on real HW): bitmap (char) in
+   A1, rotation/coefficient table in A0 -- same banks as the BOOTING cell path (cells A1,
+   K A0).  The earlier "bitmap must be in A0 / A1 anchors clobber it" was a WRONG conclusion. */
+#define RBG0_BMP_VRAM    ((void *)0x25E20000)  /* VDP2 VRAM A1: 512x256 8bpp floor bitmap       */
+#define RBG0_KTAB_VRAM   ((void *)0x25E00000)  /* VDP2 VRAM A0: coefficient/rotation table       */
+#elif VDP2_HW_SKY
 #define RBG0_KTAB_VRAM   ((void *)0x25E28000)  /* A1: collides w/ cells -- only safe if RBG0 floor off */
 #else
 #define RBG0_KTAB_VRAM   ((void *)0x25E00000)  /* VDP2 VRAM A0: freed by software sky -> K-table's own bank */
@@ -321,7 +330,7 @@ extern "C" {
    onto Doom's horizon; YAW = +90deg -> orients the flat to the world.  Texture scale came out
    1:1 (no slScale needed) once the pitch was right. */
 #define RBG0_PITCH       0x300    /* ANGLE delta on slRotX (~4.21deg) */
-#define RBG0_YAW_OFF     0x4000   /* ANGLE yaw offset (90deg)         */
+#define RBG0_YAW_OFF     0xC000   /* ANGLE yaw offset (90deg + 180deg texture rotation) */
 
 /* SKY_FIXED 1 = the sky does NOT scroll with the view angle (Romain's choice:
    a static backdrop).  0 = scroll with viewangle, slowed by SKY_PARALLAX_SHIFT
@@ -1273,6 +1282,23 @@ static void rbg0_upload_flat(int picnum)
     if (!flat) return;
     loaded = picnum;
     loaded_cmap = cmap;
+#if RBG0_BITMAP
+    /* Shade + tile the 64x64 flat DIRECTLY into the VRAM bitmap (A1) -- NO static buffer.
+       A 4KB `static shaded[64*64]` here grew HWRAM .bss past the TLSF heap region, starving
+       the pool to 96 bytes -> tlsf_add_pool failed at init = the "boot loop".  VRAM is
+       uncached so direct byte writes are fine.  slOverRA repeat wraps it for the floor. */
+    unsigned char *bmp = (unsigned char *)RBG0_BMP_VRAM;
+    for (int y = 0; y < 256; ++y)
+    {
+        const unsigned char *frow = flat + (y & 63) * 64;
+        unsigned char *drow = bmp + y * 512;
+        for (int x = 0; x < 512; ++x)
+        {
+            unsigned char px = frow[x & 63];
+            drow[x] = cmap ? cmap[px] : px;
+        }
+    }
+#else
     unsigned char *cel = (unsigned char *)RBG0_CEL_VRAM;
     for (int cy = 0; cy < 8; ++cy)
         for (int cx = 0; cx < 8; ++cx)
@@ -1285,17 +1311,33 @@ static void rbg0_upload_flat(int picnum)
                     c[ry * 8 + rx] = cmap ? cmap[px] : px;
                 }
         }
+#endif
 }
 
 static void rbg0_proto_init(void)
 {
-    /* 1) cells (64 cells x 64B = a 64x64 flat) are filled per-flat by rbg0_upload_flat()
-       on the first level frame; zero them so the brief pre-first-flat frame isn't garbage. */
+#if RBG0_BITMAP
+    /* SlaveDriver-inspired BITMAP RBG0 (PLAX.C initPlax): bitmap (char) 512x256 in A1, the
+       coefficient/rotation table in A0, OVER_0 (repeat), perspective via the coefficient
+       table.  NO pattern-name map.  Same banks as the BOOTING cell path (A1 char / A0 K).
+       NBG3 debug is fully off (B1 holds only the RPT now). */
+    memset((void *)RBG0_BMP_VRAM, 0, 512 * 256);          /* zero the whole bitmap (A1)         */
+    slRparaMode(K_CHANGE);                                 /* rpara mode FIRST (SRL/SlaveDriver order) */
+    slOverRA(0);                                            /* OVER_0: repeat (wrap the bitmap)   */
+    slBitMapRbg0(COL_TYPE_256, BM_512x256, RBG0_BMP_VRAM); /* A1 bitmap; CHCTLB BMPMD=1          */
+    slBMPaletteRbg0(1);
+    slMakeKtable(RBG0_KTAB_VRAM);                          /* A0 coefficient table               */
+    slKtableRA(RBG0_KTAB_VRAM, K_FIX | K_LINE | K_2WORD | K_ON);
+    /* NO slPageRbg0/slPlaneRA (cell-only).  CRITICAL (root cause, disasm): slBitMapRbg0 does
+       NOT call rbank_set -> the A1 bitmap bank is never registered in the RAMCTL RDBS shadow.
+       We reserve RDBS (A1=char/A0=coeff -> 0x0D) AND park the A0/A1 rotation cycle slots BY
+       HAND below (rbg0_commit_ramctl + rbg0_commit_cyc), and do NOT use slSynch -- it would
+       recompute the cycle pattern from the inconsistent shadow (= the boot-loop).  Mirrors
+       SlaveDriver's explicit vramA0=K/vramA1=CHAR + parked-0xEEEE cycle table. */
+#else
+    /* 1) cells filled per-flat by rbg0_upload_flat(); zero them for the pre-first-flat frame. */
     memset((void *)RBG0_CEL_VRAM, 0, 64 * 64);
-
-    /* 2) pattern-name table -- 1-WORD format (map word = char#*2 | palette<<12 + offset).
-       A 64x64-cell page tiling the flat's 8x8 cell grid: cell (cx,cy) = index cy*8+cx ->
-       char# = (cy*8+cx)*2, palette 1 (PLAYPAL, 0x1000), cells at the A1 bank base -> offset 0. */
+    /* 2) pattern-name table (1-WORD) tiling the flat's 8x8 cell grid, palette 1, map in B1. */
     {
         unsigned short *map = (unsigned short *)RBG0_MAP_VRAM;
         for (int my = 0; my < 64; ++my)
@@ -1305,25 +1347,17 @@ static void rbg0_proto_init(void)
                 map[my * 64 + mx] = (unsigned short)((cellidx * 2) | 0x1000);
             }
     }
-
-    /* 3) RBG0 cell config.
-       THE FIX: slPageRbg0's FIRST arg is the CELL/character base, NOT the map.  My old code
-       passed (map, cell) swapped -> RBG0 read pixels from the pattern-name table = garbage =
-       transparent.  Sequence: slPageRbg0(cell, 0, PNB_1WORD|CN_12BIT) + sl1MapRA(map).  PNB_1WORD
-       (not 2WORD).  OneAxis flat for now (no K-table); perspective K-table is the next step. */
-    slOverRA(0);                                       /* over-area: repeat the plane  */
+    /* 3) RBG0 cell config + per-line coefficient table (Mode-7 perspective). */
+    slOverRA(0);
     slCharRbg0(COL_TYPE_256, CHAR_SIZE_1x1);
-    slPageRbg0(RBG0_CEL_VRAM, 0, PNB_1WORD | CN_12BIT);/* arg1 = CELL base (the fix!)   */
+    slPageRbg0(RBG0_CEL_VRAM, 0, PNB_1WORD | CN_12BIT);
     slPlaneRA(PL_SIZE_1x1);
-    sl1MapRA(RBG0_MAP_VRAM);                            /* pattern-name table (B1)      */
-    /* PERSPECTIVE: a per-line coefficient table (1/z scaling)
-       turns the affine plane into a Mode-7 GROUND.  Static table via slMakeKtable -- the
-       vblank-filled variant needs slSynch, which we don't run.  K_LINE = one scale per
-       scanline (enough for a floor; far cheaper than a per-dot K_DOT). */
+    sl1MapRA(RBG0_MAP_VRAM);
     slMakeKtable(RBG0_KTAB_VRAM);
     slKtableRA(RBG0_KTAB_VRAM, K_FIX | K_LINE | K_2WORD | K_ON);
-    slRparaMode(K_CHANGE);                              /* use the coefficient table     */
+    slRparaMode(K_CHANGE);
     slBMPaletteRbg0(1);
+#endif
 
     /* 4) DRIVE THE ROTATION FROM THE MATRIX, NOT BY HAND.  We do NOT call slRparaInitSet:
        SRL::Core::Initialize already pointed the rotation-param table at VRAM (B1+0x1ff00).
@@ -1353,7 +1387,12 @@ static void rbg0_commit_ramctl(void)
 {
     volatile uint16_t *const RAMCTL = (volatile uint16_t *)0x25F8000E;
     ramctl_before = *RAMCTL;
-    uint16_t v = (uint16_t)((ramctl_before & 0xFC00u) | 0x0300u | 0x008Du);
+    /* RDBS low byte = (B1)<<6 | (B0)<<4 | (A1)<<2 | (A0).  1=coeff, 2=pattern-name, 3=char/bitmap. */
+#if RBG0_BITMAP
+    uint16_t v = (uint16_t)((ramctl_before & 0xFC00u) | 0x0300u | 0x000Du);  /* A1=char/bitmap(3), A0=coeff(1), B1=0 */
+#else
+    uint16_t v = (uint16_t)((ramctl_before & 0xFC00u) | 0x0300u | 0x008Du);  /* cell: + B1=pattern-name(2) = 0x8D */
+#endif
     *RAMCTL = v;
     VDP2_RAMCTL = v;   /* shadow-coherent: survive a possible per-vblank ISR re-push (RBG0 snow fix) */
     ramctl_after = *RAMCTL;
@@ -1372,8 +1411,18 @@ static void rbg0_commit_ramctl(void)
    We flush 0x0E..0xFE (skip the display/status regs 0x00-0x0C). */
 static void rbg0_commit_cyc(void)
 {
+#if RBG0_BITMAP
+    /* THE FIX (disasm + SlaveDriver): slBitMapRbg0 never reserved the A1 bitmap bank, so SGL's
+       auto-cycle leaves A0/A1 inconsistent -> the rotation engine/ISR walks a bad bank map ->
+       address error -> boot-loop.  Park BOTH rotation banks (A0=coeff, A1=bitmap) at 0xEEEE,
+       exactly like SlaveDriver's cycle[] table; B1 = normal (RPT). */
+    VDP2_CYCA0L = 0xEEEE; VDP2_CYCA0U = 0xEEEE;
+    VDP2_CYCA1L = 0xEEEE; VDP2_CYCA1U = 0xEEEE;
+    VDP2_CYCB1L = 0xFEEE; VDP2_CYCB1U = 0xEEEE;
+#else
     /* first correct the stale NBG3 reads SGL left in CYCB1's shadow (B1 is now the RBG0 map) */
     VDP2_CYCB1L = 0xFEEE; VDP2_CYCB1U = 0xEEEE;
+#endif
     volatile uint8_t *const shadow = (volatile uint8_t *)((uintptr_t)&VDP2_RAMCTL - 0x0E);
     volatile uint8_t *const chip   = (volatile uint8_t *)0x25F80000;
     for (int off = 0x0E; off <= 0xFE; off += 2)
@@ -1631,7 +1680,7 @@ extern "C" void DG_Init(void)
 #if VDP2_HW_SKY
     slScrAutoDisp(NBG0ON | NBG1ON | NBG3ON | RBG0ON);   /* sky(NBG0) + floor(RBG0) both on */
 #else
-    slScrAutoDisp(NBG1ON | NBG3ON | (RBG0_DISPLAY ? RBG0ON : 0));  /* sw sky; floor(RBG0), off if isolating */
+    slScrAutoDisp(NBG1ON | (RBG0_DISPLAY ? RBG0ON : 0));  /* sw sky; floor(RBG0).  NBG3 debug OFF (user directive) */
 #endif
 #else
     slScrAutoDisp(NBG0ON | NBG1ON | NBG3ON);
@@ -1641,12 +1690,20 @@ extern "C" void DG_Init(void)
     /* Commit the RBG0 bank assignment (RDBS) straight to the chip -- the piece SGL would
        push inside slSynch.  After slScrAutoDisp so RBG0ON is already live; once is enough
        (the SGL vblank handler re-pushes BGON/scroll, not RAMCTL). */
-    rbg0_commit_ramctl();
-#if RBG0_COMMIT_VIA_SLSYNCH
-    slSynch();                    /* TEST: one-shot full-register commit via SGL's own flush (zero per-frame
-                                    cost).  If the snow dies here, slSynch one-shot is the simplest fix. */
+#if RBG0_BITMAP
+    /* BITMAP fix (disasm + SlaveDriver): reserve the RDBS (A1=char/A0=coeff) + park the A0/A1
+       rotation cycle slots BY HAND -- slBitMapRbg0 never did (no rbank_set).  Then flush the
+       shadow.  Do NOT slSynch: it would recompute the cycle pattern from the inconsistent
+       shadow = the boot-loop. */
+    rbg0_commit_ramctl();         /* RDBS = 0x0D */
+    rbg0_commit_cyc();            /* park A0/A1 cycles + block-flush shadow -> chip */
 #else
-    rbg0_commit_cyc();            /* manual block-flush of the shadow register image (no slSynch at all) */
+    rbg0_commit_ramctl();         /* cell path: poke RDBS (B1=pattern-name) */
+#if RBG0_COMMIT_VIA_SLSYNCH
+    slSynch();                    /* one-shot full-register commit via SGL's own flush */
+#else
+    rbg0_commit_cyc();            /* manual block-flush of the shadow register image */
+#endif
 #endif
     slCashPurge();               /* TEST (cache hypothesis): flush the SH-2 cache so the RBG0 cells/map/
                                     K-table SGL wrote via CACHED addresses actually reach VRAM.  Ymir has
@@ -2852,7 +2909,7 @@ extern "C" void DG_DrawFrame(void)
         sat_vdp2_floor    = (rbg0_mode == 1) ? 0 : 1;        /* mode 1 draws the sw floor; 0,2 skip it */
         uint16_t sky_bit  = (VDP2_HW_SKY && show_sky) ? NBG0ON : 0;   /* no NBG0 when sky is software */
         uint16_t rbg0_bit = (RBG0_DISPLAY && rbg0_mode == 0) ? RBG0ON : 0;   /* HW floor only in mode 0 (off if isolating) */
-        uint16_t nbg3_bit = (rbg0_mode == 0) ? 0 : NBG3ON;   /* debug overlay only in modes 1,2   */
+        uint16_t nbg3_bit = 0;                               /* NBG3 debug COMPLETELY off (user directive) */
         slScrAutoDisp((uint16_t)(sky_bit | NBG1ON | nbg3_bit | rbg0_bit));
 #else
         slScrAutoDisp((uint16_t)(show_sky ? (NBG0ON | NBG1ON | NBG3ON)

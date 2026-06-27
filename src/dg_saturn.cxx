@@ -2984,9 +2984,13 @@ extern "C" void DG_DrawFrame(void)
            0 = VDP2 floor, no dbg   (RBG0 on, NBG3 off, sw floor skipped)
            1 = dbg + software floor (RBG0 off, NBG3 on, sw floor drawn)
            2 = dbg, no software floor (RBG0 off, NBG3 on, sw floor skipped). */
-        sat_vdp2_floor    = (rbg0_mode == 1) ? 0 : 1;        /* mode 1 draws the sw floor; 0,2 skip it */
+        /* SATURN: the VDP2/RBG0 floor is ONE rotation plane -> use it ONLY at full detail
+           (potato 0) and in 1-player; in any potato level OR split-screen it falls back to the
+           SOFTWARE floor (sat_vdp2_floor=0 -> the sw floor draws; RBG0 display off). */
+        int rbg0_active   = (potato_level == 0) && (sat_local_players <= 1);
+        sat_vdp2_floor    = (rbg0_mode == 1 || !rbg0_active) ? 0 : 1;  /* skip the sw floor only when the HW floor shows */
         uint16_t sky_bit  = (VDP2_HW_SKY && show_sky) ? NBG0ON : 0;   /* no NBG0 when sky is software */
-        uint16_t rbg0_bit = (RBG0_DISPLAY && rbg0_mode == 0) ? RBG0ON : 0;   /* HW floor only in mode 0 (off if isolating) */
+        uint16_t rbg0_bit = (RBG0_DISPLAY && rbg0_mode == 0 && rbg0_active) ? RBG0ON : 0;   /* HW floor: pot0 + 1p only */
         uint16_t nbg3_bit = (RBG0_NBG3 && nbg3_show) ? NBG3ON : 0;  /* NBG3 overlay: display = pad L+R (default off); B1 cycle reserved at init */
         slScrAutoDisp((uint16_t)(sky_bit | NBG1ON | nbg3_bit | rbg0_bit));
 #else
@@ -3004,7 +3008,7 @@ extern "C" void DG_DrawFrame(void)
        NOTE: slScrMatSet only fills SGL's CACHED RAM buffer + a dirty flag; the RPT VRAM transfer is
        done by the _BlankIn ISR, armed ONLY by slSynch (disasm-proven, docs/RBG0_STRUCTURED_GARBAGE.md).
        So the transform never reaches VRAM without RBG0_RPT_TRANSFER below. */
-    if (rbg0_mode == 0)
+    if (rbg0_mode == 0 && sat_vdp2_floor)   /* sat_vdp2_floor folds in the pot0 + 1p gate (set above) */
     {
         rbg0_upload_flat(sat_vdp2_floor_pic);
         rbg0_set_transform();

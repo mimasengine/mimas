@@ -1,3 +1,5 @@
+> ⚠️ SUPERSEDED (2026-06-27). Ce plan vise le chemin CELL abandonné (A0=K / A1=cells / B1=map) et traite la neige comme non résolue. RÉALITÉ : le sol SHIPPE en BITMAP 512x256 8bpp en A1, K/coeff en A0, fb en B0, B1 LIBRE (RPT seul) — 2 banques, pas de map ; PROPRE sur HW (commits 19768ca/41dd895). La neige était la STARVATION du motif de cycle (3e read map du chemin cell), corrigée par le bitmap + RDBS=0x0D + cycles A0/A1 parqués 0xEEEE + block-flush du shadow (rbg0_commit_cyc, DÉJÀ dans l'arbre). Larguer la map a LIBÉRÉ B1 → « floor XOR sky » est morte (vrai arbitrage = ciel-vs-NBG3). Le « fix » CYCB0=0x55EE, le plan de test HW et l'« inconnue commit-gap » sont historiques. Garder seulement la mécanique RDBS / invalidation-de-banque / park-0xEEEE. Voir docs/VDP2_RBG0_CURRENT_STATE.md.
+
 # RBG0 — Plan d'implémentation : tuer la snow du sol VDP2 texturé
 
 > Cible : faire **AFFICHER SANS SNOW** sur Saturn réelle la config

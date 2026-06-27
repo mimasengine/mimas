@@ -1,3 +1,5 @@
+> ⚠️ SUPERSEDED (2026-06-27) par la session sol bitmap. Le sol RBG0 SHIPPE en BITMAP 512x256 8bpp (RBG0_BITMAP=1, commits 19768ca/41dd895), PROPRE sur HW, gaté potato-0 + 1 joueur (ea6967c). 2 banques rotation : bitmap=A1 / K-table=A0 ; fb=B0 ; B1 LIBRE (RPT seul, pas de map) — donc « sol OFF / neige / 3 banques / Sky XOR floor » sont TOUS ABROGÉS : le sol et un ciel B1 cohabitent (le vrai arbitrage est ciel-vs-NBG3). La neige était la starvation du motif de cycle du sol CELL, corrigée par le bitmap (pas de read map) + RDBS=0x0D + cycles A0/A1 parqués 0xEEEE (rbg0_commit_ramctl/rbg0_commit_cyc, sans slSynch — rbg0_commit_cyc EST dans l'arbre). Lire §1–§4 comme historique (chemin cell) ; le modèle de banques et le verdict MP=Non tiennent. Voir docs/VDP2_RBG0_CURRENT_STATE.md.
+
 # Sol VDP2 — consolidation avant la session hardware
 
 > Document de référence préparé pour la session de test sur Saturn réelle.

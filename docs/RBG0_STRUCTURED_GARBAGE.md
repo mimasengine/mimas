@@ -1,3 +1,5 @@
+> ⚠️ SUPERSEDED (2026-06-27). Ce doc diagnostique l'ANCIEN sol RBG0 cell+map et propose slSynch par frame / copie RPT manuelle comme remède — un cul-de-sac. Le sol SHIPPE désormais en BITMAP 512x256 8bpp (RBG0_BITMAP=1), PROPRE sur HW réel, et n'a PAS besoin de slSynch par frame. Cause racine = STARVATION du motif de cycle VRAM (chemin cell : 3 reads/dot), PAS une transformation gelée. Fix = larguer la map (bitmap → 2 reads/dot) + RDBS manuel (rbg0_commit_ramctl) + cycles parqués 0xEEEE avec block-flush (rbg0_commit_cyc), à la SlaveDriver. Larguer la map a aussi LIBÉRÉ B1 → la loi « floor XOR sky » est levée. Lire ci-dessous comme historique ; les réfs de ligne (:1xxx/:2xxx) ont dérivé. Voir commits 19768ca/41dd895 et docs/VDP2_RBG0_CURRENT_STATE.md.
+
 # RBG0 — "grille de cells" sur hardware réel (perspective correcte sur Ymir)
 
 **Diagnostic & plan d'action — 2026-06-26**

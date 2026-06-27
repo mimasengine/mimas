@@ -1,3 +1,5 @@
+> ⚠️ STALE re: the RBG0 floor (pre-2026-06-27). The floor now SHIPS as a clean 512x256 8bpp BITMAP (RBG0_BITMAP=1, commits 19768ca/41dd895): 2 rotation banks — bitmap in A1 (0x25E20000) + K-table in A0 (0x25E00000); B0=NBG1 framebuffer; RPT at B1+0x1ff00, B1 otherwise FREE (no map). The snow was cell-floor cycle-pattern starvation, SOLVED by the bitmap (2 reads/dot) + manual RDBS=0x0D + parked A0/A1 cycles (rbg0_commit_ramctl/rbg0_commit_cyc, NOT slSynch — rbg0_commit_cyc IS in the tree). The "floor XOR sky" law is LIFTED (B1 freed). The §1–§3 hardware-mechanism analysis is still valid; treat every "floor off / still snows / cannot ship / floor XOR sky / cell 3-bank / cycle-pattern commit missing" conclusion as OBSOLETE. See docs/VDP2_RBG0_CURRENT_STATE.md.
+
 # VDP2 — architecture, limits, and what Mimas should put on it
 
 Written 2026-06-19 after Romain reported the VDP2 path **broken on real Saturn**:

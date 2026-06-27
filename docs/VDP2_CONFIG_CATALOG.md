@@ -1,3 +1,5 @@
+> ⚠️ CORRECTION 2026-06-27 (session sol bitmap, commits 19768ca/41dd895) : le sol RBG0 SHIPPE en BITMAP 512x256 8bpp PROPRE (RBG0_BITMAP=1, HW_SKY=0), gaté potato-0 + 1 joueur. 2 banques rotation : bitmap=A1, coeff/K=A0, fb=B0, RPT=B1+0x1ff00 → B1 LIBRE (pas de map). Le commit CYCxx est RÉSOLU (rbg0_commit_cyc + rbg0_commit_ramctl, block-flush direct sans slSynch, RDBS=0x0D). Ceci LÈVE la loi « overlay/ciel XOR sol » (config 8 ≠ configs 9/10/11 ; §4.3) : l'overlay NBG3 et un ciel B1 cohabitent. Fog distance = écran line-color + color-calc RBG0 (PAS K_LINECOL), prototype gaté OFF. slSynch ABANDONNÉ (pas réfuté) ; le tearing VDP1 est un problème séparé (swap auto FBCR=0). Voir docs/VDP2_RBG0_CURRENT_STATE.md.
+
 # Catalogue maître des configurations VDP2/VDP1 — Mimas (Doom Saturn)
 
 > Document de décision et de référence. Auteur : architecte graphique Saturn (Mimas).

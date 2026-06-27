@@ -1,3 +1,5 @@
+> ⚠️ STALE re: floors (2026-06-27). Le sol RBG0 SHIPPE en BITMAP 512x256 8bpp et est PROPRE sur HW réel (commits 19768ca/41dd895 ; dg_saturn.cxx:297 RBG0_BITMAP=1) — il n'a PAS « cassé sur HW » et n'a PAS besoin de slSynch. L'ancienne neige du sol CELL était la STARVATION du motif de cycle (3 reads/dot : coeff+map+cell), corrigée par le bitmap (2 reads/dot) + RDBS=0x0D + cycles A0/A1 parqués 0xEEEE. §6.4 / §8 sont stale : le flat dominant SHIPPE sur RBG0 (et non « VDP1 bat RBG0 ») ; VDP1 ne prend que les hauteurs/plafonds SECONDAIRES, encore TODO. Le modèle HW/coût (§1–§5, §7) est intact. Voir docs/VDP2_RBG0_CURRENT_STATE.md.
+
 # VDP1 — architecture, limits, and what Mimas should put on it
 
 Written 2026-06-19 as the companion to [`VDP2_ARCHITECTURE.md`](VDP2_ARCHITECTURE.md).

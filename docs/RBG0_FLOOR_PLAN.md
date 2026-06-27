@@ -1,3 +1,5 @@
+> ⚠️ SUPERSEDED 2026-06-27 — le sol RBG0 SHIPPE en BITMAP 512x256 8bpp PROPRE (RBG0_BITMAP=1, commits 19768ca/41dd895), vérifié sur Saturn réelle. Layout : bitmap=A1, coeff/K-table=A0, fb=B0, B1 LIBRE (RPT seul) — 2 banques rotation, pas de map. La neige, le layout cell 3-banques, la loi « floor XOR sky », le conseil « cells pas bitmap » et le statut « commit CYCxx manquant / phases gated » ci-dessous sont OBSOLÈTES. Neige corrigée par RDBS=0x0D + cycles A0/A1 parqués 0xEEEE (rbg0_commit_ramctl/rbg0_commit_cyc, PAS slSynch) ; B1 libéré → floor+sky cohabitent ; sol gaté potato-0 + 1 joueur. Garder les sections données/motivation ; traiter le reste comme historique. Voir docs/VDP2_RBG0_CURRENT_STATE.md.
+
 # VDP2 RBG0 — hardware floor/ceiling offload (the "biggest flat" lever)
 
 Deport the single **largest visible floor/ceiling flat** of each frame to a VDP2

@@ -1,3 +1,5 @@
+> ⚠️ PARTIELLEMENT OBSOLÈTE re: le sol RBG0 (état d'avant 2026-06-27). Le sol SHIPPE en BITMAP 512x256 8bpp (RBG0_BITMAP=1, commits 19768ca/41dd895), PROPRE sur HW : 2 banques — bitmap en A1, K-table en A0, fb en B0, RPT en B1+0x1ff00, B1 sinon LIBRE (pas de map). Les conclusions « sol=software/off », « neige présente », « poke CYC absent » (rbg0_commit_cyc EST dans l'arbre), « RDBS=0x8D » (c'est 0x0D), « ciel XOR sol » et « overlay incompatible » sont RENVERSÉES : l'overlay NBG3 = toggle L+R, un ciel cell peut cohabiter. Sol gaté à potato-0 + 1 joueur. La loi matérielle (§0/§2/§5) reste valable. Voir docs/VDP2_RBG0_CURRENT_STATE.md.
+
 # VDP2 Layer Budget — Mimas (Doom Saturn) : ciel, sol, overlay et les 4 banques VRAM
 
 > Document de décision. Auteur : architecte graphique Saturn (Mimas).

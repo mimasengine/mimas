@@ -245,7 +245,7 @@ extern "C" int W_SaturnCDInit(void);
    no RBG0, no RAMCTL poke (set VDP2_HW_SKY=1 with this).  1 = RBG0 Mode-7 floor test
    (needs VDP2_HW_SKY=0; still snows on HW -- the cycle-pattern commit is unsolved, see
    docs/VDP2_ARCHITECTURE.md).  Code is kept under #if either way. */
-#define VDP2_RBG0_TEST   1
+#define VDP2_RBG0_TEST   0
 /* DEBUG: force RBG0 above the game (priority 6, NBG1 dropped to 5) so its content is
    visible regardless of the index-0 window -- a definitive "does RBG0 render my grid?"
    check.  Set 0 for the real layering (RBG0 priority 5, shows only through index-0). */
@@ -258,7 +258,7 @@ extern "C" int W_SaturnCDInit(void);
    makes it worse), so this is a BUILD choice, not a pad-mode toggle.  Software sky costs
    a little REC back, but it lands on the slave the floor offload frees (slave 46->0%
    busy).  See docs/VDP2_ARCHITECTURE.md.  PAUSED config = 1 (hardware sky, RBG0 off). */
-#define VDP2_HW_SKY      0
+#define VDP2_HW_SKY      1
 /* RBG0 register-commit method (re-examining the "slSynch is poison" conviction, 2026-06-26):
    1 = ONE-SHOT slSynch at init -> SGL flushes its FULL VDP2 register shadow to the chip (commits
        every RBG0 register correctly), ZERO per-frame cost.  Tests whether slSynch one-shot is the

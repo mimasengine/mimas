@@ -309,6 +309,25 @@ extern "C" int W_SaturnCDInit(void);
    Modes 1 vs 2 (read REC/EX/P/FLAT in both) isolate the software-floor cost = the saving
    the VDP2 floor buys.  Boot = 0. */
 static int rbg0_mode = 0;
+/* RBG0_TUNE_PAD gates the live floor-tuning pad toggles (orientation / texel offset / plane
+   pitch+level) AND the d-pad-from-Doom gate.  0 = PARKED: the found values below are the baked
+   defaults and player movement is normal.  Flip to 1 to re-tune on the pad. */
+#define RBG0_TUNE_PAD 0
+/* TEMP live floor tuning (no debug overlay -> the user counts pad presses).
+   L + C      cycles the texture ORIENTATION over all 8 D4 symmetries of a square
+              (0 id, 1 rot90, 2 rot180, 3 rot270, 4 mirrorH, 5 mirrorV, 6 transpose,
+              7 anti-transpose) -- covers every rotation AND mirror.
+   L + d-pad  shifts the texture +-1 texel on X/Y (re-shades, rbg0_tex_dirty).
+   R + d-pad  nudges the PLANE in the transform: R+up/down = inclination (pitch),
+              R+left/right = the plane's near level (Z).
+   Defaults below = the values found on HW (2026-06-27): mirrorV, yoff 0, pitch +0x100.
+   Toggles kept live for validation; then bake into #defines/upload + remove the pad. */
+static int rbg0_tex_orient = 5;     /* 0..7 D4 symmetry (pad L+C); 5 = mirrorV (found on HW)    */
+static int rbg0_tex_xoff   = 0;     /* texel X offset (pad L + left/right), wraps mod 64        */
+static int rbg0_tex_yoff   = 0;     /* texel Y offset (pad L + up/down); 0 found on HW          */
+static int rbg0_tex_dirty  = 1;     /* force a re-upload after an orientation/offset change     */
+static int rbg0_pitch_adj  = 0x100; /* ANGLE added to RBG0_PITCH (pad R+up/down); +0x100 found  */
+static int rbg0_z_adj      = 0;     /* fixed_t added to the plane Z (pad R + left/right)        */
 #if SAT_FLOOR_PERFSIM
 /* Pad-Y floor perf-sim mode (0 normal / 1 dom-absent / 2 all-but-dom / 3 both).  See SAT_FLOOR_PERFSIM. */
 static int floor_perfsim_mode = 0;
@@ -330,7 +349,7 @@ extern "C" {
    onto Doom's horizon; YAW = +90deg -> orients the flat to the world.  Texture scale came out
    1:1 (no slScale needed) once the pitch was right. */
 #define RBG0_PITCH       0x300    /* ANGLE delta on slRotX (~4.21deg) */
-#define RBG0_YAW_OFF     0xC000   /* ANGLE yaw offset (90deg + 180deg texture rotation) */
+#define RBG0_YAW_OFF     0x4000   /* ANGLE yaw offset (90deg) -- texture 180deg is done at upload */
 
 /* SKY_FIXED 1 = the sky does NOT scroll with the view angle (Romain's choice:
    a static backdrop).  0 = scroll with viewangle, slowed by SKY_PARALLAX_SHIFT
@@ -1249,14 +1268,14 @@ static void rbg0_set_transform(void)
        Values are a first test -- tune the height (z) + position once it's on screen. */
     slPushMatrix();
     {
-        slRotX((ANGLE)(0x4000 + RBG0_PITCH));            /* 90 deg + baked pitch: plane far end at the horizon */
+        slRotX((ANGLE)(0x4000 + RBG0_PITCH + rbg0_pitch_adj)); /* 90deg + pitch (+ live R+up/down nudge) */
         slRotZ((ANGLE)(-(int)(viewangle >> 16) + RBG0_YAW_OFF)); /* yaw track + baked 90deg flat orientation */
         /* viewx/viewy are fixed_t (16.16) in map units; slTranslate's FIXED is also 16.16,
            so passing them directly scrolls the floor by the player's map position (1 unit ->
            1 texel for a 64-unit flat).  Z = eye height above the player's floor (viewz -
            floor height) so the plane sits EXACTLY on the floor the player stands on, and
            follows it up/down stairs.  Signs/scale tune with the real texture. */
-        slTranslate(-viewx, -viewy, -(viewz - sat_vdp2_floor_h));
+        slTranslate(-viewx, -viewy, -(viewz - sat_vdp2_floor_h) + rbg0_z_adj); /* +live R+left/right level */
         slCurRpara(RA);
         slScrMatConv();
         slScrMatSet();
@@ -1277,26 +1296,46 @@ static void rbg0_upload_flat(int picnum)
     static const unsigned char *loaded_cmap = (const unsigned char *)1;
     const unsigned char *cmap = sat_vdp2_floor_cmap;
     if (picnum < 0) return;
-    if (picnum == loaded && cmap == loaded_cmap) return;
+    if (picnum == loaded && cmap == loaded_cmap && !rbg0_tex_dirty) return;
     const unsigned char *flat = sat_vdp2_floor_data();
     if (!flat) return;
     loaded = picnum;
     loaded_cmap = cmap;
+    rbg0_tex_dirty = 0;
 #if RBG0_BITMAP
-    /* Shade + tile the 64x64 flat DIRECTLY into the VRAM bitmap (A1) -- NO static buffer.
-       A 4KB `static shaded[64*64]` here grew HWRAM .bss past the TLSF heap region, starving
-       the pool to 96 bytes -> tlsf_add_pool failed at init = the "boot loop".  VRAM is
-       uncached so direct byte writes are fine.  slOverRA repeat wraps it for the floor. */
+    /* Build each 512-wide bitmap row in a STACK buffer (cached), then bulk-memcpy to the
+       uncached VRAM (A1).  Avoids 131072 slow per-byte uncached writes (= the slowdown) and
+       uses no static .bss (a 4KB static here starved the TLSF pool = the old boot-loop).
+       The flat is re-oriented HERE (rbg0_tex_orient = one of the 8 D4 symmetries, pad Y) plus
+       a live texel offset (rbg0_tex_xoff/yoff, pad L+d-pad), so the texture aligns -- rotation
+       AND mirror -- WITHOUT a yaw offset (which would invert the scroll direction).  A MIRROR
+       (det -1) is needed, not a rotation, when the lit corner reads flipped.  slOverRA tiles. */
+    unsigned char row[512];
     unsigned char *bmp = (unsigned char *)RBG0_BMP_VRAM;
     for (int y = 0; y < 256; ++y)
     {
-        const unsigned char *frow = flat + (y & 63) * 64;
-        unsigned char *drow = bmp + y * 512;
-        for (int x = 0; x < 512; ++x)
+        int by = (y & 63);
+        for (int x = 0; x < 64; ++x)
         {
-            unsigned char px = frow[x & 63];
-            drow[x] = cmap ? cmap[px] : px;
+            int u = (x  + rbg0_tex_xoff) & 63;     /* texel offset (pad L + d-pad) */
+            int v = (by + rbg0_tex_yoff) & 63;
+            int fx, fy;                            /* D4 orientation (pad Y)       */
+            switch (rbg0_tex_orient & 7) {
+                default:
+                case 0: fx = u;      fy = v;      break;  /* identity       */
+                case 1: fx = v;      fy = 63 - u; break;  /* rot 90         */
+                case 2: fx = 63 - u; fy = 63 - v; break;  /* rot 180        */
+                case 3: fx = 63 - v; fy = u;      break;  /* rot 270        */
+                case 4: fx = 63 - u; fy = v;      break;  /* mirror H       */
+                case 5: fx = u;      fy = 63 - v; break;  /* mirror V       */
+                case 6: fx = v;      fy = u;      break;  /* transpose      */
+                case 7: fx = 63 - v; fy = 63 - u; break;  /* anti-transpose */
+            }
+            unsigned char px = flat[fy * 64 + fx];
+            row[x] = cmap ? cmap[px] : px;
         }
+        for (int t = 1; t < 8; ++t) memcpy(row + t * 64, row, 64); /* tile 64 -> 512          */
+        memcpy(bmp + y * 512, row, 512);                           /* bulk write to VRAM      */
     }
 #else
     unsigned char *cel = (unsigned char *)RBG0_CEL_VRAM;
@@ -1708,7 +1747,6 @@ extern "C" void DG_Init(void)
     slCashPurge();               /* TEST (cache hypothesis): flush the SH-2 cache so the RBG0 cells/map/
                                     K-table SGL wrote via CACHED addresses actually reach VRAM.  Ymir has
                                     no cache model (renders); HW reads stale VRAM -> snow.  Known trap. */
-    rbg0_draw_debug_readout();    /* hex dump into the framebuffer (B0 survives RBG0; the NBG3 overlay does not) */
 #endif
 
     /* Enable the core sky-skip: R_DrawPlanes leaves the sky region as index 0
@@ -3259,12 +3297,32 @@ static void poll_pad(void)
     }
 
 #if VDP2_RBG0_TEST
-    /* Pad Y cycles the 3 RBG0/debug modes (0 VDP2-floor/no-dbg -> 1 dbg+sw-floor ->
-       2 dbg/no-sw-floor -> wrap).  Modes 1 vs 2 isolate the software-floor cost (read
-       REC/EX/P/FLAT in each) = what the VDP2 floor saves.  (Y also taps 'y' to Doom --
-       harmless, like the potato Z / blit L+R live toggles.) */
+    /* Pad Y = the floor A/B comparator: 0 = VDP2 hardware floor (RBG0) <-> 1 = software floor.
+       Mode 2 (no floor) is dropped from the cycle during tuning (user) -- only the two floors
+       that matter for the side-by-side.  (Y also taps 'y' to Doom -- harmless.) */
     if ((changed & PER_DGT_TY) && !(cur & PER_DGT_TY))
-        rbg0_mode = (rbg0_mode + 1) % 3;
+        rbg0_mode = (rbg0_mode + 1) % 2;
+#if RBG0_TUNE_PAD
+    /* PARKED live floor tuning (RBG0_TUNE_PAD) -- the found values are baked as defaults:
+       L + C     = cycle the TEXTURE orientation over the 8 D4 symmetries (rotation + mirror).
+       L + d-pad = shift the TEXTURE +-1 texel on X/Y (re-shades the bitmap).
+       R + d-pad = nudge the PLANE (transform, live): up/down = inclination (pitch),
+                   left/right = the near level (Z).
+       (L taps ',' and R taps '.' to Doom -- harmless; the d-pad is gated from Doom while held.) */
+    if (!(cur & PER_DGT_TL)) {                                       /* L held: texture */
+        if ((changed & PER_DGT_TC) && !(cur & PER_DGT_TC)) { rbg0_tex_orient = (rbg0_tex_orient + 1) & 7; rbg0_tex_dirty = 1; }  /* L+C: orientation */
+        if ((changed & PER_DGT_KU) && !(cur & PER_DGT_KU)) { rbg0_tex_yoff = (rbg0_tex_yoff + 1) & 63; rbg0_tex_dirty = 1; }
+        if ((changed & PER_DGT_KD) && !(cur & PER_DGT_KD)) { rbg0_tex_yoff = (rbg0_tex_yoff - 1) & 63; rbg0_tex_dirty = 1; }
+        if ((changed & PER_DGT_KL) && !(cur & PER_DGT_KL)) { rbg0_tex_xoff = (rbg0_tex_xoff + 1) & 63; rbg0_tex_dirty = 1; }
+        if ((changed & PER_DGT_KR) && !(cur & PER_DGT_KR)) { rbg0_tex_xoff = (rbg0_tex_xoff - 1) & 63; rbg0_tex_dirty = 1; }
+    }
+    if (!(cur & PER_DGT_TR)) {                                       /* R held: plane geometry */
+        if ((changed & PER_DGT_KU) && !(cur & PER_DGT_KU)) rbg0_pitch_adj += 0x80;        /* +pitch (~0.7deg) */
+        if ((changed & PER_DGT_KD) && !(cur & PER_DGT_KD)) rbg0_pitch_adj -= 0x80;        /* -pitch           */
+        if ((changed & PER_DGT_KL) && !(cur & PER_DGT_KL)) rbg0_z_adj += (4 << 16);       /* +level (4 units) */
+        if ((changed & PER_DGT_KR) && !(cur & PER_DGT_KR)) rbg0_z_adj -= (4 << 16);       /* -level           */
+    }
+#endif
 #elif SAT_FLOOR_PERFSIM
     /* Pad Y cycles the 4 floor PERF-SIM modes (read REC/P rows 4/5 in each = the floor-offload
        ceiling, valid for RBG0 / VDP1-strips / gradient alike).  No RBG0/RAMCTL -> overlay stays
@@ -3352,6 +3410,15 @@ static void poll_pad(void)
         if (changed & pad_map[i].mask)
         {
             int pressed = !(cur & pad_map[i].mask);
+#if RBG0_TUNE_PAD
+            /* PARKED (RBG0_TUNE_PAD): while L (texture) or R (plane) is held the d-pad tunes the
+               floor (above) -- do NOT also forward it to Doom, so the player stays put.  (Press
+               L/R FIRST, then tap the d-pad, to avoid a held direction sticking in Doom.) */
+            if ((!(cur & PER_DGT_TL) || !(cur & PER_DGT_TR)) &&
+                (pad_map[i].mask == PER_DGT_KU || pad_map[i].mask == PER_DGT_KD ||
+                 pad_map[i].mask == PER_DGT_KL || pad_map[i].mask == PER_DGT_KR))
+                continue;
+#endif
             /* SATURN: in split, pad-X is the live sat_split_vdp1 A/B toggle (above),
                so DON'T also forward its KEY_TAB (= automap) -- the minimap would open
                over the 3D view and ruin the comparison.  1p keeps X = automap. */

@@ -259,6 +259,40 @@ extern "C" int W_SaturnCDInit(void);
    a little REC back, but it lands on the slave the floor offload frees (slave 46->0%
    busy).  See docs/VDP2_ARCHITECTURE.md.  PAUSED config = 1 (hardware sky, RBG0 off). */
 #define VDP2_HW_SKY      0
+/* VDP2_CELL_SKY: 1 = hardware sky on NBG0 as a 256-color CELL layer living in bank B1's free low
+   half (cells SKY_CEL_VRAM, pattern-name map SKY_MAP_VRAM), coexisting with the RBG0 BITMAP floor
+   -- A0 (K-table) / A1 (floor bitmap) / B0 (framebuffer) stay BYTE-IDENTICAL to the clean floor, so
+   the floor cannot regress.  Distinct from VDP2_HW_SKY (the old A0 512x256 bitmap path, whose address
+   IS the floor K-table -> collides).  The "floor XOR sky" law was lifted when the bitmap floor freed
+   B1 (docs/VDP2_RBG0_CURRENT_STATE.md).  CRITICAL: the cell sky's B1 read slots (256-color cell =
+   1 PN + 2 char/dot) are authored by slScrAutoDisp's allocator -- NEVER hand-pin CYCB1 (a 1-char
+   table starves the 2nd 8bpp read = sky snow on HW only, invisible in Ymir).  Gated like the floor:
+   potato-0 + 1-player.  See memory rbg0-hw-sky-feasible. */
+#define VDP2_CELL_SKY    1
+#define SKY_CEL_VRAM     ((void *)0x25E60000)  /* B1 low half: NBG0 sky 256-color cells (~32KB+filler) */
+#define SKY_MAP_VRAM     ((void *)0x25E6A000)  /* B1: NBG0 sky pattern-name map (64x64 1-word = 8KB)    */
+#define SKY_NB_CELL      512                    /* 32 cols x 16 rows of 8x8 cells (256x128 Doom sky)     */
+/* VDP2_SKY_FORCE_CYC: experimental per-frame cycle override forcing NBG0's char read into B1 when
+   RBG0 is on (sky_cell_force_cyc).  Did NOT change the "sky shows floor" HW bug -> gated OFF. */
+#define VDP2_SKY_FORCE_CYC 0
+/* VDP2_SKY_OCCL_DIAG: NBG0 sky ABOVE the RBG0 floor (sky=4 > floor=3).  The floor is a plane that is
+   OPAQUE above the horizon on real HW (CONFIRMED by the priority swap), so with the ship order
+   (sky 3 < floor 4) the floor's overspill occluded the sky; a VDP2 window to clip the floor would
+   not commit without slSynch.  So instead we put the sky ON TOP and make it TRANSPARENT below the
+   horizon (SKY_HORIZON_ROW): above the horizon the opaque sky covers the floor overspill; below it
+   the transparent sky lets the floor show.  Walls/things (NBG1=6) and sprites(5) still sit above the
+   sky.  This is the shipping config (1 = on).  0 = legacy sky(3) < floor(4). */
+#define VDP2_SKY_OCCL_DIAG 1
+/* SKY_HORIZON_ROW: screen scanline of the floor's horizon.  The sky cells are opaque ABOVE this row
+   (covering the floor's above-horizon overspill) and transparent at/below it (the floor shows).
+   Cell granularity is 8 px, so the effective boundary snaps to (SKY_HORIZON_ROW & ~7).  Tune to the
+   floor's perspective horizon. */
+#define SKY_HORIZON_ROW 96
+#if VDP2_CELL_SKY
+static void sky_cell_init(void);        /* forward decl: defined below, called from DG_Init */
+static void sky_cell_build_map(void);   /* forward decl: rebuilds the sky map (live horizon tune) */
+static int  sky_horizon_row = SKY_HORIZON_ROW;  /* live HW-sky horizon row (pad L + Up/Down); bake into SKY_HORIZON_ROW when tuned */
+#endif
 /* RBG0 register-commit method (re-examining the "slSynch is poison" conviction, 2026-06-26):
    1 = ONE-SHOT slSynch at init -> SGL flushes its FULL VDP2 register shadow to the chip (commits
        every RBG0 register correctly), ZERO per-frame cost.  Tests whether slSynch one-shot is the
@@ -1442,9 +1476,9 @@ static void rbg0_proto_init(void)
        DG_DrawFrame re-sets it each frame (rbg0_set_transform). */
     rbg0_set_transform();
 
-    slPriorityRbg0(4);           /* sky(3) < RBG0 floor(4) < VDP1 walls(5) < NBG1 game(6):
-                                    the walls cleanly occlude the infinite floor's overspill
-                                    (no priority tie), so it shows ONLY on the player's floor */
+    slPriorityRbg0(VDP2_SKY_OCCL_DIAG ? 3 : 4);   /* ship: sky(3) < RBG0 floor(4) < VDP1 walls(5) <
+                                    NBG1 game(6); the walls occlude the infinite floor's overspill.
+                                    DIAG: floor drops to 3 so NBG0 sky(4) sits ABOVE it. */
 }
 #endif
 
@@ -1493,10 +1527,12 @@ static void rbg0_commit_cyc(void)
        exactly like SlaveDriver's cycle[] table; B1 = normal (RPT). */
     VDP2_CYCA0L = 0xEEEE; VDP2_CYCA0U = 0xEEEE;
     VDP2_CYCA1L = 0xEEEE; VDP2_CYCA1U = 0xEEEE;
-#if RBG0_NBG3
-    /* NBG3 on: leave CYCB1 as slScrAutoDisp(NBG3ON) built it (NBG3 font+map reads live in B1). */
+#if RBG0_NBG3 || VDP2_CELL_SKY
+    /* NBG3 and/or the cell sky live in B1: leave CYCB1 EXACTLY as slScrAutoDisp's allocator authored it
+       (NBG0 sky = 1 PN + 2 char, NBG3 = 1 PN + 1 char).  Do NOT scrub it -- a hand-pinned/scrubbed value
+       would starve the sky's 2nd 8bpp char read = snow on HW (memory rbg0-hw-sky-feasible). */
 #else
-    VDP2_CYCB1L = 0xFEEE; VDP2_CYCB1U = 0xEEEE;   /* NBG3 off: scrub the stale NBG3 read SGL left */
+    VDP2_CYCB1L = 0xFEEE; VDP2_CYCB1U = 0xEEEE;   /* NBG3 off + no cell sky: scrub the stale NBG3 read SGL left */
 #endif
 #else
     /* first correct the stale NBG3 reads SGL left in CYCB1's shadow (B1 is now the RBG0 map) */
@@ -1511,6 +1547,34 @@ static void rbg0_commit_cyc(void)
         cyc_before[b] = ((uint32_t)s[0] << 16) | (uint32_t)s[1];
     }
 }
+
+#if VDP2_CELL_SKY
+/* Force the VRAM cycle pattern so the NBG0 cell sky reads its cells from bank B1, EVERY frame.
+   HW bug (Ymir-invisible): when RBG0 is ON, SGL's per-frame slScrAutoDisp `ape` allocator places
+   NBG0's CHARACTER read in bank A1 (the RBG0 rotation char bank = the floor bitmap), so NBG0 shows
+   the floor texture FLAT.  When RBG0 is OFF the allocator puts NBG0 in B1 and the sky is correct.
+   The _BlankIn ISR re-pushes the allocator's (wrong) cycle every frame, so we must re-author it
+   AFTER slScrAutoDisp.  Park A0/A1 (the rotation reads coeff/char via RDBS, NOT the cycle pattern --
+   this is the same state the init rbg0_commit_cyc uses, so the floor is unaffected); NBG1 in B0;
+   NBG0 (PN code 0 + two 8bpp char code 4) and NBG3 (PN code 3 + char code 7) in B1 -> NBG0 has no
+   A1 slot and must read B1.  Nibble order per VDP2_CYCxxL: T0=hi..T3=lo (matches the 0xFEEE scrub).
+   Written to the shadow (so the _BlankIn re-push stays coherent) AND straight to the chip. */
+static void sky_cell_force_cyc(int sky_on, int nbg3_on)
+{
+    uint16_t b1l, b1u;
+    if (sky_on && nbg3_on)  { b1l = 0x0443; b1u = 0x7EEE; }  /* NBG0 PN,char,char | NBG3 PN,char */
+    else if (sky_on)        { b1l = 0x044E; b1u = 0xEEEE; }  /* NBG0 PN,char,char                */
+    else if (nbg3_on)       { b1l = 0x37EE; b1u = 0xEEEE; }  /* NBG3 PN,char                     */
+    else                    { b1l = 0xEEEE; b1u = 0xEEEE; }  /* nothing in B1                    */
+    VDP2_CYCA0L = 0xEEEE; VDP2_CYCA0U = 0xEEEE;   /* park: rotation coeff via RDBS */
+    VDP2_CYCA1L = 0xEEEE; VDP2_CYCA1U = 0xEEEE;   /* park: rotation char  via RDBS */
+    VDP2_CYCB0L = 0x55EE; VDP2_CYCB0U = 0xEEEE;   /* NBG1 framebuffer (two 8bpp char) */
+    VDP2_CYCB1L = b1l;    VDP2_CYCB1U = b1u;
+    volatile uint16_t *const c = (volatile uint16_t *)0x25F80010;  /* chip CYCA0L..CYCB1U = 0x10..0x1E */
+    c[0] = 0xEEEE; c[1] = 0xEEEE;  c[2] = 0xEEEE; c[3] = 0xEEEE;   /* CYCA0L/U, CYCA1L/U */
+    c[4] = 0x55EE; c[5] = 0xEEEE;  c[6] = b1l;    c[7] = b1u;      /* CYCB0L/U, CYCB1L/U */
+}
+#endif
 
 /* 8x8 hex font (0-F), 1 byte/row, MSB = leftmost pixel. */
 static const unsigned char rbg0_hexfont[16][8] = {
@@ -1732,6 +1796,9 @@ extern "C" void DG_Init(void)
     slBMPaletteNbg0(1);
     slScrPosNbg0(toFIXED(0.0), toFIXED(0.0));
 #endif
+#if VDP2_CELL_SKY
+    sky_cell_init();   /* NBG0 = 256-color cell sky in B1 (coexists with the RBG0 bitmap floor) */
+#endif
 #if SKY_DEBUG_SHOW
     slPriorityNbg0(6); slPriorityNbg1(5);   /* sky ON TOP to verify Stage A */
 #else
@@ -1740,7 +1807,7 @@ extern "C" void DG_Init(void)
        where the software wall draw is skipped.  NBG3 debug = 7 (top).
        NBG1 game = 6  >  every sprite priority = 5  >  NBG0 sky = 4 (3 with RBG0). */
 #if VDP2_RBG0_TEST
-    slPriorityNbg0(3); slPriorityNbg1(6);   /* sky drops to 3 to sit below the RBG0 floor(4) */
+    slPriorityNbg0(VDP2_SKY_OCCL_DIAG ? 4 : 3); slPriorityNbg1(6);   /* sky 3 below floor(4); DIAG: sky 4 above floor(3) */
 #else
     slPriorityNbg0(4); slPriorityNbg1(6);
 #endif
@@ -1759,7 +1826,7 @@ extern "C" void DG_Init(void)
 #if VDP2_HW_SKY
     slScrAutoDisp(NBG0ON | NBG1ON | NBG3ON | RBG0ON);   /* sky(NBG0) + floor(RBG0) both on */
 #else
-    slScrAutoDisp(NBG1ON | (RBG0_DISPLAY ? RBG0ON : 0) | (RBG0_NBG3 ? NBG3ON : 0));  /* sw sky; floor(RBG0) + NBG3 (line-color display via slLineColDisp, NOT BGON) */
+    slScrAutoDisp((VDP2_CELL_SKY ? NBG0ON : 0) | NBG1ON | (RBG0_DISPLAY ? RBG0ON : 0) | (RBG0_NBG3 ? NBG3ON : 0));  /* +cell sky(NBG0): SGL authors NBG0's B1 cycle into the shadow before the block-flush. floor(RBG0)+NBG3 */
 #endif
 #else
     slScrAutoDisp(NBG0ON | NBG1ON | NBG3ON);
@@ -1791,7 +1858,7 @@ extern "C" void DG_Init(void)
 
     /* Enable the core sky-skip: R_DrawPlanes leaves the sky region as index 0
        (transparent) so the VDP2 NBG0 sky shows through. */
-    sat_vdp2_sky = VDP2_HW_SKY;   /* 0 = software sky (frees A0 for the RBG0 K-table) */
+    sat_vdp2_sky = (VDP2_HW_SKY || VDP2_CELL_SKY);   /* 1 = HW sky: core leaves the sky region index-0 so NBG0 shows through NBG1 */
 #if VDP2_RBG0_TEST
     /* Floor on RBG0 at boot (rbg0_mode 0); pad Y cycles the 3 RBG0/debug modes. */
     sat_vdp2_floor = 1;
@@ -1892,6 +1959,64 @@ static void sky_upload(void)
     }
     sky_loaded_tex = skytexture;
 }
+
+#if VDP2_CELL_SKY
+/* Hardware sky as a 256-color NBG0 CELL layer in bank B1 (coexists with the RBG0 bitmap floor;
+   A0/A1/B0 untouched).  The 256x128 Doom sky becomes a 32x16 grid of 8x8 cells (SKY_NB_CELL),
+   tiled 2x horizontally across the 512px page so the viewangle scroll wraps seamlessly; map rows
+   below the sky reference a single near-black filler cell (index SKY_NB_CELL) -- never seen (NBG1
+   is opaque there).  Cell index = col*16 + row (column-major, like Jo's __jo_create_map); char# =
+   cellidx*2 (a 256-color 8x8 cell = 2 of the 32-byte char units); palette bank 1 (PLAYPAL) via the
+   PN palette field (paloff 0x1000).  Cells start at bank B1's base -> char-base offset 0.  The B1
+   VRAM alias (0x25E6xxxx) is uncached, so the cell writes reach VRAM with no slCashPurge. */
+static void sky_cell_upload(void)
+{
+    unsigned char *cells = (unsigned char *)SKY_CEL_VRAM;
+    unsigned char  nb    = (unsigned char)sat_near_black();
+    for (int ccol = 0; ccol < 32; ++ccol)
+        for (int rx = 0; rx < 8; ++rx)
+        {
+            const unsigned char *src = R_GetColumn(skytexture, ccol * 8 + rx);  /* 128-tall column */
+            for (int crow = 0; crow < 16; ++crow)
+                for (int ry = 0; ry < 8; ++ry)
+                {
+                    unsigned char p = src[crow * 8 + ry];
+                    if (!p) p = nb;                /* keep the sky OPAQUE (0 = VDP2 transparent code) */
+                    cells[(ccol * 16 + crow) * 64 + ry * 8 + rx] = p;
+                }
+        }
+    memset(cells + SKY_NB_CELL * 64, 0, 64);        /* TRANSPARENT filler (index 0): floor shows below the horizon */
+    sky_loaded_tex = skytexture;
+}
+
+/* Build the NBG0 sky PN map: sky cells ABOVE the horizon (sky_horizon_row), transparent filler at/
+   below it.  Map (B1) is uncached -> writes land with no purge; cheap (4096 entries) so it can be
+   rebuilt live when the pad nudges sky_horizon_row. */
+static void sky_cell_build_map(void)
+{
+    unsigned short *map = (unsigned short *)SKY_MAP_VRAM;
+    int thresh = sky_horizon_row >> 3;   /* cell-row boundary (8px cells) */
+    for (int my = 0; my < 64; ++my)
+        for (int mx = 0; mx < 64; ++mx)
+        {
+            int cellidx = (my < thresh) ? ((mx & 31) * 16 + my) : SKY_NB_CELL;  /* sky above the horizon; transparent filler at/below it */
+            map[my * 64 + mx] = (unsigned short)((cellidx * 2) | 0x1000);       /* char#=idx*2, palette bank 1 */
+        }
+}
+
+/* One-shot NBG0 cell config + PN map (cells change per level; map rebuilds on a live horizon tune). */
+static void sky_cell_init(void)
+{
+    memset((void *)SKY_CEL_VRAM, 0, (SKY_NB_CELL + 1) * 64);
+    memset((void *)SKY_MAP_VRAM, 0, 64 * 64 * 2);
+    slPlaneNbg0(PL_SIZE_1x1);
+    slCharNbg0(COL_TYPE_256, CHAR_SIZE_1x1);
+    slMapNbg0(SKY_MAP_VRAM, SKY_MAP_VRAM, SKY_MAP_VRAM, SKY_MAP_VRAM);
+    slPageNbg0(SKY_CEL_VRAM, 0, PNB_1WORD | CN_12BIT);
+    sky_cell_build_map();
+    slScrPosNbg0(toFIXED(0.0), toFIXED(0.0));
+}
+#endif
 
 /* ------------------------------------------------------------------ */
 /* VDP1 weapon sprite -- player gun on the hardware sprite layer        */
@@ -2945,6 +3070,19 @@ extern "C" void DG_DrawFrame(void)
     }
 #endif
 #endif
+#if VDP2_CELL_SKY
+    if (skytexture > 0 && skytexture != sky_loaded_tex)
+        sky_cell_upload();   /* re-pack the sky into B1 cells on level/episode change */
+#if SKY_FIXED
+    slScrPosNbg0(toFIXED(0.0), toFIXED(-(double)VIEW_Y_OFFSET));   /* static backdrop */
+#else
+    {
+        /* scroll the cell plane by viewangle; the 2x-tiled sky wraps seamlessly at the 512px page */
+        int sx = -(int)(viewangle >> (SKY_ANGLESHIFT + SKY_PARALLAX_SHIFT));
+        slScrPosNbg0((FIXED)(sx << 16), toFIXED(-(double)VIEW_Y_OFFSET));
+    }
+#endif
+#endif
 
     /* SATURN sky index-0 reservation (index 0 = VDP2 transparent code; where NBG1
        has 0 the NBG0 sky behind shows through):
@@ -2989,10 +3127,13 @@ extern "C" void DG_DrawFrame(void)
            SOFTWARE floor (sat_vdp2_floor=0 -> the sw floor draws; RBG0 display off). */
         int rbg0_active   = (potato_level == 0) && (sat_local_players <= 1);
         sat_vdp2_floor    = (rbg0_mode == 1 || !rbg0_active) ? 0 : 1;  /* skip the sw floor only when the HW floor shows */
-        uint16_t sky_bit  = (VDP2_HW_SKY && show_sky) ? NBG0ON : 0;   /* no NBG0 when sky is software */
+        uint16_t sky_bit  = ((VDP2_HW_SKY || VDP2_CELL_SKY) && show_sky) ? NBG0ON : 0;   /* HW sky: show_sky carries GS_LEVEL/!automap/has_sky/1p. NOT potato-gated -- a backdrop is cheap and offloads the SW sky most at low detail; sat_vdp2_sky=1 leaves index-0, so NBG0 must stay on whenever the core skips the sky */
         uint16_t rbg0_bit = (RBG0_DISPLAY && rbg0_mode == 0 && rbg0_active) ? RBG0ON : 0;   /* HW floor: pot0 + 1p only */
         uint16_t nbg3_bit = (RBG0_NBG3 && nbg3_show) ? NBG3ON : 0;  /* NBG3 overlay: display = pad L+R (default off); B1 cycle reserved at init */
         slScrAutoDisp((uint16_t)(sky_bit | NBG1ON | nbg3_bit | rbg0_bit));
+#if VDP2_CELL_SKY && VDP2_SKY_FORCE_CYC
+        sky_cell_force_cyc(sky_bit, nbg3_bit);   /* RBG0-on makes the allocator put NBG0's char in A1; force it back to B1 */
+#endif
 #else
         slScrAutoDisp((uint16_t)(show_sky ? (NBG0ON | NBG1ON | NBG3ON)
                                           : (NBG1ON | NBG3ON)));
@@ -3356,6 +3497,25 @@ static void poll_pad(void)
         int lr_now = ((cur & lr) == 0);          /* both held (active-low) */
         if (lr_now && !lr_was) nbg3_show = !nbg3_show;
         lr_was = lr_now;
+    }
+#endif
+#if VDP2_CELL_SKY
+    /* Pad L + Up/Down nudges the HW-sky horizon (the row where the sky turns transparent so the
+       floor shows below it), 8px (one cell row) per press.  Up raises the horizon up the screen,
+       Down lowers it.  (L taps ',' and Up/Down also move the player -- minor during tuning.)
+       Bake the found value into SKY_HORIZON_ROW and remove this block once tuned. */
+    if (!(cur & PER_DGT_TL))   /* L held */
+    {
+        int adj = 0;
+        if ((changed & PER_DGT_KU) && !(cur & PER_DGT_KU)) adj = -8;  /* Up: raise the horizon  */
+        if ((changed & PER_DGT_KD) && !(cur & PER_DGT_KD)) adj = +8;  /* Down: lower the horizon */
+        if (adj)
+        {
+            sky_horizon_row += adj;
+            if (sky_horizon_row < 8)   sky_horizon_row = 8;
+            if (sky_horizon_row > 128) sky_horizon_row = 128;
+            sky_cell_build_map();
+        }
     }
 #endif
 #if RBG0_LINECOL_TEST

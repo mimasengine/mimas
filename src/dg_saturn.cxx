@@ -273,6 +273,12 @@ extern "C" int W_SaturnCDInit(void);
    its cell map.  NBG3's font/page/map live in B1 (SRL default) away from the RPT (B1+0x1ff00);
    when on, we let slScrAutoDisp schedule NBG3's B1 cycle (DON'T scrub CYCB1).  0 = off. */
 #define RBG0_NBG3        1
+/* RBG0_LINECOL_TEST: per-distance floor light via the VDP2 line-color screen + RBG0 color-calc
+   (see rbg0_linecol_apply).  Currently RUNG A = a FLAT darken proof, runtime-toggled by pad C and
+   default OFF (the committed floor is unchanged).  Kept compiled in (1) so the effect can be
+   evaluated keep-vs-gate; set 0 to compile it out.  RUNG C (per-line distance gradient) is a
+   future session. */
+#define RBG0_LINECOL_TEST 1
 /* RBG0 per-frame ROTATION-PARAMETER-TABLE transfer (the real root cause, proven by LIBSGL.A disasm,
    docs/RBG0_STRUCTURED_GARBAGE.md): slScrMatSet only fills SGL's CACHED RAM buffer (_RotScrParA) +
    sets a dirty flag; the RAM->VRAM DMA of the RPT is done ONLY by the _BlankIn ISR, armed ONLY by
@@ -1359,6 +1365,27 @@ static void rbg0_upload_flat(int picnum)
 #endif
 }
 
+#if RBG0_LINECOL_TEST
+/* Per-distance floor light, RUNG A (FLAT darken proof) -- PARKED default-OFF, toggle pad C.
+   The VDP2 LINE-COLOR SCREEN blended into RBG0 only (color-calc) darkens the whole floor with a
+   single near-black line color.  GOTCHA (cost a build): do NOT add LNCLON to the slScrAutoDisp
+   (BGON) mask -- it broke NBG1 (the whole software framebuffer vanished); the line-color DISPLAY
+   is enabled by slLineColDisp(LNCLON) alone.  Enable regs (LCTAU 0xA8/LCTAL 0xAA, LNCLEN 0xE8,
+   CCCTL 0xEC) are INSIDE the 0x0E..0xFE block-flush; the RATIO reg CCRR (0x10C) is OUTSIDE it ->
+   direct-poke.  Pad C toggles the ratio (off<->dark).  NEXT (future session): RUNG C = a per-line
+   line-color table (in spare VRAM) for the real DISTANCE gradient instead of this flat darken. */
+static int rbg0_linecol_on = 0;     /* default OFF: the committed floor is unchanged; C opts in */
+static void rbg0_linecol_apply(void)
+{
+    slLine1ColSet((void *)RBG0_KTAB_VRAM, (unsigned short)0x8000);  /* one near-black line color (MSB=insert) */
+    slLineColDisp(LNCLON);                                          /* enable the line-color screen           */
+    slColorCalc(0);                                                 /* CC_RATE | CC_TOP: ratio mode, top pixel */
+    slColorCalcOn(RBG0ON);                                          /* RBG0 ONLY -> NBG1/HUD untouched         */
+    *(volatile unsigned short *)0x25F8010C =                        /* CCRR: RBG0 color-calc ratio (outside flush) */
+        (unsigned short)(rbg0_linecol_on ? 24 : 0);
+}
+#endif
+
 static void rbg0_proto_init(void)
 {
 #if RBG0_BITMAP
@@ -1373,6 +1400,9 @@ static void rbg0_proto_init(void)
     slBMPaletteRbg0(1);
     slMakeKtable(RBG0_KTAB_VRAM);                          /* A0 coefficient table               */
     slKtableRA(RBG0_KTAB_VRAM, K_FIX | K_LINE | K_2WORD | K_ON);
+#if RBG0_LINECOL_TEST
+    rbg0_linecol_apply();   /* RUNG A: line-color screen + RBG0 color-calc (flat); no K_LINECOL yet */
+#endif
     /* NO slPageRbg0/slPlaneRA (cell-only).  CRITICAL (root cause, disasm): slBitMapRbg0 does
        NOT call rbank_set -> the A1 bitmap bank is never registered in the RAMCTL RDBS shadow.
        We reserve RDBS (A1=char/A0=coeff -> 0x0D) AND park the A0/A1 rotation cycle slots BY
@@ -1729,7 +1759,7 @@ extern "C" void DG_Init(void)
 #if VDP2_HW_SKY
     slScrAutoDisp(NBG0ON | NBG1ON | NBG3ON | RBG0ON);   /* sky(NBG0) + floor(RBG0) both on */
 #else
-    slScrAutoDisp(NBG1ON | (RBG0_DISPLAY ? RBG0ON : 0) | (RBG0_NBG3 ? NBG3ON : 0));  /* sw sky; floor(RBG0) + NBG3 debug (lets slScrAutoDisp build NBG3's B1 cycle) */
+    slScrAutoDisp(NBG1ON | (RBG0_DISPLAY ? RBG0ON : 0) | (RBG0_NBG3 ? NBG3ON : 0));  /* sw sky; floor(RBG0) + NBG3 (line-color display via slLineColDisp, NOT BGON) */
 #endif
 #else
     slScrAutoDisp(NBG0ON | NBG1ON | NBG3ON);
@@ -3322,6 +3352,15 @@ static void poll_pad(void)
         int lr_now = ((cur & lr) == 0);          /* both held (active-low) */
         if (lr_now && !lr_was) nbg3_show = !nbg3_show;
         lr_was = lr_now;
+    }
+#endif
+#if RBG0_LINECOL_TEST
+    /* Pad C toggles the floor line-color darken A/B (RBG0_LINECOL_TEST).  Direct-poke CCRR
+       (0x10C, outside the block-flush) -- the only register that changes at runtime; the SGL
+       enables are already committed at init.  (C also taps run to Doom -- harmless.) */
+    if ((changed & PER_DGT_TC) && !(cur & PER_DGT_TC)) {
+        rbg0_linecol_on = !rbg0_linecol_on;
+        *(volatile unsigned short *)0x25F8010C = (unsigned short)(rbg0_linecol_on ? 24 : 0);
     }
 #endif
 #if RBG0_TUNE_PAD

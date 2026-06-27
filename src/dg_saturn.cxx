@@ -274,11 +274,11 @@ extern "C" int W_SaturnCDInit(void);
    when on, we let slScrAutoDisp schedule NBG3's B1 cycle (DON'T scrub CYCB1).  0 = off. */
 #define RBG0_NBG3        1
 /* RBG0_LINECOL_TEST: per-distance floor light via the VDP2 line-color screen + RBG0 color-calc
-   (see rbg0_linecol_apply).  Currently RUNG A = a FLAT darken proof, runtime-toggled by pad C and
-   default OFF (the committed floor is unchanged).  Kept compiled in (1) so the effect can be
-   evaluated keep-vs-gate; set 0 to compile it out.  RUNG C (per-line distance gradient) is a
-   future session. */
-#define RBG0_LINECOL_TEST 1
+   (see rbg0_linecol_apply).  RUNG A (flat darken) only PROVED the plumbing; the effect is not
+   convincing yet, so it is GATED OFF (0) -- the code stays for the RUNG C rework (per-line
+   distance gradient, future session, see memory rbg0-floor-distance-light).  Footprint when on:
+   0 VRAM banks / 0 CRAM / 0 cycles (rides the K-table + color-calc registers).  Set 1 to revisit. */
+#define RBG0_LINECOL_TEST 0
 /* RBG0 per-frame ROTATION-PARAMETER-TABLE transfer (the real root cause, proven by LIBSGL.A disasm,
    docs/RBG0_STRUCTURED_GARBAGE.md): slScrMatSet only fills SGL's CACHED RAM buffer (_RotScrParA) +
    sets a dirty flag; the RAM->VRAM DMA of the RPT is done ONLY by the _BlankIn ISR, armed ONLY by

@@ -9,7 +9,7 @@
 # SRL configuration
 # -----------------------------------------------------------------------
 SRL_MALLOC_METHOD         = TLSF
-SRL_MAX_TEXTURES          = 16      # We don't use VDP1 textures
+SRL_MAX_TEXTURES          = 20      # VDP1 wall texture pool (16 narrow 128x128 + 3 wide 256x128 + margin)
 SRL_MODE                  = NTSC
 SRL_HIGH_RES              = 0
 SRL_FRAMERATE             = 0
@@ -23,8 +23,14 @@ SRL_MAX_CD_RETRIES        = 5
 # Keep 68K + SGL sound driver alive (required for SRL::Sound::Cdda CDDA routing)
 SRL_USE_SGL_SOUND_DRIVER  = 1
 
-# SGL work area -- shrunk: we render no SGL polygons/sprites
-SGL_MAX_VERTICES          = 64
+# SGL work area for the VDP1 walls (slSetSprite per tile).  HARD LIMIT: workarea.o's MaxPolygons-
+# scaled buffers (SortList/SpriteBuf/CommandBuf...) live in the ~11KB window [_end .. 0x060FC000]
+# SHARED with the TLSF heap (sgl.linker pins WORK_AREA to end at 0x060FC000, growing DOWN; heap =
+# [_end, work_area_start]).  MaxPolygons > ~80 pushes work_area_start below _end -> NEGATIVE heap ->
+# tlsf boot loop.  So sprites cap at ~64 here until high RAM is freed (e.g. relocate tables.o's
+# ~66KB .rodata).  VERTICES=8: we draw NO 3D polygons (slPutPolygon), only 2D sprites, so the
+# vertex Pbuffer can be tiny -> a bit more heap headroom.
+SGL_MAX_VERTICES          = 16
 SGL_MAX_POLYGONS          = 64
 SGL_MAX_EVENTS            = 4
 SGL_MAX_WORKS             = 4

@@ -122,6 +122,17 @@ extern "C" char *gamedescription;
    sub-quad subdivision is needed).  1 = on (this test), 0 = off. */
 #define VDP1_WALL_TEST 1
 
+/* Wall present path.  1 = HYBRID (default, WORKS): build a raw VDP1 command list ourselves and draw
+   it after Synchronize, slSynch owns the present.  0 = FULL SGL (parked): slSetSprite into SGL's
+   sprite sort -- never delivered to VDP1 in this config (the invariant CO10), kept revivable only
+   if that is ever cracked.  Doom needs no SGL z-sort (walls are emitted far->near = painter's). */
+#define VDP1_RAW_WALLS 1
+
+/* SLSYNCH Stage 2 bring-up diagnostic: two magenta boxes (LEFT via slDispSprite4P, RIGHT via the
+   wall's slSetSprite path) to localise why the walls still don't show.  SAFE now (direct-store
+   texture, no slDMACopy).  Set 0 once resolved. */
+#define SAT_VDP1_SPRITE_DIAG 1
+
 /* VDP1 FLOOR inc-1: deport SECONDARY floors/ceilings (other heights + ceilings; NOT the RBG0
    dominant, NOT sky) to the VDP1 strip layer.  This increment is the index-0 SKIP ONLY -- with the
    stub hook below, the owned surfaces go BLACK (index 0), which (a) validates the skip targets the
@@ -373,6 +384,11 @@ extern "C" int            sat_potato_walls; /* core: solid-colour walls (opaque,
 extern "C" int            sat_wall_nocpu;   /* core: banded/flat -> skip close-wall CPU fallback */
 extern "C" int            sat_local_players; /* core: LIVE local-coop player count (1 = single) */
 extern "C" int            sat_split_vdp1;    /* core: split keeps walls on VDP1 (views 0/1); pad-X A/B */
+#if SAT_VDP1_SPRITE_DIAG
+extern "C" int sat_dbg_cull, sat_dbg_part, sat_dbg_cpu, sat_dbg_v1;  /* core: per-frame wall-route tally */
+#endif
+extern "C" int sat_wall_floorcull;   /* core: 1 = RBG0 floor-cull on (normal); 0 = A/B test (CPU draws would-be-culled walls clipped) */
+extern "C" int sat_wall_forcev1;     /* core: 1 = FORCE every tier onto VDP1 (bypass magnified/span/cull/partial); 0 = normal routing */
 #if VDP1_FLOOR_TEST || SAT_FLOOR_PERFSIM
 extern "C" int            sat_vdp1_floor;   /* core: skip secondary floors/ceilings (=> VDP1 strips) */
 extern "C" int          (*sat_floor_vdp1_hook)(int picnum, int height, int minx, int maxx,
@@ -1632,6 +1648,10 @@ extern "C" void DG_Init(void)
 #endif
     slPrioritySpr0(5); slPrioritySpr1(5); slPrioritySpr2(5); slPrioritySpr3(5);
     slPrioritySpr4(5); slPrioritySpr5(5); slPrioritySpr6(5); slPrioritySpr7(5);
+    /* VDP1 sprite layer = priority 5 (below NBG1=6): walls drop into NBG1's index-0 gaps (the
+       software wall columns are skipped, sat_wall_skip=1); floor/sky (RBG0=4 / NBG0=3) show through
+       where a wall is transparent.  (The diag priority-7 "walls on top" override is removed now that
+       placement is fixed.) */
 #endif
 #if VDP2_RBG0_TEST
     /* rbg0_proto_init() was called above, before the NBG bitmaps (cycle-pattern order). */
@@ -1685,6 +1705,12 @@ extern "C" void DG_Init(void)
     /* Floor on RBG0 at boot (rbg0_mode 0); pad Y cycles the 3 RBG0/debug modes. */
     sat_vdp2_floor = 1;
 #endif
+    sat_wall_floorcull = 1;   /* floor-cull exonerated (cull-off test still missed the boxes); back to normal */
+    /* forcev1 reverted to 0: forcing every wall onto VDP1 proved the present, not the routing, is the
+       bug (walls still vanish at heavy angles because the 1-cycle-auto draw can't finish in one
+       vblank).  Normal routing (close->CPU) is the LOAD FALLBACK; the fix is synchronising the VDP1
+       draw with slSynch + a draw-completion fallback (in progress). */
+    sat_wall_forcev1 = 0;
     sat_apply_potato();   /* boot Potato level; pad Z cycles it live */
 
     /* LAYER INVERSION: the weapon + HUD now render in SOFTWARE (NBG1, on top) -- do NOT
@@ -1692,12 +1718,35 @@ extern "C" void DG_Init(void)
        HUD path is left in the file but unhooked.) */
 
 #if VDP1_WALL_TEST
-    /* SLSYNCH Stage 1: walls render in SOFTWARE (into the NBG1 framebuffer).  slSynch owns VDP1
-       and the raw VDP1 wall list is gone, so leave the VDP1 wall hooks UNSET and the software
-       wall draw ENABLED (sat_wall_skip = 0).  Stage 2 re-routes the walls onto SGL's sprite list
-       (slDispSprite4P) here. */
-    sat_wall_hook       = nullptr;
-    sat_wall_skip       = 0;
+    /* SLSYNCH Stage 2: route the one-sided walls to the VDP1 renderer (now emitted as SGL sprites
+       via slSetSprite -> slSynch presents them) and SKIP the software wall draw.  sat_walls_kick
+       (after the BSP walk) drains the accumulated walls onto SGL's sort list before the frame's
+       Synchronize().  Where a wall is dropped to flat / starved, the layer-inversion fallback keeps
+       it visible (index-0 in NBG1 -> the wall shows below). */
+    /* SLSYNCH: slSynch() now runs every frame and owns the SGL slave work-pointer reset, so
+       neutralise the manual rp_sgl_workptr_reset() everywhere (rp_restart, the extra wallprep/
+       plane/masked dispatches, and the dual-CPU blit).  Its +68 (slave READ cursor) rewind to a
+       stale frame-1 base is what desynced the slave command consumer and made the VDP1 wall id=40
+       sprite records get sorted into a list slSynch never DMA'd = invisible walls. */
+    rp_slsynch_owns_frame = 1;
+
+    sat_wall_hook       = sat_wall_vdp1;
+    sat_wall_skip       = 1;
+    /* MISSING-WALLS DECISIVE A/B (2026-06-28): SAT_DIAG_ALLSOFT=1 renders EVERY wall tier in
+       software (VDP1 hook OFF, skip OFF) -- exactly master/DoomJo's renderer.  If the vanished
+       tech-room boxes APPEAR here, the renderer generates them and the VDP1 hook was dropping a
+       tier-type (fix the hook, no revert).  If they STILL miss, it is core BSP/visibility/masked
+       -- NOT a VDP1 issue, so reverting to master's VDP1 code could not fix it.  Set back to 0. */
+#define SAT_DIAG_ALLSOFT 0
+#if SAT_DIAG_ALLSOFT
+    sat_wall_hook       = nullptr;   /* no VDP1 wall accumulation */
+    sat_wall_skip       = 0;         /* the column loop draws every tier in software */
+#endif
+    /* SLSYNCH Stage 2: do NOT flush at the BSP-done hook -- R_DrawPlanes/R_DrawMasked run AFTER it
+       (r_main.c:1097 vs 1104/1114) and their rp_sgl_workptr_reset() rewinds GBR+72, which would
+       clobber the wall sprite records (slSetSprite shares the SGL slave command buffer at GBR+72).
+       sat_wall_vdp1 still ACCUMULATES into wall_acc during the BSP walk; the slSetSprite emit is
+       deferred to DG_DrawFrame (after the renderer's + blit's slave dispatches). */
     sat_walls_done_hook = nullptr;
 #endif
 
@@ -1938,14 +1987,33 @@ static inline unsigned short pal_rgb555(int idx)
 /* 8BPP: 1 byte/texel (was 2) -> HALF the VRAM per texture -> DOUBLE the slots in the same budget.
    Two pools keyed by size: 16 x 16KB (narrow, <=128x128) + 6 x 32KB (wide, up to 256x128) = 22
    slots (was 11).  Same VRAM region 0x25C05000..0x25C75000 (16*16KB + 6*32KB = 448KB, unchanged). */
-#define WTEX_BASE      0x25C05000u
+/* SLSYNCH Stage 2: the wall textures now live in the SGL texture heap (allocated by
+   SRL::VDP1::TryAllocateTexture in wtex_setup), NOT a hand-placed VRAM region -- SGL owns
+   SpriteVRAM so there is no collision with its command/sort list.  The heap runs from
+   0x25C10000 up to the gouraud table at 0x25C70000 (~384KB); 16 narrow (128x128=16KB) + 3 wide
+   (256x128=32KB) = 19 slots = 352KB fits with margin.  WTEX_*_SZ stay as the per-slot capacity
+   used by the size-keyed cache logic. */
 #define WTEX_NARROW_N  16
 #define WTEX_NARROW_SZ 0x4000u                                      /* 16KB -> 128x128 @ 8bpp */
-#define WTEX_WIDE_N    6
+#define WTEX_WIDE_N    3
 #define WTEX_WIDE_SZ   0x8000u                                      /* 32KB -> 256x128 @ 8bpp */
-#define WTEX_WIDE_BASE (WTEX_BASE + WTEX_NARROW_N * WTEX_NARROW_SZ) /* 0x25C45000 */
-#define WTEX_SLOTS     (WTEX_NARROW_N + WTEX_WIDE_N)                /* 22; ends 0x25C75000 */
-#define WALL_CMD_CAP   (VDP1_BANK_CMDS - 8)   /* walls stop here -> room for end + margin */
+#define WTEX_SLOTS     (WTEX_NARROW_N + WTEX_WIDE_N)                /* 19 slots, 352KB in the SGL heap */
+/* Per-frame wall command budget.  slSetSprite appends to SGL's sort list (MaxPolygons in workarea.c,
+   currently 64 -- see the Makefile note: it is MEMORY-capped at ~64, not freely growable, because
+   the work area shares an ~11KB high-RAM window with the TLSF heap).  Keep a margin below
+   MaxPolygons for SGL's own frame-end / system commands; the SGL sort SILENTLY CORRUPTS on
+   overflow.  56 = a safe wall budget under MaxPolygons=64 (validation size; raise once high RAM is
+   freed to allow a bigger MaxPolygons). */
+#if VDP1_RAW_WALLS
+/* HYBRID: walls are a raw VDP1 command list in a DOUBLE-BUFFERED command bank (VDP1_BANK[2],
+   256 cmds each), NOT SGL's sprite sort -- so NO MaxPolygons limit.  Cap = bank size - 2 (slot 0
+   is the per-bank local-coordinate, +1 for the draw-end) so walls + localcoord + end fit one bank
+   and bank0 never spills into bank1.  >= WALL_ACC_MAX (128) so every accumulated wall fits its flat
+   baseline; surplus upgrades near walls to textured. */
+#define WALL_CMD_CAP   (VDP1_BANK_CMDS - 2)   /* 254 */
+#else
+#define WALL_CMD_CAP   56     /* FULL SGL (parked): hard-capped by MaxPolygons=64 */
+#endif
 
 /* 8BPP PALETTE LIGHTING (replaces gouraud, which can't light a 256-colour BANK: VDP1 applies
    gouraud to the palette CODE before the CRAM lookup -> it shifts the index, not the RGB).
@@ -1969,12 +2037,19 @@ static unsigned char wlight_bank_lut[34];
    and build the colormap-level -> CRAM-bank lookup. */
 static void wtex_setup(void)
 {
+    /* SLSYNCH Stage 2: allocate each wall-cache slot in the SGL texture heap so SGL owns the VRAM
+       (no collision with its command/sort list).  We bake raw 8bpp indices into the slot's VRAM
+       (Textures[idx].GetData()) and emit with slSetSprite (SRCA = slot VRAM + band offset), so the
+       table entry just RESERVES the VRAM -- the per-draw size/light come from the SPRITE command,
+       not the table.  256-colour (Paletted256) slots; palette arg is unused (COLR overrides it). */
     for (int i = 0; i < WTEX_NARROW_N; ++i)
-    { wtex_cache[i].addr = WTEX_BASE + (unsigned int)i * WTEX_NARROW_SZ;
+    { int idx = SRL::VDP1::TryAllocateTexture(128, 128, SRL::CRAM::TextureColorMode::Paletted256, 1);
+      wtex_cache[i].addr = (idx >= 0) ? (unsigned int)(uintptr_t)SRL::VDP1::Textures[idx].GetData() : 0;
       wtex_cache[i].cap = WTEX_NARROW_SZ; }
     for (int i = 0; i < WTEX_WIDE_N; ++i)
-    { wtex_cache[WTEX_NARROW_N + i].addr = WTEX_WIDE_BASE + (unsigned int)i * WTEX_WIDE_SZ;
-      wtex_cache[WTEX_NARROW_N + i].cap = WTEX_WIDE_SZ; }
+    { int idx = SRL::VDP1::TryAllocateTexture(256, 128, SRL::CRAM::TextureColorMode::Paletted256, 1);
+      wtex_cache[WTEX_NARROW_N + i].addr = (idx >= 0) ? (unsigned int)(uintptr_t)SRL::VDP1::Textures[idx].GetData() : 0;
+      wtex_cache[WTEX_NARROW_N + i].cap = (idx >= 0) ? WTEX_WIDE_SZ : 0; }   /* cap 0 = alloc failed -> never chosen */
     for (int L = 0; L < 34; ++L)
     {
         int Lc = L > 31 ? 31 : L;
@@ -2093,7 +2168,13 @@ extern "C" void DG_FadeIn(void)     /* rise the freshly-drawn frame from black *
    hook (below) reserves the upper half for the right view so a dense LEFT view -- accumulated first
    -- can't hog every VDP1 slot.  When the cap is hit the hook REJECTS the wall and the core renders
    it in SOFTWARE (no sky) -- so the cap is also the VDP1->CPU starvation handoff. */
-#define WALL_ACC_MAX 240
+/* WALL_ACC_MAX sits in HWRAM .bss (240 * ~44 B = ~10.5 KB) and that region squeezes the SRL TLSF
+   pool (_end .. __heap_end) -- when the pool drops below the ~2.6 KB TLSF control struct, boot
+   loops with "tlsf_add_pool: Memory size must be between 20 and ...".  1p accumulates only ~23-57
+   tiers/frame, so 128 keeps >2x headroom while reclaiming ~4.9 KB for the pool.  Overflow is SAFE:
+   the hook returns 1 -> the core renders that wall in software (no sky, no crash).  4-way split =
+   32 tiers/view (overflow -> CPU).  See memory [[boot-loop-can-be-tlsf-pool-starvation]]. */
+#define WALL_ACC_MAX 128
 /* vx/vxr = the view's framebuffer x-range [vx, vxr] this wall belongs to (split-screen: 0..159 for
    the left view, 160..319 for the right).  x1/x2 are stored ALREADY offset by viewwindowx, so the
    emit works in absolute framebuffer coords; vx/vxr drive the per-view user-clip window. */
@@ -2285,6 +2366,61 @@ static inline int wrmul_(long long num, int recip)   /* ~= num/den, rounded, sig
 #define WDIV(numP, denP, recip)  ((int)((long long)(numP) / (denP)))
 #endif
 
+/* SLSYNCH Stage 2: submit one wall command (built in the legacy cmd[16], which is bit-for-bit a
+   VDP1 SPRITE) to SGL's sort list via slSetSprite, so slSynch transfers + presents it.  Replaces
+   the raw vdp1_cmd_at() write into our own command bank.  Doom's wall quads never overlap in
+   screen space (BSP clips segs to distinct columns; vertical bands and horizontal tiles are
+   distinct y/x slices), so a CONSTANT sort depth is fine -- the Z-sort order is visually
+   irrelevant.  cmd[16] maps 1:1 onto the SPRITE struct (CTRL/LINK/PMOD/COLR/SRCA/SIZE/XA..YD).
+   COORDINATE ORIGIN: SGL sprite coords are SCREEN-CENTRE-relative (0,0 = centre), proven by
+   Samples/VDP1 - Distorted sprite (points span +/-halfWidth, +/-halfHeight).  Mimas builds its
+   corners TOP-LEFT (0..319 / 0..223), so subtract the centre (160,112) here -- otherwise every
+   wall lands off-screen to the lower-right (= the "pas de mur" symptom). */
+#define SAT_WALL_DEPTH toFIXED(10.0)
+#define SAT_SCR_CX 160   /* 320x224 screen centre X */
+#define SAT_SCR_CY 112   /* 320x224 screen centre Y */
+#if SAT_VDP1_SPRITE_DIAG
+short g_dbg_xmin = 0, g_dbg_xmax = 0, g_dbg_ymin = 0, g_dbg_ymax = 0;  /* emitted wall corner extent */
+#endif
+static void wall_put(const unsigned short *cmd)
+{
+#if SAT_VDP1_SPRITE_DIAG
+    for (int k = 6; k <= 12; k += 2) {                /* track min/max of the 4 emitted corners */
+        short x = (short)cmd[k], y = (short)cmd[k + 1];
+        if (x < g_dbg_xmin) g_dbg_xmin = x;  if (x > g_dbg_xmax) g_dbg_xmax = x;
+        if (y < g_dbg_ymin) g_dbg_ymin = y;  if (y > g_dbg_ymax) g_dbg_ymax = y;
+    }
+#endif
+#if VDP1_RAW_WALLS
+    /* HYBRID (DOUBLE-BUFFERED): write the 16-word VDP1 command into the INACTIVE bank
+       (VDP1_BANK[vdp1_wbank]) at the current slot -- NOT in place at VRAM base.  VDP1's 1-cycle-auto
+       plot reads the root @0 -> the OTHER (active) bank each vblank, so it never sees this
+       half-written list.  vdp1_raw_present atomically flips the root link to this bank once it is
+       complete -> race-free (the in-place single-buffer write was the "walls vanish at certain
+       angles" bug: VDP1 plotted a half-rewritten list).
+       COORDS: corners are ABSOLUTE framebuffer coords (0..319 / 0..223) and are written VERBATIM.
+       The double-buffer bank carries its OWN local-coordinate (0, VIEW_Y_OFFSET=0) and that origin
+       NOW takes effect (the bank is a clean chain, unlike the old in-place list at 0x25C00000 where
+       SGL's centre origin leaked in and forced the -(160,112) subtraction).  Subtracting the centre
+       here would double-shift the walls up-left (behind the ceiling / top-left corner). */
+    volatile unsigned short *slot =
+        (volatile unsigned short *)(VDP1_BANK[vdp1_wbank] + (unsigned int)vdp1_wnext * 0x20u);
+    for (int k = 0; k < 16; ++k) slot[k] = cmd[k];   /* verbatim: bank local-coord owns the origin */
+#else
+    /* FULL SGL (parked): slSetSprite into SGL's sort.  Coords are top-left, so subtract the screen
+       centre (SGL's default local coordinate).  Never delivered to VDP1 here (CO10) -- see header. */
+    SPRITE spr;
+    spr.CTRL = cmd[0];  spr.LINK = 0;      spr.PMOD = cmd[2];  spr.COLR = cmd[3];
+    spr.SRCA = cmd[4];  spr.SIZE = cmd[5];
+    spr.XA = (int16_t)((int16_t)cmd[6]  - SAT_SCR_CX); spr.YA = (int16_t)((int16_t)cmd[7]  - SAT_SCR_CY);
+    spr.XB = (int16_t)((int16_t)cmd[8]  - SAT_SCR_CX); spr.YB = (int16_t)((int16_t)cmd[9]  - SAT_SCR_CY);
+    spr.XC = (int16_t)((int16_t)cmd[10] - SAT_SCR_CX); spr.YC = (int16_t)((int16_t)cmd[11] - SAT_SCR_CY);
+    spr.XD = (int16_t)((int16_t)cmd[12] - SAT_SCR_CX); spr.YD = (int16_t)((int16_t)cmd[13] - SAT_SCR_CY);
+    spr.GRDA = cmd[14]; spr.DMMY = 0;
+    slSetSprite(&spr, SAT_WALL_DEPTH);
+#endif
+}
+
 static void wall_emit_band(int x1, int x2, int yl1, int yh1, int yl2, int yh2,
                            int u1, int u2, int texw,
                            unsigned short charAddr, unsigned short charSize, unsigned short colr,
@@ -2292,6 +2428,7 @@ static void wall_emit_band(int x1, int x2, int yl1, int yh1, int yl2, int yh2,
 {
     int xspan = x2 - x1, du = u2 - u1;
     unsigned short cmd[16];
+    (void)vx; (void)vxr;   /* SLSYNCH: no per-wall user-clip window (it can't survive SGL's Z-sort) */
 
     if (xspan <= 0 || du == 0 || texw <= 0)            /* degenerate -> single quad */
     {
@@ -2304,7 +2441,7 @@ static void wall_emit_band(int x1, int x2, int yl1, int yh1, int yl2, int yh2,
         cmd[8]  = (short)x2; cmd[9]  = (short)yl2;
         cmd[10] = (short)x2; cmd[11] = (short)yh2;
         cmd[12] = (short)x1; cmd[13] = (short)yh1;
-        vdp1_cmd_at(VDP1_BANK[vdp1_wbank], vdp1_wnext++, cmd);
+        wall_put(cmd); vdp1_wnext++;
         return;
     }
 
@@ -2319,7 +2456,7 @@ static void wall_emit_band(int x1, int x2, int yl1, int yh1, int yl2, int yh2,
     int umin = (u1 < u2) ? u1 : u2;
     int umax = (u1 < u2) ? u2 : u1;
 
-    int winset = 0, ntiles = 0;
+    int ntiles = 0;
     for (int ub = umin & ~(texw - 1); ub < umax && ntiles < MAXWALLTILES; ub += texw, ++ntiles)
     {
         if (vdp1_wnext >= WALL_CMD_CAP) break;
@@ -2328,59 +2465,27 @@ static void wall_emit_band(int x1, int x2, int yl1, int yh1, int yl2, int yh2,
         int lo = (xs < xe) ? xs : xe, hi = (xs < xe) ? xe : xs;
         if (hi < x1 || lo > x2) continue;                /* tile outside the visible range */
 
-        int yls = yl1 + WDIV((long long)(yl2 - yl1) * (xs - x1), xspan, inv_xspan);
-        int yhs = yh1 + WDIV((long long)(yh2 - yh1) * (xs - x1), xspan, inv_xspan);
-        int yle = yl1 + WDIV((long long)(yl2 - yl1) * (xe - x1), xspan, inv_xspan);
-        int yhe = yh1 + WDIV((long long)(yh2 - yh1) * (xe - x1), xspan, inv_xspan);
-
-        if (lo >= -wall_ext && hi <= 320 + wall_ext)     /* extend + window-clip (correct) */
-        {
-            if (!winset)
-            {
-                /* extend the window 1px each side so adjacent walls OVERLAP -> no seam
-                   (the gap that, in motion, let the NBG0 sky show between quads).  CLAMP to the
-                   view's x-range [vx, vxr] (full-screen 0..319 for 1p; the left/right half in
-                   split) so the overlap never bleeds across the split seam into the other view. */
-                int wx1 = x1 > vx  ? x1 - 1 : vx;
-                int wx2 = x2 < vxr ? x2 + 1 : vxr;
-                memset(cmd, 0, sizeof cmd);
-                cmd[0] = 0x0008;                         /* FUNC_UserClip = wall window */
-                cmd[6]  = (short)wx1; cmd[7]  = 0;       /* upper-left  (XA,YA) */
-                cmd[10] = (short)wx2; cmd[11] = 223;     /* lower-right (XC,YC) */
-                vdp1_cmd_at(VDP1_BANK[vdp1_wbank], vdp1_wnext++, cmd);
-                winset = 1;
-                if (vdp1_wnext >= WALL_CMD_CAP) break;
-            }
-            /* grow the quad 1px top+bottom -> close vertical seams; the overspill into the
-               (software NBG1) floor/ceiling is hidden by the layer inversion. */
-            memset(cmd, 0, sizeof cmd);
-            cmd[0] = 0x0002; cmd[2] = 0x04E0;  /* DISTORSP | Window_In | COLOR_4 8bpp | SPD | ECD-off */
-            cmd[3] = colr;                                 /* CMDCOLR = CRAM light-bank base */
-            cmd[4] = charAddr; cmd[5] = charSize;
-            cmd[6]  = (short)xs; cmd[7]  = (short)(yls - 1);   /* A col0  top */
-            cmd[8]  = (short)xe; cmd[9]  = (short)(yle - 1);   /* B colW  top */
-            cmd[10] = (short)xe; cmd[11] = (short)(yhe + 1);   /* C colW  bot */
-            cmd[12] = (short)xs; cmd[13] = (short)(yhs + 1);   /* D col0  bot */
-            vdp1_cmd_at(VDP1_BANK[vdp1_wbank], vdp1_wnext++, cmd);
-        }
-        else                                             /* grazing -> clamp + squish */
-        {
-            int cxs = xs < x1 ? x1 : (xs > x2 ? x2 : xs);
-            int cxe = xe < x1 ? x1 : (xe > x2 ? x2 : xe);
-            int cyls = yl1 + WDIV((long long)(yl2 - yl1) * (cxs - x1), xspan, inv_xspan);
-            int chys = yh1 + WDIV((long long)(yh2 - yh1) * (cxs - x1), xspan, inv_xspan);
-            int cyle = yl1 + WDIV((long long)(yl2 - yl1) * (cxe - x1), xspan, inv_xspan);
-            int chye = yh1 + WDIV((long long)(yh2 - yh1) * (cxe - x1), xspan, inv_xspan);
-            memset(cmd, 0, sizeof cmd);
-            cmd[0] = 0x0002; cmd[2] = 0x00E0;                 /* DISTORSP | COLOR_4 8bpp | SPD | ECD-off */
-            cmd[3] = colr;                                    /* CMDCOLR = CRAM light-bank base */
-            cmd[4] = charAddr; cmd[5] = charSize;
-            cmd[6]  = (short)cxs; cmd[7]  = (short)cyls;
-            cmd[8]  = (short)cxe; cmd[9]  = (short)cyle;
-            cmd[10] = (short)cxe; cmd[11] = (short)chye;
-            cmd[12] = (short)cxs; cmd[13] = (short)chys;
-            vdp1_cmd_at(VDP1_BANK[vdp1_wbank], vdp1_wnext++, cmd);
-        }
+        /* SLSYNCH Stage 2: SGL Z-sorts the sprite list, so the per-wall FUNC_UserClip window can't
+           survive the sort.  Instead CLAMP each tile's corners to the wall's [x1,x2] (recomputing y
+           at the clamped x) so nothing spills onto neighbours -- the canonical no-clip route.  Full
+           tiles clamp to themselves (no-op, world-anchored); only partial end-tiles get a slight
+           texture squish.  Grow 1px top/bottom to close vertical seams (overspill hidden by the
+           layer inversion). */
+        int cxs = xs < x1 ? x1 : (xs > x2 ? x2 : xs);
+        int cxe = xe < x1 ? x1 : (xe > x2 ? x2 : xe);
+        int cyls = yl1 + WDIV((long long)(yl2 - yl1) * (cxs - x1), xspan, inv_xspan);
+        int chys = yh1 + WDIV((long long)(yh2 - yh1) * (cxs - x1), xspan, inv_xspan);
+        int cyle = yl1 + WDIV((long long)(yl2 - yl1) * (cxe - x1), xspan, inv_xspan);
+        int chye = yh1 + WDIV((long long)(yh2 - yh1) * (cxe - x1), xspan, inv_xspan);
+        memset(cmd, 0, sizeof cmd);
+        cmd[0] = 0x0002; cmd[2] = 0x00E0;                /* DISTORSP | COLOR_4 8bpp | SPD | ECD-off */
+        cmd[3] = colr;                                   /* CMDCOLR = CRAM light-bank base */
+        cmd[4] = charAddr; cmd[5] = charSize;
+        cmd[6]  = (short)cxs; cmd[7]  = (short)(cyls - 1);
+        cmd[8]  = (short)cxe; cmd[9]  = (short)(cyle - 1);
+        cmd[10] = (short)cxe; cmd[11] = (short)(chye + 1);
+        cmd[12] = (short)cxs; cmd[13] = (short)(chys + 1);
+        wall_put(cmd); vdp1_wnext++;
     }
 }
 
@@ -2467,7 +2572,7 @@ static void wall_emit_flat(int wi)
     cmd[8]  = (short)x2; cmd[9]  = (short)(yl2 - 1);
     cmd[10] = (short)x2; cmd[11] = (short)(yh2 + 1);
     cmd[12] = (short)x1; cmd[13] = (short)(yh1 + 1);
-    vdp1_cmd_at(VDP1_BANK[vdp1_wbank], vdp1_wnext++, cmd);
+    wall_put(cmd); vdp1_wnext++;
 }
 
 /* Banded wall (pot2-bd): emit ONE narrow band (BAND_ROWS texels at a fixed source row) and let
@@ -2519,10 +2624,16 @@ static int wall_potato(int wi)
    (The previous "greedy" flush charged the worst-case tile estimate without that reservation, so an
    over-estimate -- VD1 finished at ~147/248 yet far walls vanished -- dropped them to mode 0 = sky.)
    Painted far->near (painter's algorithm). */
+/* DIAG (SAT_VDP1_SPRITE_DIAG): last frame's wall counts, surfaced on the debug overlay so one HW
+   boot tells us WHERE the wall path breaks -- acc=0 means the walls never accumulate (hook/wiring);
+   acc>0 with nothing on screen means they emit but the sprite present/colour is the problem. */
+int g_dbg_wall_acc = 0, g_dbg_wall_emit = 0;
+
 static void vdp1_walls_flush(void)
 {
     wtex_bakes = 0;                      /* count this frame's texture re-bakes (the `k` driver) */
-    if (wall_acc_n == 0) return;
+    g_dbg_wall_acc = wall_acc_n;         /* DIAG: walls accumulated this frame (before the flush) */
+    if (wall_acc_n == 0) { g_dbg_wall_emit = 0; return; }
     wtex_tick++;
     for (int i = 0; i < WTEX_SLOTS; ++i) wtex_cache[i].locked = 0;
 
@@ -2577,7 +2688,126 @@ static void vdp1_walls_flush(void)
         else if (wall_acc[i].mode == 2) wall_emit_flat(i);
     }
 
+    g_dbg_wall_emit = vdp1_wnext;        /* DIAG: sprite commands actually emitted this frame */
     wall_acc_n = 0;
+}
+
+/* MANUAL VDP1 wall present (the cherry-picked raw path, synced with slSynch).  Called AFTER
+   SRL::Core::Synchronize() -- i.e. after slSynch has erased the VDP1 back buffer and swapped, in
+   the post-vblank window the direct-FB probe proved survives.  Builds the VDP1 command list at
+   VRAM base 0 (overwriting SGL's empty SortList DMA): [system-clip][local-coord][wall quads][end],
+   then triggers the draw (PTMR).  VDP1 rasterizes the walls into the freshly-erased back buffer;
+   the NEXT Synchronize swaps it on screen.  slSynch owns the swap -> no tearing (the old raw path's
+   own FBCR swap is what tore).  SGL's sprite sort is bypassed entirely (it never worked here). */
+#if SAT_VDP1_SPRITE_DIAG
+/* Print a debug row PADDED to the full 40-column width: SRL::Debug::Print only writes the chars
+   given and never clears, so a value that shrinks next frame (e.g. "v119" -> "v19") leaves stale
+   glyphs behind -- the bleed that made the readout unreadable.  Rows 11/12 are free of the perf
+   overlay (which owns 0,1,2,4,6-10,13,14,16-21,23) so the diag never fights another line. */
+static void dbg_row_padded(int row, const char *buf)
+{
+    char b[41];
+    int i = 0;
+    while (i < 40 && buf[i]) { b[i] = buf[i]; ++i; }
+    while (i < 40) b[i++] = ' ';
+    b[40] = 0;
+    SRL::Debug::Print(0, row, b);
+}
+#endif
+
+static void vdp1_raw_present(void)
+{
+    unsigned short cmd[16];
+
+    /* DOUBLE-BUFFERED present (master's race-free architecture, restored): build this frame's command
+       list into the INACTIVE bank while VDP1's 1-cycle-auto plot keeps reading the ACTIVE bank via
+       the fixed root @0x25C00000.  Flip the root's JUMP link to the new bank only once it is
+       COMPLETE -> VDP1 never plots a half-written list.  THIS is the fix for "walls vanish at certain
+       angles": the old single-buffer path rewrote the list in place, so the 1-cycle-auto plot read it
+       mid-rewrite (timing/load-dependent => angle-dependent black).  Each bank is self-contained:
+       [local-coord][walls][end]; the root is [sysclip + JUMP -> active bank]. */
+    int wbank = vdp1_bank ^ 1;                        /* write the bank VDP1 is NOT displaying */
+    vdp1_wbank = wbank;
+
+    /* bank slot 0: local coordinate (origin -> walls aligned with NBG1) */
+    memset(cmd, 0, sizeof cmd);
+    cmd[0] = 0x000A;
+    cmd[6] = 0; cmd[7] = VIEW_Y_OFFSET;
+    { volatile unsigned short *s = (volatile unsigned short *)(VDP1_BANK[wbank] + 0u * 0x20u);
+      for (int i = 0; i < 16; ++i) s[i] = cmd[i]; }
+
+    /* SLOT 1 = FULL-SCREEN ERASE polygon.  ROOT CAUSE of the floor pile-up (4-agent investigation):
+       the VDP1 erase region EWLR/EWRR is NEVER set under slSynch -- slSynch owns VDP2, not VDP1's
+       EWxx, so VDP1 erases a ZERO-WIDTH rect every vblank = erases nothing -> walls accumulate.
+       Setting EWxx/FBCR ourselves fought slSynch (froze / got clobbered).  Instead erase IN the
+       command list (SEGA's sotn-decomp pattern): a full-screen flat polygon writing colour 0 (SPD on
+       so 0 IS written, not skipped as transparent) clears the framebuffer to VDP2-transparent before
+       the walls draw on top.  Plot-mechanism-independent (rides whatever plots our list), no register
+       pokes (no freeze), and stays in the SAME single plot (no lag).  ~1 screen fill / frame. */
+    memset(cmd, 0, sizeof cmd);
+    cmd[0] = 0x0004;                                  /* flat polygon */
+    cmd[2] = 0x00C0;                                  /* SPD on: write colour 0 (don't skip it as transparent) */
+    cmd[3] = 0x0000;                                  /* colour 0 = VDP2-transparent -> floor/sky show through */
+    cmd[6]  = 0;   cmd[7]  = 0;
+    cmd[8]  = 319; cmd[9]  = 0;
+    cmd[10] = 319; cmd[11] = 223;
+    cmd[12] = 0;   cmd[13] = 223;
+    { volatile unsigned short *s = (volatile unsigned short *)(VDP1_BANK[wbank] + 1u * 0x20u);
+      for (int i = 0; i < 16; ++i) s[i] = cmd[i]; }
+
+    vdp1_wnext = 2;                                   /* walls start after local-coord (0) + erase poly (1) */
+#if SAT_VDP1_SPRITE_DIAG
+    g_dbg_xmin = 0x7fff; g_dbg_xmax = -0x8000;        /* reset before the walls -> wall_put tracks the */
+    g_dbg_ymin = 0x7fff; g_dbg_ymax = -0x8000;        /* min/max EMITTED corner coords (no markers) */
+#endif
+#if VDP1_WALL_TEST
+    vdp1_walls_flush();                               /* emit walls into bank[wbank] slots 1.. (wall_put) */
+#endif
+
+    memset(cmd, 0, sizeof cmd);
+    cmd[0] = 0x8000;                                  /* draw end terminates this bank's chain */
+    { volatile unsigned short *s = (volatile unsigned short *)(VDP1_BANK[wbank] + (unsigned int)vdp1_wnext * 0x20u);
+      for (int i = 0; i < 16; ++i) s[i] = cmd[i]; }
+
+    /* THE FLIP: root @0x25C00000 = sysclip + JUMP_ASSIGN -> the freshly-built (complete) bank.  The
+       OLD bank is untouched while we build the new one, so VDP1 always plots a complete list.  CTRL
+       and clip are constant each frame; only the JUMP link (cmd[1]) actually changes -> even a
+       mid-write read by VDP1 lands on a valid bank.  Re-written every frame because SGL may touch
+       VRAM 0 under slSynch.  (sysclip + JUMP_NEXT did NOT reach the local-coord -> JUMP_ASSIGN.) */
+    memset(cmd, 0, sizeof cmd);
+    cmd[0] = (unsigned short)(0x0009 | 0x1000);       /* system clip + JUMP_ASSIGN */
+    cmd[1] = (unsigned short)((VDP1_BANK[wbank] - VDP1_VRAM_BASE) >> 3);  /* link -> bank[wbank] slot 0 */
+    cmd[10] = 319; cmd[11] = 223;                     /* clip lower-right = screen */
+    { volatile unsigned short *s = (volatile unsigned short *)(VDP1_ROOT_ADDR + 0u * 0x20u);
+      for (int i = 0; i < 16; ++i) s[i] = cmd[i]; }
+
+    vdp1_bank = wbank;                                /* the freshly-built bank is now the active one */
+    /* NO manual PTMR and NO FBCR/erase pokes: slSynch (called right after this, in DG_DrawFrame) OWNS
+       the VDP1 plot + erase + swap.  This runs BEFORE Synchronize, so slSynch plots OUR root->bank
+       for THIS frame -> walls match the CPU/NBG1 layer (no lag) and are plotted exactly ONCE (a
+       manual PTMR was the 2nd, accumulating draw; poking FBCR/PTMR fought slSynch -> menu freeze). */
+
+#if SAT_VDP1_SPRITE_DIAG
+    /* Print the ACTUAL emitted wall corner extent + view config -- no more guessing.
+         x0..x1 = full-width (0..319) => coords fine, shift is in VDP1/local-coord
+         x0..x1 = right-half (~160..319) => coords already shifted upstream (renderer/accumulator) */
+    /* emit = VDP1 cmds written, acc = walls accumulated, ED = LIVE EDSR (3=draw done, 1=began/not
+       done => overrun/incomplete -> missing walls).  (The old row-2 "VD1 ..Dr0%" is the DEAD
+       manual-present metric, stale under the hybrid -- ignore it.) */
+    char line[45];
+    sprintf(line, "emit%d acc%d ED%x Wx%d..%d",
+            g_dbg_wall_emit, g_dbg_wall_acc,
+            (int)*(volatile unsigned short *)0x25D00010,
+            (int)g_dbg_xmin, (int)g_dbg_xmax);
+    dbg_row_padded(11, line);
+    /* WHERE the wall tiers went this frame (sum = visible textured tiers).  cull = floor-culled
+       (drawn by NEITHER VDP1 nor CPU) -> if this is large, the RBG0 floor-cull is eating walls.
+       v1 = VDP1 hook, cpu = close/magnified -> CPU, part = partially-below-floor -> CPU. */
+    sprintf(line, "cull%d part%d cpu%d v1%d",
+            sat_dbg_cull, sat_dbg_part, sat_dbg_cpu, sat_dbg_v1);
+    dbg_row_padded(12, line);
+    sat_dbg_cull = sat_dbg_part = sat_dbg_cpu = sat_dbg_v1 = 0;   /* reset for the next frame's BSP */
+#endif
 }
 #endif
 
@@ -2614,11 +2844,16 @@ static void vdp1_vblank_present(void)
    bank, then put VDP1 in 1-cycle auto (or manual-change) mode. */
 static void vdp1_wpn_init(void)
 {
+    /* RESTORED FROM MASTER (the slSynch hybrid had gutted this, assuming slSynch would erase VDP1 --
+       but in 1-cycle auto VDP1 is AUTONOMOUS, slSynch only drives VDP2, so with no erase region set
+       the framebuffer never cleared -> walls "s'agglutinent" / accumulate on the floor).  Set up the
+       fixed root (sysclip + JUMP -> empty bank), the empty bank, and VDP1 in 1-cycle auto so it
+       auto-erases+draws+swaps every vblank.  slSynch keeps owning VDP2/RBG0/timing in parallel. */
     unsigned short cmd[16];
 
     memset(cmd, 0, sizeof cmd);
     cmd[0] = (unsigned short)(0x0009 | 0x1000);      /* system clip + JUMP_ASSIGN */
-    cmd[1] = (unsigned short)((VDP1_BANKE_ADDR - VDP1_VRAM_BASE) >> 3);  /* link */
+    cmd[1] = (unsigned short)((VDP1_BANKE_ADDR - VDP1_VRAM_BASE) >> 3);  /* link -> empty bank */
     cmd[10] = 319; cmd[11] = 223;
     vdp1_cmd_at(VDP1_ROOT_ADDR, 0, cmd);
 
@@ -2633,35 +2868,22 @@ static void vdp1_wpn_init(void)
     for (int i = 0; i < WPN_TEX_SLOTS; ++i) wpn_cache[i].lump = -1;
     wpn_cache_rr = 0;
 #if VDP1_WALL_TEST
-    wtex_setup();                                    /* fixed per-slot VRAM addr + capacity */
+    wtex_setup();                                    /* allocate the wall texture pool in the SGL heap */
     for (int i = 0; i < WTEX_SLOTS; ++i) { wtex_cache[i].texnum = -1; wtex_cache[i].lru = 0;
                                            wtex_cache[i].locked = 0; }
     wtex_tick = 0; wall_acc_n = 0;
 #endif
 
-    VDP1_TVMR = 0x0000;                              /* 16bpp, VBE=0 (erase in display: full-screen safe) */
-    VDP1_EWDR = 0x0000;                              /* erase to 0 = transparent */
-    VDP1_EWLR = 0x0000;
-    VDP1_EWRR = (unsigned short)(((320 >> 3) << 9) | 223);
-#if VDP1_MANUAL_CHANGE
-    /* Manual-change double-buffer (anti-tear).  Clear BOTH framebuffers first: each change
-       erases the buffer that becomes the new back buffer, so two changes (a field apart) wipe
-       both -> no boot garbage in the index-0 (sky/ceiling) gaps.  Then stay in manual mode;
-       the per-frame swap is driven by vdp1_vblank_present on draw-complete. */
-    VDP1_PTMR = 0x0000;                              /* no draw; first plot kicked per-frame */
-    VDP1_FBCR = 0x0003; vdp1_wait_field();           /* change + erase back buffer #1 */
-    VDP1_FBCR = 0x0003; vdp1_wait_field();           /* change + erase back buffer #2 (both clear) */
-    SRL::Core::OnVblank += vdp1_vblank_present;
-#else
-    VDP1_FBCR = 0x0000;                              /* 1-cycle auto erase+draw+swap (tears) */
-    VDP1_PTMR = 0x0002;
-#endif
+    /* NO VDP1 TVMR/FBCR/PTMR/EWxx pokes here: slSynch OWNS the VDP1 erase + framebuffer change +
+       plot under this branch.  Poking FBCR/PTMR fought slSynch (PTMR=0x01 deadlocked its
+       wait-for-CEF -> menu freeze; FBCR=0 changed the mode out from under it).  We only provide the
+       root + a valid empty bank so slSynch always has a complete list to plot; the per-frame present
+       flips the root to the freshly-built wall bank BEFORE Synchronize so slSynch plots it. */
 }
 
 /* core hook: begin this frame's player-sprite list in the OFF-screen bank. */
 extern "C" void sat_vdp1_wpn_begin(void)
 {
-    unsigned short cmd[16];
     /* NO RE-BAKE ON FLASH: the wall cache stores raw palette indices and is NOT dropped on
        palette_changed (that re-baked every visible texture each flash frame -> the damage/pickup
        SLOWDOWN).  The flash re-tints the walls' CRAM light-banks instead (wtex_rebuild_banks, in
@@ -2671,18 +2893,12 @@ extern "C" void sat_vdp1_wpn_begin(void)
         for (int i = 0; i < WPN_TEX_SLOTS; ++i) wpn_cache[i].lump = -1;
         vdp1_hud_csum = 0xFFFFFFFFu;
     }
-#if VDP1_DBLBANK
-    vdp1_wbank = vdp1_bank ^ 1;                      /* the bank VDP1 isn't showing */
-#else
-    vdp1_wbank = vdp1_bank;                          /* TEST: single bank (no extra frame?) */
-#endif
-    memset(cmd, 0, sizeof cmd);
-    cmd[0] = 0x000A;                                 /* bank cmd0 = local coord */
-    cmd[7] = VIEW_Y_OFFSET;                          /* local Y origin -> walls centred like NBG1 */
-    vdp1_cmd_at(VDP1_BANK[vdp1_wbank], 0, cmd);
-    vdp1_wnext   = 1;
+    /* SLSYNCH Stage 2: no command bank to open -- walls go onto SGL's sort list (slSetSprite in
+       vdp1_walls_flush) and slSynch presents them.  Reset the per-frame command-budget counter
+       and drain the accumulated walls. */
+    vdp1_wnext = 0;
 #if VDP1_WALL_TEST
-    vdp1_walls_flush();   /* textured walls -- behind the weapon, in front of NBG1 */
+    vdp1_walls_flush();
 #endif
     vdp1_wactive = 1;
 }
@@ -2823,8 +3039,9 @@ static void vdp1_wpn_kick(void)
 static int vdp1_kicked_this_frame = 0;
 extern "C" void sat_walls_kick(void)
 {
+    /* SLSYNCH Stage 2: emit the accumulated walls onto SGL's sort list (slSetSprite); the
+       per-frame Synchronize() in DG_DrawFrame transfers + presents them.  No PTMR/link kick. */
     sat_vdp1_wpn_begin();
-    vdp1_wpn_kick();
     vdp1_kicked_this_frame = 1;
 }
 #endif
@@ -2865,9 +3082,9 @@ extern "C" void DG_DrawFrame(void)
         console_enabled  = 0;
         sat_console_clear();
         dma_table_build();
-        /* SLSYNCH Stage 1: no raw VDP1 driver init -- slSynch/SRL own VDP1 (slInitSystem put it in
-           SGL's manual-change mode at boot).  Stage 2 will set up the SGL sprite path for the walls
-           here instead. */
+#if VDP1_WEAPON
+        vdp1_wpn_init();   /* SLSYNCH Stage 2: allocate the wall texture pool in the SGL heap + reset caches */
+#endif
         SRL::Debug::Print(0, 1, "FRAME1 OK               ");
     }
 
@@ -3087,6 +3304,19 @@ extern "C" void DG_DrawFrame(void)
         int clear_rows = (sat_local_players >= 3) ? 224 : (sat_local_players == 2 ? 160 : 192);
         memset(framebuffer, 0, clear_rows * 320);
     }
+#if VDP1_WALL_TEST && VDP1_RAW_WALLS
+    /* SYNCHRONISED VDP1 walls: build THIS frame's command bank + flip the root JUMP-link to it
+       BEFORE Synchronize, so the slSynch frame plots OUR root->bank itself (slSynch DOES plot the
+       VDP1 command list, proven by the old double-plot accumulation) -- a SINGLE plot, this frame,
+       into the buffer slSynch erases + swaps.  => no 1-frame lag (walls match the CPU/NBG1 layer,
+       killing the décalage) and no double-plot pile-up.  The double-buffer keeps it race-free:
+       slSynch always reads a COMPLETE bank (we only flip the root once the bank is fully built).
+       No manual PTMR -- slSynch owns the plot/erase/swap (a manual PTMR was the 2nd, accumulating draw). */
+    vdp1_raw_present();
+#endif
+#if VDP1_WALL_TEST && !VDP1_RAW_WALLS
+    sat_vdp1_wpn_begin();   /* FULL SGL (parked): flush walls onto SGL's sprite sort BEFORE Synchronize */
+#endif
     /* SLSYNCH: the canonical per-frame sync (= slSynch + input refresh + timer update).  Blocks
        until the next graphic-processing window (>= 1 vblank; SynchConst=1), then SGL commits
        everything for this frame: the VDP1 framebuffer present, the VDP2 register shadow
@@ -3094,6 +3324,13 @@ extern "C" void DG_DrawFrame(void)
        the per-frame slave work-pointer reset.  This single call replaces every hand-rolled commit
        Mimas used to do to avoid it. */
     SRL::Core::Synchronize();
+#if VDP1_WALL_TEST && !VDP1_RAW_WALLS && SAT_VDP1_SPRITE_DIAG
+    /* SGL A/B readout: did SGL's sort populate the VDP1 command table this time?  CO != 10 = it did
+       (progress); CO == 10 = still the empty-sort symptom and SGL stays parked. */
+    SRL::Debug::Print(0, 4, "SGL e%d ED%x CO%x",
+                      g_dbg_wall_emit, (int)*(volatile unsigned short *)0x25D00010,
+                      (int)*(volatile unsigned short *)0x25D00014);
+#endif
     return;
 #endif
 

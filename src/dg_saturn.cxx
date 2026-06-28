@@ -1260,7 +1260,10 @@ static void rbg0_set_transform(void)
        Values are a first test -- tune the height (z) + position once it's on screen. */
     slPushMatrix();
     {
-        slRotX((ANGLE)(0x4000 + RBG0_PITCH + 0x100));    /* 90deg + baked pitch (+0x100 nudge found correct on HW) */
+        slRotX((ANGLE)(0x4000 + RBG0_PITCH + 0xC0));     /* 90deg + baked pitch.  TUNABLE: a bigger nudge
+                                                            raises the floor's far end toward the horizon,
+                                                            smaller lowers it.  0xC0 lowers it slightly vs
+                                                            0x100 (far end was a touch too high on HW). */
         slRotZ((ANGLE)(-(int)(viewangle >> 16) + RBG0_YAW_OFF)); /* yaw track + baked 90deg flat orientation */
         /* viewx/viewy are fixed_t (16.16) in map units; slTranslate's FIXED is also 16.16,
            so passing them directly scrolls the floor by the player's map position (1 unit ->

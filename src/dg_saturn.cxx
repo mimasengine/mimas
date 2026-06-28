@@ -231,9 +231,24 @@ extern "C" int W_SaturnCDInit(void);
    into VDP2 VRAM bank A0 as a 512x256 8bpp NBG0 bitmap (tiled 2x horizontally so
    the scroll wraps seamlessly) and scroll it by viewangle.  NBG1 (the game
    framebuffer) is at bank B0. */
-#define SKY_VRAM         ((unsigned char *)0x25E00000)  /* VDP2 VRAM A0 */
+#define SKY_VRAM         ((unsigned char *)0x25E00000)  /* VDP2 VRAM A0 (legacy bitmap sky path) */
 #define SKY_VRAM_STRIDE  512
 #define SKY_ANGLESHIFT   22   /* r_sky.h ANGLETOSKYSHIFT: 90deg (0x40000000)->256px */
+
+/* SLSYNCH: hardware sky on NBG0 as a 256-color CELL layer in bank B1 (coexists with the RBG0
+   BITMAP floor -- A0 K-table / A1 floor bitmap / B0 framebuffer all untouched).  The bitmap floor
+   freed B1, so the old "sky XOR floor" constraint is lifted.  The cell sky's B1 read slots
+   (256-color cell = 1 PN + 2 char/dot) are authored by slScrAutoDisp's allocator -- we never
+   hand-pin CYCB1 (a 1-char table would starve the 2nd 8bpp read = sky snow on HW).  Ported from
+   rbg0-rework; see memory rbg0-hw-sky-feasible. */
+#define VDP2_CELL_SKY    1
+#define SKY_CEL_VRAM     ((void *)0x25E60000)  /* B1 low half: NBG0 sky 256-color cells (~32KB) */
+#define SKY_MAP_VRAM     ((void *)0x25E6A000)  /* B1: NBG0 sky pattern-name map (64x64 1-word = 8KB) */
+#define SKY_NB_CELL      512                    /* 32 cols x 16 rows of 8x8 cells (256x128 Doom sky) */
+#define SKY_HORIZON_ROW  96                     /* horizon scanline: sky cells above it, RBG0 floor
+                                                   (clipped by VDP2 window 0) below it.  8px-snapped. */
+static void sky_cell_init(void);    /* fwd: defined below sky_upload, called from DG_Init */
+static void sky_cell_upload(void);  /* fwd: per-level sky re-pack, called from DG_DrawFrame */
 
 /* SATURN RBG0 floor prototype (docs/RBG0_FLOOR_PLAN.md).  Phase-0 = bring-up +
    coexistence test: a cell-based rotation plane (tiled test flat, IDENTITY transform,
@@ -276,7 +291,12 @@ extern "C" int W_SaturnCDInit(void);
    0 = none (broken)  ;  1 = per-frame slSynch (Test A: confirms, but caps fps + mutes SCSP SFX)
    2 = manual RPT memcpy reproducing _BlankIn, NO slSynch (Test B: the real shipping fix). */
 #define RBG0_RPT_TRANSFER 2
-#define RBG0_CEL_VRAM    ((void *)0x25E20000)  /* VDP2 VRAM A1: cell (char) data    */
+#define RBG0_CEL_VRAM    ((void *)0x25E20000)  /* VDP2 VRAM A1: cell (char) data (legacy cell path) */
+/* SLSYNCH snow fix: 2-bank BITMAP floor (ported from rbg0-rework, ships clean on HW; SlaveDriver
+   PLAX.C ships its rotation bitmap the same way).  The 512x256 8bpp floor bitmap lives in A1, the
+   coefficient/rotation table in A0 (RBG0_KTAB_VRAM below).  There is NO pattern-name map -> B1 is
+   freed and the floor drops from 3-4 banks to 2 = no HW cycle starvation (= the cell floor's snow). */
+#define RBG0_BMP_VRAM    ((void *)0x25E20000)  /* VDP2 VRAM A1: 512x256 8bpp floor bitmap */
 /* A rotation BG's pattern-name map must live in a VRAM B-bank.  An A-bank (map in A0/A1,
    tried to keep the NBG3 debug text) gives slScrAutoDisp ok=0 -> RBG0 reads starve ->
    squished bands.  B0 = the game framebuffer (non-negotiable), so the map goes in B1 and
@@ -1240,7 +1260,7 @@ static void rbg0_set_transform(void)
        Values are a first test -- tune the height (z) + position once it's on screen. */
     slPushMatrix();
     {
-        slRotX((ANGLE)(0x4000 + RBG0_PITCH));            /* 90 deg + baked pitch: plane far end at the horizon */
+        slRotX((ANGLE)(0x4000 + RBG0_PITCH + 0x100));    /* 90deg + baked pitch (+0x100 nudge found correct on HW) */
         slRotZ((ANGLE)(-(int)(viewangle >> 16) + RBG0_YAW_OFF)); /* yaw track + baked 90deg flat orientation */
         /* viewx/viewy are fixed_t (16.16) in map units; slTranslate's FIXED is also 16.16,
            so passing them directly scrolls the floor by the player's map position (1 unit ->
@@ -1273,57 +1293,43 @@ static void rbg0_upload_flat(int picnum)
     if (!flat) return;
     loaded = picnum;
     loaded_cmap = cmap;
-    unsigned char *cel = (unsigned char *)RBG0_CEL_VRAM;
-    for (int cy = 0; cy < 8; ++cy)
-        for (int cx = 0; cx < 8; ++cx)
+    /* BITMAP floor: build each 512-wide row in a STACK buffer (cached), then bulk-memcpy to the
+       uncached A1 VRAM -- avoids 131072 slow per-byte uncached writes.  The 64x64 Doom flat is
+       tiled 8x across (and wrapped in y) and MIRRORED-V (orientation 5, the one found correct on
+       real HW in rbg0-rework) so it aligns without a yaw offset that would invert the scroll. */
+    unsigned char row[512];
+    unsigned char *bmp = (unsigned char *)RBG0_BMP_VRAM;
+    for (int y = 0; y < 256; ++y)
+    {
+        const unsigned char *frow = flat + (63 - (y & 63)) * 64;   /* mirror-V (baked orient 5) */
+        for (int x = 0; x < 64; ++x)
         {
-            unsigned char *c = cel + (cy * 8 + cx) * 64;
-            for (int ry = 0; ry < 8; ++ry)
-                for (int rx = 0; rx < 8; ++rx)
-                {
-                    unsigned char px = flat[(cy * 8 + ry) * 64 + (cx * 8 + rx)];
-                    c[ry * 8 + rx] = cmap ? cmap[px] : px;
-                }
+            unsigned char px = frow[x];
+            row[x] = cmap ? cmap[px] : px;
         }
+        for (int t = 1; t < 8; ++t) memcpy(row + t * 64, row, 64);  /* tile 64 -> 512        */
+        memcpy(bmp + y * 512, row, 512);                            /* bulk write to A1 VRAM */
+    }
 }
 
 static void rbg0_proto_init(void)
 {
-    /* 1) cells (64 cells x 64B = a 64x64 flat) are filled per-flat by rbg0_upload_flat()
-       on the first level frame; zero them so the brief pre-first-flat frame isn't garbage. */
-    memset((void *)RBG0_CEL_VRAM, 0, 64 * 64);
-
-    /* 2) pattern-name table -- 1-WORD format (map word = char#*2 | palette<<12 + offset).
-       A 64x64-cell page tiling the flat's 8x8 cell grid: cell (cx,cy) = index cy*8+cx ->
-       char# = (cy*8+cx)*2, palette 1 (PLAYPAL, 0x1000), cells at the A1 bank base -> offset 0. */
-    {
-        unsigned short *map = (unsigned short *)RBG0_MAP_VRAM;
-        for (int my = 0; my < 64; ++my)
-            for (int mx = 0; mx < 64; ++mx)
-            {
-                int cellidx = (my & 7) * 8 + (mx & 7);
-                map[my * 64 + mx] = (unsigned short)((cellidx * 2) | 0x1000);
-            }
-    }
-
-    /* 3) RBG0 cell config.
-       THE FIX: slPageRbg0's FIRST arg is the CELL/character base, NOT the map.  My old code
-       passed (map, cell) swapped -> RBG0 read pixels from the pattern-name table = garbage =
-       transparent.  Sequence: slPageRbg0(cell, 0, PNB_1WORD|CN_12BIT) + sl1MapRA(map).  PNB_1WORD
-       (not 2WORD).  OneAxis flat for now (no K-table); perspective K-table is the next step. */
-    slOverRA(0);                                       /* over-area: repeat the plane  */
-    slCharRbg0(COL_TYPE_256, CHAR_SIZE_1x1);
-    slPageRbg0(RBG0_CEL_VRAM, 0, PNB_1WORD | CN_12BIT);/* arg1 = CELL base (the fix!)   */
-    slPlaneRA(PL_SIZE_1x1);
-    sl1MapRA(RBG0_MAP_VRAM);                            /* pattern-name table (B1)      */
-    /* PERSPECTIVE: a per-line coefficient table (1/z scaling)
-       turns the affine plane into a Mode-7 GROUND.  Static table via slMakeKtable -- the
-       vblank-filled variant needs slSynch, which we don't run.  K_LINE = one scale per
-       scanline (enough for a floor; far cheaper than a per-dot K_DOT). */
-    slMakeKtable(RBG0_KTAB_VRAM);
-    slKtableRA(RBG0_KTAB_VRAM, K_FIX | K_LINE | K_2WORD | K_ON);
-    slRparaMode(K_CHANGE);                              /* use the coefficient table     */
+    /* SLSYNCH snow fix -- 2-bank BITMAP RBG0 floor (ported from rbg0-rework; ships clean on HW,
+       same A1-bitmap/A0-coeff banks SlaveDriver PLAX.C uses).  A 512x256 8bpp bitmap (char) in A1,
+       the coefficient/rotation table in A0, OVER_0 (wrap), Mode-7 perspective via the coefficient
+       table.  NO pattern-name map -> B1 freed and the floor drops from 3-4 banks to 2, which is
+       what removes the cell floor's HW cycle starvation ("snow").  rbg0_upload_flat fills A1. */
+    memset((void *)RBG0_BMP_VRAM, 0, 512 * 256);          /* zero the A1 bitmap (pre-first-flat) */
+    slRparaMode(K_CHANGE);                                 /* rpara mode first (SRL/SlaveDriver order) */
+    slOverRA(0);                                            /* OVER_0: wrap the bitmap            */
+    slBitMapRbg0(COL_TYPE_256, BM_512x256, RBG0_BMP_VRAM); /* A1 bitmap; CHCTLB BMPMD=1          */
     slBMPaletteRbg0(1);
+    slMakeKtable(RBG0_KTAB_VRAM);                          /* A0 coefficient table (Mode-7, K_LINE) */
+    slKtableRA(RBG0_KTAB_VRAM, K_FIX | K_LINE | K_2WORD | K_ON);
+    /* NB: slBitMapRbg0 does NOT register the A1 bitmap bank in the RAMCTL RDBS, and the per-frame
+       slScrAutoDisp recomputes the cycle pattern from that inconsistent state.  The per-frame
+       shadow author in DG_DrawFrame (RDBS + parked rotation-bank cycle slots, after slScrAutoDisp,
+       before Synchronize) makes the image slSynch flushes CONSISTENT -> no boot-loop, no snow. */
 
     /* 4) DRIVE THE ROTATION FROM THE MATRIX, NOT BY HAND.  We do NOT call slRparaInitSet:
        SRL::Core::Initialize already pointed the rotation-param table at VRAM (B1+0x1ff00).
@@ -1604,6 +1610,9 @@ extern "C" void DG_Init(void)
     slBMPaletteNbg0(1);
     slScrPosNbg0(toFIXED(0.0), toFIXED(0.0));
 #endif
+#if VDP2_CELL_SKY
+    sky_cell_init();   /* NBG0 = 256-color cell sky in B1 (coexists with the RBG0 bitmap floor) */
+#endif
 #if SKY_DEBUG_SHOW
     slPriorityNbg0(6); slPriorityNbg1(5);   /* sky ON TOP to verify Stage A */
 #else
@@ -1631,32 +1640,42 @@ extern "C" void DG_Init(void)
 #if VDP2_HW_SKY
     slScrAutoDisp(NBG0ON | NBG1ON | NBG3ON | RBG0ON);   /* sky(NBG0) + floor(RBG0) both on */
 #else
-    slScrAutoDisp(NBG1ON | NBG3ON | (RBG0_DISPLAY ? RBG0ON : 0));  /* sw sky; floor(RBG0), off if isolating */
+    slScrAutoDisp((VDP2_CELL_SKY ? NBG0ON : 0) | NBG1ON | NBG3ON | (RBG0_DISPLAY ? RBG0ON : 0));  /* +cell sky(NBG0): slScrAutoDisp authors NBG0's B1 cycle into the shadow */
 #endif
 #else
     slScrAutoDisp(NBG0ON | NBG1ON | NBG3ON);
 #endif
 
 #if VDP2_RBG0_TEST
-    /* Commit the RBG0 bank assignment (RDBS) straight to the chip -- the piece SGL would
-       push inside slSynch.  After slScrAutoDisp so RBG0ON is already live; once is enough
-       (the SGL vblank handler re-pushes BGON/scroll, not RAMCTL). */
-    rbg0_commit_ramctl();
-#if RBG0_COMMIT_VIA_SLSYNCH
-    slSynch();                    /* TEST: one-shot full-register commit via SGL's own flush (zero per-frame
-                                    cost).  If the snow dies here, slSynch one-shot is the simplest fix. */
-#else
-    rbg0_commit_cyc();            /* manual block-flush of the shadow register image (no slSynch at all) */
-#endif
-    slCashPurge();               /* TEST (cache hypothesis): flush the SH-2 cache so the RBG0 cells/map/
-                                    K-table SGL wrote via CACHED addresses actually reach VRAM.  Ymir has
-                                    no cache model (renders); HW reads stale VRAM -> snow.  Known trap. */
-    rbg0_draw_debug_readout();    /* hex dump into the framebuffer (B0 survives RBG0; the NBG3 overlay does not) */
+    /* SLSYNCH: no manual RBG0 register commit here.  rbg0_proto_init() (above) authored the SGL
+       VDP2 register shadow (RAMCTL/CYC/coefficient bits via slKtableRA/slCharRbg0/slPageRbg0 +
+       slScrAutoDisp); the first SRL::Core::Synchronize() in DG_DrawFrame flushes that shadow to
+       the chip and DMAs the rotation-parameter table.  (Was: rbg0_commit_ramctl + one-shot
+       slSynch / rbg0_commit_cyc + slCashPurge + the debug hex readout.) */
+    /* SLSYNCH ADVANTAGE -- VDP2 WINDOW: clip the RBG0 floor to BELOW the horizon so its opaque
+       above-horizon overspill no longer covers the NBG0 sky.  These window registers commit via
+       slSynch -- they could NOT without it, which is exactly why rbg0-rework had to use the
+       sky-on-top + transparent-below-horizon hack instead.  Window 0 = rows [SKY_HORIZON_ROW..bottom],
+       full width; RBG0 displays only INSIDE it.  Set once: slSynch re-pushes the shadow each frame. */
+    slScrWindow0(0, SKY_HORIZON_ROW, 319, 223);
+    slScrWindowModeRbg0(win0_IN);   /* RBG0 shows INSIDE window 0 (below horizon).  NB: the VDP2
+                                       window-mode byte is win0_IN=0x03 (slScrWindowMode does a mov.b),
+                                       NOT the VDP1 sprite-clip Window_In (2<<9) which truncates to 0. */
+    /* slScrWindow0/Mode only wrote the SGL shadow (chip offsets 0xC0 / 0xD0+).  The floor's
+       rotation regs (0xB0-0xBE) already reach the chip via slSynch's per-frame shadow DMA (the
+       floor renders), so the window at 0xC0+ is almost certainly covered too -- but one-time flush
+       the window shadow -> chip here as insurance.  These are "set once" regs (nothing rewrites
+       them per frame), so a single copy holds even if slSynch's DMA happens to stop before 0xC0. */
+    {
+        volatile uint8_t *const shadow = (volatile uint8_t *)((uintptr_t)&VDP2_RAMCTL - 0x0E);
+        for (int off = 0xC0; off <= 0xD6; off += 2)
+            *(volatile uint16_t *)(0x25F80000u + off) = *(volatile uint16_t *)(shadow + off);
+    }
 #endif
 
     /* Enable the core sky-skip: R_DrawPlanes leaves the sky region as index 0
        (transparent) so the VDP2 NBG0 sky shows through. */
-    sat_vdp2_sky = VDP2_HW_SKY;   /* 0 = software sky (frees A0 for the RBG0 K-table) */
+    sat_vdp2_sky = (VDP2_HW_SKY || VDP2_CELL_SKY);   /* HW sky: core leaves the sky region index-0 so NBG0 shows through NBG1 */
 #if VDP2_RBG0_TEST
     /* Floor on RBG0 at boot (rbg0_mode 0); pad Y cycles the 3 RBG0/debug modes. */
     sat_vdp2_floor = 1;
@@ -1668,13 +1687,13 @@ extern "C" void DG_Init(void)
        HUD path is left in the file but unhooked.) */
 
 #if VDP1_WALL_TEST
-    /* Route one-sided (solid) walls to the VDP1 world renderer AND skip their
-       software column draw -> see the VDP1 coverage + the perf it buys back. */
-    sat_wall_hook = sat_wall_vdp1;
-    sat_wall_skip = 1;
-    /* kick VDP1 right after the BSP walk (parallel with the CPU floors/sprites) so the
-       walls present the SAME frame as the framebuffer (no 1-frame lag / sky-at-the-seam). */
-    sat_walls_done_hook = sat_walls_kick;
+    /* SLSYNCH Stage 1: walls render in SOFTWARE (into the NBG1 framebuffer).  slSynch owns VDP1
+       and the raw VDP1 wall list is gone, so leave the VDP1 wall hooks UNSET and the software
+       wall draw ENABLED (sat_wall_skip = 0).  Stage 2 re-routes the walls onto SGL's sprite list
+       (slDispSprite4P) here. */
+    sat_wall_hook       = nullptr;
+    sat_wall_skip       = 0;
+    sat_walls_done_hook = nullptr;
 #endif
 
 #if VDP1_FLOOR_TEST
@@ -1757,6 +1776,60 @@ static void sky_upload(void)
     }
     sky_loaded_tex = skytexture;
 }
+
+#if VDP2_CELL_SKY
+/* HW sky as a 256-color NBG0 CELL layer in bank B1 (coexists with the RBG0 bitmap floor; A0/A1/B0
+   untouched).  The 256x128 Doom sky becomes a 32x16 grid of 8x8 cells, tiled 2x across the 512px
+   page so the viewangle scroll wraps; map rows below the horizon reference a transparent filler
+   cell so the floor (clipped to below-horizon by VDP2 window 0) shows there.  Cell index =
+   col*16 + row (column-major); char# = idx*2 (256-color 8x8 = 2 char units); palette bank 1. */
+static void sky_cell_upload(void)
+{
+    unsigned char *cells = (unsigned char *)SKY_CEL_VRAM;
+    unsigned char  nb    = (unsigned char)sat_near_black();
+    for (int ccol = 0; ccol < 32; ++ccol)
+        for (int rx = 0; rx < 8; ++rx)
+        {
+            const unsigned char *src = R_GetColumn(skytexture, ccol * 8 + rx);  /* 128-tall column */
+            for (int crow = 0; crow < 16; ++crow)
+                for (int ry = 0; ry < 8; ++ry)
+                {
+                    unsigned char p = src[crow * 8 + ry];
+                    if (!p) p = nb;                /* keep the sky OPAQUE (0 = transparent code) */
+                    cells[(ccol * 16 + crow) * 64 + ry * 8 + rx] = p;
+                }
+        }
+    memset(cells + SKY_NB_CELL * 64, 0, 64);        /* transparent filler (index 0) for below-horizon */
+    sky_loaded_tex = skytexture;
+}
+
+/* NBG0 sky PN map: sky cells ABOVE the horizon, transparent filler at/below it (the floor shows
+   there via the VDP2 window).  Uncached B1 -> writes land with no purge. */
+static void sky_cell_build_map(void)
+{
+    unsigned short *map = (unsigned short *)SKY_MAP_VRAM;
+    int thresh = SKY_HORIZON_ROW >> 3;   /* cell-row boundary (8px cells) */
+    for (int my = 0; my < 64; ++my)
+        for (int mx = 0; mx < 64; ++mx)
+        {
+            int cellidx = (my < thresh) ? ((mx & 31) * 16 + my) : SKY_NB_CELL;
+            map[my * 64 + mx] = (unsigned short)((cellidx * 2) | 0x1000);  /* char#=idx*2, palette 1 */
+        }
+}
+
+/* One-shot NBG0 cell config + PN map (cells change per level; map is static here). */
+static void sky_cell_init(void)
+{
+    memset((void *)SKY_CEL_VRAM, 0, (SKY_NB_CELL + 1) * 64);
+    memset((void *)SKY_MAP_VRAM, 0, 64 * 64 * 2);
+    slPlaneNbg0(PL_SIZE_1x1);
+    slCharNbg0(COL_TYPE_256, CHAR_SIZE_1x1);
+    slMapNbg0(SKY_MAP_VRAM, SKY_MAP_VRAM, SKY_MAP_VRAM, SKY_MAP_VRAM);
+    slPageNbg0(SKY_CEL_VRAM, 0, PNB_1WORD | CN_12BIT);
+    sky_cell_build_map();
+    slScrPosNbg0(toFIXED(0.0), toFIXED(0.0));
+}
+#endif
 
 /* ------------------------------------------------------------------ */
 /* VDP1 weapon sprite -- player gun on the hardware sprite layer        */
@@ -2787,9 +2860,9 @@ extern "C" void DG_DrawFrame(void)
         console_enabled  = 0;
         sat_console_clear();
         dma_table_build();
-#if VDP1_WEAPON
-        vdp1_wpn_init();
-#endif
+        /* SLSYNCH Stage 1: no raw VDP1 driver init -- slSynch/SRL own VDP1 (slInitSystem put it in
+           SGL's manual-change mode at boot).  Stage 2 will set up the SGL sprite path for the walls
+           here instead. */
         SRL::Debug::Print(0, 1, "FRAME1 OK               ");
     }
 
@@ -2805,6 +2878,19 @@ extern "C" void DG_DrawFrame(void)
     {
         /* Negated: invert the scroll direction (Romain -- the un-negated way felt
            wrong-way round; this was the real issue, not the speed). */
+        int sx = -(int)(viewangle >> (SKY_ANGLESHIFT + SKY_PARALLAX_SHIFT));
+        slScrPosNbg0((FIXED)(sx << 16), toFIXED(-(double)VIEW_Y_OFFSET));
+    }
+#endif
+#endif
+#if VDP2_CELL_SKY
+    if (skytexture > 0 && skytexture != sky_loaded_tex)
+        sky_cell_upload();   /* re-pack the sky into B1 cells on level/episode change */
+#if SKY_FIXED
+    slScrPosNbg0(toFIXED(0.0), toFIXED(-(double)VIEW_Y_OFFSET));   /* static backdrop */
+#else
+    {
+        /* scroll the cell plane by viewangle; the 2x-tiled sky wraps at the 512px page */
         int sx = -(int)(viewangle >> (SKY_ANGLESHIFT + SKY_PARALLAX_SHIFT));
         slScrPosNbg0((FIXED)(sx << 16), toFIXED(-(double)VIEW_Y_OFFSET));
     }
@@ -2850,7 +2936,7 @@ extern "C" void DG_DrawFrame(void)
            1 = dbg + software floor (RBG0 off, NBG3 on, sw floor drawn)
            2 = dbg, no software floor (RBG0 off, NBG3 on, sw floor skipped). */
         sat_vdp2_floor    = (rbg0_mode == 1) ? 0 : 1;        /* mode 1 draws the sw floor; 0,2 skip it */
-        uint16_t sky_bit  = (VDP2_HW_SKY && show_sky) ? NBG0ON : 0;   /* no NBG0 when sky is software */
+        uint16_t sky_bit  = ((VDP2_HW_SKY || VDP2_CELL_SKY) && show_sky) ? NBG0ON : 0;   /* HW sky (cell in B1) shown in-level */
         uint16_t rbg0_bit = (RBG0_DISPLAY && rbg0_mode == 0) ? RBG0ON : 0;   /* HW floor only in mode 0 (off if isolating) */
         uint16_t nbg3_bit = (rbg0_mode == 0) ? 0 : NBG3ON;   /* debug overlay only in modes 1,2   */
         slScrAutoDisp((uint16_t)(sky_bit | NBG1ON | nbg3_bit | rbg0_bit));
@@ -2864,37 +2950,34 @@ extern "C" void DG_DrawFrame(void)
     }
 
 #if VDP2_RBG0_TEST
-    /* When the floor toggle is on: upload the player's floor texture to RBG0 (only when the
-       flat changes), then re-write its rotation params from the matrix each frame.
-       NOTE: slScrMatSet only fills SGL's CACHED RAM buffer + a dirty flag; the RPT VRAM transfer is
-       done by the _BlankIn ISR, armed ONLY by slSynch (disasm-proven, docs/RBG0_STRUCTURED_GARBAGE.md).
-       So the transform never reaches VRAM without RBG0_RPT_TRANSFER below. */
+    /* SLSYNCH: refill the RBG0 bitmap + the rotation-parameter RAM buffer each frame; the per-frame
+       SRL::Core::Synchronize() at the end of this function lands them in VRAM.  slScrMatSet (inside
+       rbg0_set_transform) only fills SGL's cached RAM rpara + sets a dirty flag; slSynch's _BlankIn
+       ISR DMAs that RPT into VRAM and flushes the whole VDP2 register shadow.  No manual RPT memcpy
+       / register block-flush any more (was RBG0_RPT_TRANSFER / rbg0_commit_*). */
     if (rbg0_mode == 0)
     {
         rbg0_upload_flat(sat_vdp2_floor_pic);
         rbg0_set_transform();
-#if RBG0_RPT_TRANSFER == 1
-        slSynch();   /* Test A: per-frame slSynch -> _BlankIn transfers the RPT.  Confirms the cause
-                        (the floor should warp into perspective), but caps fps + mutes SCSP SFX. */
-#elif RBG0_RPT_TRANSFER == 2
-        /* Test B (the real fix): reproduce _BlankIn's RPT DMA, NO slSynch.  Source = SGL's RAM RPT
-           buffer read via the UNCACHED 0x26 alias (so slScrMatSet's cached stores are seen); dest =
-           the RPT VRAM at VDP2_VRAM_B1 + 0x1ff00.  0x30 bytes/plane (RA, then RB at +0x68). */
-        memcpy((void *)0x25E7FF00,          (const void *)0x260FFE1C, 0x30);
-        memcpy((void *)(0x25E7FF00 + 0x68), (const void *)0x260FFE84, 0x30);
-#endif
+        /* BITMAP-FLOOR SHADOW COMMIT (the snow fix's load-bearing piece): slBitMapRbg0 never
+           registered the A1 bitmap bank in the RAMCTL RDBS, and the slScrAutoDisp above just
+           recomputed the cycle pattern from that inconsistent state.  Author the correct RDBS +
+           parked rotation-bank cycle slots into the SGL VDP2 shadow HERE -- after slScrAutoDisp,
+           before the Synchronize() below -- so slSynch flushes a CONSISTENT register image (no bad
+           bank map = no boot-loop; the 2-bank pattern = no snow).  A1 = char/bitmap (RDBS 3),
+           A0 = coefficient (RDBS 1) -- both read via RDBS so their cycle slots park at 0xEEEE;
+           B0 = NBG1 framebuffer (two 8bpp char reads = 0x55EE). */
+        VDP2_RAMCTL = (uint16_t)((VDP2_RAMCTL & 0xFC00u) | 0x0300u | 0x000Du);
+        VDP2_CYCA0L = 0xEEEE; VDP2_CYCA0U = 0xEEEE;   /* A0 coefficient (read via RDBS) */
+        VDP2_CYCA1L = 0xEEEE; VDP2_CYCA1U = 0xEEEE;   /* A1 bitmap      (read via RDBS) */
+        VDP2_CYCB0L = 0x55EE; VDP2_CYCB0U = 0xEEEE;   /* B0 NBG1 framebuffer: two 8bpp reads */
     }
 #endif
 
-#if VDP1_WEAPON
-    /* LAYER INVERSION: VDP1 carries ONLY the walls (below NBG1).  During a LEVEL render the
-       early hook (sat_walls_kick, right after the BSP walk) already flushed+kicked so VDP1
-       presents the same frame.  Only kick HERE when it did NOT fire (menu/intermission: no
-       R_RenderPlayerView) -> the empty bank clears any stale walls.  Both before the
-       palette_changed reset so the wall cache re-tints on a damage/pickup flash. */
-    if (!vdp1_kicked_this_frame) { sat_vdp1_wpn_begin(); vdp1_wpn_kick(); }
-    vdp1_kicked_this_frame = 0;
-#endif
+    /* SLSYNCH Stage 1: VDP1 walls/weapon render in SOFTWARE (into the NBG1 framebuffer).  The raw
+       VDP1 command-list present is gone -- slSynch owns VDP1 and presents an empty SGL sprite list
+       (= transparent).  Stage 2 will rebuild the walls onto SGL's sprite list (slDispSprite4P) so
+       slSynch presents them. */
 
     if (palette_changed)
     {
@@ -2919,11 +3002,9 @@ extern "C" void DG_DrawFrame(void)
     fps_update();
 #endif
 
-    /* SATURN: no per-frame slSynch / SRL::Core::Synchronize here -- the freeze is
-       handled by rp_sgl_workptr_reset() (core/r_parallel.c) resetting BOTH the
-       slave write (GBR+72) and read (GBR+68) pointers each frame.  That avoids
-       slSynch's vblank-cap (~7-12fps) and its SCSP-sound conflict (silent SFX),
-       so we keep the full parallel speed and working sound. */
+    /* SLSYNCH: this branch adopts the canonical SGL frame model.  The framebuffer is blitted to
+       VDP2 VRAM below (slSynch commits NBG registers, never the bitmap pixels), then the single
+       SRL::Core::Synchronize() at the end of this branch owns the present + all commits. */
 
 #if !USE_SCU_DMA
     /* CPU blit fallback (no SCU DMA).  The raw SCU DMA blit below hangs the
@@ -3001,6 +3082,13 @@ extern "C" void DG_DrawFrame(void)
         int clear_rows = (sat_local_players >= 3) ? 224 : (sat_local_players == 2 ? 160 : 192);
         memset(framebuffer, 0, clear_rows * 320);
     }
+    /* SLSYNCH: the canonical per-frame sync (= slSynch + input refresh + timer update).  Blocks
+       until the next graphic-processing window (>= 1 vblank; SynchConst=1), then SGL commits
+       everything for this frame: the VDP1 framebuffer present, the VDP2 register shadow
+       (BGON/scroll/RAMCTL/CYC/priorities), the RBG0 rotation-parameter table (via _BlankIn), and
+       the per-frame slave work-pointer reset.  This single call replaces every hand-rolled commit
+       Mimas used to do to avoid it. */
+    SRL::Core::Synchronize();
     return;
 #endif
 

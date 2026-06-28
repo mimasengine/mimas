@@ -427,7 +427,8 @@ extern "C" int            sat_potato_walls; /* core: solid-colour walls (opaque,
 extern "C" int            sat_wall_nocpu;   /* core: banded/flat -> skip close-wall CPU fallback */
 extern "C" int            sat_local_players; /* core: LIVE local-coop player count (1 = single) */
 extern "C" int            sat_split_vdp1;    /* core: split keeps walls on VDP1 (views 0/1); pad-X A/B */
-extern "C" int            sat_plane_tas;     /* core: TAS.B plane work-steal A/B (pad-C 'ts') */
+extern "C" int            sat_plane_tas;     /* core: TAS.B plane work-steal A/B (pad-C 'pm1') */
+extern "C" int            sat_plane_rowsplit;/* core: row-split plane balancer (pad-C 'pm2') */
 #if VDP1_FLOOR_TEST || SAT_FLOOR_PERFSIM
 extern "C" int            sat_vdp1_floor;   /* core: skip secondary floors/ceilings (=> VDP1 strips) */
 extern "C" int          (*sat_floor_vdp1_hook)(int picnum, int height, int minx, int maxx,
@@ -1120,9 +1121,10 @@ static void fps_update(void)
                 potato_modes[potato_level].name, blit_mode,
                 sat_blit_ms10 / 10, sat_blit_ms10 % 10, sat_plane_steal, sat_wallprep_slave, ccr);
 #else
-        sprintf(r1, "vp%3d %-7s bl%d b%u.%u cc%02x ts%d", r_visplane_peak,
+        sprintf(r1, "vp%3d %-7s bl%d b%u.%u cc%02x pm%d  ", r_visplane_peak,
                 potato_modes[potato_level].name, blit_mode,
-                sat_blit_ms10 / 10, sat_blit_ms10 % 10, ccr, sat_plane_tas);
+                sat_blit_ms10 / 10, sat_blit_ms10 % 10, ccr,
+                sat_plane_rowsplit ? 2 : sat_plane_tas);   /* plane mode: 0 static / 1 TAS / 2 row-split */
 #endif
         SRL::Debug::Print(0, 1, r1);
         {
@@ -2282,7 +2284,7 @@ extern "C" void DG_FadeIn(void)     /* rise the freshly-drawn frame from black *
    so a dense LEFT view -- accumulated first -- can't hog every VDP1 slot.  When the cap is hit the
    hook REJECTS the wall and the core renders it in SOFTWARE (no sky) -- so the cap is also the
    VDP1->CPU starvation handoff. */
-#define WALL_ACC_MAX 160
+#define WALL_ACC_MAX 144   /* 160->144: the row-split code grew .text, reclaim ~0.7KB pool back to the proven ~7KB boot margin (1p peaks ~57 << 144, soft overflow -> CPU, zero in-game change) */
 /* vx/vxr = the view's framebuffer x-range [vx, vxr] this wall belongs to (split-screen: 0..159 for
    the left view, 160..319 for the right).  x1/x2 are stored ALREADY offset by viewwindowx, so the
    emit works in absolute framebuffer coords; vx/vxr drive the per-view user-clip window. */
@@ -3495,11 +3497,17 @@ static void poll_pad(void)
     if ((changed & PER_DGT_TY) && !(cur & PER_DGT_TY))
         rbg0_mode = (rbg0_mode + 1) % 2;
 #if !RBG0_LINECOL_TEST && !RBG0_TUNE_PAD
-    /* Pad C toggles the TAS plane work-steal (sat_plane_tas, overlay row1 'ts'): both SH-2 claim
-       planes via atomic TAS.B meet-in-the-middle instead of the static half-split -- watch w /
-       SLVidle (row 3); ts1 should drop the master-wait.  (C also taps RSHIFT/run -- harmless.) */
+    /* Pad C cycles the plane-split mode (overlay row1 'pm'): 0 = static half-split, 1 = TAS plane
+       work-steal, 2 = ROW-SPLIT (the universal balancer -- both SH-2 split the screen ROWS, so a
+       dominant plane is balanced too, which pm0/pm1 cannot).  Watch w / SLVidle (row 3): pm2 should
+       drop the master-wait in dominant-plane rooms.  (C also taps RSHIFT/run -- harmless.) */
     if ((changed & PER_DGT_TC) && !(cur & PER_DGT_TC))
-        sat_plane_tas = !sat_plane_tas;
+    {
+        static int pmode = 1;   /* boot default = TAS (sat_plane_tas=1); first press -> row-split */
+        pmode = (pmode + 1) % 3;
+        sat_plane_tas      = (pmode == 1);
+        sat_plane_rowsplit = (pmode == 2);
+    }
 #endif
 #if RBG0_NBG3
     /* Pad L+R (chord) toggles the NBG3 debug overlay (default OFF).  The B1 cycle is reserved at

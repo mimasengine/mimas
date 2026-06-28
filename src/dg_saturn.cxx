@@ -427,6 +427,7 @@ extern "C" int            sat_potato_walls; /* core: solid-colour walls (opaque,
 extern "C" int            sat_wall_nocpu;   /* core: banded/flat -> skip close-wall CPU fallback */
 extern "C" int            sat_local_players; /* core: LIVE local-coop player count (1 = single) */
 extern "C" int            sat_split_vdp1;    /* core: split keeps walls on VDP1 (views 0/1); pad-X A/B */
+extern "C" int            sat_plane_tas;     /* core: TAS.B plane work-steal A/B (pad-C 'ts') */
 #if VDP1_FLOOR_TEST || SAT_FLOOR_PERFSIM
 extern "C" int            sat_vdp1_floor;   /* core: skip secondary floors/ceilings (=> VDP1 strips) */
 extern "C" int          (*sat_floor_vdp1_hook)(int picnum, int height, int minx, int maxx,
@@ -1119,9 +1120,9 @@ static void fps_update(void)
                 potato_modes[potato_level].name, blit_mode,
                 sat_blit_ms10 / 10, sat_blit_ms10 % 10, sat_plane_steal, sat_wallprep_slave, ccr);
 #else
-        sprintf(r1, "vp%3d %-7s bl%d b%u.%u cc%02x", r_visplane_peak,
+        sprintf(r1, "vp%3d %-7s bl%d b%u.%u cc%02x ts%d", r_visplane_peak,
                 potato_modes[potato_level].name, blit_mode,
-                sat_blit_ms10 / 10, sat_blit_ms10 % 10, ccr);
+                sat_blit_ms10 / 10, sat_blit_ms10 % 10, ccr, sat_plane_tas);
 #endif
         SRL::Debug::Print(0, 1, r1);
         {
@@ -3493,6 +3494,13 @@ static void poll_pad(void)
        that matter for the side-by-side.  (Y also taps 'y' to Doom -- harmless.) */
     if ((changed & PER_DGT_TY) && !(cur & PER_DGT_TY))
         rbg0_mode = (rbg0_mode + 1) % 2;
+#if !RBG0_LINECOL_TEST && !RBG0_TUNE_PAD
+    /* Pad C toggles the TAS plane work-steal (sat_plane_tas, overlay row1 'ts'): both SH-2 claim
+       planes via atomic TAS.B meet-in-the-middle instead of the static half-split -- watch w /
+       SLVidle (row 3); ts1 should drop the master-wait.  (C also taps RSHIFT/run -- harmless.) */
+    if ((changed & PER_DGT_TC) && !(cur & PER_DGT_TC))
+        sat_plane_tas = !sat_plane_tas;
+#endif
 #if RBG0_NBG3
     /* Pad L+R (chord) toggles the NBG3 debug overlay (default OFF).  The B1 cycle is reserved at
        init (slScrAutoDisp(NBG3ON) + no scrub), so this only flips BGON.  (L/R also tap ','/'.' to

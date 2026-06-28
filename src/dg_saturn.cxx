@@ -2271,11 +2271,17 @@ extern "C" void DG_FadeIn(void)     /* rise the freshly-drawn frame from black *
    SPLIT-SCREEN shares this ONE command bank/budget across BOTH half-views (accumulated together,
    kicked once).  The cap MUST stay <= the budget: the flush guarantees >=1 flat per wall only while
    wall_acc_n <= budget; a larger accumulator makes `used+1+remaining > budget` fire for the NEAREST
-   walls instead (they vanish).  So it stays 240 (a 480 would break that); a per-view SOFT cap in the
-   hook (below) reserves the upper half for the right view so a dense LEFT view -- accumulated first
-   -- can't hog every VDP1 slot.  When the cap is hit the hook REJECTS the wall and the core renders
-   it in SOFTWARE (no sky) -- so the cap is also the VDP1->CPU starvation handoff. */
-#define WALL_ACC_MAX 240
+   walls instead (they vanish).  Stays <= the ~248 budget (a 480 would break that).  SET TO 160 (not
+   240): on the current core 240->3520B / 248->3168B TLSF pool BOOT-LOOP, 160->~7KB BOOTS (the
+   tlsf-create floor rose to ~3.5KB+ with the rbg0-rework SRL init allocs -- see boot-loop memory).
+   160 also leaves headroom for the Tier-1 span-steal spanjobs[] .bss.  SOFT consequence: 1p never
+   hits the cap (identical to 240); only the densest rooms / 4-way split bump a few far walls -- and
+   per below those go to CPU SOFTWARE (graceful, never a missing wall; the old 128 "clipping" predates
+   this fallback).  A per-view SOFT cap in the hook (below) reserves the upper half for the right view
+   so a dense LEFT view -- accumulated first -- can't hog every VDP1 slot.  When the cap is hit the
+   hook REJECTS the wall and the core renders it in SOFTWARE (no sky) -- so the cap is also the
+   VDP1->CPU starvation handoff. */
+#define WALL_ACC_MAX 160
 /* vx/vxr = the view's framebuffer x-range [vx, vxr] this wall belongs to (split-screen: 0..159 for
    the left view, 160..319 for the right).  x1/x2 are stored ALREADY offset by viewwindowx, so the
    emit works in absolute framebuffer coords; vx/vxr drive the per-view user-clip window. */

@@ -128,6 +128,11 @@ extern "C" char *gamedescription;
    if that is ever cracked.  Doom needs no SGL z-sort (walls are emitted far->near = painter's). */
 #define VDP1_RAW_WALLS 1
 
+/* DÉCROCHAGE DIRECTION TEST (CONCLUDED 2026-06-28): delaying VDP1 +1 frame made the skew WORSE ->
+   VDP1 is already BEHIND the CPU/NBG1 layer by ~1 vblank = the slSynch VDP1 framebuffer-swap latency
+   (NBG1 is a direct 0-latency bitmap).  Back to 0. */
+#define SAT_VDP1_DELAY1 0
+
 /* SLSYNCH Stage 2 bring-up diagnostic: two magenta boxes (LEFT via slDispSprite4P, RIGHT via the
    wall's slSetSprite path) to localise why the walls still don't show.  SAFE now (direct-store
    texture, no slDMACopy).  Set 0 once resolved. */
@@ -163,7 +168,10 @@ extern "C" char *gamedescription;
    last COMPLETE frame and only swaps when the draw finished (EDSR CEF), triggered from the
    existing OnVblank -- i.e. vsync the VDP1 presentation WITHOUT slSynch (no fps tax, no SCSP
    sound conflict, no latency: the CPU never waits).  1 = on (anti-tear), 0 = old auto swap. */
-#define VDP1_MANUAL_CHANGE 0   /* BISECT: 0 = revert 3faaa95's manual-change present -> 1-cycle auto (test if the VDP1 walls come back, with tearing) */
+#define VDP1_MANUAL_CHANGE 0   /* DÉCROCHAGE KILL attempt (2026-06-28): manual VDP1 swap had NO EFFECT
+                                  on Ymir -> slSynch re-asserts the VDP1 swap each frame and overrides
+                                  our manual mode (it genuinely owns the swap).  Reverted to 0 (let
+                                  slSynch own it).  Kept as a compile toggle for HW re-test. */
 
 extern "C" byte *I_VideoBuffer;
 extern "C" int   gametic;
@@ -955,6 +963,9 @@ extern "C" int rp_timeout_count;
 extern "C" unsigned int rp_master_ms;   /* master frame ms -> prefixes r_parallel.c's row-18 SLV line */
 static unsigned int dg_frame_count = 0;
 static int vdp1_last_cmds = 0;
+/* Live VDP1 wall counters (defined later, in vdp1_walls_flush) -- forward-declared so the row-2
+   "VD1" overlay can show the REAL VDP1 capacity instead of the dead vdp1_wpn_kick metric. */
+extern int g_dbg_wall_emit, g_dbg_wall_acc;
 
 /* SATURN PERF (2026-06-24): windowed REC stats exported by core/r_parallel.c (set on the
    ship path's rp_p3_prof_show), surfaced on the 1/s overlay tick + reset by RP_ProfReset
@@ -1142,10 +1153,13 @@ static void fps_update(void)
                Post-8bpp the VDP1 CAN finish within a frame, so Dr is a live VDP1-floor
                headroom signal (high Dr => spare budget for floor strips).  b:__TIME__ =
                build stamp (build.ps1 touches this file so it refreshes). */
-            unsigned int dr = vd1_win_tot ? (vd1_win_done * 100u / vd1_win_tot) : 0;
+            /* row 2 VDP1 CAPACITY (fixed -- was the dead vdp1_wpn_kick "Dr" metric, always 0D Dr0%):
+               cmd = command slots used this frame, acc = walls accumulated, ED = live EDSR
+               (3 = draw done).  b:__TIME__ = build stamp (build.ps1 touches this file). */
             static char r2v[45];
-            snprintf(r2v, sizeof r2v, "VD1 %d%c Dr%u%% b:" __TIME__,
-                    vdp1_last_cmds, vdp1_prev_done ? 'D' : 'B', dr);
+            snprintf(r2v, sizeof r2v, "VD1 cmd%d acc%d ED%x b:" __TIME__,
+                    g_dbg_wall_emit, g_dbg_wall_acc,
+                    (int)*(volatile unsigned short *)0x25D00010);
             SRL::Debug::Print(0, 2, r2v);
             /* row 4: WINDOWED REC distribution p50/p95/max (tenths-ms) -- robust to the
                single-outlier max (a lone CD hitch) AND to an arbitrary threshold.  p50 =
@@ -1935,6 +1949,13 @@ static int          vdp1_wbank;    /* bank being written this frame */
 static int          vdp1_wnext;    /* next command slot in the write bank */
 static int          vdp1_wactive;  /* 1 = R_DrawPlayerSprites ran this frame */
 static unsigned int vdp1_hud_csum = 0xFFFFFFFFu;  /* status-bar change detector */
+#if VDP1_MANUAL_CHANGE
+/* DÉCROCHAGE KILL: manual VDP1 framebuffer swap state (declared here so vdp1_raw_present, which
+   runs earlier in the file, can arm it).  present_pending = a freshly-plotted frame awaits its
+   swap; present_wd = vblanks waited (Ymir never sets EDSR.CEF, so a watchdog forces the swap). */
+static volatile int vdp1_present_pending = 0;
+static volatile int vdp1_present_wd = 0;
+#endif
 
 /* HUD on VDP1: the status bar (framebuffer rows 168-199, drawn by ST_Drawer) is
    re-drawn as a VDP1 sprite -- appended AFTER the weapon so it sits ON TOP of it
@@ -2769,52 +2790,59 @@ static void vdp1_raw_present(void)
     { volatile unsigned short *s = (volatile unsigned short *)(VDP1_BANK[wbank] + (unsigned int)vdp1_wnext * 0x20u);
       for (int i = 0; i < 16; ++i) s[i] = cmd[i]; }
 
-    /* THE FLIP: root @0x25C00000 = sysclip + JUMP_ASSIGN -> the freshly-built (complete) bank.  The
-       OLD bank is untouched while we build the new one, so VDP1 always plots a complete list.  CTRL
-       and clip are constant each frame; only the JUMP link (cmd[1]) actually changes -> even a
-       mid-write read by VDP1 lands on a valid bank.  Re-written every frame because SGL may touch
-       VRAM 0 under slSynch.  (sysclip + JUMP_NEXT did NOT reach the local-coord -> JUMP_ASSIGN.) */
+    /* DÉCROCHAGE DIRECTION TEST (SAT_VDP1_DELAY1): point the root at LAST frame's bank (vdp1_bank --
+       built last frame, still intact) instead of THIS frame's (wbank) -> VDP1 shows 1 frame LATE.
+       If this ALIGNS VDP1 with the CPU layer, VDP1 was running AHEAD (NBG1 is the laggard) -> fix =
+       keep this delay / stop early-plotting.  If it DOUBLES the skew, VDP1 was already behind -> fix
+       = delay NBG1 (double-buffer it).  No extra memory; race-safe (build wbank, plot show_bank,
+       wbank != vdp1_bank).  0 = normal (show this frame's bank). */
+#if SAT_VDP1_DELAY1
+    int show_bank = vdp1_bank;                        /* last frame's bank -> +1 frame VDP1 delay */
+#else
+    int show_bank = wbank;                            /* this frame's freshly-built bank -> 0 delay */
+#endif
+    /* THE FLIP: root @0x25C00000 = sysclip + JUMP_ASSIGN -> a COMPLETE bank.  Only the JUMP link
+       (cmd[1]) changes per frame; re-written every frame because SGL may touch VRAM 0 under slSynch. */
     memset(cmd, 0, sizeof cmd);
     cmd[0] = (unsigned short)(0x0009 | 0x1000);       /* system clip + JUMP_ASSIGN */
-    cmd[1] = (unsigned short)((VDP1_BANK[wbank] - VDP1_VRAM_BASE) >> 3);  /* link -> bank[wbank] slot 0 */
+    cmd[1] = (unsigned short)((VDP1_BANK[show_bank] - VDP1_VRAM_BASE) >> 3);  /* link -> bank[show_bank] */
     cmd[10] = 319; cmd[11] = 223;                     /* clip lower-right = screen */
     { volatile unsigned short *s = (volatile unsigned short *)(VDP1_ROOT_ADDR + 0u * 0x20u);
       for (int i = 0; i < 16; ++i) s[i] = cmd[i]; }
 
-    vdp1_bank = wbank;                                /* the freshly-built bank is now the active one */
-    /* NO manual PTMR and NO FBCR/erase pokes: slSynch (called right after this, in DG_DrawFrame) OWNS
-       the VDP1 plot + erase + swap.  This runs BEFORE Synchronize, so slSynch plots OUR root->bank
-       for THIS frame -> walls match the CPU/NBG1 layer (no lag) and are plotted exactly ONCE (a
-       manual PTMR was the 2nd, accumulating draw; poking FBCR/PTMR fought slSynch -> menu freeze). */
+    vdp1_bank = wbank;                                /* this frame's built bank (next frame builds the other) */
+    /* EARLY PLOT (décrochage fix): trigger the VDP1 plot NOW so it rasterises DURING the CPU blit and
+       FINISHES before the vblank -> the vblank swap shows THIS frame's walls, 0-latency, matching the
+       NBG1 bitmap (which is also 0-latency: blitted straight into VDP2 VRAM).  Without this, VDP1's
+       1-cycle plot-at-vblank shows one frame LATE while NBG1 shows current -> the ~1-frame skew at the
+       wall seam.  Reference projects (fafling/retail Doom, SlideHop) likewise plot in parallel with the
+       CPU.  PTMR=0x02 (one-shot) -- safe (0x01 continuous was the slSynch wait-for-CEF freeze); the
+       in-list erase polygon (bank slot 1) clears before the walls, so a 2nd slSynch plot can't pile up. */
+    VDP1_PTMR = 0x0002;
+#if VDP1_MANUAL_CHANGE
+    /* DÉCROCHAGE KILL: arm the OnVblank presenter to swap THIS freshly-plotted buffer at the next
+       vblank (on CEF, or the watchdog on Ymir) -> VDP1 shows this frame at the SAME vblank as NBG1,
+       killing the 1-vblank slSynch swap lag.  vdp1_vblank_present owns the FBCR swap now. */
+    vdp1_present_wd = 0;
+    vdp1_present_pending = 1;
+#endif
 
 #if SAT_VDP1_SPRITE_DIAG
-    /* Print the ACTUAL emitted wall corner extent + view config -- no more guessing.
-         x0..x1 = full-width (0..319) => coords fine, shift is in VDP1/local-coord
-         x0..x1 = right-half (~160..319) => coords already shifted upstream (renderer/accumulator) */
-    /* emit = VDP1 cmds written, acc = walls accumulated, ED = LIVE EDSR (3=draw done, 1=began/not
-       done => overrun/incomplete -> missing walls).  (The old row-2 "VD1 ..Dr0%" is the DEAD
-       manual-present metric, stale under the hybrid -- ignore it.) */
+    /* VDP1 capacity (cmd/acc/ED) now lives on the row-2 "VD1" overlay line -- this row removed to
+       de-clutter.  Keep ONLY the wall-route tally: cull = floor-culled (drawn by NEITHER VDP1 nor
+       CPU), part = partial-below-floor -> CPU, cpu = close/magnified -> CPU, v1 = VDP1 hook. */
     char line[45];
-    sprintf(line, "emit%d acc%d ED%x Wx%d..%d",
-            g_dbg_wall_emit, g_dbg_wall_acc,
-            (int)*(volatile unsigned short *)0x25D00010,
-            (int)g_dbg_xmin, (int)g_dbg_xmax);
-    dbg_row_padded(11, line);
-    /* WHERE the wall tiers went this frame (sum = visible textured tiers).  cull = floor-culled
-       (drawn by NEITHER VDP1 nor CPU) -> if this is large, the RBG0 floor-cull is eating walls.
-       v1 = VDP1 hook, cpu = close/magnified -> CPU, part = partially-below-floor -> CPU. */
-    sprintf(line, "cull%d part%d cpu%d v1%d",
+    sprintf(line, "WALLS cull%d part%d cpu%d v1%d",
             sat_dbg_cull, sat_dbg_part, sat_dbg_cpu, sat_dbg_v1);
-    dbg_row_padded(12, line);
+    dbg_row_padded(11, line);
     sat_dbg_cull = sat_dbg_part = sat_dbg_cpu = sat_dbg_v1 = 0;   /* reset for the next frame's BSP */
 #endif
 }
 #endif
 
 #if VDP1_MANUAL_CHANGE
-/* Set by the kick after a plot is triggered: "a new frame is being drawn; present it (swap
-   the VDP1 framebuffers) once its draw completes."  Read/cleared by the vblank handler. */
-static volatile int vdp1_present_pending = 0;
+/* (vdp1_present_pending / vdp1_present_wd are declared up near vdp1_bank so vdp1_raw_present can
+   arm them -- that function is defined earlier in the file.) */
 
 /* Wait one field (init only): used to space the two startup erases a frame apart so each
    manual change actually executes (FBCR latches but runs at the next field). */
@@ -2832,10 +2860,18 @@ static void vdp1_wait_field(void)
    frame is held.  No fps/latency cost: we don't wait, the swap is just deferred to draw-done. */
 static void vdp1_vblank_present(void)
 {
-    if (vdp1_present_pending && (VDP1_EDSR & 0x0002))
+    if (vdp1_present_pending)
     {
-        VDP1_FBCR = 0x0003;          /* manual change: swap + erase the new back buffer */
-        vdp1_present_pending = 0;
+        /* Swap when the draw finished (EDSR.CEF=bit1) OR after a 1-vblank watchdog.  The plot is
+           triggered EARLY (before the blit), so it completes within the frame -> the first vblank
+           is safe to swap on.  The watchdog is REQUIRED on Ymir, which doesn't model manual-mode
+           draw-end (CEF never sets -> without it the walls would freeze). */
+        if ((VDP1_EDSR & 0x0002) || (++vdp1_present_wd >= 1))
+        {
+            VDP1_FBCR = 0x0003;          /* manual change: swap + erase the new back buffer */
+            vdp1_present_pending = 0;
+            vdp1_present_wd = 0;
+        }
     }
 }
 #endif
@@ -2874,11 +2910,28 @@ static void vdp1_wpn_init(void)
     wtex_tick = 0; wall_acc_n = 0;
 #endif
 
+#if VDP1_MANUAL_CHANGE
+    /* DÉCROCHAGE KILL: take the VDP1 framebuffer swap from slSynch.  Put VDP1 in MANUAL change mode
+       (FCM sticky) so it does NOT auto-swap each vblank (that's the 1-vblank lag); WE swap the
+       finished buffer at the vblank (vdp1_vblank_present) so VDP1 shows the same frame as NBG1.
+       Set the full-screen erase region, clear BOTH framebuffers (two changes a field apart), then
+       register the OnVblank presenter.  (If slSynch re-asserts FBCR each frame and fights this, the
+       symptom will be tearing/double-swap or a freeze -> revert VDP1_MANUAL_CHANGE to 0.) */
+    VDP1_TVMR = 0x0000;                              /* 16bpp, VBE=0 */
+    VDP1_EWDR = 0x0000;                              /* erase colour 0 = VDP2-transparent */
+    VDP1_EWLR = 0x0000;
+    VDP1_EWRR = (unsigned short)(((320 >> 3) << 9) | 223);   /* erase region = full screen */
+    VDP1_PTMR = 0x0000;                              /* no draw yet */
+    VDP1_FBCR = 0x0003; vdp1_wait_field();           /* change + erase back buffer #1 */
+    VDP1_FBCR = 0x0003; vdp1_wait_field();           /* change + erase back buffer #2 (both clear) */
+    SRL::Core::OnVblank += vdp1_vblank_present;       /* we own the swap from here */
+#else
     /* NO VDP1 TVMR/FBCR/PTMR/EWxx pokes here: slSynch OWNS the VDP1 erase + framebuffer change +
        plot under this branch.  Poking FBCR/PTMR fought slSynch (PTMR=0x01 deadlocked its
        wait-for-CEF -> menu freeze; FBCR=0 changed the mode out from under it).  We only provide the
        root + a valid empty bank so slSynch always has a complete list to plot; the per-frame present
        flips the root to the freshly-built wall bank BEFORE Synchronize so slSynch plots it. */
+#endif
 }
 
 /* core hook: begin this frame's player-sprite list in the OFF-screen bank. */
@@ -3228,6 +3281,15 @@ extern "C" void DG_DrawFrame(void)
        VDP2 VRAM below (slSynch commits NBG registers, never the bitmap pixels), then the single
        SRL::Core::Synchronize() at the end of this branch owns the present + all commits. */
 
+#if VDP1_WALL_TEST && VDP1_RAW_WALLS
+    /* DÉCROCHAGE FIX: build + flip + EARLY-PLOT the VDP1 walls HERE, BEFORE the blit, so the plot
+       rasterises in parallel with the CPU/slave blit and completes before the vblank.  The vblank
+       swap then shows THIS frame's walls (0-latency), matching the NBG1 bitmap (also 0-latency) ->
+       no 1-frame skew at the VDP1/CPU wall seam.  (Was after Synchronize = plotted too late = the
+       1-cycle plot-at-vblank shows one frame late = the décrochage.) */
+    vdp1_raw_present();
+#endif
+
 #if !USE_SCU_DMA
     /* CPU blit fallback (no SCU DMA).  The raw SCU DMA blit below hangs the
        SH-2 bus on real hardware; until that is fixed properly this plain CPU
@@ -3304,16 +3366,8 @@ extern "C" void DG_DrawFrame(void)
         int clear_rows = (sat_local_players >= 3) ? 224 : (sat_local_players == 2 ? 160 : 192);
         memset(framebuffer, 0, clear_rows * 320);
     }
-#if VDP1_WALL_TEST && VDP1_RAW_WALLS
-    /* SYNCHRONISED VDP1 walls: build THIS frame's command bank + flip the root JUMP-link to it
-       BEFORE Synchronize, so the slSynch frame plots OUR root->bank itself (slSynch DOES plot the
-       VDP1 command list, proven by the old double-plot accumulation) -- a SINGLE plot, this frame,
-       into the buffer slSynch erases + swaps.  => no 1-frame lag (walls match the CPU/NBG1 layer,
-       killing the décalage) and no double-plot pile-up.  The double-buffer keeps it race-free:
-       slSynch always reads a COMPLETE bank (we only flip the root once the bank is fully built).
-       No manual PTMR -- slSynch owns the plot/erase/swap (a manual PTMR was the 2nd, accumulating draw). */
-    vdp1_raw_present();
-#endif
+    /* (VDP1 walls were already built + early-plotted ABOVE, before the blit, for 0-latency same-frame
+       present -- see the décrochage-fix block.) */
 #if VDP1_WALL_TEST && !VDP1_RAW_WALLS
     sat_vdp1_wpn_begin();   /* FULL SGL (parked): flush walls onto SGL's sprite sort BEFORE Synchronize */
 #endif

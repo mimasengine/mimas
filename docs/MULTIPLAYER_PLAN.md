@@ -4,32 +4,27 @@
 the 2-view sequential render, Iter 4's HUD). Still TODO: 4-player HUD, DM polish, auto/forced
 potato in MP.
 
-> **RECONCILED 2026-06-24.** parallel-REC is SHIPPED — but as a **WITHIN-VIEW phase-split**
-> (P3 plane-split + masked-by-half, the slave draws half the visplanes and the right-half
-> sprites of *each* view), **NOT** the per-CPU 2nd-renderer this plan describes. The full
-> per-CPU `R_RenderPlayerView` on the slave (Iter 2/3 x-split) was **REJECTED** — it overflows
-> the Saturn's 2MB (`r_main.c:1186`, the `RP_SLAVE_BUILD` dual-compile was removed). 2p views
-> render **sequentially on the master**, with the slave doing P3+masked phase work within each.
-> The +25% 1p x-split bonus and "4p ≈ today's 1p fps" headlines below rest on that rejected
-> path and are unreachable as written. See per-section RECONCILED notes.
-**Target:** **4-player local split-screen**, potato floor, VDP1 walls, **REC parallelised across both SH-2**.
+> **RECONCILED — present reality.** Multi-view IS shipped, but every view renders
+> **sequentially on the master**; the slave contributes a **WITHIN-VIEW phase-split**
+> (P3 plane-split + masked-by-half — the slave draws half the visplanes and the right-half
+> sprites of *each* view). The per-CPU 2nd-renderer this plan was originally built around
+> (a full `R_RenderPlayerView` on the slave, the Iter 2/3 x-split) was **REJECTED** — it
+> overflows the Saturn's 2MB (`r_main.c:1186`, the `RP_SLAVE_BUILD` dual-compile was removed).
+> Everything below that depends on that 2nd-renderer (the +25% 1p x-split bonus, "4p ≈ today's
+> 1p fps") is **historical/theoretical-only**. Plane work-steal ("TAS") later SHIPPED default-on
+> (core `73f8cdc` / parent `4857f87`); only **wall-prep→slave** is confirmed dead.
+**Target:** **4-player local split-screen**, software floor (split fallback), VDP1 walls.
 **Scope:** *local* split-screen only. No link-cable / no netcode (`FEATURE_MULTIPLAYER` stays off). Coop first, then DM.
 
 This file is the resume point. Iterations are independently testable; do them in order.
 
-> **Strategy (decided 2026-06-19).** Shared-view coop was dropped — a single camera is nonsense for an
-> FPS. The real architecture: **floor = potato software** (sidesteps the RBG0 single-matrix limit),
-> **walls = VDP1** (capacity-validated for 2/4 players, ceiling is REC×N — see [[doomsrl-vdp1-capacity]]),
-> and the bottleneck is **REC generation, which is master-only today while the slave is ~80% idle**. So
-> the lever is: **make the idle slave render too.** The unit of work is a task = **`(player, x-range)`**,
-> partitioned so both CPUs are always busy:
-> - 1 player → split by **x** (left/right) → **1-player speed bonus** (the same mechanism serves 1p).
-> - 2 players → one per CPU.
-> - 4 players → two per CPU.
->
-> This is "global" REC sharing that **also benefits single-player**, and it avoids the producer/consumer
-> coherency hazard that got the intra-view `Bw‖Bp` / plane-offload splits **rejected** ([[doomsrl-perf]]):
-> spatially-disjoint tasks each own their render state — no two CPUs write the same visplanes/clip.
+> **Note (historical strategy, 2026-06-19).** Shared-view coop was dropped — a single camera is
+> nonsense for an FPS. The shipped dominant flat now goes to the **RBG0 hardware bitmap floor**
+> (see [VDP2_RBG0_CURRENT_STATE.md](VDP2_RBG0_CURRENT_STATE.md)); the **software ("potato") floor
+> is the MP/split fallback** (RBG0's single transform matrix can't serve multiple viewangles).
+> **Walls = VDP1** (capacity-reviewed for 2/4 players; see [VDP1_PRESENT_SYNC_PLAN.md](VDP1_PRESENT_SYNC_PLAN.md)
+> for the present/sync model). The plan's original `(player, x-range)` per-CPU 2nd-renderer lever
+> (1p x-split / one-per-CPU / two-per-CPU) was **REJECTED** (2MB overflow); kept below for history only.
 
 ---
 
@@ -156,20 +151,13 @@ slave can't also dual-CPU-blit in MP — it's busy rendering**, so MP keeps the 
 | Config | Views × size | Tasks (per CPU) | Σ REC work | REC wall-clock (÷S=1.5) | Frame | fps | vs 1p today |
 |--------|--------------|------------------|-----------|--------------------------|-------|-----|-------------|
 | **1p today** | 1 × 320×192 | 1 (master) | 48 | 48 | 76 | ~13 | — |
-| **1p x-split (bonus)** | 1 × 320×192 | 2 (1+1) | 50.4 | **33.6** | 61.6 | **~16** | **+25 %** |
-| **2p vertical** | 2 × 160×192 | 2 (1+1) | 50.4 | 33.6 | 61.6 | ~16 | +25 % |
-| **2p horizontal** | 2 × 320×96 | 2 (1+1) | 77 | 51 | 79 | ~13 | ~0 % |
-| **4p quadrants** | 4 × 160×96 | 4 (2+2) | 81.8 | **54.5** | 82.5 | **~12** | −7 % |
 
-Headline (if S≥1.4 and Bw stays modest): **4 players ≈ today's 1-player fps**, and a **free ~+25 %
-single-player bonus** from the same machinery. *RECONCILED 2026-06-24: REJECTED — both headlines
-depend on the per-CPU 2nd-renderer that overflows 2MB and was removed (see §3.3 note).* Sensitivity
-at the range ends:
-
-| Config | S=1.4 | S=1.8 |
-|--------|-------|-------|
-| 1p x-split REC | 36.0 | 28.0 |
-| 4p quadrant REC | 58.4 | 45.4 |
+The 1-view baseline row above is the measured anchor (Bw 8 · Bp 21 · P 15 · M 4 → REC ≈ 48 ms).
+The per-CPU task rows (1p x-split bonus, 2p/4p quadrants) and the "**4 players ≈ today's 1-player
+fps**" / "**free ~+25 % single-player bonus**" headlines — plus the S=1.4/1.8 sensitivity table —
+all assumed the per-CPU 2nd-renderer that overflows 2MB and was removed (`r_main.c:1186`). They are
+**historical/theoretical only**, not reproducible as written; the shipped multi-view path renders
+sequentially on the master (see §3.3 note above).
 
 ### 3.4 Caveats that cap the optimism (read these)
 

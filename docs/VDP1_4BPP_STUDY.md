@@ -1,5 +1,16 @@
 # VDP1 4bpp vs 8bpp — étude du passage 8bpp → 4bpp pour Mimas
 
+> **STATUT (révisé 2026-06-29) — verdict murs TOUJOURS VALIDE ; volet « sol VDP1 » OBSOLÈTE.**
+> Le verdict de fond tient : **ne PAS migrer les murs en 4bpp ; garder le 8bpp index-brut +
+> banques CRAM** (§2, §5, §6 — données mesurées intactes). En revanche tout ce qui motivait le
+> 4bpp comme *enabler du sol VDP1* est caduc : **le sol/flat dominant est parti sur RBG0**, livré
+> en bitmap 8bpp 512×256 propre (`RBG0_BITMAP=1`, voir [`VDP2_RBG0_CURRENT_STATE.md`](VDP2_RBG0_CURRENT_STATE.md)).
+> Le **sol VDP1 reste un pari NON SHIPPÉ** ([`VDP1_WORLD_PLAN.md`](VDP1_WORLD_PLAN.md)) ; les
+> sections qui le supposaient (§4, ligne « flats » de §8, leviers sol de §9, Q1/Q4 de §10) sont
+> conservées comme **conditionnelles à un sol VDP1 qui n'existe pas**. Pour la réalité du floor,
+> voir **[`VDP2_RBG0_CURRENT_STATE.md`](VDP2_RBG0_CURRENT_STATE.md)** ; pour le present VDP1↔NBG1,
+> **[`VDP1_PRESENT_SYNC_PLAN.md`](VDP1_PRESENT_SYNC_PLAN.md)**.
+>
 > Document de décision. Date : 2026-06-26. Public : Romain.
 > Objet : étudier le passage des textures VDP1 de 8bpp (256-couleurs color-bank, l'état
 > shippé) vers 4bpp (16-couleurs) — ce qu'on y gagne, ce que ça ouvre, ce qu'on y perd, et
@@ -22,10 +33,11 @@
 Le 4bpp n'est **ni** un tweak gratuit **ni** la catastrophe qu'on croit : son **seul gain**
 est la VRAM (texel ½ octet), son **seul coût irréductible** est la **quantization destructive
 256→16 couleurs par texture**, et tout le reste (lighting, flash) dépend d'un **choix de
-sous-mode** que l'analyse naïve rate. **Recommandation : ne PAS migrer les murs ; faire naître
-le sol VDP1 directement en 4bpp pour ses flats** — c'est le seul endroit où le ½-octet/texel
-compte (VRAM serrée), où la quantization est indolore (flats ~0 RMS) et où il n'y a pas de
-seam (surface 100%-VDP1, jamais software).
+sous-mode** que l'analyse naïve rate. **Recommandation (toujours valide) : ne PAS migrer les
+murs en 4bpp — garder le 8bpp index-brut + banques CRAM.** (Le second volet historique « faire
+naître le sol VDP1 en 4bpp pour ses flats » est **caduc** : le sol dominant est parti sur RBG0
+bitmap, voir le banner et [`VDP2_RBG0_CURRENT_STATE.md`](VDP2_RBG0_CURRENT_STATE.md). Les
+sections qui en parlent restent conditionnelles à un sol VDP1 non shippé.)
 
 > **⚠️ Cadrage (Romain, 2026-06-26) — le 4bpp ne touche PAS le problème VDP1 #1.** Le levier
 > 4bpp est **VRAM/stockage** ; le problème dur du VDP1 est l'**overdraw** (itération des pixels
@@ -110,23 +122,22 @@ seul gain qui compte est le scénario A** : les 224KB libérés.
 
 ---
 
-## 4. Ce que ça OUVRE — le sol VDP1 sans le « cull obligatoire »
+## 4. Ce que ça OUVRAIT — le sol VDP1 (volet CADUC : le sol est parti sur RBG0)
 
-C'est le vrai potentiel. Le plan sol VDP1 ([`VDP1_WORLD_PLAN.md §7.2`](VDP1_WORLD_PLAN.md))
-exige une banque commande F dédiée (16KB) + un cache flat (32KB) = **48KB**, dans une VRAM
-512KB si serrée qu'il faut un **cull obligatoire** qui *réduit le cache mur de 448→416KB*
-(perd 2 slots narrow, surveille `bk` row 16).
+> **OBSOLÈTE (2026-06-29).** Cette section motivait le 4bpp comme *enabler* d'un **sol rendu en
+> quads VDP1**. Ce sol n'a **jamais shippé** : le flat dominant (sol/plafond) a été livré sur
+> **RBG0 en bitmap 8bpp 512×256 propre** (`RBG0_BITMAP=1`), voir
+> [`VDP2_RBG0_CURRENT_STATE.md`](VDP2_RBG0_CURRENT_STATE.md). Le « cull VRAM obligatoire » qui
+> amputait le cache mur n'existe donc pas dans l'arbre. Le sol VDP1 reste un **pari non shippé**
+> ([`VDP1_WORLD_PLAN.md`](VDP1_WORLD_PLAN.md)) ; l'argumentaire ci-dessous ne vaut que **si** on
+> le reprenait un jour — il n'a aucune incidence sur le floor actuel.
 
-Avec le 4bpp en scénario A, **les 224KB libérés rendent ce cull inutile** : on garde les 22
-slots murs pleins, on ajoute la banque F + le cache flat, et il reste de la marge pour :
-
-1. la **2e banque commande multijoueur** (+8KB) ;
-2. éventuellement des **world-sprites sur VDP1** (mais là le bloqueur est l'occlusion sans
-   Z-buffer, pas la VRAM).
-
-Et surtout : **les flats sont le cas idéal 4bpp** (§6). Un flat 64×64 passe de 4KB à **2KB** →
-le cache flat passe de 32KB à 16KB, doublant ses slots **là où la VRAM était précisément
-tight**.
+Pour mémoire (conditionnel à un sol VDP1 non shippé) : le plan sol VDP1
+([`VDP1_WORLD_PLAN.md §7.2`](VDP1_WORLD_PLAN.md)) exigeait une banque commande F dédiée (16KB) +
+un cache flat (32KB) = **48KB**, dans une VRAM 512KB si serrée qu'il fallait un cull réduisant le
+cache mur. Le scénario A (§3, 224KB libérés) aurait rendu ce cull inutile, et un flat 64×64
+passant de 4KB à **2KB** aurait doublé les slots du cache flat. Tout cela est sans objet tant que
+le sol vit sur RBG0.
 
 ---
 
@@ -207,8 +218,9 @@ Lloyd, RMS pondéré-fréquence en RGB 0-255 ; scripts `scratchpad/wad_quant.py`
    exclut les murs near-wall, inclut les **flats** et les sprites compacts.
 4. **Partager les sous-palettes de 16** entre textures de même famille pour tenir sous les 128
    fenêtres CRAM (§5.3).
-5. **Cibler les flats du sol VDP1 d'abord** : seul endroit sans seam (100%-VDP1, jamais
-   software), sans perte (flats ~0 RMS), et utile (VRAM tight). Cache flat 32→16KB.
+5. ~~**Cibler les flats du sol VDP1 d'abord**~~ — **CADUC** : le sol est sur RBG0 bitmap, pas
+   sur VDP1 (voir §4 et [`VDP2_RBG0_CURRENT_STATE.md`](VDP2_RBG0_CURRENT_STATE.md)). Cette cible
+   n'existe que si un sol VDP1 non shippé était repris.
 6. **Colour-offset VDP2 (`COAR/COAG/COAB`)** reste souhaitable pour porter flash/fade en
    registre — mais **orthogonal**, pas un prérequis (et ce n'est pas « 3 écritures » triviales :
    il faut l'assigner par-couche participante, et le wrapper SRL `UseColorOffset` ne couvre que
@@ -221,12 +233,12 @@ Lloyd, RMS pondéré-fréquence en RGB 0-255 ; scripts `scratchpad/wad_quant.py`
 | Cible | Verdict | Pourquoi |
 |---|---|---|
 | **Murs en 4bpp (full)** | ❌ **Non** | Gain VRAM marginal (starvation déjà résolue à 22 slots) ; perte de fidélité sur la famille tech ; **seam software/VDP1 clignotant** ; budget fenêtres CRAM ; et c'est l'inverse de ce que fait le meilleur FPS Saturn (16bpp RGB + Gouraud). |
-| **Flats du sol VDP1 en 4bpp (`CL16Bnk`)** | ✅ **Oui — LE bon cas** | 100% quantizables sans perte ; jamais splittés software (pas de seam) ; débloque le plan sol VDP1 **sans** le cull qui ampute le cache mur ; cache flat 32→16KB. |
+| **Flats du sol VDP1 en 4bpp (`CL16Bnk`)** | ⚪ **Sans objet** | Le sol dominant vit sur **RBG0 bitmap 8bpp** ([`VDP2_RBG0_CURRENT_STATE.md`](VDP2_RBG0_CURRENT_STATE.md)), pas sur VDP1. Le verdict d'origine (« 100% quantizables sans perte, pas de seam ») reste vrai *en théorie* mais ne s'applique qu'à un **sol VDP1 non shippé** ([`VDP1_WORLD_PLAN.md`](VDP1_WORLD_PLAN.md)). |
 | **Sprites acteurs compacts low-color** | 🟡 Peut-être | Réutilise le pipeline ; gain modeste ; à valider via le routage hybride. |
 
-**Ligne directrice :** ne touche pas au joyau 8bpp des murs. **Fais naître le sol VDP1
-directement en 4bpp `CL16Bnk` pour ses flats** — c'est là que le ½-octet/texel compte (VRAM
-serrée), que la quantization est indolore (flats), et que le seam n'existe pas.
+**Ligne directrice :** ne touche pas au joyau 8bpp des murs — c'est la conclusion durable de
+l'étude. (La cible « flats du sol VDP1 en 4bpp » est caduque : le sol est sur RBG0 bitmap, voir
+le banner.)
 
 ---
 
@@ -244,44 +256,44 @@ l'écran. **Ce coût est purement géométrique, indépendant de la profondeur d
 ni l'overdraw, ni le budget commandes (`WALL_CMD_CAP`/`FLOOR_CMD_CAP`), ni le décrochage
 CPU/VDP1 (~1 frame variable).
 
-**Pire : ajouter les flats du sol sur VDP1 CRÉE une nouvelle surface d'overdraw.** Un sol balaie
-des pieds à l'horizon → la courbure 1/z explose près de l'horizon, et un quad sol near-floor
-re-projette vers l'infini (`yslope[ym]→∞` quand `ym→centery`). C'est le blow-up de la §3.3.1 du
-plan monde. **Le 4bpp ne le borne en rien** ; il n'est borné que par la discipline
-**géométrique** : bandes screen-Y *world-anchored* + `SAT_YCLAMP_GUARD` + flat-clamp des bandes
-d'horizon ([`VDP1_WORLD_PLAN.md §3.3.1, §7.4`](VDP1_WORLD_PLAN.md)). Donc le 4bpp-flats **réduit
-la VRAM** du sol mais **n'aide pas** — et expose une nouvelle source d'overdraw à dompter par
-ailleurs.
+> **Note (le sol est sur RBG0, pas sur VDP1).** L'ancien §9 avertissait qu'« ajouter les flats
+> du sol sur VDP1 crée une nouvelle surface d'overdraw » (blow-up `yslope[ym]→∞` près de
+> `centery`). Comme le sol a été livré sur **RBG0 bitmap** ([`VDP2_RBG0_CURRENT_STATE.md`](VDP2_RBG0_CURRENT_STATE.md)),
+> cet overdraw-sol **ne se produit pas** dans l'arbre actuel — il ne resurgirait que si le sol
+> VDP1 non shippé ([`VDP1_WORLD_PLAN.md`](VDP1_WORLD_PLAN.md)) était repris. La leçon d'overdraw
+> reste valable **pour les murs** ci-dessous. (À ne pas confondre avec la « falaise de fps face à
+> un mur » qui, elle, est un coût **VDP2** — la transform RBG0 par frame — analysé à part, voir
+> [`VDP1_PRESENT_SYNC_PLAN.md`](VDP1_PRESENT_SYNC_PLAN.md).)
 
-**Les vrais leviers d'overdraw (déjà shippés pour les murs, à reproduire pour le sol) :**
+**Les vrais leviers d'overdraw (déjà shippés pour les murs) :**
 
 | Levier | Ce qu'il borne | Statut |
 |---|---|---|
 | **Fallback software des murs proches** (span > 480px → colonnes CPU NBG1) | tue les pires explosions near-wall | shippé (`core/r_segs.c`) |
-| **Sub-quad tiling vertical world-anchored + cull des bandes hors-écran** | borne le swim sans clamp écran | shippé (murs) ; à porter au sol (§3.3.1 plan monde) |
+| **Sub-quad tiling vertical world-anchored + cull des bandes hors-écran** | borne le swim sans clamp écran | shippé (murs) ; sans objet pour le sol (sol = RBG0, pas VDP1) |
 | **Flat fallback** (`FUNC_Polygon`, ~½ fill) pour murs lointains/over-budget | garantit que la liste finit toujours (jamais de trou) | shippé (`dg_saturn.cxx:2225`) |
-| **`SAT_YCLAMP_GUARD`** (clamp `ym` loin de `centery`) | borne le blow-up near-floor sur l'axe screen-Y | à construire avec le sol |
+| **`SAT_YCLAMP_GUARD`** (clamp `ym` loin de `centery`) | borne le blow-up near-floor sur l'axe screen-Y | n/a — n'aurait servi qu'à un sol VDP1 (non shippé) |
 | **Cap commandes + truncation far-first** (`Dr%` < 80% = NO-GO) | borne le budget, pas l'overdraw lui-même | partiel |
 
-> **Conclusion §9 :** le 4bpp-flats est validé **comme optimisation VRAM** (il débloque le plan
-> sol sans amputer le cache mur, §4) — **et seulement ça**. Le problème VDP1 #1 (overdraw +
-> budget commandes + décrochage) reste **entièrement** du ressort du **bornage géométrique
-> world-anchored**, un chantier **distinct et prioritaire**. Ne pas vendre le 4bpp comme un gain
-> de perf VDP1 : c'est un gain de **place**, pas de **temps**.
+> **Conclusion §9 :** quoi qu'on fasse du 4bpp, c'est un levier de **place** (VRAM), **jamais** de
+> **temps** : il ne touche ni l'overdraw, ni le budget commandes. Le problème VDP1 #1 reste
+> **entièrement** du ressort du **bornage géométrique** des murs. (Le bénéfice « débloque le sol
+> VDP1 » est caduc — le sol vit sur RBG0, voir §4.) Ne pas vendre le 4bpp comme un gain de perf.
 
 ---
 
 ## 10. Questions ouvertes (à trancher sur HW/émulateur)
 
-1. Le `CL16Bnk` flat-sol bit-matche-t-il acceptablement le sol RBG0 dominant (256-col) à la
-   couture inter-surface ? (Quantization flat ~0 RMS → probablement oui, à confirmer.)
+1. ~~Le `CL16Bnk` flat-sol bit-matche-t-il le sol RBG0 à la couture ?~~ **CADUC** — il n'y a pas
+   de strips sol VDP1 à coudre au RBG0 : le sol entier vit sur RBG0 bitmap
+   ([`VDP2_RBG0_CURRENT_STATE.md`](VDP2_RBG0_CURRENT_STATE.md)), pas de couture inter-surface.
 2. Combien de **sous-palettes 16-col distinctes** un niveau Doom montre-t-il simultanément ?
    Détermine si les 128 fenêtres CRAM suffisent sans re-bake par frame (§5.3).
 3. Le test perceptuel réel (filtrage point VDP1 + échelle 320×200 + distance) rachète-t-il la
    famille `TEKWALL` (RMS 17-20) — ce qui réduirait encore la liste 8bpp-only ?
-4. Le sol VDP1 étant aujourd'hui un **stub** (aucun quad émis), le gain 4bpp-flats est
-   **hypothétique** tant que le strip-emitter n'existe pas → prioriser le sol VDP1 8bpp d'abord,
-   puis basculer les flats en 4bpp si la VRAM serre vraiment.
+4. ~~Prioriser le sol VDP1 8bpp puis basculer en 4bpp~~ **CADUC** — le sol n'a pas pris le chemin
+   VDP1 ; il est livré sur RBG0 bitmap. Le gain 4bpp-flats ne redeviendrait pertinent que si le
+   pari sol VDP1 ([`VDP1_WORLD_PLAN.md`](VDP1_WORLD_PLAN.md)) était repris.
 
 ---
 

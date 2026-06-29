@@ -7,8 +7,9 @@ Budget mesuré : voir `docs/REC_REDUCTION.md` L2 + ce doc §6. Gain **HW-only et
 > `-DRP_CMD_BUF_SIZE=0x14000` = **80 KB** (PAS le 0x10000/64 KB de cette spec). Le buffer
 > reste en haut de LWRAM (adresse dérivée `0x300000-SIZE`), `DG_ZoneBase` rend les 80 KB
 > à la zone heap streaming. Seule la moitié **RELOCATE** (buffer → HWRAM BSS) reste non codée.
-> Le gate §8 « coder après RBG0 » est **caduc** : RBG0-floors a cassé sur HW (snow + ciel
-> mort) et a été reverté — il n'y a plus de session RBG0 vivante à coordonner.
+> Le gate §8 « coder après RBG0 » est **caduc** : le floor RBG0 a SHIPPÉ proprement comme
+> bitmap 512×256 8bpp (voir `docs/VDP2_RBG0_CURRENT_STATE.md`) — il n'y a plus de session
+> RBG0 vivante à coordonner, le hunk `DG_ZoneBase` peut être codé directement.
 
 ## 1. Objectif
 
@@ -123,10 +124,11 @@ HWRAM ; n doit rester 0 comme aujourd'hui.
 
 ## 8. Coordination RBG0 (session parallèle) — **CADUC**
 
-> **RECONCILED 2026-06-24 :** ce gate est annulé. RBG0-floors a **cassé sur HW** (snow +
-> ciel mort : RAMCTL/cycle-pattern jamais committé sans slSynch) et a été reverté — il
-> n'y a **plus de session RBG0 vivante** à coordonner. Le hunk `DG_ZoneBase` du RELOCATE
-> peut être codé directement.
+> **RECONCILED 2026-06-24 :** ce gate est annulé. Le floor RBG0 a **SHIPPÉ proprement**
+> comme bitmap 512×256 8bpp (la « snow » était de la starvation de cycle-pattern, résolue
+> par bitmap + RDBS=0x0D + cycles A0/A1 parkés — pas slSynch ; voir
+> `docs/VDP2_RBG0_CURRENT_STATE.md`). Il n'y a **plus de session RBG0 vivante** à
+> coordonner. Le hunk `DG_ZoneBase` du RELOCATE peut être codé directement.
 
 ~~RBG0-floors touche très probablement **`dg_saturn.cxx`** (setup VDP2/RBG0) et la
 floor-path de `r_plane.c`. **L2 touche `dg_saturn.cxx` (DG_ZoneBase)** → **point de merge

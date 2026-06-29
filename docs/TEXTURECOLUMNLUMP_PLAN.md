@@ -1,16 +1,20 @@
 # Cutting the `texturecolumnlump` / `texturecomposite` PU_STATIC floor — deep plan
 
-Status: **PHASE 0 COMPLETE 2026-06-24 — MEASURED; GATE VERDICT = DEFER (NO-GO for now).**
-The directory floor was measured exactly by parsing the shipping WADs' `TEXTURE1/2`/`PNAMES`
-lumps (`tools/measure_texfloor.py`, mirrors `R_InitTextures`/`R_GenerateLookup`; numbers
-cross-checked and adversarially verified high-confidence). **It is 117–253 KB, NOT the
-~400–600 KB estimated below** (the estimate assumed ~1000–1400 Doom II textures; the real
-count is **428**). This trips the plan's own Phase-0 gate (§7: "deprioritize if <250 KB") for
-3 of 4 IWADs. Option E specifically would *worsen* pool pressure (its `height×width` slabs
-are 2.2–2.7× the current `height×mpc` composites against a fixed 256 KB pool cap). **See the
-new §9 (PHASE 0 RESULTS) for the full measured table, the Option-E pool-pressure finding, the
-cheaper-lever ranking, and the gate verdict.** The original research below (§1–§8) is retained
-as the design study; §1's byte estimates are superseded by §9's measurements.
+Status: **PHASE 0 COMPLETE — MEASURED; GATE VERDICT = DEFER (NO-GO).** This doc is the
+rationale behind that DEFER gate. The directory floor was measured exactly by parsing the
+shipping WADs' `TEXTURE1/2`/`PNAMES` lumps (`tools/measure_texfloor.py`, mirrors
+`R_InitTextures`/`R_GenerateLookup`; cross-checked and adversarially verified
+high-confidence). **It is 117–253 KB, NOT the ~400–600 KB first estimated** (that assumed
+~1000–1400 Doom II textures; the real count is **428**). This trips the plan's own Phase-0
+gate (§7: "deprioritize if <250 KB") for 3 of 4 IWADs. Option E specifically would *worsen*
+pool pressure (its `height×width` slabs are 2.2–2.7× the current `height×mpc` composites
+against a fixed 256 KB pool cap). **See §9 (PHASE 0 RESULTS)** for the full measured table,
+the Option-E pool-pressure finding, the cheaper-lever ranking, and the gate verdict.
+
+The cache-carve prerequisites are now **SHIPPED** (big-WAD CD streaming Phase 0 `99ced62` +
+CD-read alignment `a693a4e`; 1p is cacheless by design — §9.3(5)). The refactor itself stays
+deferred. §1's byte estimates are superseded by §9's measurements. VDP1 carries walls only;
+the dominant flat lives on RBG0 — see [`VDP2_RBG0_CURRENT_STATE.md`](VDP2_RBG0_CURRENT_STATE.md).
 
 Original framing (superseded where noted): three parallel investigations done
 (current `core/r_data.c` system, the VDP1 wall-path dependency, the d32xr
@@ -23,8 +27,8 @@ natural follow-on to [`STREAMING_ANALYSIS.md` **§S4(b)**](STREAMING_ANALYSIS.md
 
 Companion docs: [`STREAMING_ANALYSIS.md`](STREAMING_ANALYSIS.md) (the CD-streaming
 architecture; this plan is its S4(b)), [`VDP1_ARCHITECTURE.md`](VDP1_ARCHITECTURE.md) and
-[`VDP1_FLOOR_PLAN.md`](VDP1_FLOOR_PLAN.md) (why the VDP1 wall bake still funnels through
-`R_GetColumn`).
+[`VDP1_PRESENT_SYNC_PLAN.md`](VDP1_PRESENT_SYNC_PLAN.md) (the VDP1 wall path that still
+funnels through `R_GetColumn`).
 
 > **One-line conclusion.** The VDP1 wall renderer is **not** independent of Doom's
 > composite tables — it bakes VRAM through `R_GetColumn` (`src/dg_saturn.cxx:1686-1687`),
@@ -56,20 +60,12 @@ texturecolumnofs[tex]   = Z_Malloc(texture->width * sizeof(unsigned short), PU_S
 
 Combined per-column cost = **`4 bytes × Σ(texture width)`** = `4 × numtextures × avg_width`.
 
-> ⚠ **SUPERSEDED by §9 measurement.** The estimates in the table below were wrong — they
-> assumed ~1000–1400 Doom II textures. The **real** count is **428** (Σwidth 40,240 → floor
-> **157 KB**), measured exactly from the WAD. See §9 for the verified per-WAD floor.
-
-| WAD | numtextures | avg width | Σ width (cols) | columnlump+ofs total |
-|---|---|---|---|---|
-| Doom shareware | ~125 | ~100 | ~12,500 | ~~~50 KB~~ → **42 KB** (§9) |
-| Doom II (lower) | ~~~1000~~ **428** | ~~~100~~ **94** | ~~~100,000~~ **40,240** | ~~~400 KB~~ → **157 KB** (§9) |
-| Doom II (upper) | ~~~1400~~ — | — | — | ~~~600 KB~~ — |
-
-The original "Doom II is the binding case at ~400–600 KB" claim is **false**; the measured
-binding case is **TNT at 253 KB** (Doom II 157 KB, Plutonia 202 KB, Ultimate 117 KB). These
-arrays are still unconditional PU_STATIC, allocated once at `R_InitTextures`, never freed —
-but at a third of the assumed size. See §9.
+> The early ~400–600 KB estimate (which assumed ~1000–1400 Doom II textures) was **wrong**.
+> The floor was measured exactly from the WADs — see **§9** for the verified per-WAD table.
+> The measured binding case is **TNT at 253 KB** (Doom II 157 KB, Plutonia 202 KB,
+> Ultimate 117 KB, shareware 42 KB; real Doom II count is **428**, not ~1400). These arrays
+> are still unconditional PU_STATIC, allocated once at `R_InitTextures`, never freed — but at
+> roughly a third of the original assumption.
 
 ### The secondary terms (smaller, listed for completeness)
 
@@ -526,9 +522,10 @@ D (WAD-format + correctness cap + residency hazard as a *first* move).
   ("composite-on-demand `decals[]` — deferred (heavier structural change)"). S4(a) (the
   bounded LRU pool, `core/r_cache.c`) is the **storage target** these options reuse; this
   document is the deferred producer-side half.
-- [`VDP1_ARCHITECTURE.md`](VDP1_ARCHITECTURE.md) / [`VDP1_FLOOR_PLAN.md`](VDP1_FLOOR_PLAN.md) —
+- [`VDP1_ARCHITECTURE.md`](VDP1_ARCHITECTURE.md) / [`VDP1_PRESENT_SYNC_PLAN.md`](VDP1_PRESENT_SYNC_PLAN.md) —
   the VDP1 wall bake (`src/dg_saturn.cxx:1686`) that funnels through `R_GetColumn`, proving
-  the cut is a shared-core change, not a VDP1-local one.
+  the cut is a shared-core change, not a VDP1-local one. (VDP1 carries walls only; the
+  dominant flat went to RBG0 — see [`VDP2_RBG0_CURRENT_STATE.md`](VDP2_RBG0_CURRENT_STATE.md).)
 - d32xr reference: `c:/Users/pcico/Projects/saturn-refs/d32xr/` —
   `r_local.h:155-182`, `r_data.c:119-124,936-1035`, `r_phase6.c:126-147`,
   `r_phase9.c:13-247`, `r_cache.c:102-250`.
@@ -600,19 +597,14 @@ visible set < referenced set). Option E ~2.2× that pressure against the same 25
 4. **The real remaining bind is PU_LEVEL geometry (700–900 KB on big maps)** — which this refactor
    does **not** touch. The 157 KB floor is ~16–18 % of the zone / ~40–45 % of the PU_STATIC
    residents, small next to the geometry it competes with.
-5. **Cheap unblock — SUPERSEDED (was core `4f06d65`):** `R_SetupTextureCaches` sizes the LRU
-   carve from `Z_LargestAllocatable` (**purge-inclusive**) instead of `Z_LargestFreeBlock`
-   (**pure-free only**). *RECONCILED 2026-06-24: SUPERSEDED by the uncommitted `r_cache.c`
-   rework.* The `Z_LargestAllocatable` call survives (`r_cache.c:120`) BUT it now runs **only in
-   split-screen** — 1p early-returns at `r_cache.c:110`
-   (`if (!sat_streaming_mode || sat_local_players <= 1)`), so **1p is CACHELESS by design**. The
-   largest-MARGIN sizing this bullet described is replaced by a **FIXED 96KB slab**
-   (`TEXCACHE_FIXED`) with a `largest < FIXED+MARGIN` guard (`r_cache.c:123`). The original
-   "1p zone is walled by PU_CACHE → pure-free was only ~10 KB → the carve bailed `TXC a0` →
-   purge-inclusive flips it `TXC a0→a1`" story no longer applies: 1p does not carve at all.
-   `Z_LargestAllocatable` is now **only the split-screen FIXED-slab guard.** *Validate on Ymir:*
-   the **2p** slab (does the contiguous 96KB carve succeed; does it cure the 2p composite-
-   fragmentation OOM) and the `z_zone.c` re-anchor retry — NOT a 1p `TXC a0→a1` flip.
+5. **Cache carve — SHIPPED, 1p is cacheless by design.** The LRU carve now runs **only in
+   split-screen**: 1p early-returns at `r_cache.c:110`
+   (`if (!sat_streaming_mode || sat_local_players <= 1)`), so **1p is CACHELESS**. The
+   split-screen path uses a **FIXED 96KB slab** (`TEXCACHE_FIXED`) with a
+   `Z_LargestAllocatable`-based `largest < FIXED+MARGIN` guard (`r_cache.c:120,123`). The old
+   "purge-inclusive carve flips 1p `TXC a0→a1`" story no longer applies — 1p does not carve.
+   `Z_LargestAllocatable` is now **only the split-screen FIXED-slab guard.** Settled together
+   with big-WAD CD streaming Phase 0 (`99ced62`) and the CD-read alignment fix (`a693a4e`).
 
 ### 9.4 GATE VERDICT — **DEFER the texture-directory refactor (C/D/E).**
 
@@ -620,12 +612,10 @@ Not justified now: the floor is a third of the estimate and under the deprioriti
 (the recommended path) would worsen the pool churn it aims to relieve; the cheap levers already
 shipped; and the dominant zone consumer is PU_LEVEL geometry, untouched by this work.
 
-**Recommended order instead:** (1) *RECONCILED 2026-06-24:* the §9.3(5) carve fix is SUPERSEDED
-— 1p is now CACHELESS (no carve), and the CD-read-alignment fix already SHIPPED (`a693a4e`). So
-step 1 is: validate the **uncommitted** `r_cache.c` split-only FIXED-96KB slab + the `z_zone.c`
-re-anchor retry on Ymir/hardware — confirm the **2p** slab carves and cures the 2p
-composite-fragmentation OOM, and that no map `I_Error`s (1p OR 2p) across all 32 maps (NOT a 1p
-`TXC a0→a1` flip — 1p no longer carves); (2) if specific big maps still `I_Error` at load, attack
+**Recommended order instead:** (1) **SHIPPED** — the §9.3(5) carve is settled: 1p is CACHELESS
+(no carve), the split-only FIXED-96KB slab + `z_zone.c` re-anchor retry landed with big-WAD
+CD streaming Phase 0 (`99ced62`) and the CD-read alignment fix (`a693a4e`). (2) if specific
+big maps still `I_Error` at load, attack
 **PU_LEVEL geometry** directly (per-level bump arena S4(c), geometry trims) — that is where the
 bytes are (700–900 KB vs the 157 KB texture floor); (3) revisit this refactor **only** if, after
 the above, the carve is *still* starved **and** on TNT-class WADs where the floor exceeds 250 KB —

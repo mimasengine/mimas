@@ -1,16 +1,12 @@
 # Parallel-REC audit — putting the slave SH-2 on the render GENERATION
 
-> **STATUS BANNER — RECONCILED 2026-06-24:** Option C is no longer "future" — it is
-> SHIPPED. **P (plane-half) + M (sprite right-half) are SHIPPED, on by default**
-> (`main.cxx:52-53` `sat_plane_parallel=1` / `sat_masked_parallel=1`;
-> `r_plane.c:1206`, `r_things.c:1185`). The **two-pointer EX work-steal is SHIPPED
-> but INACTIVE in the ship config** (plane-parallel forces `rp_disabled=1` at
-> `r_main.c:1181`, so the parity renderer that hosts the steal is never dispatched
-> in 1p). **Bp wall-prep STEP-1 defer is committed but gated OFF**
-> (`sat_wallprep_defer=0`); **STEP-2 producer/consumer overlap is NOT built** (the
-> only remaining future lever here). **Dual-CPU framebuffer blit is HW-REJECTED**
-> (2026-06-22). Consequently the "slave ~80% idle" framing below is STALE — in ship
-> config the slave already runs P+M; see the §4 reconciliation note.
+> **STATUS BANNER — SETTLED 2026-06-29:** Planes are SETTLED. The dual-SH2 **plane
+> work-steal "TAS" SHIPPED DEFAULT-ON** (core `73f8cdc` / parent `4857f87`); row-split
+> parked. **M (sprite right-half) ships** alongside it. **Wall-prep → slave (the "Bp"
+> lever) is CONFIRMED DEAD** — memory-bound, tried 3×, TAS does not revive it — so the
+> §4 "chase Bp / STEP-2 overlap is the remaining lever" recommendation below is OBSOLETE
+> and has been retired to a historical note. **Dual-CPU framebuffer blit is HW-REJECTED**
+> (2026-06-22). The §1 duplication memory measurements and §2 d32xr model remain valid.
 
 **Question:** how to make the second SH-2 do REC work (wall-prep / planes / sprites generation),
 not just draw columns, to break the master-only REC ceiling (the 1p speed bonus + multiplayer).
@@ -83,8 +79,9 @@ duplication model. THAT is why it fits.
 > and **sprites-by-screen-half (M)** — `r_things.c:1170-1210` master pre-caches every
 > sprite patch (PU_CACHE) then `RP_DispatchMasked(half,viewwidth)`, slave draws the
 > right half via `R_SlaveDrawMasked`, master the left (dispatch `r_parallel.c:904-916`).
-> Only **Option B's wall-prep producer/consumer (Bp) remains future** — STEP-1 defer
-> harness is committed but gated OFF (`sat_wallprep_defer=0`), STEP-2 overlap not built.
+> Only **Option B's wall-prep producer/consumer (Bp)** was never adopted — it is now
+> **CONFIRMED DEAD** (memory-bound, tried 3×; see §4). The plane phase (P) since evolved
+> into the SHIPPED-default dual-SH2 work-steal "TAS" (core `73f8cdc` / parent `4857f87`).
 
 **Notes**
 - **B/C keep the 1p bonus:** the phase-split accelerates EACH view (intra-view parallelism), so 1p
@@ -100,28 +97,21 @@ duplication model. THAT is why it fits.
 - **The freeze-zone** (the perf notes' fear about the "2.4" wall-prep offload): d32xr **proves it's
   manageable** with the right protocol — comm-register handoff + `Mars_ClearCacheLine` + phase ordering.
 
-## 4. Recommendation
+## 4. Outcome (historical)
 
-**Option B, entered via C.** Start with **one isolated phase** (recommended: **sprites by screen-half**
-— it's `M`, small, self-contained, low coherency; or **planes**) to validate the trio
-*producer/consumer + GBR-TLS + cache coherency* on Ymir + hardware, then extend to the wall-prep
-producer/consumer (the big `Bp` lever).
+**Option C shipped, and planes are now SETTLED.** Both isolated phases landed and are on by
+default: **sprites by screen-half (M)** and **planes (P)** — the latter evolved into the
+dual-SH2 plane work-steal **"TAS", SHIPPED DEFAULT-ON** (core `73f8cdc` / parent `4857f87`);
+the row-split variant is parked. The trio *producer/consumer + per-CPU state + cache coherency*
+is proven on hardware.
 
-> **RECONCILED 2026-06-24:** This recommendation is **describing already-shipped code**.
-> Both entry phases — sprites-by-half (M) and planes (P) — are committed and on by
-> default. The validated trio (producer/consumer + per-CPU state + cache coherency)
-> is proven on hardware. The ONLY remaining future work is the wall-prep `Bp` lever
-> (Option B big step): STEP-1 master-only defer is committed gated OFF and currently
-> has ZERO runtime validation (flip `sat_wallprep_defer=1` once to confirm STEP-1 is
-> byte-identical before attempting STEP-2 overlap). STEP-2 is the d32xr freeze-zone.
->
-> **Slave idle correction:** the "second SH-2 effectively idle / ~80% idle" claim in
-> the original prose **predates P+M shipping and is STALE**. In ship config the slave
-> actively runs the P plane-half AND the M sprite-half. Its residual idle is the
-> **B phase** (BSP walk + clip + sprite projection), of which only **Bp (wall-prep,
-> `R_StoreWallRange`)** is coherency-safe to offload; **Bw (the solidsegs occlusion
-> walk)** is inherently serial (single occlusion chain) and is foreclosed. So the last
-> safe REC lever is Bp only.
+> **SETTLED 2026-06-29 — the "Bp" recommendation is retired.** The earlier framing here
+> ("extend to the wall-prep producer/consumer, the big `Bp` lever / the last safe REC lever")
+> is OBSOLETE. **Wall-prep → slave is CONFIRMED DEAD:** it is memory-bound (multiplexed
+> SDRAM/cache contention, not CPU-bound), tried 3×, and the TAS work-steal does not revive
+> it. STEP-1 master-only defer and STEP-2 producer/consumer overlap are NOT pursued. The
+> real remaining lever is non-render work (`nr`), not render generation on the slave. The §1
+> measurements and the §2 d32xr model below remain valid as background.
 
 ## 5. Leads to study (local `saturn-refs/d32xr/`)
 - `marsnew.c` — the mailbox loop + GBR-TLS setup (`Mars_Secondary`, `I_Init`).

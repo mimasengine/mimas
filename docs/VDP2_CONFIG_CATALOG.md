@@ -1,4 +1,4 @@
-> ⚠️ CORRECTION 2026-06-27 (session sol bitmap, commits 19768ca/41dd895) : le sol RBG0 SHIPPE en BITMAP 512x256 8bpp PROPRE (RBG0_BITMAP=1, HW_SKY=0), gaté potato-0 + 1 joueur. 2 banques rotation : bitmap=A1, coeff/K=A0, fb=B0, RPT=B1+0x1ff00 → B1 LIBRE (pas de map). Le commit CYCxx est RÉSOLU (rbg0_commit_cyc + rbg0_commit_ramctl, block-flush direct sans slSynch, RDBS=0x0D). Ceci LÈVE la loi « overlay/ciel XOR sol » (config 8 ≠ configs 9/10/11 ; §4.3) : l'overlay NBG3 et un ciel B1 cohabitent. Fog distance = écran line-color + color-calc RBG0 (PAS K_LINECOL), prototype gaté OFF. slSynch ABANDONNÉ (pas réfuté) ; le tearing VDP1 est un problème séparé (swap auto FBCR=0). Voir docs/VDP2_RBG0_CURRENT_STATE.md.
+> ✅ STATUT 2026-06-29 — **catalogue de recherche** (énumération de configs candidates). Réalité shippée : le sol RBG0 vit en **BITMAP 512×256 8bpp PROPRE** (`RBG0_BITMAP=1`, commits 19768ca/41dd895), gaté potato-0 + 1 joueur. 2 banques rotation : bitmap=A1, coeff/K=A0, fb=B0, RPT=B1+0x1ff00 → **B1 LIBRE (pas de map)**. Le commit CYCxx est **RÉSOLU** (`rbg0_commit_cyc` + `rbg0_commit_ramctl` déjà dans l'arbre, block-flush direct sans slSynch, RDBS=0x0D) — la « neige » était de la **starvation de cycle-pattern** du sol cellulaire, pas un commit-gap. La loi « overlay/ciel **XOR** sol » est **LEVÉE** : B1 libre → overlay NBG3 **et** un ciel B1 cohabitent avec le sol. Fog distance = écran line-color + color-calc RBG0 (PAS K_LINECOL), prototype gaté OFF. slSynch ABANDONNÉ (pas réfuté). **Référence sol faisant autorité : [`docs/VDP2_RBG0_CURRENT_STATE.md`](VDP2_RBG0_CURRENT_STATE.md). Présent VDP1↔NBG1 : [`docs/VDP1_PRESENT_SYNC_PLAN.md`](VDP1_PRESENT_SYNC_PLAN.md).** Ci-dessous : énumération historique conservée pour les paris non-shippés ; les fiches sol-cellulaire « snow/bloqué CYCxx » sont obsolètes (cf. la réf sol).
 
 # Catalogue maître des configurations VDP2/VDP1 — Mimas (Doom Saturn)
 
@@ -11,13 +11,13 @@
 >
 > Fusionne 5 enumerations paralleles (ciel-centric, sol-centric, baseline-minimal,
 > disruptif-exotique, perf-grounding). Croise avec [`docs/VDP2_LAYER_BUDGET.md`](VDP2_LAYER_BUDGET.md)
-> et [`docs/VDP2_FLOOR_CONSOLIDATION.md`](VDP2_FLOOR_CONSOLIDATION.md).
+> et [`docs/VDP2_RBG0_CURRENT_STATE.md`](VDP2_RBG0_CURRENT_STATE.md) (réalité sol shippée).
 
 ---
 
-## 0. Les 4 verites qui structurent tout le catalogue
+## 0. Les verites qui structurent tout le catalogue
 
-Avant la matrice, quatre faits durs qui dictent le classement (ils reviennent dans **chaque**
+Avant la matrice, les faits durs qui dictent le classement (ils reviennent dans **chaque**
 config) :
 
 1. **LE GAIN, C'EST LE *SKIP*, PAS LA TECHNO DE SOL.** Le `+20-33 % fps` (`-17 a -26 ms`) vient
@@ -25,21 +25,17 @@ config) :
    RBG0, VDP1-strips, gradient back-screen, fake-mode7 captent **tous le meme** gain : ils ne
    different que par ce qui **transparait** dans le trou, et par le cout en banques/CRAM/VDP1.
    *C'est le fait le plus contre-intuitif du catalogue* — il ecrase la fausse opposition « ciel XOR sol ».
-   (cf. `VDP2_FLOOR_CONSOLIDATION.md §1.4`, `VDP2_LAYER_BUDGET.md §6`.)
+   (cf. `VDP2_LAYER_BUDGET.md §6`.)
 
-2. **LE CONFLIT B1 EST LE FORK STRUCTUREL.** B1 est **triple-booke** : overlay NBG3 (cable en dur
-   par SRL a `B1+0x1E000`), map pattern-name RBG0 (`0x25E70000`), back-screen color word
-   (`B1+0x1fee0`). Tout sol **RBG0 cellulaire** evince les trois. Tout sol qui **garde B1**
-   (VDP1-strips, gradient) garde **overlay ET back-screen**. (cf. `VDP2_LAYER_BUDGET.md §1`.)
+2. **B1 N'EST PLUS LE FORK** (résolu, cf. réf sol). Le sol shippé est un **bitmap RBG0** : pas de
+   map pattern-name → la RPT vit en `B1+0x1ff00` et **B1 reste LIBRE**. Conséquence : overlay NBG3,
+   back-screen color word **et** un ciel B1 cohabitent avec le sol. La « neige » du sol cellulaire
+   était de la **starvation de cycle-pattern**, réglée par `rbg0_commit_ramctl`/`rbg0_commit_cyc`
+   (déjà dans l'arbre, block-flush direct **sans** slSynch) + RDBS=0x0D + cycles A0/A1 parqués —
+   **pas** un commit-gap. Les seules variantes qui évincent B1 sont les anciennes configs sol
+   **cellulaires** (9/10/11), conservées ci-dessous comme paris non-shippés.
 
-3. **LE COMMIT-GAP EST LE TUEUR SILENCIEUX.** Mimas ne lance **jamais** `slSynch` (il cape les fps
-   a ~7-12 et coupe le SFX SCSP direct). Or SGL ne flushe `RAMCTL`/`CYCxx` (et peut-etre
-   `slBackColTable`/`slLineColTable`) **que** dans `slSynch`. Le seul chemin de commit **prouve**
-   est le **poke registre direct** (FBCR/PTMR, valide HW 2026-06-16). Tout ce qui depend de CYCxx
-   **neige sur HW** tant que ce poke n'est pas ecrit + prouve-collant. Ymir masque le bug (il lit
-   les registres shadow). (cf. `VDP2_FLOOR_CONSOLIDATION.md §1.3, §0`.)
-
-4. **LE PRIX RETRECIT AU POTATO SHIPPE.** Le `+20-33 %` est **pot0, pre-potato** (A/B Romain
+3. **LE PRIX RETRECIT AU POTATO SHIPPE.** Le `+20-33 %` est **pot0, pre-potato** (A/B Romain
    2026-06-19). Au potato reel (pot1/pot2) le terme `P` est deja effondre (62 → 17 → 11 ms) et le
    slave est deja ~80 % idle → l'offload de sol devient surtout une affaire de **QUALITE** (sol
    texture/perspective), pas un gros gain fps. **Les configs valent le plus au pot0.**
@@ -73,10 +69,10 @@ Gain : ✓ = mesure HW, ~ = estime/extrapole, `0` = nul par design, `?` = a esti
 | **5** | **Rich-sky** (S6) | bg ciel NBG0 / **fg ciel NBG2 (cells)** / fb / overlay NBG3 / 8 pal | Si fg veut sa palette → 1 light-bank CRAM | Plus de banque spare (A1 depense) ; VDP1 intouche ; slave inchange | `0` (pur visuel ; +20-33 % si on ajoute le skip) ~ | **MEILLEUR ciel du catalogue** : vraie parallaxe 2 plans + translucidite color-calc au raccord | **LIKELY-OK** (analogie ciel HW prouve, pas de poke). Inconnu = NBG2 jamais allume + CRAM |
 | **6** | **VDP1-floor / multi-surface** (S5 / F3) | ciel HW / LIBRE / fb / overlay NBG3 **(garde !)** / 8 pal | Rien cote VDP2 ; cote VDP1 : cull du HUD/arme mort pour banque cmd F + cache flat 32 Ko | A1 libre ; slave libere du sol ; **VDP1 = ressource consommee, TENDUE** (Dr 25-42 %) | **~+15-24 %** (`-4 a -9 ms` ; multi-surface) ~ | MEILLEURE couverture (sols+plafonds+marches), garde ciel+overlay. PIRE : swim horizon + **plus de tearing** (Dr chute) | **FONDATION PROUVEE-HW** (driver async no-slSynch valide ; murs+arme shippes) mais **emitter = STUB** (`sat_floor_vdp1_stub` renvoie 1, 0 strip). Gate reel = `Dr%` post-floor |
 | **7** | **Fake-mode7 line-scroll** (exotique) | ciel HW / **NBG2 cells + table line-scroll** / fb / overlay NBG3 / 8 pal | **Reponse au yaw** (la texture ne tourne pas quand on pivote) → faux pour free-look Doom | Frees toute la pile RBG0 (pas de K, pas de CYC) ; overlay survit ; A1 = 1 banque cell | **~+20-33 %** (le skip, sous la couche) ~ | Pire que RBG0 (pas de yaw → shimmer/shear sur flats gridded) mais mieux que gradient (scaling profondeur) | **COMPILE / dodge le minefield CYCxx** (line-scroll = NBG normal ~1-2 slots, pas banque rotation). Inconnu = commit line-scroll sans slSynch + look sous yaw |
-| **8** | **Sky+textured-floor RBG0 bitmap** (C / F2) | ciel HW / **bitmap RBG0** / fb / overlay NBG3 **(revient !)** / 8 pal | **Flats dynamiques** : 1 bitmap statique 512×256 ; changer flat/lumiere = re-upload 128 Ko | B1 libere (bitmap = pas de PN read) → overlay + back-screen reviennent | **~+20-33 %** (le skip) ~ | PIRE que F1 (mono-texture, pas de flats/secteur) mais garde ciel HW + overlay | **PARTIEL** : bitmap frees la banque map mais la **K-table veut encore une banque** (CRKTE pour la liberer → collision CRAM). **Snowe encore** (meme commit CYCxx que F1) |
-| **9** | **Sky+textured-floor RBG0 cell, K en CRAM** (G / S4) | ciel HW **(garde !)** / cells RBG0 / fb / map RBG0 **(EVINCE overlay)** / **K-table (CRKTE)** + pal | **OVERLAY NBG3** (map force B1) ; risque 1+ light-banks CRAM | Slave libere du sol ; VDP1 intouche ; **0 banque spare** ; CRAM = ressource contestee | **~+20-33 %** + sol texture perspective-exact ~ | **MEILLEUR sol des configs ciel-keeping** : texture perspective-exact + K_LINECOL possible. MAIS overlay parti | **NON PROUVE** : seule voie « ciel+sol texture » sur 4 banques, mais (1) CRKTE collisionne CRAM mode 1 vs color-calc ; (2) SGL n'expose **aucun** K-en-CRAM → poke brut ; (3) **CYCxx absent** → neige. Recherche |
-| **10** | **Textured-floor RBG0 cell** (B/E / F1) | **K-table** / cells RBG0 / fb / map RBG0 **(EVINCE overlay)** / 8 pal | **Ciel HW** (→ ciel SW sur slave) **ET overlay** | A0/A1 ~126 Ko storage tail ; slave ~80 % idle pot1/2 reabsorbe ciel SW ; VDP1 intouche | **~+20-33 %** (le skip) ~ | **MEILLEUR sol de la famille** : perspective-exact texture, distance-dimme. Perd ciel HW + overlay | **NON PROUVE — SNOWE sur HW.** Compile (`VDP2_RBG0_TEST=1`+`HW_SKY=0`). **BLOQUE sur le poke CYCxx direct** (absent de l'arbre, reverte 2026-06-26) |
-| **11** | **K-table LIT (per-line K_LINECOL)** (F6) | = F1 mais K en **K_LINECOL** / cells / fb / map / 8 pal | = F1 (ciel HW → SW, overlay off). Rien de plus | = F1 ; les 8 slots de la banque K deja owned → K_LINECOL coute **0 cycle de plus** | `0` de plus vs F1 (meme skip) ; **QUALITE** ~ | **MEILLEUR variant RBG0** : perspective-exact **ET** distance-shade (fog Doom). Jo ship exactement ca | **Herite du blocage F1** (CYCxx). K_LINECOL lui-meme **prouve** (Jo, `slKtableRA` deja dans l'arbre `dg_saturn.cxx:1250` en K_LINE → un flag) |
+| **8** | **Sky+textured-floor RBG0 bitmap** (C / F2) — **SHIPPÉ** | ciel HW / **bitmap RBG0** / fb / overlay NBG3 **(revient !)** / 8 pal | **Flats dynamiques** : 1 bitmap statique 512×256 ; changer flat/lumiere = re-upload 128 Ko | B1 libere (bitmap = pas de PN read) → overlay + back-screen reviennent | **~+20-33 %** (le skip) ~ | PIRE que F1 (mono-texture, pas de flats/secteur) mais garde ciel HW + overlay | **SHIPPÉ HW PROPRE** (commits 19768ca/41dd895, gaté potato-0 + 1 joueur) : bitmap A1, coeff/K A0, RPT B1+0x1ff00 → B1 libre. Commit RÉSOLU (`rbg0_commit_cyc`/`ramctl`, RDBS=0x0D). Voir VDP2_RBG0_CURRENT_STATE.md |
+| **9** | **Sky+textured-floor RBG0 cell, K en CRAM** (G / S4) | ciel HW **(garde !)** / cells RBG0 / fb / map RBG0 **(EVINCE overlay)** / **K-table (CRKTE)** + pal | **OVERLAY NBG3** (map force B1) ; risque 1+ light-banks CRAM | Slave libere du sol ; VDP1 intouche ; **0 banque spare** ; CRAM = ressource contestee | **~+20-33 %** + sol texture perspective-exact ~ | **MEILLEUR sol des configs ciel-keeping** : texture perspective-exact + K_LINECOL possible. MAIS overlay parti | **NON PROUVE** : seule voie « ciel+sol **cell** texture » sur 4 banques (le bitmap config 8 garde déjà ciel+overlay sans ça), mais (1) CRKTE collisionne CRAM mode 1 vs color-calc ; (2) SGL n'expose **aucun** K-en-CRAM → poke brut. Recherche |
+| **10** | **Textured-floor RBG0 cell** (B/E / F1) — **superseded** | **K-table** / cells RBG0 / fb / map RBG0 **(EVINCE overlay)** / 8 pal | **Ciel HW** (→ ciel SW sur slave) **ET overlay** | A0/A1 ~126 Ko storage tail ; slave ~80 % idle pot1/2 reabsorbe ciel SW ; VDP1 intouche | **~+20-33 %** (le skip) ~ | **MEILLEUR sol de la famille** : perspective-exact texture, distance-dimme. Perd ciel HW + overlay | **SUPERSEDED par config 8 (bitmap).** Le cell-floor **snowait** (starvation cycle-pattern) ; le bitmap shippe propre **et** garde l'overlay → préférer config 8. Variante cell parquée |
+| **11** | **K-table LIT (per-line K_LINECOL)** (F6) — **piste qualité** | = F1 mais K en **K_LINECOL** / cells / fb / map / 8 pal | = F1 (ciel HW → SW, overlay off). Rien de plus | = F1 ; les 8 slots de la banque K deja owned → K_LINECOL coute **0 cycle de plus** | `0` de plus vs F1 (meme skip) ; **QUALITE** ~ | **MEILLEUR variant RBG0** : perspective-exact **ET** distance-shade (fog Doom). Jo ship exactement ca | Fog actuel sur le bitmap shippé = écran line-color + color-calc RBG0 (PAS K_LINECOL). K_LINECOL reste une piste qualité non-shippée (`slKtableRA` déjà dans l'arbre `dg_saturn.cxx:1250` en K_LINE → un flag) |
 | **12** | **WORLD-on-VDP1** (tout le monde → VDP1) | ciel HW / LIBRE / fb / overlay NBG3 / 8 pal | Base : rien cote VDP2 (deporte le monde du CPU vers VDP1). Variante RBG0 : ciel+overlay | A1 100 % idle ; VDP2 = pur compositeur ; **VDP1 NON idle (Dr 25-42 %)** | **~+15-24 %** (deux SH-2 liberes ; master n'attend jamais VDP1) ~ | Walls inchanges ; sol affine swim + **plus de tearing**. Permet « ciel+sol+overlay » SI sol = gradient 0-banque | **FONDATION PROUVEE** mais **cull VRAM requis** (~52 Ko honnetes : 20 Ko HUD mort + 32 Ko wtex shrink ; les 176 Ko WPN **aliasent** wtex = 0 Ko). Swim/Dr = verdict HW only |
 | **13** | **4bpp framebuffer** (libere une demi-banque B0) | ciel HW / LIBRE / **fb 4bpp 64 Ko** / overlay / sous-palettes 16-col | **Profondeur 8bpp de Doom** (256 PLAYPAL + 34 light) → 1 palette 16-col pour tout l'ecran en bitmap | 64 Ko de B0 mais **echoue** (ne peut heberger la map RBG0 : double whole-bank interdit) | **blit ~5.5→2.75 ms** (-2.75 ms, bus-bound) ~ MAIS qualite catastrophique | Catastrophique pour la vue 3D (16 couleurs). Viable **seulement** en strip HUD 4bpp | **FANTASME pour la vue 3D** (8bpp non negociable). La meme economie blit = **W5** (blit que les rangees 3D) sans perte → preferer W5 |
 | **14** | **Reduction-FB (ZMCTL 1/2 ou 1/4)** | ciel HW (reduit) / capacite cycle / fb / overlay / pal | A 1/4 : **NBG2 ET NBG3 (overlay)** desactives ; reduction **coute** des reads (×2/×4) | Minimal — la reduction adresse les **slots** (que Mimas n'a pas en pression), pas le stockage | **~0** pour Mimas ~ | PIRE (cap couleur + flou horizontal) pour 0 gain | **COMPILE mais POINTLESS** : resout une contrainte (slots) que Mimas n'a pas, casse l'overlay. Non-starter |
@@ -122,7 +118,7 @@ Gain : ✓ = mesure HW, ~ = estime/extrapole, `0` = nul par design, `?` = a esti
 - **Inutilise :** A1 libre (nuages NBG2 possibles par-dessus) ; slave libere ~62 ms (reabsorbe le ciel SW si besoin) ; VDP1 intouche (0 cout tearing).
 - **Gain perf :** **~+20-33 %** (`-17 a -26 ms`, master **ET** slave) — **le meme prix** que RBG0 car le gain EST le skip. **Estime** (A/B pot0). Dimensionne par `dom%` : ~+15 ms a d48 %, ~+28 ms a d95 %. Plus faible au pot1/2 (P deja effondre).
 - **Qualite :** PIRE sol (degrade non texture, pas de flats/secteur) MAIS garde ciel HW **ET** overlay (B1 intouche), 0 nouveau tearing, 0 minefield. Lit comme un sol « fog/profondeur » — jouable (d32xr ship exactement ca).
-- **Faisabilite :** **HAUTE** — le skip est shippe (`r_plane.c:1078`), le gradient repose sur des primitives back-screen deja vivantes. **PAS de commit RAMCTL/CYC, PAS de RBG0.** Seul travail neuf : relacher le band-match du skip + ecrire la table gradient. `VDP2_FLOOR_CONSOLIDATION.md §6` la nomme « meilleure piste tout-en-un ». **A verifier HW :** `slBackColTable`/`slLineColTable` sont des shadow-writes (famille flush-in-slSynch) → tester si un poke direct colle comme FBCR/PTMR (§3 idee transversale).
+- **Faisabilite :** **HAUTE** — le skip est shippe (`r_plane.c:1078`), le gradient repose sur des primitives back-screen deja vivantes. **PAS de commit RAMCTL/CYC, PAS de RBG0.** Seul travail neuf : relacher le band-match du skip + ecrire la table gradient (« meilleure piste tout-en-un »). **A verifier HW :** `slBackColTable`/`slLineColTable` sont des shadow-writes (famille flush-in-slSynch) → tester si un poke direct colle comme FBCR/PTMR (§3 idee transversale).
 - **A essayer de maniere disruptive :** animer la table gradient per-frame (trick reflets d'eau de Sonic R, tcrf-documente) → sol nukage/lave **shimmering** a ~0 cout, en detectant le flatnum liquide. Puis poser une NBG2 nuages dans A1 → ciel + sol-gradient-anime + nuages + overlay + le gain, **0 banque jeu**.
 
 #### Config 4 — Eye-candy / nuages NBG2 (docs S3)
@@ -141,7 +137,7 @@ Gain : ✓ = mesure HW, ~ = estime/extrapole, `0` = nul par design, `?` = a esti
 - **Gain perf :** **`0` REC** seul (pur visuel, comme config 4). Fps seulement si combine au skip (alors +20-33 %).
 - **Qualite :** **MEILLEUR ciel du catalogue** : vraie parallaxe 2 plans (ciel lointain + foreground derivant a un taux angulaire different) + translucidite color-calc au raccord. Le « showpiece exterieur ».
 - **Faisabilite :** **LIKELY-OK** par analogie au ciel HW prouve (NBG0 marche ; NBG2 = meme classe dans A1 libre, pas de poke). Inconnu = NBG2 jamais allume + CRAM.
-- **A essayer de maniere disruptive :** piloter le scroll du fg par une **line-scroll table** (X scroll per-raster) pour faker un horizon courbe / parallaxe-montagne dans un seul plan. Ou ne l'activer que sur les maps grand-exterieur (classifieur, `FLOOR_CONSOLIDATION §4`) → les maps fermees reclament A1 pour le gradient ou les nuages.
+- **A essayer de maniere disruptive :** piloter le scroll du fg par une **line-scroll table** (X scroll per-raster) pour faker un horizon courbe / parallaxe-montagne dans un seul plan. Ou ne l'activer que sur les maps grand-exterieur (classifieur au load) → les maps fermees reclament A1 pour le gradient ou les nuages.
 
 #### Config 6 — VDP1-floor / multi-surface (docs S5 / F3) — **le vrai cheval 1P**
 - **Bank map :** A0 = ciel HW (garde) · A1 = LIBRE (VDP2-wise) · B0 = fb · B1 = overlay NBG3 **(garde — VDP1 n'a pas besoin de B1 !)** · CRAM = 8 pal. **Le sol vit dans la VRAM VDP1** (banque cmd F + cache flat 32 Ko @`0x25Cxxxxx`), **hors** des 4 banques VDP2.
@@ -149,7 +145,7 @@ Gain : ✓ = mesure HW, ~ = estime/extrapole, `0` = nul par design, `?` = a esti
 - **Inutilise :** A1 libre (nuages possibles) ; slave libere du sol ; **VDP1 = ressource consommee, et TENDUE au pot0 (Dr 25-42 %)** → le sol mange du headroom VDP1 reel → plus de tearing.
 - **Gain perf :** **~+15-24 %** (`-4 a -9 ms` cites pour les strips ; l'inverted-hybrid tue P + fill EX + blit de ces pixels). **Multi-surface** : autres hauteurs + plafonds non-sky. Master n'attend jamais VDP1 (`CRITICAL_PATH §0`) → le gain **banque** vraiment. **Estime**, inputs mesures : Qp~169 quads monde, Vp~158 quads sol, q4 80-93 % pure-quad.
 - **Qualite :** MEILLEURE couverture (multi-surface : sols+plafonds+marches), garde ciel **ET** overlay. PIRE : swim affine pres de l'horizon (mitige par bandes fines + flat-clamp) + **plus de tearing** (Dr descend sous le confort).
-- **Faisabilite :** **FONDATION PROUVEE-HW** (driver async VDP1 valide 2026-06-16, murs+arme shippes) mais l'**emitter est un STUB** aujourd'hui (`sat_floor_vdp1_stub` renvoie 1, emet 0 strip). Plumbing prouve, emitter non bati. `FLOOR_CONSOLIDATION §3` : « VDP1 bat RBG0 : roule sur le registre-direct prouve, evite le minefield, multi-surface ». **Gate reel = `Dr%` post-floor**, pas Vp.
+- **Faisabilite :** **FONDATION PROUVEE-HW** (driver async VDP1 valide 2026-06-16, murs+arme shippes) mais l'**emitter est un STUB** aujourd'hui (`sat_floor_vdp1_stub` renvoie 1, emet 0 strip). Plumbing prouve, emitter non bati. Note : le sol RBG0 bitmap (config 8) a entre-temps SHIPPÉ pour le flat dominant ; VDP1-floor garderait sa valeur **multi-surface** (autres hauteurs + plafonds) en complément (cf. §3 « RBG0 + VDP1 = partenaires »). **Gate reel = `Dr%` post-floor**, pas Vp.
 - **A essayer de maniere disruptive :** per-subsector inverted-hybrid (`VDP1_WORLD_PLAN`) — emettre sols/plafonds **pendant** la BSP walk sur le kick mur existant (pas de 2e kick) → nulle floorplane/ceilingplane a `R_Subsector` → la **generation P disparait** aussi. Puis **composer avec la config 9/10** : RBG0 prend le seul flat dominant (pire swim), VDP1 prend le residuel — **partenaires, pas rivaux** (`CRITICAL_PATH §5`). Batir le toggle A/B (`VDP1_FLOOR_TEST_AB`) **d'abord** pour mesurer Dr + swim sur une scene fixe avant de committer.
 
 #### Config 7 — Fake-mode7 line-scroll (exotique, ciel-keeping)
@@ -163,14 +159,14 @@ Gain : ✓ = mesure HW, ~ = estime/extrapole, `0` = nul par design, `?` = a esti
 
 ### 2.C — Famille SOL-CENTRIC (sol meilleur/moins cher ; ciel software accepte)
 
-#### Config 8 — RBG0 BITMAP floor (docs C / F2)
-- **Bank map :** A0 = ciel HW (garde) · A1 = **bitmap RBG0 (512×256 8bpp pre-tile, pas de PN read)** · B0 = fb · B1 = overlay NBG3 + back-screen **(libere : bitmap droppe le PN read)** · CRAM = 8 pal.
+#### Config 8 — RBG0 BITMAP floor (docs C / F2) — **SHIPPÉ ✅**
+- **Bank map :** A0 = ciel HW (garde) + coeff/K · A1 = **bitmap RBG0 (512×256 8bpp pre-tile, pas de PN read)** · B0 = fb · B1 = overlay NBG3 + back-screen + RPT `B1+0x1ff00` **(libre : bitmap droppe le PN read)** · CRAM = 8 pal.
 - **Ce qui part :** **flats dynamiques** — 1 bitmap statique. Changer le flat dominant/lumiere = re-upload 128 Ko (vs 4 Ko cells) → rejete pour la bande passante per-frame. Variete per-secteur perdue (hauteurs encore via la matrice affine).
 - **Inutilise :** B1 libere de la map → overlay revient + back-screen revit (debug-pendant-sol enfin possible) ; A0 ciel ~2/8 slots ; slave idle.
 - **Gain perf :** **meme +20-33 %** (skip identique). **Avantage sur F1** : garde ciel HW + overlay → pas de cout ciel-SW re-ajoute au slave. Mais le re-upload (changement de flat) peut spiker une frame. **Estime**.
 - **Qualite :** PIRE que F1 (mono-texture, pas de flats/secteur) mais garde ciel HW + overlay. Perspective-exact dans le flat unique. Bon pour cours exterieures (d95 % un flat), pauvre pour nukage mixte (d48 %).
-- **Faisabilite :** **PARTIEL NON PROUVE.** Bitmap = 2 reads (bitmap+K) → frees la banque map, MAIS la K-table veut **encore sa banque** → si K en CRAM (CRKTE) frees la 2e banque mais collision CRAM (non prouvee) + CRAM mode 1 vs color-calc. SRL ne supporte que 512×256/512×512 bitmap. **Snowe encore** (meme commit CYCxx que F1).
-- **A essayer de maniere disruptive :** baker le flat dominant dans le bitmap **une fois par map au load** (pas per-frame) et l'accepter comme texture sol unique du niveau (d32xr ship un look sol). Alors B1 permanemment libre → poser une NBG2 nuages, OU garder l'overlay live pour le profiling. Troque variete sol contre une config debuggable, ciel-keeping, overlay-keeping.
+- **Faisabilite :** **SHIPPÉ HW PROPRE** (commits 19768ca/41dd895, gaté potato-0 + 1 joueur). Le bitmap = 2 reads (bitmap A1 + coeff/K A0) → pas de banque map → **B1 libre**. Le commit est **RÉSOLU** : `rbg0_commit_ramctl`/`rbg0_commit_cyc` (block-flush direct **sans** slSynch) + RDBS=0x0D + cycles A0/A1 parqués. La « neige » du sol cellulaire était de la **starvation de cycle-pattern**, pas un commit-gap. SRL supporte 512×256/512×512 bitmap. **Détails faisant autorité : [`docs/VDP2_RBG0_CURRENT_STATE.md`](VDP2_RBG0_CURRENT_STATE.md).**
+- **A essayer de maniere disruptive :** baker le flat dominant dans le bitmap **une fois par map au load** (pas per-frame) et l'accepter comme texture sol unique du niveau (d32xr ship un look sol). B1 étant libre → poser une NBG2 nuages OU un ciel B1, OU garder l'overlay live pour le profiling. Fog distance = écran line-color + color-calc RBG0 (prototype gaté OFF).
 
 #### Config 9 — RBG0 cell, K en CRAM (CRKTE) — ciel HW garde (docs G / S4)
 - **Bank map :** A0 = ciel HW **(garde — la SEULE voie ciel+sol-texture)** · A1 = cells RBG0 (char) · B0 = fb · B1 = map RBG0 **(EVINCE overlay NBG3)** · CRAM = K-table (CRKTE, RAMCTL bit15) partageant 4 Ko avec les 8 palettes.
@@ -178,17 +174,17 @@ Gain : ✓ = mesure HW, ~ = estime/extrapole, `0` = nul par design, `?` = a esti
 - **Inutilise :** slave libere du sol ; VDP1 intouche ; **pas de banque spare** (4 pleines : ciel/cells/fb/map). CRAM est la ressource contestee, pas les cycles VRAM.
 - **Gain perf :** **~+20-33 %** (meme skip) + flat dominant texture perspective-exact (qualite, pas fps de plus) sur une 3e unite HW (charge ni master ni VDP1, 0 tearing ajoute, `CRITICAL_PATH §5`). **Estime.**
 - **Qualite :** **MEILLEUR sol des configs ciel-keeping** : vraie perspective-correct texture + K_LINECOL per-line possible. MAIS overlay parti + 1 seul flat/hauteur (1 plan RBG0). Ciel garde.
-- **Faisabilite :** **NON PROUVE** — la seule config qui garde ciel **ET** sol texture sur 4 banques, mais : (1) CRKTE risque collision CRAM/palette-8bpp (mode 1 vs color-calc etendu) ; (2) SGL/SRL n'exposent **aucun** K-en-CRAM (`srl_vdp2.hpp` alloue toujours K en VRAM) → poke registre brut ; (3) **encore le CYCxx direct** (absent) ou ca neige. `VDP2_LAYER_BUDGET config G`, `FLOOR_CONSOLIDATION §1.4(b)`. Recherche, pas ship.
+- **Faisabilite :** **NON PROUVE** — la voie qui garde ciel **ET** sol **cell** texture sur 4 banques (note : le bitmap config 8 SHIPPÉ garde déjà ciel+overlay sans CRKTE), mais : (1) CRKTE risque collision CRAM/palette-8bpp (mode 1 vs color-calc etendu) ; (2) SGL/SRL n'exposent **aucun** K-en-CRAM (`srl_vdp2.hpp` alloue toujours K en VRAM) → poke registre brut. `VDP2_LAYER_BUDGET config G`. Recherche, pas ship.
 - **A essayer de maniere disruptive :** prouver CRKTE **d'abord** en isolation (poke RAMCTL bit15 + K a `CRAM 0x100800`, RBG0 off, observer la palette) **AVANT** de cabler le sol — decoupler les deux inconnues. Si CRKTE collisionne, fallback K_LINE/TwoAxis (peut couter 0 cycle, pourrait tenir en haut de A0 a cote du ciel). Si ca colle, ajouter K_LINECOL = fog Doom gratuit sur le flat dominant.
 
-#### Config 10 — RBG0 CELL floor (ciel software, overlay off) (docs B/E / F1)
+#### Config 10 — RBG0 CELL floor (ciel software, overlay off) (docs B/E / F1) — **superseded par config 8**
 - **Bank map :** A0 = K-table (coefficient, freed par le ciel SW) · A1 = cells/char RBG0 (le flat dominant 64×64 swizzle en cells 8×8, re-upload ~0.6 ms au changement) · B0 = fb · B1 = map RBG0 **(EVINCE overlay NBG3 ET le back-screen color word)** · CRAM = 8 pal.
-- **Ce qui part :** ciel HW (NBG0 off → ciel software sur le slave libere). **Overlay GONE** (map veut B1, RDBS 0x8D marque B1 rotation-PN → le texte neige). Back-screen color collisionne aussi.
+- **Ce qui part :** ciel HW (NBG0 off → ciel software sur le slave libere). **Overlay GONE** (map veut B1). Back-screen color collisionne aussi.
 - **Inutilise :** A0 K-table en K_LINE/TwoAxis ~0 storage past la base → ~126 Ko de A0 libres en storage (mais les 8 slots owned par le read coefficient). A1 ~124 Ko libres past les 4 Ko cells. Slave ~80 % idle pot1/2 absorbe le ciel SW gratis. VDP1 intouche.
 - **Gain perf :** **~+20-33 %** (`-17 a -26 ms` master ET slave) quand `dom%` du sol = le flat dominant. **Le gain vient du SKIP index-0**, pas de RBG0. **Estime** (A/B pot0). Au pot1/2 le prix retrecit (P deja 17/11 ms) ; valeur la-bas = QUALITE.
 - **Qualite :** **MEILLEUR sol de la famille** : perspective-EXACT (pas de swim), texture, distance-dimme via cells colormap-swizzle. Perd ciel HW (ciel SW correct-ish, moins crisp) + overlay (cout dev seul).
-- **Faisabilite :** **NON PROUVE — SNOWE sur HW.** Compile (`VDP2_RBG0_TEST=1`+`HW_SKY=0`, layout legal). **BLOQUE sur** : (1) ecrire `rbg0_commit_cyc()` poke direct CYCA0/A1/B0/B1 `@0x25F80010` **sans** slSynch (slSynch=poison) ; (2) confirmer que le poke colle comme FBCR/PTMR pour VDP1 (prouve 2026-06-16) ou s'il faut re-poker per-frame (clobber ISR). Mid-game bank re-commit = poison → **toggle ecran-titre seulement**.
-- **A essayer de maniere disruptive :** ajouter l'eclairage K-table per-line (K_LINECOL=0x10, `slKtableRA` deja dans l'arbre `dg_saturn.cxx:1250` en K_LINE) → le flat dominant recoit le diminishing-light/fog de Doom **gratuit** sur la meme banque coefficient → fixe la brightness uniforme-par-secteur, 0 banque de plus (= config 11 fusionnee).
+- **Faisabilite :** **SUPERSEDED par config 8 (bitmap, SHIPPÉ).** Le sol cellulaire **snowait** sur HW — la cause s'est avérée être de la **starvation de cycle-pattern** (RAMCTL/CYC), pas un commit-gap : le bitmap (1 read de moins) + `rbg0_commit_ramctl`/`rbg0_commit_cyc` + RDBS=0x0D + cycles parqués shippe **propre** sans slSynch (cf. VDP2_RBG0_CURRENT_STATE.md), **et** garde l'overlay (B1 libre). Le cell-floor est donc parqué : le bitmap couvre le même besoin sans évincer B1.
+- **A essayer de maniere disruptive :** ajouter l'eclairage K-table per-line (K_LINECOL=0x10, `slKtableRA` deja dans l'arbre `dg_saturn.cxx:1250` en K_LINE) → le flat dominant recoit le diminishing-light/fog de Doom **gratuit** sur la meme banque coefficient → fixe la brightness uniforme-par-secteur, 0 banque de plus (= config 11 fusionnee). (Note : sur le bitmap shippé le fog passe par écran line-color + color-calc, pas K_LINECOL.)
 
 #### Config 11 — Per-line K_LINECOL LIT floor (enhancer SUR config 10) (docs F6)
 - **Bank map :** identique a la config 10, mais la K-table en **K_LINECOL** (per-line coefficient = brightness per-bande-profondeur). **Pas de banque de plus vs F1** — la K-table est deja une banque entiere ; K_LINECOL change juste son contenu.
@@ -196,7 +192,7 @@ Gain : ✓ = mesure HW, ~ = estime/extrapole, `0` = nul par design, `?` = a esti
 - **Inutilise :** = config 10. Les 8 slots de la banque K deja owned par le read coefficient → K_LINECOL coute **0 bande passante de plus** (meme read/dot, contenu different).
 - **Gain perf :** **`0` de plus vs config 10** (meme skip). Le gain est **QUALITE** : le diminishing-light/fog de Doom sur le sol HW gratuit, fixe la limite « brightness uniforme par secteur » de F1. **Jo utilise exactement `slKtableRA(..., K_ON|K_LINECOL)`.** L'arbre appelle deja `slKtableRA` en K_LINE → un flag.
 - **Qualite :** **MEILLEUR variant** du sol RBG0 texture : perspective-exact **ET** distance-shade (proche brillant, loin fog), matche le zlight software. Le plus gros upgrade visuel du chemin RBG0 a cout banque zero. Recommande par `VDP2_ARCHITECTURE §6.5`.
-- **Faisabilite :** **herite du blocage F1 (CYCxx)** pour ne pas neiger. K_LINECOL lui-meme **PROUVE** (Jo ship, constante SGL 0x10, `slKtableRA` deja dans l'arbre). Une fois F1 demine, F6 = flip de flag. Risque independant = BAS.
+- **Faisabilite :** le commit RBG0 lui-même est **résolu** (config 8 shippe propre). Le fog **actuel** sur le bitmap shippé passe par écran line-color + color-calc RBG0, **pas** K_LINECOL. K_LINECOL reste une **piste qualité non-shippée** (per-line K) : prouvé ailleurs (Jo ship, constante SGL 0x10, `slKtableRA` deja dans l'arbre en K_LINE → un flag), mais demande la K-table per-line en VRAM (variante cell, pas le bitmap actuel). Risque independant = BAS.
 - **A essayer de maniere disruptive :** utiliser le K per-line pour **faker une 2e surface** : au-dessus de l'horizon Doom, pointer le K vers un coefficient hauteur-plafond ; en-dessous, vers le sol → un plan RBG0 rendant sol en bas + plafond incline en haut, 0 banque (le substitut a la config 15). Ou animer la brightness per-line pour un sol lave-glow pulsant. Ou K_DOT (per-dot, 0x20) pour vraie perspective per-pixel si la bande passante suit.
 
 ### 2.D — Famille DISRUPTIF / EXOTIQUE (repenser la division VDP1/VDP2/SH-2)
@@ -259,7 +255,7 @@ Gain : ✓ = mesure HW, ~ = estime/extrapole, `0` = nul par design, `?` = a esti
 | **TOUT-sur-VDP1** (config 12 max) : monde entier → VDP1, VDP2 = pur compositeur → frees A1 **ET** B1 | **fondation PROUVEE, ampleur non-prouvee** | Frees 2 banques pour un parallaxe nuages OU sortir le HUD/status-bar sur sa propre NBG (W5-style ~14 % blit). VDP2 devient compositeur pur |
 | **Bouger TOUT le sol hors VDP2 fait disparaitre la GENERATION (P)**, pas que le fill : per-subsector VDP1 inverted-hybrid (emit pendant la BSP walk, nulle floorplane/ceilingplane a `R_Subsector`) → le bucket dominant 48 %-du-render disparait, **les deux SH-2 liberes** (~62 ms master + ~62 ms slave-equiv) | **fondation PROUVEE, emitter STUB** | Le plus gros levier compute du catalogue — attaque le P de 48 % a la racine, pas juste le fill |
 | **Prouver le commit gradient SGL** (`slBackColTable`/`slLineColTable`) **comme le path VDP1 l'a ete** : ce sont des shadow-writes qui flushent normalement en slSynch (jamais lance) → tester si un poke direct colle comme FBCR/PTMR (valide 2026-06-16) | **a verifier HW** | Si ca colle, le sol gradient 0-banque (config 3) est **totalement debloque sans minefield** — debloque la config la plus rentable |
-| **Classifier la map au LOAD** (open/closed, has-sky/no-sky — `FLOOR_CONSOLIDATION §4`) : maps closed/no-sky frees A0 pour une K-table RBG0 (sol texture, le ciel etait gache), maps open gardent ciel HW + gradient | **mecanique saine, commit non-prouve** | Committer le layout **une fois au load** (jamais per-frame — fragile RAMCTL/CYC) via le toggle. Le signal per-frame `sat_frame_has_sky` existe deja |
+| **Classifier la map au LOAD** (open/closed, has-sky/no-sky) : maps closed/no-sky frees A0 pour une K-table RBG0 (sol texture, le ciel etait gache), maps open gardent ciel HW + gradient | **mecanique saine, commit prouvé au load** | Committer le layout **une fois au load** (jamais per-frame — fragile RAMCTL/CYC) via le toggle. Le signal per-frame `sat_frame_has_sky` existe deja |
 | **4bpp framebuffer pour libérer une banque** : 8bpp 512×256 = 128 Ko = toute B0 ; 4bpp halve storage + halve les octets blit (~5.5→2.75 ms) | **fantasme pour la 3D, viable HUD** | Doom est 256-col → trop lossy pour la vue 3D ; viable pour le strip HUD 4bpp en sa propre NBG (= W5 sans perte, prefere W5) |
 | **Fake-mode7 line-scroll** (config 7) : NBG per-line H-scroll + zoom widening-vers-le-bas ≈ plan sol **sans** moteur rotation, sans minefield CYCxx, sans cout 3-banques (1 banque cell) | **compile, dodge le minefield, non-prouve sous yaw** | Le trick SNES-mode7-on-Saturn pas cher. Qualite entre gradient et RBG0 ; rentre la ou la neige RBG0 bloque |
 | **Color-math = un 2e renderer GRATUIT** : back-screen + line-color + color-offset (COAR/COAG/COAB) + color-calc sont **0 banque, 0 slot**, usables dans **N'IMPORTE QUELLE** config | **PROUVE-class (registres)** | Fog distance, damage-flash, pickup-flash, fondus, translucidite raccord ciel — en hardware. Tue le spike damage-flash (~40 ms re-bake CRAM). Idle dans tout build aujourd'hui |
@@ -273,8 +269,8 @@ Gain : ✓ = mesure HW, ~ = estime/extrapole, `0` = nul par design, `?` = a esti
 
 ### 4.1 Principe de commit (la loi)
 Le **layout de banque** se commit **UNE SEULE FOIS**, avant le gameplay (au pire **par map au
-load**), **jamais per-frame** : un re-commit RAMCTL/CYCxx mid-game sans slSynch est poison
-(`FLOOR_CONSOLIDATION §4.3`). Seul le **flag software-skip** (`sat_vdp2_floor` on/off) est cheap a
+load**), **jamais per-frame** : un re-commit RAMCTL/CYCxx mid-game sans slSynch est poison.
+Seul le **flag software-skip** (`sat_vdp2_floor` on/off) est cheap a
 basculer per-frame. Le **toggle potato** (pad-Z, 7 niveaux) reste **orthogonal** — il varie la
 qualite software dans n'importe quel layout sans toucher les banques.
 
@@ -287,13 +283,14 @@ qualite software dans n'importe quel layout sans toucher les banques.
 | **Rich sky** | 4 / 5 (nuages/parallaxe NBG2 dans A1) | runtime (NBG2 dans A1 libre) | **likely-OK** (NBG2 jamais allume) |
 | **VDP1 floor** *(multi-surface)* | 6 | **build flag** (emitter non bati + cull VRAM) | fondation prouvee, **emitter STUB** |
 | **Fake-mode7 floor** | 7 (line-scroll) | **build flag** (path neuf) | non-prouve sous yaw |
-| **Textured floor** *(RBG0)* | 10 (+11 K_LINECOL) | **build flag** (`VDP2_RBG0_TEST=1`+`HW_SKY=0`) | **BLOQUE CYCxx — snowe** |
-| **Sky + textured floor** *(CRKTE)* | 9 | **build flag** | recherche (collision CRAM + CYCxx) |
+| **Textured floor** *(RBG0 bitmap)* | **8 (SHIPPÉ)** | **build flag** (`RBG0_BITMAP=1`, gaté potato-0 + 1P) | **PROUVE HW** (cf. VDP2_RBG0_CURRENT_STATE.md) |
+| **Textured floor** *(RBG0 cell + K_LINECOL)* | 10 / 11 | **build flag** | superseded par config 8 ; cell-floor parqué |
+| **Sky + textured floor** *(CRKTE cell)* | 9 | **build flag** | recherche (collision CRAM ; config 8 couvre déjà ciel+overlay) |
 | *(non expose — fantasme/pointless)* | 13, 14, 15 | — | infaisable/pointless |
 
 ### 4.3 Exclusions mutuelles (build vs runtime)
-- **Runtime-switchable entre elles** (memes banques de base A0=ciel/B0=fb, B1 garde l'overlay) : **1, 2, 3, 4, 5, 6, 7**. Ces 7 ne committent **aucun** RAMCTL/CYC → basculables au load sans risque.
-- **Build-exclusives** (forcent ciel SW et/ou evincent l'overlay via map RBG0 en B1) : **8, 9, 10, 11**. Elles exigent `VDP2_HW_SKY=0` et/ou `VDP2_RBG0_TEST=1` → un build different. **Overlay XOR sol-RBG0-cellulaire est inevitable.**
+- **Garde l'overlay** (B1 libre) : **1, 2, 3, 4, 5, 6, 7** (memes banques de base A0=ciel/B0=fb) **et le sol RBG0 bitmap SHIPPÉ config 8** (bitmap = pas de map → RPT en B1+0x1ff00, B1 libre). Les 7 premières ne committent **aucun** RAMCTL/CYC ; la 8 commit son RAMCTL/CYC **une fois au load** (block-flush direct, prouvé HW).
+- **Build-exclusives qui ÉVINCENT l'overlay** : seules les variantes sol **cellulaires** **9, 10, 11** (map RBG0 en B1). **Overlay XOR sol-RBG0-CELLULAIRE** reste vrai — mais le sol bitmap shippé (config 8) **lève** cette contrainte (overlay conservé). Préférer config 8.
 - **Potato (pad-Z)** : orthogonal a tout — runtime, dans n'importe quelle entree.
 
 ### 4.4 Ordre d'implementation propose (gain/risque)
@@ -301,9 +298,10 @@ qualite software dans n'importe quel layout sans toucher les banques.
 1. **Config 3 (Fast-floor gradient)** — *highest-confidence fps move*. Skip deja shippe + gradient 0-banque + garde ciel+overlay. **Premier a cabler** (apres validation HW du commit back-screen).
 2. **Config 4/5 (nuages/parallaxe NBG2)** — eye-candy +0 REC, A1 libre, meme classe que le ciel prouve. **Bas risque, fort visuel.** Cable en parallele de la 3.
 3. **Config 6 (VDP1-floor)** — le vrai cheval 1P (multi-surface, master n'attend jamais VDP1). **Cabler le toggle A/B d'abord** pour mesurer Dr/swim ; emitter a batir.
-4. **Config 10+11 (RBG0 + K_LINECOL)** — **research-only** tant que le poke CYCxx n'est pas ecrit + prouve-collant HW. Quand demine, K_LINECOL = flip de flag.
-5. **Configs 9 (CRKTE), 7 (fake-mode7)** — research/experimental, gates HW propres avant tout.
-6. **Configs 13/14/15** — **non exposees** (documentees pour ecarter, pas poursuivre).
+4. **Config 8 (RBG0 bitmap)** — **SHIPPÉ** (gaté potato-0 + 1P). Le sol texture HW propre qui garde l'overlay ; commit RAMCTL/CYC résolu au load.
+5. **Config 10/11 (RBG0 cell + K_LINECOL)** — **superseded par config 8** (cell-floor parqué). K_LINECOL = piste qualité non-shippée.
+6. **Configs 9 (CRKTE), 7 (fake-mode7)** — research/experimental, gates HW propres avant tout.
+7. **Configs 13/14/15** — **non exposees** (documentees pour ecarter, pas poursuivre).
 
 ### 4.5 Defaut
 **Config 1 (Classic)** — la seule prouvee bout-en-bout. Le toggle propose les autres comme
@@ -330,15 +328,17 @@ experiences, jamais comme defaut tant qu'elles ne sont pas validees HW.
    et est **multi-surface** (sols+plafonds+marches) la ou RBG0/gradient ne font qu'un flat. Mais
    l'**emitter est un stub** → batir le **toggle A/B d'abord** pour mesurer `Dr%`/swim sur scene fixe.
 
-4. **Config 10+11 — RBG0 + K_LINECOL (B/F1+F6).** *La meilleure qualite de sol, mais research-only.*
-   Le seul sol perspective-EXACT texture + fog Doom, **mais bloque sur le poke CYCxx** (absent,
-   reverte 2026-06-26). A ne cabler **qu'apres** que le poke colle sans slSynch sur HW.
+4. **Config 8 — RBG0 BITMAP floor (C/F2). SHIPPÉ ✅.** *Le sol texture HW qui a gagné.* Bitmap
+   512×256 8bpp propre (commits 19768ca/41dd895, gaté potato-0 + 1P), garde ciel HW **ET** overlay
+   (B1 libre), commit RAMCTL/CYC résolu au load (`rbg0_commit_ramctl`/`rbg0_commit_cyc`, sans slSynch).
+   La variante **cellulaire** (config 10/11, perspective-exact + K_LINECOL fog) est **superseded** :
+   elle snowait (starvation cycle-pattern) et évince l'overlay. Réf : [`docs/VDP2_RBG0_CURRENT_STATE.md`](VDP2_RBG0_CURRENT_STATE.md).
 
 ### Les plus gros inconnus — *a verifier sur HW*
 
 - **(config 3)** Le commit `slBackColTable`/`slLineColTable` colle-t-il sans slSynch comme FBCR/PTMR ? *Le seul gate de la config la plus rentable.* — **a verifier HW.**
 - **(config 6)** Le `Dr%` post-floor reste-t-il ≥ 80 % une fois ~158 quads sol ajoutes a un VDP1 deja tendu (Dr 25-42 %) ? *Le gate reel, pas Vp.* — **a verifier HW.**
-- **(config 10)** Le poke CYCxx direct colle-t-il sans slSynch, ou l'ISR vblank le clobbe-t-il chaque frame (→ poke per-frame) ? — **a verifier HW.**
+- **(config 8, RÉSOLU)** Le commit RAMCTL/CYC colle sans slSynch (block-flush direct au load) — **prouvé HW** (sol bitmap shippé). La variante cell (10/11) reste parquée. — **résolu, cf. VDP2_RBG0_CURRENT_STATE.md.**
 - **(config 9)** CRKTE coexiste-t-il avec la palette 8bpp dans 4 Ko de CRAM (mode 1 vs color-calc) ? — **a verifier HW, en isolation d'abord.**
 - **(config 12)** Combien de VRAM VDP1 honnetement reclamable ? (~52 Ko vs le mirage 196 Ko) et le swim affine est-il acceptable ? — **a verifier HW.**
 - **(general)** Le framebuffer 320×200 laisse-t-il du storage en B0, ou consomme-t-il toute la banque comme un 512×256 ? — **a verifier** (`VDP2_LAYER_BUDGET §3 piste B`).
@@ -354,7 +354,7 @@ de **qualite** (le slave est deja idle, P deja effondre) — les configs valent 
 ---
 
 ### Sources
-- Docs repo : [`docs/VDP2_LAYER_BUDGET.md`](VDP2_LAYER_BUDGET.md), [`docs/VDP2_FLOOR_CONSOLIDATION.md`](VDP2_FLOOR_CONSOLIDATION.md), `docs/CRITICAL_PATH.md`, `docs/VDP1_WORLD_PLAN.md`, `docs/VDP2_ARCHITECTURE.md`, `docs/REC_BENCHMARKS.md`.
+- Docs repo : [`docs/VDP2_LAYER_BUDGET.md`](VDP2_LAYER_BUDGET.md), [`docs/VDP2_RBG0_CURRENT_STATE.md`](VDP2_RBG0_CURRENT_STATE.md) (réalité sol shippée), [`docs/VDP1_PRESENT_SYNC_PLAN.md`](VDP1_PRESENT_SYNC_PLAN.md) (présent VDP1↔NBG1), `docs/CRITICAL_PATH.md`, `docs/VDP1_WORLD_PLAN.md`, `docs/VDP2_ARCHITECTURE.md`, `docs/REC_BENCHMARKS.md`.
 - Code : `src/dg_saturn.cxx`, `core/r_plane.c`, `core/r_parallel.c`.
 - SRL/SGL : `SaturnRingLib/saturnringlib/srl_vdp2.hpp`, `srl_ascii.hpp`, `SaturnRingLib/modules/sgl/INC/sl_def.h`.
 - Enumerations sources : 5 agents paralleles (ciel-centric S1-S6, sol-centric F1-F6, baseline/overlay, disruptif/exotique, perf-grounding), fusionnees 2026-06-26.

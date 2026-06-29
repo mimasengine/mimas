@@ -1,26 +1,29 @@
-> ⚠️ STALE re: the RBG0 floor (pre-2026-06-27). The floor now SHIPS as a clean 512x256 8bpp BITMAP (RBG0_BITMAP=1, commits 19768ca/41dd895): 2 rotation banks — bitmap in A1 (0x25E20000) + K-table in A0 (0x25E00000); B0=NBG1 framebuffer; RPT at B1+0x1ff00, B1 otherwise FREE (no map). The snow was cell-floor cycle-pattern starvation, SOLVED by the bitmap (2 reads/dot) + manual RDBS=0x0D + parked A0/A1 cycles (rbg0_commit_ramctl/rbg0_commit_cyc, NOT slSynch — rbg0_commit_cyc IS in the tree). The "floor XOR sky" law is LIFTED (B1 freed). The §1–§3 hardware-mechanism analysis is still valid; treat every "floor off / still snows / cannot ship / floor XOR sky / cell 3-bank / cycle-pattern commit missing" conclusion as OBSOLETE. See docs/VDP2_RBG0_CURRENT_STATE.md.
+> **STATUS — hardware mechanism reference (§1–§3, §6.5, §7).** This doc's value is the
+> VDP2 hardware model: the chip, the VRAM access-cycle/snow law, the per-layer bandwidth
+> cost table, and the bank-free register-feature catalog. Those are accurate and load-bearing.
+> The RBG0 floor it was originally written to diagnose has since SHIPPED as a clean
+> 512x256 8bpp **bitmap** (RBG0_BITMAP=1, commits 19768ca/41dd895): bitmap in A1 + K-table
+> in A0, B0=NBG1 framebuffer, B1 free → a B1 sky can coexist (the "floor XOR sky" law is
+> LIFTED). Snow was cell-floor cycle-pattern STARVATION, solved by the bitmap (2 reads/dot)
+> + manual RDBS=0x0D + parked A0/A1 cycles (`rbg0_commit_ramctl`/`rbg0_commit_cyc`, **in the
+> tree, NOT slSynch**). For the live floor reality see **docs/VDP2_RBG0_CURRENT_STATE.md**;
+> for VDP1↔NBG1 present sync see **docs/VDP1_PRESENT_SYNC_PLAN.md**. The §4–§6 "two defects /
+> sky XOR floor / can't ship" diagnosis below was the 2026-06-19 snapshot and is now
+> historical — kept only as a trimmed note.
 
 # VDP2 — architecture, limits, and what Mimas should put on it
 
 Written 2026-06-19 after Romain reported the VDP2 path **broken on real Saturn**:
 sky dead (blue / not displayed) + **"snow"** (white pixel bands of varying length
 over the whole image). This doc explains *why* — at the hardware level (chip, VRAM,
-bandwidth) and the software level (SGL register commit) — and ends with **convictions
-+ a capacity budget** for what VDP2 should carry in this port.
+bandwidth) and the software level (SGL register commit). §1–§3 are the durable
+hardware model; §4–§6 are the (now historical) 2026-06-19 diagnosis.
 
-TL;DR — two independent defects stack:
-1. **Commit gap.** Mimas never runs `slSynch`, so the VRAM **cycle pattern** and
-   **RAMCTL** that the RBG0 floor needs never reach the chip. Ymir reads SGL's *shadow*
-   registers and hides it; the real VDP2 reads the actual registers → the bitmap layers
-   starve → snow + dead sky. Same emulator-vs-hardware trap as the SCU-DMA cache bug.
-2. **Bank over-subscription.** A cell RBG0 Mode-7 floor with a VRAM coefficient table
-   needs **3 whole VRAM banks** (pattern-name, character, coefficient) on top of the 2
-   bitmap banks (framebuffer + sky) = **5 bank-claims for 4 banks**. It physically
-   cannot fit while the hardware sky is also on. Our layout even puts the cells and the
-   K-table in the *same* bank A1, which the hardware forbids.
-
-The hardware **sky-only** config (framebuffer NBG1 + sky NBG0, no rotation) was
-hardware-validated and is the safe baseline. **RBG0 is what broke it.**
+> The original snow/dead-sky diagnosis (§4–§6) has since been resolved in shipped code:
+> the RBG0 floor went out as an 8bpp **bitmap** (2 reads/dot) with RAMCTL/CYC committed by
+> **direct register write** (`rbg0_commit_ramctl`/`rbg0_commit_cyc`, not slSynch), the
+> K-table in its own bank A0, and B1 freed so a sky can coexist. See
+> **docs/VDP2_RBG0_CURRENT_STATE.md** for the live floor.
 
 ---
 
@@ -147,164 +150,38 @@ costs.
 
 ---
 
-## 4. Why ours breaks — the two defects in detail
+## 4. Historical — the 2026-06-19 snow/dead-sky diagnosis (RESOLVED)
 
-### Defect 1 — the commit gap (no `slSynch`)
-
-SGL programs VDP2 through **shadow registers** in work RAM and flushes them to the
-actual chip **inside `slSynch()`** (its frame sync). RAMCTL (bank split, RDBS) and the
-CYC cycle-pattern registers are part of that flush.
-
-Mimas **deliberately dropped per-frame `slSynch`** ([[doomsrl-known-bugs]]: it
-vblank-caps fps to ~7-12 and its SGL sound-driver tick silenced direct-SCSP SFX; the
-freeze is instead handled by `rp_sgl_workptr_reset`). Consequence: **the RBG0 cycle
-pattern + RAMCTL are set in the shadows but never written to the chip.** On the real
-VDP2 the registers keep whatever SRL's init left → the *added* RBG0 read demand isn't
-scheduled → the bitmap NBG reads starve → **snow + dead sky**. Ymir reads SGL's shadows,
-so it looked fine in the emulator (and that is the trap behind the "hardware-confirmed
-end-to-end" claim in older notes — **treat that claim as unverified**; the committed
-`HEAD` has *no* commit of the pattern, only `slScrAutoDisp(... | RBG0ON)`).
-
-> **RECONCILED 2026-06-24:** The "*no* commit of the pattern" line is stale for the
-> RDBS half. The tree now has `rbg0_commit_ramctl()` (`dg_saturn.cxx:1031-1039`) which
-> direct-writes RAMCTL `@0x25F8000E` (RDBS / rotation-data-bank-select) with before/after
-> readback (overlay row 14), called at :1219 — gated under `VDP2_RBG0_TEST`. So the
-> **RAMCTL/RDBS direct-register commit exists**. What is still absent is the
-> **CYCA0/A1/B0/B1 cycle-pattern direct-poke** — and per the failure law (§2) that is the
-> half that actually causes the snow. RDBS alone is implemented but insufficient; still
-> gated + unverified on HW.
-
-**Jo Engine, by contrast, calls `slSynch()` every frame** (`core.c:560/629`,
-`console.c:307`) — which is why Jo's RBG0 floor works: Jo's whole frame is built around
-`slSynch`, so its shadow registers always reach the chip. Mimas is not.
-
-**`slSynch` is NOT an option for us — even one-shot.** It was tried on hardware
-(`rbg0_commit_pattern()` = `slScrAutoDisp(maximal) + slSynch()`, once at init): it made
-the corruption **worse**, not better, and was reverted ([[doomsrl-rbg0-floor]]). The SGL
-transfer/sound-driver tick inside `slSynch` fights SRL's VDP2/back-screen setup and the
-async-VDP1 path (the same family as the `slScrTransparent` black-screen trap,
-[[doomsrl-sky-vdp2]]). So the commit must **not** go through `slSynch` at all.
-
-The only viable commit path is therefore **direct VDP2 register programming**: write
-`RAMCTL` (bank split + RDBS) and `CYCA0/A1/B0/B1` to the actual chip registers ourselves
-(Jo's NOSGL `RAMCTL=0x1327` / `CYCxx` constants are the known-good reference values),
-bypassing SGL's shadow→`slSynch` path entirely. More work, but it's the one mechanism
-compatible with Mimas's no-`slSynch` architecture. **Caveat: SGL `slScrCycleSet` also
-writes only the shadow** (still needs `slSynch` to flush) — so "manual" here means poking
-the memory-mapped registers at `0x25F8000E` (RAMCTL) / the CYC registers directly, not
-the SGL helper.
-
-### Defect 2 — bank over-subscription (the layout can't fit)
-
-Current intended layout (`src/dg_saturn.cxx`):
-
-| bank | content | read type |
-|---|---|---|
-| A0 `0x25E00000` | sky bitmap NBG0 | char (2 slots) |
-| B0 `0x25E40000` | framebuffer NBG1 | char (2 slots) |
-| A1 `0x25E20000` | RBG0 **cells** *and* **K-table** | char **+** coefficient |
-| B1 `0x25E60000` | RBG0 map (+ SRL rpara) | pattern-name |
-
-Two things are wrong:
-- **cells + K-table share A1.** Char and coefficient reads *each* need the **entire**
-  bank timing — they cannot coexist in one bank. The K-table must be its own bank.
-- **There is no 5th bank for it.** Framebuffer (B0) is non-negotiable; sky (A0),
-  cells (A1), map (B1) fill the rest. A correct cell-RBG0 needs PN + CP + K = 3 banks,
-  which with the framebuffer = 4, leaving **zero** for the hardware sky.
-
-So the full config **HW-sky + framebuffer + cell-RBG0-with-VRAM-K is unsatisfiable**.
-The earlier note "2 bitmaps + RBG0 fits at the bank level" was wrong: it counted the
-two bitmap banks and the cells+map but **forgot the coefficient table needs its own
-bank**.
+> This section diagnosed the original break as **two stacked defects**: (1) a *commit gap*
+> — Mimas runs no per-frame `slSynch`, so SGL's shadow RAMCTL/CYC never reached the chip;
+> and (2) *bank over-subscription* — a **cell** RBG0 with a VRAM coefficient table claimed
+> PN + CP + K = 3 banks, which with the framebuffer left no bank for a hardware sky, and the
+> intended layout illegally shared cells + K-table in A1.
+>
+> **Both are now resolved in shipped code** and the framing is obsolete:
+> - The floor ships as an 8bpp **bitmap** (2 reads/dot, no pattern-name read), so it needs
+>   only **2 rotation banks** — bitmap in A1, K-table in its own bank A0.
+> - RAMCTL (RDBS=0x0D) and the CYC cycle pattern are committed by **direct register write**
+>   (`rbg0_commit_ramctl`/`rbg0_commit_cyc`, both in the tree), bypassing SGL's
+>   shadow→`slSynch` flush. `slSynch` was tried on HW and made it worse; it stays abandoned.
+> - With the bitmap floor dropping the map bank, **B1 is free → a sky can coexist with the
+>   floor.** The old "exactly one of {HW sky, RBG0 floor}" / "sky XOR floor" law is **lifted**.
+>
+> The durable lesson is the §2 failure law (a read not scheduled in the bank holding its data
+> → snow) — the snow was bitmap-layer cycle-pattern starvation, cured by the bitmap's lower
+> read demand + parked A0/A1 cycles, not by `slSynch`. Live floor: **docs/VDP2_RBG0_CURRENT_STATE.md**.
 
 ---
 
-## 5. Capacity budget — the 4-bank ledger
-
-Hard ceiling: **4 banks**. The framebuffer always takes one. Everything else competes
-for the other three.
-
-| config | B0 | A0 | A1 | B1 | fits? | committed? |
-|---|---|---|---|---|---|---|
-| **Framebuffer only** | fb | — | — | — | ✅ trivial | baseline |
-| **Framebuffer + HW sky** *(known-good on HW)* | fb | sky | — | — | ✅ | yes (was validated) |
-| **+ cell RBG0, VRAM K, keep HW sky** | fb | sky | cells **+K❌** | map | ❌ no K bank | + commit gap |
-| **SW sky + cell RBG0, VRAM K** | fb | **K** | cells | map | ✅ exactly 4 | needs commit |
-| **HW sky + RBG0, K in Color RAM (CRKTE)** | fb | sky | cells | map | ✅ banks ok | needs commit **+** CRAM/palette conflict risk |
-
-Two readings jump out:
-
-- The **safe, shippable** VDP2 today is **framebuffer + hardware sky** — it fits, it was
-  hardware-validated, and it needs no rotation gymnastics. RBG0 is what regressed it.
-- To ship the **RBG0 Mode-7 floor**, you must **give up the hardware sky** (software-sky,
-  freeing A0 for the K-table) **or** move the coefficient table into **Color RAM** (keeps
-  the sky, but risks colliding with the 8bpp palette — unproven here). **You cannot have
-  the hardware sky and a VRAM-coefficient RBG0 floor at the same time.** That is a
-  hardware law, not a tuning knob.
-
----
-
-## 6. Convictions — what belongs on VDP2 in Mimas
+## 5. Convictions — what belongs on VDP2 in Mimas
 
 Principle: **put on VDP2 the surfaces that are large, move coherently, and don't need
-the framebuffer's arbitrary per-pixel freedom** — and spend the scarce VRAM banks on
-the highest payoff. Ranked:
-
-1. **Framebuffer (NBG1 bitmap) — mandatory.** The composited 3D view + HUD. 1 bank. Not
-   negotiable; this is the screen.
-
-2. **Sky (NBG0 scroll) — the ideal *cheap* VDP2 use, and the safe fallback — but it
-   yields to the floor.** A single wrapping backdrop, scrolls with yaw, always behind
-   everything, 1 bitmap bank. It's the *known-good* hardware config (fb + sky, no RBG0)
-   and the right thing to ship if the floor isn't ready. **But** its REC saving is small
-   (absent indoors) and the floor's is large (§6.5), so when only one fits, the **floor
-   wins** and the sky drops to software (cheaply, on the freed slave).
-
-3. **RBG0 Mode-7 floor — the biggest single lever; take it, drop the HW sky.**
-   Hardware A/B (§6.5) puts the floor offload at **+20 to +33 % fps (−17 to −26 ms)** —
-   far above any other VDP2 option. It is the one VDP2 feature that's genuinely
-   bank-hungry and it **mutually excludes the hardware sky** on a 4-bank budget, but at
-   that price the trade is clearly worth it: software sky (sky is small/rarely-visible and
-   its cost lands on the now-idle slave) in exchange for the floor on VDP2. Requires the
-   cycle pattern committed by **direct register write** (not slSynch). This is the
-   recommended target config.
-
-4. **Status-bar / HUD background, automap, menus — NO (low value).** Could be NBG
-   layers, but they're already composited cheaply in the framebuffer and would burn
-   scarce banks for little gain. Leave them software. NBG3 cell text stays a dev-only
-   overlay (and note it shares B1 with the RBG0 map → can't show with the floor).
-
-5. **Future multi-layer parallax sky (clouds) — PARKED.** Needs a 2nd free NBG bank;
-   only affordable in the *sky-without-RBG0* world (A1/B1 free). Mutually exclusive with
-   the floor for the same bank-budget reason. ([[doomsrl-sky-vdp2]] future idea.)
-
-### The decision tree
-
-```
-Is the RBG0 floor's measured hardware CPU win  >  the cost of losing the HW sky?
-│
-├─ NO  → ship  Framebuffer + HW sky  (known-good; drop RBG0). ← safe default TODAY
-│
-└─ YES → ship  Framebuffer + SW sky + RBG0 floor
-         requires: (a) K-table in its own bank A0 (4-bank fit), AND
-                   (b) commit RAMCTL/CYC by DIRECT register writes — NOT slSynch
-                       (even one-shot slSynch was HW-tested worse), NOT slScrCycleSet
-                       (shadow-only). Poke RAMCTL @0x25F8000E + CYCxx, Jo 0x1327 style.
-                       [RECONCILED 2026-06-24] The RAMCTL/RDBS direct-register write
-                       NOW EXISTS in the tree (rbg0_commit_ramctl, gated). The STILL-
-                       MISSING piece is the CYCA0/A1/B0/B1 cycle-pattern direct-poke —
-                       RAMCTL RDBS alone is implemented but insufficient (snow persists).
-         optional: keep HW sky only if the coefficient table goes in Color RAM
-                   (CRKTE) without breaking the 8bpp palette — unproven, investigate.
-```
-
-### Capacity verdict
-
-**We have the capacity for exactly one of {hardware sky, RBG0 Mode-7 floor} on top of
-the mandatory framebuffer — not both** (with a VRAM coefficient table). The 4-bank VRAM
-ceiling is the binding constraint; the missing per-frame `slSynch` commit is the second,
-orthogonal blocker that breaks *any* hand-rolled cycle pattern on real hardware. Both
-must be respected for VDP2 to display correctly on a Saturn.
+the framebuffer's arbitrary per-pixel freedom**. As shipped, the mandatory framebuffer
+(NBG1 bitmap) carries the composited 3D view + HUD; the RBG0 floor rides the rotation
+engine (bitmap in A1 + K in A0); the sky rides a B1 cell layer; HUD/automap/menus stay
+software in the framebuffer (cheap; not worth a bank). The measured offload that made the
+floor worth shipping is preserved in §6.5 below. (For the exact shipped bank layout see
+**docs/VDP2_RBG0_CURRENT_STATE.md**.)
 
 ---
 
@@ -316,15 +193,7 @@ indoors** (only F_SKY1 ceilings/outdoor upper walls) and only grows outdoors —
 where the floor is *also* large.
 
 **Hardware A/B (Romain, 2026-06-19) — the floor offload is the single biggest lever**
-*(pot0, pre-potato-ship)*:
-
-> **RECONCILED 2026-06-24:** This 6-row table is **pot0, pre-potato-ship**. The actual
-> ship config is now **potato (pot1/pot2)**: solo baseline ~5-12 fps depending on scene,
-> blit ~5.5 ms (recalibrated down from ~12), slave **~80 % idle** at pot1/2. So at the
-> ship config the RBG0 floor's **CPU prize shrinks** (already noted §6) AND its
-> **slave-relief is smaller** (the slave is already mostly idle, not 46% busy). The
-> floor's value at potato is therefore mostly **quality** (textured-in-perspective
-> dominant flat) rather than a large fps gain.
+*(pot0, pre-potato-ship; the numbers below are the original measurement, preserved)*:
 
 | | frame | fps | master EX | slave |
 |---|---|---|---|---|
@@ -340,54 +209,27 @@ it to VDP2 frees the slave entirely, which can then **absorb the re-added softwa
 (or more VDP1 walls) — so "VDP2 floor + software sky" is even better than the bank ledger
 alone suggests: the sky's software cost lands on otherwise-idle silicon.
 
-The 4-bank ledger then forces these combinations:
+> The **bitmap** RBG0 floor that shipped (2 banks: bitmap in A1 + K in A0) freed B1, so
+> the once-feared "sky XOR floor" 5-banks-for-4 conflict no longer applies — floor + a B1
+> sky coexist. See **docs/VDP2_RBG0_CURRENT_STATE.md**. The notes below are the durable
+> *value* analysis (what's worth offloading), independent of the resolved bank squeeze.
 
-| combination | banks | verdict |
-|---|---|---|
-| **fb + cell-RBG0 floor** (B0,A1,A0,K… +B1 map) | **4 / full** | best REC; **software sky**; nothing else fits — enhance the floor *in place* |
-| **fb + sky** (B0,A0) — A1,B1 free | 2 + 2 free | known-good; sky is cheap; the 2 free banks buy **eye-candy, not REC** |
-| **fb + sky + parallax clouds** (NBG2 cells in A1/B1) | 4 | Hexen/Doom-64 style; **+0 REC** (pure visual) |
-| **fb + sky + cell-RBG0 floor** | 5 needed | ❌ impossible |
-| **fb + sky + *bitmap*-RBG0 floor** (no PN = 2 banks) | 4 | fits banks, **but** the flat must be pre-tiled into a 128 KB bitmap and re-uploaded per dominant-flat/light change (~heavy vs 4 KB cells) → rejected on bandwidth |
-| **fb + sky + cell-RBG0, K-table in Color RAM** (CRKTE) | 4 | the only "both" that keeps cells; **risk = K-table vs the 8bpp palette in 4 KB CRAM** — unproven, investigate |
-
-**"Sky + X" — the REC win is the SKIP, not the RBG0.** The −17/−26 ms above come from
-*not drawing the floor* (index-0), not from RBG0 — RBG0 is merely the prettiest thing to
-put *behind* the skip. Put something **cheaper** behind it and you keep ~the same REC win
-**and** the hardware sky:
-- **Hardware-gradient floor/ceiling (~0 banks).** Skip the floor/ceiling software fill and
-  let a **per-line back-screen colour** or the **line-colour screen** show through — a
-  vertical gradient shaded by distance (the plane recedes ≈ one scanline per depth band).
-  Captures essentially the same +20–33 % (the cost removed is the software fill, which
-  both this and RBG0 skip), costs ~no bank → **the hardware sky stays**, and there's **no
-  RBG0 cycle-pattern commit to do**. Price = visual: an *untextured* shaded floor (the
-  Doom-32X / d32xr flat-floor compromise, [[saturn-perf-references]]) instead of a textured
-  perspective floor; a single gradient can't show per-sector flats/heights. This is the
-  real sky-only REC lever — the floor-quality-vs-bank-cost axis, not a flat "sky XOR floor".
-- **HUD / status bar → its own NBG layer (A1):** lifts the HUD composit + the bottom-32-row
-  blit out of the framebuffer path. Small but real.
+**The REC win is the SKIP, not RBG0 specifically.** The −17/−26 ms above come from
+*not drawing the floor* in software (index-0), not from RBG0 — RBG0 is merely the
+prettiest thing to put *behind* the skip. Enhancements worth pursuing on the floor:
+- **Progressive distance lighting** — the ideal one. The RBG0 plane recedes with distance
+  ≈ one scanline per depth band, so a **per-line colour table (`K_LINECOL`)** on the
+  existing coefficient table = Doom's diminishing-light/fog **for free**, fixing the
+  "uniform per-sector brightness" limitation. Jo uses exactly
+  `slKtableRA(…, K_ON | K_LINECOL)`.
+- Dynamic dominant-flat selection (per-frame biggest `(picnum,height)`), ceiling support.
 - **Parallax cloud layer (NBG2 cells):** Hexen/Doom-64 eye-candy — **+0 REC** (the renderer
   already skips the sky span). Visual only, not a REC lever.
 
 VDP1 load is **not** reducible via free VDP2 banks: walls (per-column perspective-scaled)
 and sprites can't live on an NBG scroll layer — only a rotation plane handles a tilted
-surface, and that's the floor. VDP1 relief is a separate problem (quad overdraw).
-
-**"Floor + X":** all four banks are spent, so X can only be an *enhancement of the floor
-itself*, none needing a new bank:
-- **Progressive distance lighting** — the ideal one. The RBG0 plane recedes with distance
-  ≈ one scanline per depth band, so a **per-line colour table (`K_LINECOL`)** on the
-  existing coefficient table = Doom's diminishing-light/fog **for free**, fixing the
-  current "uniform per-sector brightness" limitation. Jo uses exactly
-  `slKtableRA(…, K_ON | K_LINECOL)`. **This is the recommended next step for the floor.**
-- Dynamic dominant-flat selection (per-frame biggest `(picnum,height)`), ceiling support.
-
-**"Sky XOR floor, but dynamic":** swap the *bank layout* at area boundaries —
-floor-layout indoors/most scenes, sky(+clouds)-layout in the rare big exterior. Viable,
-but needs a runtime RAMCTL/CYC **re-commit by direct register write** at the transition
-(cheap if the commit mechanism is solid) and is only worth it if exterior profiling shows
-the **sky REC there actually beats the floor REC there** — not assumed, *measured*.
-Given the floor is big even outdoors, the swap is a *later* idea, not a default.
+surface, and that's the floor. VDP1 relief is a separate problem (quad overdraw) — see
+**docs/VDP1_PRESENT_SYNC_PLAN.md** for the present/sync path.
 
 ### Bank-free VDP2 features worth using (orthogonal to the ledger)
 
@@ -414,7 +256,8 @@ These are **register/colour-math** features — no VRAM bank, usable in *any* co
 - Jo Engine `joengine/jo_engine/vdp2.c` + `jo/sega_saturn.h`: working SGL RBG0 path
   (cells / map / K-table / R-table in **separate** banks; `KTBL0_RAM = VDP2_VRAM_A1`)
   and per-frame `slSynch()` commit (`core.c:560/629`).
-- Mimas `src/dg_saturn.cxx`; `docs/RBG0_FLOOR_PLAN.md`; memories
+- Mimas `src/dg_saturn.cxx`; `docs/VDP2_RBG0_CURRENT_STATE.md` (shipped floor),
+  `docs/VDP1_PRESENT_SYNC_PLAN.md` (VDP1↔NBG1 present); memories
   [[doomsrl-rbg0-floor]], [[doomsrl-sky-vdp2]], [[doomsrl-known-bugs]],
   [[saturn-memory-map]].
 </content>

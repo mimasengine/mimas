@@ -1,5 +1,14 @@
 # VDP1 world floors/ceilings — the per-subsector inverted hybrid (bet A)
 
+> **STATUS: ARCHIVED — design-of-record for an UNSHIPPED bet, not pursued.** The dominant
+> flat went to **RBG0**, which **shipped clean** as a 512x256 8bpp bitmap floor (potato-0,
+> 1-player) — see the authoritative [`VDP2_RBG0_CURRENT_STATE.md`](VDP2_RBG0_CURRENT_STATE.md).
+> VDP1 ships **walls only**. This document remains a complete, self-consistent design study
+> for deporting the *whole world's* floors/ceilings to VDP1 (the SlaveDriver/PowerSlave
+> model); the measured HW geometry/cost numbers (§7, §8) and the world-anchored anti-swim
+> derivation (§3.3.1) are preserved verbatim as reference. Nothing below is wired in the
+> tree. For VDP1<->NBG1 present sync see [`VDP1_PRESENT_SYNC_PLAN.md`](VDP1_PRESENT_SYNC_PLAN.md).
+
 Written 2026-06-25 after a multi-agent investigation (per-subsector classifier, the
 emitter, occlusion/painter order, the command/VRAM budget + RBG0 integration, the
 measurement protocol, and SlaveDriver/PowerSlave ground-truth), then revised the same day
@@ -7,17 +16,16 @@ against a critic pass that flagged the command-bank story, the VRAM arithmetic, 
 "verbatim reuse" overclaim, the swim-band re-derivation, the painter-order granularity, the
 missing A/B toggle, the ladder ordering, and the colormap-availability proof. Companion to
 [`VDP1_ARCHITECTURE.md`](VDP1_ARCHITECTURE.md) (the chip/cost reference),
-[`VDP1_FLOOR_PLAN.md`](VDP1_FLOOR_PLAN.md) (the earlier per-visplane dominant-flat strip
-plan this **subsumes**), [`VDP2_ARCHITECTURE.md`](VDP2_ARCHITECTURE.md) and
-[`VDP2_FLOOR_CONSOLIDATION.md`](VDP2_FLOOR_CONSOLIDATION.md) (the RBG0 commit status).
+[`VDP2_ARCHITECTURE.md`](VDP2_ARCHITECTURE.md) and
+[`VDP2_RBG0_CURRENT_STATE.md`](VDP2_RBG0_CURRENT_STATE.md) (the shipped RBG0 bitmap floor).
 
 This plan is the PowerSlave/SlaveDriver model adapted to Doom's BSP: **the whole world's
 floors and ceilings become per-subsector VDP1 distorted-sprite quads, emitted during the
 BSP walk like the walls, with only the non-quad-able residue left to the CPU and the
-dominant flat to RBG0.** It supersedes the per-visplane affine-strip plan
-([`VDP1_FLOOR_PLAN.md`](VDP1_FLOOR_PLAN.md)): the floor is known at `R_Subsector`, not
-deferred to `R_DrawPlanes`, so it rides the **existing wall kick** with no visplane
-deferral — the structural advantage that makes the bet cheap.
+dominant flat to RBG0.** The floor is known at `R_Subsector`, not deferred to
+`R_DrawPlanes`, so it rides the **existing wall kick** with no visplane deferral — the
+structural advantage that would make the bet cheap. (Historically this subsumed an even
+earlier per-visplane affine-strip plan, since deleted.)
 
 ---
 
@@ -41,11 +49,15 @@ deferral — the structural advantage that makes the bet cheap.
    space. The closed address ledger is in §7.1–7.2.
 5. **The risk is swim + REC, not fill.** Affine swim near the horizon (HW-judged) and the
    chance the per-band CPU build *raises* REC instead of lowering `P` are the two live
-   unknowns; both are hardware-only verdicts. The whole ladder is gated by overlay
-   counters with explicit GO/NO-GO and a one-button A/B toggle (built in **inc-A0**, §9).
+   unknowns; both are hardware-only verdicts. The whole ladder would be gated by overlay
+   counters with explicit GO/NO-GO and a one-button A/B toggle (**inc-A0**, §9).
 
-> **What is real today.** The inc-0 profilers (`RP_Subsector` row 20, `RP_PlanePixels`
-> row 17, `RP_PROF=1`) are BUILT and live. The inc-1 floor-skip hook
+> **Archived-status note.** The dominant flat this plan would split off to RBG0 **shipped
+> clean on RBG0** as a 512x256 8bpp bitmap (potato-0, 1p) —
+> [`VDP2_RBG0_CURRENT_STATE.md`](VDP2_RBG0_CURRENT_STATE.md). This VDP1-world bet was not
+> pursued; the rungs below were never built past the inc-0 profilers. The inc-0 profilers
+> (`RP_Subsector` row 20, `RP_PlanePixels` row 17, `RP_PROF=1`) are BUILT and live. The inc-1
+> floor-skip hook
 > (`sat_vdp1_floor`/`sat_floor_vdp1_hook`, [r_plane.c:892](../core/r_plane.c)) exists with
 > an own-everything stub (`sat_floor_vdp1_stub` returns 1, emits zero strips). **No floor
 > quad is emitted yet, no second command bank exists yet, the A/B toggle does not exist yet
@@ -55,22 +67,24 @@ deferral — the structural advantage that makes the bet cheap.
 
 ## 1. Target architecture — the inverted hybrid
 
-Today: VDP1 = **walls only**, drawn *below* a software NBG1 that does floors/ceilings/
-sprites/HUD with Doom's occlusion (the layer inversion). Floors/ceilings are software
-visplanes + spans on master+slave (the P3 path). RBG0 is parked (commit gap on HW).
+Today (shipped): VDP1 = **walls only**, drawn *below* a software NBG1 that does
+sprites/HUD/CPU-residue with Doom's occlusion (the layer inversion). The **dominant flat is
+on RBG0** — a clean 512x256 8bpp bitmap, gated potato-0 + 1-player
+([`VDP2_RBG0_CURRENT_STATE.md`](VDP2_RBG0_CURRENT_STATE.md)). Non-dominant floors/ceilings
+are software visplanes + spans on master+slave (the P3 path).
 
-Target: VDP1 carries **walls + floors + ceilings** as per-subsector quads; RBG0 carries
-the single dominant flat; the CPU keeps only the non-quad-able residue. The layer/priority
-stack (verified [dg_saturn.cxx:1448-1457](../src/dg_saturn.cxx); RBG0-on path
-[:1239/:1453](../src/dg_saturn.cxx)):
+Target (this bet, unshipped): VDP1 carries **walls + floors + ceilings** as per-subsector
+quads; RBG0 keeps the single dominant flat; the CPU keeps only the non-quad-able residue.
+The layer/priority stack (verified [dg_saturn.cxx:1448-1457](../src/dg_saturn.cxx); RBG0-on
+path [:1239/:1453](../src/dg_saturn.cxx)):
 
 | Priority | Layer | Role (target) | vs today |
 |---|---|---|---|
 | 7 | NBG3 | debug overlay text | unchanged |
-| 6 | NBG1 (software) | occlusion master + sprites + HUD + **CPU residue** floors/ceilings | was: + all floors/ceilings |
+| 6 | NBG1 (software) | occlusion master + sprites + HUD + **CPU residue** floors/ceilings | was: + all non-dominant floors/ceilings |
 | 5 | VDP1 sprites | **walls + floor quads + ceiling quads** | was: walls only |
-| 4 | RBG0 (Mode-7) | the **dominant flat** (perspective-exact), gated on HW commit | was: parked |
-| 3 | NBG0 | sky (drops 4→3 when RBG0 is on; software sky if RBG0 needs the bank) | was: sky at 4 |
+| 4 | RBG0 (Mode-7) | the **dominant flat** (shipped bitmap floor) | unchanged role |
+| 3 | NBG0 | sky (drops 4→3 when RBG0 is on; a B1 cell sky coexists with the bitmap floor) | was: sky at 4 |
 
 So `sky(3) < RBG0(4) < VDP1(5) < NBG1(6) < debug(7)`. Two ordering problems live in this
 stack and are answered by **two different mechanisms** (§4): VDP1-internal overlap by
@@ -78,8 +92,8 @@ command-list position (painter's, reverse-BSP), and VDP1-vs-NBG1 overlap by hard
 priority mediated by the **index-0 hole** contract. The whole feature is NULL-default
 hooked so DoomJo links unchanged (§11) and the shipping VDP1 walls are untouched.
 
-**Why it beats the per-visplane plan.** The earlier strip plan
-([`VDP1_FLOOR_PLAN.md`](VDP1_FLOOR_PLAN.md)) emits at `R_DrawPlanes` (end of frame) because
+**Why it beats the per-visplane plan.** The earlier strip plan (a per-visplane
+dominant-flat strip emitter, since deleted) emitted at `R_DrawPlanes` (end of frame) because
 a *visplane's* silhouette is only complete after the full BSP walk + seg clipping. The
 per-subsector emitter takes the floor at `R_Subsector` ([r_bsp.c:556](../core/r_bsp.c)),
 the instant its sector data (height/picnum/light) and seg fan are final — identical to how
@@ -731,24 +745,21 @@ int dom_floor = (sat_vdp2_floor && floorplane
 /* dom_floor => the emitter SKIPS this floor (RBG0 owns it; leave index-0). */
 ```
 
-**The slot, and why it is gated.** RBG0 requires the direct-register cycle-pattern commit
-(`rbg0_commit_cyc()` @0x25F80010 + `rbg0_commit_ramctl()` @0x25F8000E, **no slSynch** —
-[dg_saturn.cxx:1276/:1255](../src/dg_saturn.cxx)) which is **wired but unverified on HW**
-(snow + dead sky if it fails). Per [`VDP2_FLOOR_CONSOLIDATION.md`](VDP2_FLOOR_CONSOLIDATION.md)
-(2026-06-25) the CYCxx poke now exists (correcting the older docs that say it is missing),
-but its HW verdict is pending (readback rows 13/14/15: A0/A1/B1 must read `FFFFFFFF`,
-`CYa≠CYb`).
+**The slot (shipped).** RBG0 **shipped clean** as a 512x256 8bpp **bitmap** floor
+(`RBG0_BITMAP=1`), gated potato-0 + 1-player. The earlier cell-floor "snow" was
+cycle-pattern **starvation**, solved by the bitmap layout + `RDBS=0x0D` + parked A0/A1
+cycles (`rbg0_commit_ramctl`/`rbg0_commit_cyc`, already in tree — **not** slSynch). The
+authoritative description is [`VDP2_RBG0_CURRENT_STATE.md`](VDP2_RBG0_CURRENT_STATE.md).
 
-> **The commit gap is the open HW blocker.** The plan defines RBG0 as the dominant slot but
-> **gates it behind HW verification**. The VDP1 floor ladder (§9 inc-A0..D) **ships without
-> RBG0** — the strips ride the validated async driver. RBG0 and VDP1-floors **compose by
-> strength**, not mutual exclusion: if the commit cannot be made to work, the fallback is
-> **the dominant flat ALSO goes to VDP1 bank F** (`Vs` becomes `vqtot`, `Vp` rises toward
-> ~227 — still inside the 2-bank budget, re-checked against the §7.2 ledger). Two hardware
-> laws constrain RBG0 regardless: **HW sky XOR RBG0 floor** (cell RBG0 + VRAM K-table =
-> 3 banks + framebuffer = 4; enabling RBG0 means dropping HW sky to software to free the
-> K-table bank), and **MP = RBG0 off** (one affine matrix can't serve two split views — MP
-> floor stays software potato).
+> **RBG0 owns the dominant flat; no open commit gap.** RBG0 is the shipped dominant slot,
+> so this VDP1-floor bet only ever had to carry the *non-dominant* secondaries. RBG0 and a
+> VDP1-floor would **compose by strength**, not mutual exclusion: if VDP1 floors were not
+> built (as is the case), the dominant simply stays on RBG0 and the secondaries stay
+> software. The shipped bitmap floor is **2-bank** (bitmap in A1, K in A0; SRL relocated the
+> live RPT to B1+0x1ff00), which **frees B1's map** so a **B1 cell sky coexists** with the
+> floor (the old "HW sky XOR RBG0 floor = 3 banks" law applied to the *cell* floor and is
+> obsolete here). The remaining hardware constraint: **MP = RBG0 off** (one affine matrix
+> can't serve two split views — the 2-player floor stays software potato).
 
 ---
 
@@ -941,8 +952,9 @@ degrades, in 2p.
 
 ### 8.2 The exact overlay rows = GO/NO-GO, and the A/B toggle (a hard prerequisite)
 
-Current layout (verified [dg_saturn.cxx](../src/dg_saturn.cxx); the overlay was reorged
-2026-06-24/25 — benchmark docs use the **stale** numbering):
+Overlay layout as captured 2026-06-25 (the overlay was reorged 2026-06-24/25; **the row
+numbers below are a point-in-time snapshot — DO NOT TRUST them against the current build,
+re-verify in [dg_saturn.cxx](../src/dg_saturn.cxx) before use**):
 
 | Row | Content | Use |
 |---|---|---|
@@ -1070,12 +1082,10 @@ residue/VDP1 boundaries, demoted-on-overflow surfaces fall back cleanly; net fps
 spots AND in 2p split (row 16 `v0/v1`↓ per view, `k` not regressed). *NO-GO:* REC rises
 (per-band build > P saved — the bet fails, revert) or 2p regression (`k`/MST up).
 
-**inc-E (optional, HW-blocked) — RBG0 dominant flat.** Enable `sat_vdp2_floor`, drop HW sky to
-software, verify `rbg0_commit_cyc` lands (rows 13/14/15: A0/A1/B1 = `FFFFFFFF`, `CYa≠CYb`, no
-snow). Independent of inc-A0..D (VDP1 takes whatever RBG0 cannot). *GO:* dominant renders
-perspective-correct under VDP1, no snow, software sky still draws. *NO-GO:* snow persists →
-RBG0 parked, dominant falls back to VDP1 bank F (`Vs`→`vqtot`, recheck the §7.2 budget); ship
-inc-A0..D regardless.
+**inc-E — RBG0 dominant flat (SHIPPED, independent of this bet).** The RBG0 dominant flat
+shipped as a clean 512x256 8bpp bitmap (potato-0, 1p) —
+[`VDP2_RBG0_CURRENT_STATE.md`](VDP2_RBG0_CURRENT_STATE.md). It is independent of inc-A0..D:
+RBG0 carries the dominant, this bet (had it been built) would carry the secondaries.
 
 ---
 
@@ -1092,7 +1102,7 @@ inc-A0..D regardless.
 | **No-double-draw breaks** (emit-time vs skip-time routing disagree → double-bright shimmer) | inc-D HW (shimmer at residue/VDP1 boundaries) | accumulator frozen at the kick before `R_DrawPlanes`; stamp `visplane_t.sat_vdp1_owned` as the single source of truth (emit-time and skip-time agree by construction) |
 | **Colormap mismatch** (VDP1 floor lands in a different CRAM bank than the software/RBG0 layers) | inc-C HW: floor-ON color differs from floor-OFF software at the same sector | resolve `(lightlevel>>LIGHTSEGSHIFT)+extralight` at `R_Subsector` (§3.1.1), identical to `R_MapPlane`; same base index as `sat_vdp2_floor_cmap`; bank 1 = live PLAYPAL; byte-identity GO |
 | **REC rises instead of falling** (per-band build > P saved) | row 5 `P` does not drop / `Bp` rises on HW | the emitter must be sub-ms; if not, the bet fails for that surface class — revert (HW-only verdict; Ymir understates P 3–10×) |
-| **RBG0 commit gap** (cycle-pattern never reaches the chip → snow + dead sky; Ymir hides it) | rows 13/14/15 HW readback — A0/A1/B1 must read `FFFFFFFF`; `CYa==CYb` ⇒ SGL ISR clobbered the poke | keep RBG0 (inc-E) fully independent of the VDP1 ladder; if the poke fails, dominant → VDP1 strips or CPU; HW sky XOR RBG0 floor remains a hard bank-budget law; MP = RBG0 off |
+| **RBG0** (the dominant-flat slot) | — | RESOLVED: shipped clean as a 512x256 8bpp bitmap floor (potato-0, 1p) — [`VDP2_RBG0_CURRENT_STATE.md`](VDP2_RBG0_CURRENT_STATE.md); fully independent of this VDP1 ladder; MP = RBG0 off (2p stays software potato) |
 | **VRAM cull frees less than expected** | the post-cull byte map (§7.2) | the cull frees HUD (20 KB real) + wtex shrink (32 KB); WPN frees nothing (aliases wtex); if short, shrink the flat cache to 6 slots / drop a wide wtex slot; reserve ≥8 KB headroom |
 
 ---
@@ -1149,8 +1159,9 @@ ground-truth); `saturn-refs/SlaveDriver-Engine` `WALLS.C`/`WALLASM.S`/`SPR.C` (t
 VDP1-quad reference: `rectTransform` lattice, `TILENEARCLIP F(33)`, `MIPDIST F(256)`, `EZ_`
 command system, reverse-FIFO truncation, per-sector JUMP_CALL chaining, per-sector user-clip
 occlusion); companions [`VDP1_ARCHITECTURE.md`](VDP1_ARCHITECTURE.md),
-[`VDP1_FLOOR_PLAN.md`](VDP1_FLOOR_PLAN.md), [`VDP2_ARCHITECTURE.md`](VDP2_ARCHITECTURE.md),
-[`VDP2_FLOOR_CONSOLIDATION.md`](VDP2_FLOOR_CONSOLIDATION.md); the HW perf record
+[`VDP1_PRESENT_SYNC_PLAN.md`](VDP1_PRESENT_SYNC_PLAN.md),
+[`VDP2_ARCHITECTURE.md`](VDP2_ARCHITECTURE.md),
+[`VDP2_RBG0_CURRENT_STATE.md`](VDP2_RBG0_CURRENT_STATE.md) (the shipped RBG0 bitmap floor); the HW perf record
 (`REC_REDUCTION.md`, `REC_BENCHMARKS.md`, `SPLIT_BENCHMARKS.md` — the Ymir-vs-HW law and the
 `Qp/q4/Vp/Dr%` measurements); memories [[doomsrl-vdp1-capacity]],
 [[doomsrl-vdp1-world-renderer]], [[doomsrl-vdp1-async]], [[romain-perf-economy]].

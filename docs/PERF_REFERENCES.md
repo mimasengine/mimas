@@ -3,38 +3,22 @@
 Research notes on how other Saturn / dual-SH2 / optimized-Doom projects exploit
 the hardware, and what is **directly transferable to Mimas**.
 
-Context: Mimas is a 100% **software** renderer (Doom's classic column/span
-rasterizer) split across the two SH-2s, writing an 8bpp framebuffer that is
-blitted to a VDP2 NBG1 bitmap. VDP1 is currently **unused**. Baseline ~5–10 fps
-(cart, CPU blit). The SCU DMA blit is disabled (hangs on hardware), so the blit
-is a per-frame CPU `memcpy` of 320×200. See `src/dg_saturn.cxx` and
-`core/r_parallel.c`.
+> **Status: REFERENCE — external-project catalog & transferable lessons.**
+> The architecture question this doc once framed as open ("two philosophies /
+> should we go hardware") is **decided**: Mimas shipped **hybrid** — VDP1 carries
+> **walls only** (8bpp + CRAM light-banks); the dominant flat (floor) is a clean
+> 512×256 8bpp RBG0 **bitmap** on VDP2. For the floor reality see
+> [`VDP2_RBG0_CURRENT_STATE.md`](VDP2_RBG0_CURRENT_STATE.md); for VDP1↔NBG1
+> present sync see [`VDP1_PRESENT_SYNC_PLAN.md`](VDP1_PRESENT_SYNC_PLAN.md); the
+> unshipped VDP1 world-renderer bet lives in `VDP1_WORLD_PLAN.md`. The
+> d32xr / Hexen / FastDoom *software* lessons below still stand and are the
+> reason to keep this file.
 
-> **⚠️ STALE as of 2026-06-19.** This file is the *pre-VDP1* research snapshot.
-> Mimas has since gone hybrid: **VDP1 now renders all walls** (8bpp textures +
-> CRAM light-banks, below software NBG1 floors/sprites). For the current VDP1
-> hardware model, cost budget, IN/OUT convictions, and multiplayer capacity, see
-> [`VDP1_ARCHITECTURE.md`](VDP1_ARCHITECTURE.md); for VDP2, [`VDP2_ARCHITECTURE.md`](VDP2_ARCHITECTURE.md).
-> The "two philosophies / should we go hardware" framing below is now decided
-> (we went hybrid), but the d32xr/Hexen/FastDoom *software* lessons still stand.
+Context: Mimas splits Doom's classic column/span software rasterizer across the
+two SH-2s. Walls render on VDP1; the floor is a VDP2 RBG0 bitmap; sprites and
+HUD composite via NBG1. See `src/dg_saturn.cxx` and `core/r_parallel.c`.
 
 Compiled June 2026 from web research (sources at the bottom).
-
----
-
-## The two philosophies
-
-Every Saturn FPS / Doom-class engine falls into one of two camps. **Mimas is
-in the software camp today.**
-
-| Camp | Games | Principle |
-|------|-------|-----------|
-| **Hardware VDP1** | PowerSlave/Exhumed, Duke Nukem 3D Saturn, Quake Saturn | World rebuilt as textured VDP1 quads; no software framebuffer |
-| **Software → VDP2** | Doom Saturn (official), Hexen Saturn, Doom 32X, **Mimas** | CPU rasterizer writes pixels; result blitted to a VDP2 bitmap |
-
-Switching camps = rewriting the renderer (Tier-1 effort). Staying in the
-software camp but copying the best software techniques = Tier-2 effort, the
-better short-term bet.
 
 ---
 
@@ -78,14 +62,16 @@ even/odd column parity**.
 
 Key techniques (transferable):
 
-1. **Split by *phase*, not just by drawing.** The 2nd CPU does *wall prep* +
-   visplane computation *while the primary is still walking the BSP*. In
-   Mimas the slave only **executes draw commands** (`rp_slave_body` in
-   `core/r_parallel.c`) and is largely idle during the BSP walk —
-   **this is our biggest untapped gain.**
+1. **Split by *phase*, not just by drawing.** d32xr's 2nd CPU does *wall prep* +
+   visplane computation *while the primary walks the BSP*. **Mimas tried this 3×
+   and it is CONFIRMED DEAD**: wall-prep→slave is memory-bound and multiplexed on
+   this hardware; even a TAS work-steal queue doesn't revive it. The slave stays
+   a draw/plane executor (`rp_slave_body` in `core/r_parallel.c`).
 2. **Lock-free work queue via the SH-2 `TAS` instruction** (test-and-set, locks
-   the bus) for wall drawing: both CPUs atomically pull walls, **zero overdraw**
-   because Doom walls don't overlap. Better load balance than fixed parity.
+   the bus): both CPUs atomically pull work, **zero overdraw** because Doom walls
+   don't overlap; better load balance than fixed parity. **SHIPPED in Mimas as
+   the dual-SH2 plane work-steal ("TAS"), default-on** (core `73f8cdc` / parent
+   `4857f87`); the old even/odd parity split is retired and row-split is parked.
 3. **Sprite split at the *mean X* coordinate** (equal pixel counts per CPU), not
    at screen center.
 4. **Pre-sort visplanes** by width / flat number / lighting to minimize pipeline
@@ -98,11 +84,9 @@ Key techniques (transferable):
 Hexen does **software rendering to the VDP2 framebuffer via DMA** (exactly
 Mimas's model) **and drives the slave SH-2 to ~80%**.
 
-**Lesson for Mimas:** the software→VDP2 path *can* perform decently, but only
-if (a) the **DMA does the blit** — ours is currently disabled and falls back to a
-CPU `memcpy` (`src/dg_saturn.cxx`, `USE_SCU_DMA 0`, hangs on hardware), and
-(b) the **slave is saturated** (the d32xr lesson). Hexen validates both open
-chantiers at once.
+**Lesson for Mimas:** the software→VDP2 path *can* perform decently when the
+**slave is saturated** (the d32xr lesson) — which Mimas now does via the shipped
+TAS plane work-steal. Hexen validates the partitioned-slave approach.
 
 ## 5. FastDoom (viti95) — free algorithmic wins, hardware-agnostic
 
@@ -130,14 +114,16 @@ games are the exceptions — and the lesson is exactly "use the slave hard."**
 
 ## Priority for Mimas
 
-1. **`d32xr`** — same architecture, documented, 2–4× gains. Pillage first.
-   Concretely: give the slave the **wall-prep + visplane** phases (not just
-   drawing), and replace the even/odd parity split with a **`TAS` work queue**.
-2. **Hexen** — proof that software + VDP2 + a saturated slave performs → fix the
-   **SCU DMA blit** and load the slave more.
+1. **`d32xr`** — same architecture, documented, 2–4× gains. Already pillaged: the
+   **`TAS` work queue replaced even/odd parity (shipped, default-on)**, and the
+   **wall-prep→slave phase split was tried 3× and is dead** (memory-bound). What
+   remains untapped: mean-X sprite split and visplane pre-sort.
+2. **Hexen** — proof that software + VDP2 + a saturated slave performs; the slave
+   is now loaded via the TAS plane work-steal.
 3. **FastDoom** — free algorithmic wins (Potato/low-detail + VDP2 zoom,
    colormap preprocessing, skip dead visplanes, cache-fit loops).
-4. **SlaveDriver** — the blueprint *if* we ever switch to the VDP1 hardware path.
+4. **SlaveDriver** — the blueprint for the unshipped VDP1 world-renderer bet
+   (`VDP1_WORLD_PLAN.md`).
 
 See `docs/SRL_NOTES.md` (integration notes) and the in-repo perf notes in
 `core/r_parallel.c` / `src/dg_saturn.cxx`.

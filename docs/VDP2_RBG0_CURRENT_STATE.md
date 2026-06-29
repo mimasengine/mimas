@@ -1,11 +1,13 @@
 # VDP2 RBG0 — Current State (authoritative)
 
-> **Status: CURRENT (2026-06-27).** This is the live reference for the VDP2 RBG0
+> **Status: CURRENT (2026-06-27, reorg 2026-06-29).** This is the live reference for the VDP2 RBG0
 > hardware floor. It supersedes the floor-related conclusions in
-> `VDP2_ARCHITECTURE.md`, `VDP2_LAYER_BUDGET.md`, `VDP2_CONFIG_CATALOG.md`,
-> `VDP2_FLOOR_CONSOLIDATION.md`, `RBG0_FLOOR_PLAN.md`, `RBG0_SNOW_FIX_PLAN.md`,
-> `RBG0_STRUCTURED_GARBAGE.md`, and the §6.4/§8 floor routing in `VDP1_ARCHITECTURE.md`.
-> Where those docs and this one disagree about the floor, **this doc wins.**
+> `VDP2_ARCHITECTURE.md`, `VDP2_LAYER_BUDGET.md`, `VDP2_CONFIG_CATALOG.md`, the
+> trimmed-to-data `RBG0_FLOOR_PLAN.md` (kept only for its FLAT-profiler numbers),
+> and the §6 floor routing in `VDP1_ARCHITECTURE.md`. The fully-obsolete cell-era
+> plans `VDP2_FLOOR_CONSOLIDATION.md`, `RBG0_SNOW_FIX_PLAN.md`, and
+> `RBG0_STRUCTURED_GARBAGE.md` were **deleted** in the 2026-06-29 docs reorg (their
+> useful mechanism lives here). Where any doc and this one disagree about the floor, **this doc wins.**
 
 ## TL;DR
 

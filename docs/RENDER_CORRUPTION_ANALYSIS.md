@@ -1,5 +1,15 @@
 # Mimas — Doom II first-frame render: master-stack corruption root-cause analysis
 
+> **STATUS — RESOLVED (shipped 2026-06-23, core `b3acd9f`).** Root cause was the
+> **Rank-4** candidate (`spanstart_l[]`/`spanstart[]`/`spanstop[]` sized `[224]` but
+> indexed by 0..255 byte `top`/`bottom`); fix = size all three `[256]`. The original
+> **#1 suspect (`openings[]` overflow) was DISPROVEN** — its preventive guard (§4b/§5)
+> was **never shipped** and is only a latent backstop. §3/§4/§5 below are kept as a
+> historical investigation record, demoted accordingly. This is a one-time render
+> corruption analysis; it is unrelated to the steady-state render path — for the RBG0
+> floor see `VDP2_RBG0_CURRENT_STATE.md` and for VDP1↔NBG1 present sync see
+> `VDP1_PRESENT_SYNC_PLAN.md`.
+
 ## 0. RESOLUTION (shipped 2026-06-23, core `b3acd9f`) — root cause was Rank 4, not #1
 
 **This crash is FIXED.** The root cause turned out to be the **Rank-4** candidate
@@ -193,151 +203,66 @@ and stomps the zone heap; guarded by skipping such planes) and core/d_main.c:215
 
 ---
 
-## 3. #1 suspect
+## 3. Original #1 suspect — `openings[]` overflow (DISPROVEN, historical note)
 
-**`openings[]` overflow via the unguarded `lastopening` advance / clip-array `memcpy`s in
-`R_StoreWallRange` (core/r_segs.c:999-1000, 1111-1113, 1119-1121).**
+> **DISPROVEN.** This was the lead hypothesis during the investigation, but the real
+> cause was **Rank 4** (§2 / §0). The openings overflow never occurred and its guard
+> (§4b/§5) was **never shipped**. Retained as a record of the reasoning and as the
+> rationale for the *latent backstop* in §5.
 
-Clearest reasoning:
+The hypothesis was: **`openings[]` overflow via the unguarded `lastopening` advance /
+clip-array `memcpy`s in `R_StoreWallRange` (core/r_segs.c:999-1000, 1111-1113,
+1119-1121).** It was attractive because:
 1. It is the **only large unguarded bulk forward write** in the render path (40 KB array,
-   two `memcpy`s per masked/silhouette seg). The right shape to stomp a distant pointer /
-   saved-PR region and fault only on unwind — matching `R:5-end` printed, fault on RETURN.
-2. Its consumption **scales with exactly the geometry Doom II MAP01 has and shareware
-   doesn't** — two-sided/masked windows, grates, railings, the open nukage room. This is
-   the textbook vanilla Doom II openings overflow, and this core keeps the fixed vanilla array.
+   two `memcpy`s per masked/silhouette seg) — the right shape to stomp a distant pointer /
+   saved-PR region and fault only on unwind (matching `R:5-end` printed, fault on RETURN).
+2. Its consumption would scale with Doom II MAP01 geometry (two-sided/masked windows,
+   grates, railings, the open nukage room) that shareware lacks — the textbook vanilla
+   Doom II openings overflow; this core keeps the fixed vanilla array.
 3. The ONLY `MAXOPENINGS` check is post-hoc in `R_DrawPlanes` (r_plane.c:884) — too late
    and not preventive; consistent with `R:5-end` completing without an `I_Error`.
 4. The .map proves immediate adjacency: `openings` (0x060b6420→0x060c0420) is directly
    followed by `ceilingplane`/`floorplane`/`lastvisplane` (0x060c0420/24/28), giving a
    clean overflow→wild-pointer→arbitrary-write chain into a saved PR.
-5. It became reachable/fatal exactly when the brief says: post-`-DMAXVISPLANES=256` (OOM
-   removed + BSS relaid). Rank-4 (`spanstart_l`) is the direct-stack-write backup theory;
-   telemetry below distinguishes them in one build.
+
+The direct fix at Rank 4 (sizing `spanstart_l[]`/`spanstart[]`/`spanstop[]` to `[256]`)
+resolved the crash without ever needing to confirm or clamp this path.
 
 ---
 
-## 4. Confirmation plan — ONE Ymir build
+## 4. Historical confirmation plan (superseded)
 
-Add read-mostly high-water counters for every limit, PLUS one preventive clamp at the #1
-site that converts the silent overflow into a visible `dbg_print` + safe skip. Overlay rows
-6-7 are the existing D:/R: markers; use **rows 8, 9, 10** for telemetry.
-
-### 4a. Counters (BSS globals; declare near the arrays, reset per frame)
-
-In core/r_plane.c, near the existing `r_visplane_peak` (r_plane.c:64), add:
-```c
-int r_openings_peak;     /* max (lastopening - openings) seen this frame */
-int r_openings_ovf;      /* count of skipped openings writes (guard trips) */
-int r_drawseg_peak;      /* max (ds_p - drawsegs) */
-int r_solidseg_peak;     /* max (newend - solidsegs) */
-int r_topbot_peak;       /* max top/bottom byte fed to spanstart_l[] */
-```
-Reset them in `R_ClearPlanes` (where `lastopening = openings` is reset, r_plane.c:410):
-```c
-/* after: lastopening = openings; */
-r_openings_peak = 0; r_openings_ovf = 0; r_drawseg_peak = 0;
-r_solidseg_peak = 0; r_topbot_peak = 0;
-```
-
-### 4b. openings high-water + preventive guard (THE confirmer) — core/r_segs.c
-
-Site 1, masked-midtexture col (currently r_segs.c:999-1000):
-```c
-/* BEFORE */
-ds_p->maskedtexturecol = maskedtexturecol = lastopening - rw_x;
-lastopening += rw_stopx - rw_x;
-/* AFTER */
-if ((int)(lastopening - openings) + (rw_stopx - rw_x) > MAXOPENINGS) {
-    r_openings_ovf++; maskedtexture = 0; ds_p->maskedtexturecol = NULL;
-} else {
-    ds_p->maskedtexturecol = maskedtexturecol = lastopening - rw_x;
-    lastopening += rw_stopx - rw_x;
-}
-if ((int)(lastopening - openings) > r_openings_peak)
-    r_openings_peak = (int)(lastopening - openings);
-```
-Site 2, sprtopclip (currently r_segs.c:1111-1113) — guard mirrors the drawseg early-return:
-```c
-/* BEFORE */
-memcpy (lastopening, ceilingclip+start, sizeof(*lastopening)*(rw_stopx-start));
-ds_p->sprtopclip = lastopening - start;
-lastopening += rw_stopx - start;
-/* AFTER */
-if ((int)(lastopening - openings) + (rw_stopx - start) > MAXOPENINGS) {
-    r_openings_ovf++; ds_p->sprtopclip = screenheightarray; /* full-screen sentinel */
-} else {
-    memcpy (lastopening, ceilingclip+start, sizeof(*lastopening)*(rw_stopx-start));
-    ds_p->sprtopclip = lastopening - start;
-    lastopening += rw_stopx - start;
-}
-```
-Site 3, sprbottomclip (currently r_segs.c:1119-1121) — same pattern, fall back to
-`negonearray` (the full-screen sentinels live at core/r_main.c:94-95):
-```c
-/* AFTER */
-if ((int)(lastopening - openings) + (rw_stopx - start) > MAXOPENINGS) {
-    r_openings_ovf++; ds_p->sprbottomclip = negonearray;
-} else {
-    memcpy (lastopening, floorclip+start, sizeof(*lastopening)*(rw_stopx-start));
-    ds_p->sprbottomclip = lastopening - start;
-    lastopening += rw_stopx - start;
-}
-if ((int)(lastopening - openings) > r_openings_peak)
-    r_openings_peak = (int)(lastopening - openings);
-```
-
-### 4c. drawseg + solidseg + top/bottom peaks (rule the others in/out)
-
-drawseg, after `ds_p++` (core/r_segs.c:1134):
-```c
-if ((int)(ds_p - drawsegs) > r_drawseg_peak) r_drawseg_peak = (int)(ds_p - drawsegs);
-```
-solidseg, after `newend++` (core/r_bsp.c:126) and after the crunch (core/r_bsp.c:185):
-```c
-if ((int)(newend - solidsegs) > r_solidseg_peak) r_solidseg_peak = (int)(newend - solidsegs);
-```
-top/bottom byte fed to the stack array, in `R_DrawVisplaneTextured`/`Potato` right after
-`int t2 = pl->top[x], b2 = pl->bottom[x];` (core/r_plane.c:702 / :767):
-```c
-if (t2 > r_topbot_peak) r_topbot_peak = t2;
-if (b2 > r_topbot_peak) r_topbot_peak = b2;
-```
-
-### 4d. Overlay print (rows 8/9/10) — in R_DrawPlanes, reuse the VP_DIAG block style
-
-Near the existing diag print (core/r_plane.c:1124-1138):
-```c
-dbg_print(0, 8, "OPN %5d/%5d ovf%d", r_openings_peak, MAXOPENINGS, r_openings_ovf);
-dbg_print(0, 9, "DSG %3d/%3d SSG %3d/%3d", r_drawseg_peak, MAXDRAWSEGS,
-          r_solidseg_peak, MAXSEGS);
-dbg_print(0,10, "VPL %3d/%3d TBpk %3d", r_visplane_peak, MAXVISPLANES, r_topbot_peak);
-```
-
-### 4e. Verdict reading
-- `OPN peak >= 20480` and/or `ovf > 0`, while the render now **completes** (D:3-postRPV
-  prints) → **#1 confirmed**: openings overflow was the corruptor and the guard fixed it.
-- `TBpk >= 224` → Rank-4 `spanstart_l` stack write is (also) live; add the y-clamp (5b).
-- `SSG` pinned at 32 → Rank-3 solidsegs contributes; bound `newend`.
-- `VPL` pinned at 256 with an `I_Error` halt (not a garbage-PR) → that is the visplane
-  ceiling, a different/cleaner failure, not this crash.
+> **SUPERSEDED.** A single instrumented Ymir build was *planned* to distinguish the
+> openings (#1) and `spanstart_l` (Rank 4) theories via high-water counters. In the end
+> Rank 4 was diagnosed directly from the array-size mismatch and fixed without this
+> telemetry pass. The counter/guard scaffolding was never shipped; it is kept only as a
+> reference for how the limits could be instrumented if a *future* overflow is suspected.
+> The peak counters of interest were: `r_openings_peak`/`r_openings_ovf` (vs
+> `MAXOPENINGS`), `r_drawseg_peak` (vs `MAXDRAWSEGS`), `r_solidseg_peak` (vs `MAXSEGS`),
+> and `r_topbot_peak` — the max `top`/`bottom` byte fed to `spanstart_l[]`, the Rank-4
+> tell, which would read **≥224** on a tripping frame (and did, confirming Rank 4).
 
 ---
 
-## 5. Candidate fix for #1 (cross-port-safe)
+## 5. Latent openings backstop (NOT shipped — defensive only)
 
-Ship the **preventive openings guard from 4b** as the fix (drop the `dbg_print`/peak
-bookkeeping or keep it behind a debug `#ifdef`). It mirrors the existing in-class defensive
-idioms: the `drawsegs` early-return guard (core/r_segs.c:773-775), the `R_CheckPlane`
-visplane guard (core/r_plane.c:576), and the "skip rather than corrupt" pattern of the
-documented r_plane.c:185-202 / d_main.c:215-222 guards.
+> **This is a backstop, not "the fix."** The Doom II crash was fixed at Rank 4 (§0).
+> The openings guard below was **never shipped** and is **not required**; it is the only
+> large unguarded bulk write in the render path, so it remains a reasonable *latent*
+> defensive backstop to add **only if** openings telemetry ever shows a genuine overflow.
 
-Behaviour: when a seg's clip/masked data would not fit, **skip** that seg's openings write
-(masked midtexture dropped; sprite clips fall back to the full-screen `screenheightarray` /
-`negonearray` sentinels, core/r_main.c:94-95). Worst-case visible artifact = a few unclipped
-sprite edges on an over-budget frame — never a stack stomp. This is the minimal, perf-economy
-fix (no per-frame cost on the common path: one compare per masked/silhouette seg). Do NOT
-grow `openings` dynamically (PrBoom approach) — heavier and unwarranted; only bump
-`MAXOPENINGS` if telemetry shows the *legitimate* working set genuinely exceeds 20480.
+If added, the guard would clamp the three `lastopening` write sites
+(core/r_segs.c:999-1000, 1111-1113, 1119-1121) so an over-budget seg is **skipped**
+rather than overrunning `openings`: masked midtexture dropped; sprite clips fall back to
+the full-screen `screenheightarray` / `negonearray` sentinels (core/r_main.c:94-95).
+Worst-case visible artifact = a few unclipped sprite edges on an over-budget frame —
+never a stack stomp. It mirrors the existing in-class defensive idioms: the `drawsegs`
+early-return guard (core/r_segs.c:773-775), the `R_CheckPlane` visplane guard
+(core/r_plane.c:576), and the "skip rather than corrupt" pattern of the documented
+r_plane.c:185-202 / d_main.c:215-222 guards. It is the minimal, perf-economy form (one
+compare per masked/silhouette seg on the common path). Do NOT grow `openings` dynamically
+(PrBoom approach) — heavier and unwarranted; only bump `MAXOPENINGS` if telemetry shows
+the *legitimate* working set genuinely exceeds 20480.
 
 **Cross-port safety (DoomJo / shared core):**
 - The edits are pure C in core/r_segs.c — no C++isms, no unnamed params; compiles clean on

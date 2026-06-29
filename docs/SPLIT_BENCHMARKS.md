@@ -39,22 +39,25 @@ On **console**: pot0 ≈ **~100ms / ~7fps = "playable"** (Romain, 2026-06-21).
    error. **Validated on Ymir (Romain, 2026-06-22): `k` drops, no seams.** Flip `SAT_WALL_RMUL` 0
    for the original divisions (A/B). [append the measured k-drop in the table below]
 2. **Bp (software wall-prep) = 5.5-11.4ms/view**, the dominant per-view software term in dense
-   scenes. Lever: **detailshift** (halve the columns → ~half Bp; ~5-11ms/frame; a quality hit)
-   or the parked slave wall-prep offload. detailshift caveat: the VDP1 wall emit
+   scenes. Lever: **detailshift** (halve the columns → ~half Bp; ~5-11ms/frame; a quality hit).
+   (Offloading wall-prep to the slave is CONFIRMED DEAD — memory-bound, tried 3×; the slave win
+   that DID ship is the TAS plane work-steal, default-on, core 73f8cdc / parent 4857f87.)
+   detailshift caveat: the VDP1 wall emit
    (`sat_wall_vdp1`) does NOT shift x by detailshift today (walls would squish to the left
    half) → needs `x<<detailshift` in the emit + R_SetViewWindow width/columnofs/colfunc.
 3. **P (floors) = 22ms at pot0, ~3-8ms at pot1/2** → potato is the floor lever (known). At
    pot1/2 P is already cheap, so it is NOT the split ceiling.
 
-**Slave idle 58-65% at pot1/2** → spare capacity for the parked Bp offload (freeze-zone).
+**Slave idle 58-65% at pot1/2** → headroom now consumed by the shipped TAS plane work-steal.
 
-> **RECONCILED 2026-06-24.** The slave is NOT idle-doing-nothing: it already runs **P3 plane-split
+> **NOTE.** The slave is NOT idle-doing-nothing: it already runs **P3 plane-split
 > + masked-by-half SHIPPED** within each view (the slave draws half the visplane worklist and the
 > RIGHT-half vissprites of every view — `r_parallel.c` `RP_DispatchPlanes`/`RP_DispatchMasked`,
 > gates `sat_plane_parallel`/`sat_masked_parallel`=1). The 58-65% idle is the headroom **AFTER**
-> that phase work. The "parked offload" still open is specifically **Bp (wall-prep)**, the
-> freeze-zone item — distinct from the already-shipped P/M phase-split. (NB: this is the master/slave
-> LEFT/RIGHT masked split, not the x-split 2nd-renderer, which is compiled off — overflows 2MB.)
+> that phase work; it is now taken by the dual-SH2 plane work-steal (TAS, default-on, core 73f8cdc
+> / parent 4857f87). Offloading Bp (wall-prep) to the slave was tried 3× and is CONFIRMED DEAD
+> (memory-bound). (NB: this is the master/slave LEFT/RIGHT masked split, not the x-split
+> 2nd-renderer, which is compiled off — overflows 2MB.)
 
 ## Future rows (append measured runs here for comparison)
 

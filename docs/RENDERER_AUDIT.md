@@ -5,12 +5,16 @@ is tied to actual source. Action items at the end are split into **implement
 directly** (high confidence) vs **A/B test** (measure first), continuing the
 `SATURN PERF x.y` numbering from `core/r_parallel.c` / the perf notes.
 
-> **⚠️ §4 ("should we go hardware?") is DECIDED as of 2026-06-19.** Mimas took
-> **Track B**: VDP1 now renders all walls (hybrid — VDP1 walls below software NBG1).
-> The current VDP1 hardware model, costs, and convictions are in
-> [`VDP1_ARCHITECTURE.md`](VDP1_ARCHITECTURE.md). The §1–§3 *software-renderer*
-> findings (slave-as-worker, kill the per-column memcpy, Potato) remain valid and
-> still relevant — VDP1 offloads EX/fill, not REC, which is still the frame's bulk.
+> **STATUS — historical audit, partially settled.** This doc is the original
+> four-renderer code audit; keep §2 (inner-loop comparison) and the still-valid
+> levers (2.2, 2.7) as live reference. The hardware question (§4) is **settled**:
+> VDP1 carries **walls only** (8bpp + CRAM light-banks), and the dominant flat
+> (floor/ceiling) went to **RBG0 as a clean 512×256 8bpp bitmap**, NOT VDP1 — see
+> [`VDP2_RBG0_CURRENT_STATE.md`](VDP2_RBG0_CURRENT_STATE.md) for the floor reality
+> and [`VDP1_PRESENT_SYNC_PLAN.md`](VDP1_PRESENT_SYNC_PLAN.md) for VDP1↔NBG1 present
+> sync. A from-scratch VDP1 world renderer remains an unshipped bet
+> ([`VDP1_WORLD_PLAN.md`](VDP1_WORLD_PLAN.md)). The dual-SH2 plane split is also
+> settled (see §5): work-steal "TAS" shipped default-on; wall-prep→slave is dead.
 
 Repos audited (cloned in `../saturn-refs/`):
 - **d32xr** — Doom 32X: Resurrection. Same architecture as Mimas (2× SH-2,
@@ -20,21 +24,13 @@ Repos audited (cloned in `../saturn-refs/`):
   VDP1 hardware path.
 - **Mimas** — us. `core/r_parallel.c` + `src/dg_saturn.cxx`.
 
-> **Reality check (from the perf notes):** Mimas's parallel renderer has been
-> **disabling itself near frame 1** (slave timeout → `rp_disabled` permanent), so
-> the ~8.6 fps baseline is **serial master-only** rendering. We are nowhere near
-> the software ceiling — the second SH-2 is effectively idle. This reframes the
-> whole "should we go hardware?" question (see §4).
->
-> **RECONCILED 2026-06-24 — THIS REALITY CHECK IS STALE.** The slave is no longer
-> idle and the renderer no longer disables itself in ship config. The slave now
-> actively runs the **P plane-half** (`r_plane.c:1206`) AND the **M sprite-half**
-> (`r_things.c:1185`), both SHIPPED on by default (`main.cxx:52-53`). The
-> `rp_disabled=1` at `r_main.c:1181` is now *intentional* — plane-parallel forces
-> the legacy parity renderer off so there is no double-dispatch conflict; it is not
-> a timeout failure. Residual slave idle = the serial **B phase** (BSP/clip), of
-> which only **Bp wall-prep** is offloadable. The ~8.6 fps figure also predates the
-> potato ship config; current solo is ~5–12 fps depending on scene (hardware-measured).
+> **Renderer status (settled).** The slave is **not** idle: it actively runs the
+> **P plane-half** (`r_plane.c:1206`) AND the **M sprite-half** (`r_things.c:1185`),
+> both shipped on by default (`main.cxx:52-53`). `rp_disabled=1` at `r_main.c:1181`
+> is *intentional* — plane-parallel forces the legacy parity renderer off so there
+> is no double-dispatch conflict. Residual serial work is the **B phase** (BSP/clip);
+> only **Bp wall-prep** was offloadable, and that is **confirmed dead** (memory-bound,
+> tried 3×). Current solo is ~5–12 fps depending on scene (hardware-measured).
 
 ---
 
@@ -50,17 +46,10 @@ Repos audited (cloned in `../saturn-refs/`):
   disables it.
 - The slave does **nothing** during the BSP walk except spin on `ready`.
 
-> **RECONCILED 2026-06-24 — dual-CPU framebuffer blit is HW-REJECTED, do not
-> re-investigate.** A separate "use the slave to copy the bottom framebuffer rows"
-> lever was built and measured on real hardware (2026-06-22). Verdict: **DROP** — no
-> dual config beats single. `src/dg_saturn.cxx`: `DUAL_CPU_BLIT=1` is compiled
-> (full dual path :2495-2523, `blit_slave_body` copies the bottom rows with a
-> bounded-wait fallback to the master), but `blit_mode` boot default = **0
-> (single-CPU)** (:366-368). Measured: blit ~5.5ms (recalibrated down from ~12ms),
-> **bus-bound S~1.3**; the 50/50 split is the WORST at 6.0ms vs 5.5ms single. The
-> code is KEPT GATED (not dead-stripped) only as the live **L+R-chord A/B harness**
-> (:2773) and because it shares `rp_sgl_workptr_reset` plumbing with the P/M
-> dispatch; compiled-out cost is ~nil since `blit_mode=0` takes the single path.
+> **Dual-CPU framebuffer blit — HW-REJECTED (do not re-investigate).** Measured on
+> real hardware (2026-06-22): blit ~5.5ms, bus-bound S~1.3, the 50/50 split is the
+> WORST (6.0ms vs 5.5ms single); `blit_mode` boot default = 0 (single-CPU). Kept
+> gated only as the L+R-chord A/B harness; zero cost when off.
 
 ### d32xr (the model to copy)
 - The secondary SH-2 runs a **persistent dispatch loop**, `Mars_Secondary()`
@@ -135,54 +124,50 @@ Both software ports independently converged on the same big lever:
   (`viewwidth >>= detailshift`, potato = `>>2`), solid-color planes.
 
 Floor/ceiling **spans are the most expensive fill** (full-width, perspective).
-Flat-shading them (or dropping to quarter-width) is where both projects buy the
-most fps. Mimas currently renders full spans (`rp_exec_span`) **and disables the
-parallel renderer entirely when `detailshift != 0`** (`RP_BeginFrame`) — so it has
-no working low-detail mode at all. Big, cheap, untapped.
+Flat-shading them (or dropping to quarter-width) is where both software projects
+buy the most fps. **Mimas took a different route and shipped it:** the dominant
+flat went to **VDP2 RBG0 as a clean 512×256 8bpp bitmap** (the rotation hardware
+does the perspective), so the software span path is no longer the floor's bulk —
+see [`VDP2_RBG0_CURRENT_STATE.md`](VDP2_RBG0_CURRENT_STATE.md). The d32xr/FastDoom
+flat-shade lever stands as a software reference, not an open Mimas item.
 
 ---
 
-## 4. So — should we go hardware (VDP1)?
+## 4. So — should we go hardware (VDP1)? — SETTLED
 
-**Short answer: not yet, and not as "an optimization."** Reasoning from the audit:
+This section's original Track-A/Track-B "not yet, de-risk with a measurement"
+staging is now **resolved**, and the answer was a split, not an either/or:
 
-1. **You're not at the software ceiling — you're far below it.** The parallel
-   renderer is self-disabled; you're running serial on one SH-2. d32xr proves the
-   *same hardware* (2× SH-2, software) reaches 2–4× by (a) a robust secondary-CPU
-   job loop and (b) phase-level parallelism. That headroom is real, lower-risk,
-   and **keeps the shared `core/` with DoomJo** (doomgeneric stays intact).
-2. **VDP1 is a different project, not a patch.** SlaveDriver is a from-scratch
-   sector/sprite engine; it is *not* Doom's renderer with VDP1 bolted on. Going
-   VDP1 means rewriting r_segs/r_plane/r_things into VDP1 command-list generation,
-   abandoning doomgeneric's column renderer, and inheriting the **affine texture
-   warp** (the exact thing Carmack rejected on Saturn Doom) plus the hard
-   floor/ceiling problem. It breaks the DoomJo code-sharing.
-3. **But it's the only path to a *big* leap** (full framerate, smooth). PowerSlave
-   proves it. So it shouldn't be dismissed — it should be **de-risked with a
-   measurement**, not entered on faith.
+- **VDP1 carries walls only** — 8bpp textured wall quads with CRAM light-banks
+  (the hybrid path). See [`VDP1_PRESENT_SYNC_PLAN.md`](VDP1_PRESENT_SYNC_PLAN.md)
+  for the VDP1↔NBG1 present sync; SlaveDriver's `WALLS.C` was the reference for
+  feeding VDP1.
+- **The dominant flat went to VDP2 RBG0**, not VDP1 — a clean 512×256 8bpp bitmap
+  (the rotation hardware does the perspective):
+  [`VDP2_RBG0_CURRENT_STATE.md`](VDP2_RBG0_CURRENT_STATE.md).
+- **A from-scratch VDP1 world renderer** (the full sector/sprite rewrite) remains
+  an **unshipped bet**: [`VDP1_WORLD_PLAN.md`](VDP1_WORLD_PLAN.md).
 
-**Recommended staging:**
-- **Track A (now): make the software renderer do what it already promises.** Fix
-  the slave reliability, copy d32xr's secondary-as-worker model, rebalance, kill
-  the per-column memcpy, add a real Potato mode. Target d32xr-level (~2–3×). High
-  ROI, keeps the shared core.
-- **Track B (parallel, cheap): a throwaway VDP1 wall prototype.** Draw a handful
-  of walls as VDP1 distorted sprites on *your* Saturn and measure real fillrate
-  and warp. Decide the hardware bet with numbers from your hardware — not from
-  forum lore. SlaveDriver's `WALLS.C` is the reference for how to feed VDP1.
+The software-renderer findings in §1–§3 still informed the shipped dual-SH2 split
+(see §5). The "facing-a-wall fps cliff" is a **VDP2 cost** (the per-frame RBG0
+transform), analysed separately — not a VDP1 problem.
 
 ---
 
 ## 5. Action list
 
-Measure everything on the row-19 profiler (`REC / EX / W / c`) **after** the
-parallel renderer is confirmed live again — today's numbers are serial.
+Measure everything on the row-19 profiler (`REC / EX / W / c`).
+
+> **Planes settled.** The dual-SH2 plane split is decided: work-steal **TAS**
+> shipped default-on (core `73f8cdc` / parent `4857f87`), row-split parked, and
+> **wall-prep→slave is confirmed dead** (memory-bound, tried 3×). The old "make the
+> slave a persistent mailbox worker / give it whole phases / rebalance the column
+> split" items (2.1, 2.4, 2.5) are therefore closed and removed below.
 
 ### A. Implement directly (high confidence, low risk)
 
 | # | Change | Source / rationale | Touches |
 |---|--------|--------------------|---------|
-| **2.1** | **Make the slave a persistent job worker** driven by a comm-register mailbox loop (à la `Mars_Secondary`), instead of relaunching `slSlaveFunc` every frame. Removes the GBR+72 leak hack *and* the permanent-disable fragility. | d32xr `marsnew.c:334`; fixes the self-disable in the perf notes | `core/r_parallel.c`, `src/main.cxx` |
 | **2.2** | **Kill the per-column `memcpy(col_cache,src,128)`** in `rp_exec_col`; index `dc_source` directly with a height mask (add an NPo2 path if needed). | d32xr `sh2_draw.s` does zero source copy; already a suspect | `core/r_parallel.c` |
 | **2.3** | **Real low-detail / Potato mode**: quarter-width render + solid-color floors/ceilings, **and keep the parallel renderer enabled** under `detailshift` (remove the `RP_BeginFrame` bail-out). | d32xr + FastDoom both ship this as their top fps lever | `core/r_parallel.c`, `core/r_plane.c`, `core/r_main.c` |
 
@@ -190,25 +175,6 @@ parallel renderer is confirmed live again — today's numbers are serial.
 
 | # | Hypothesis | Source / risk | How to measure |
 |---|-----------|---------------|----------------|
-| **2.4** | **Give the slave whole phases, not half the columns**: move wall-prep / visplane setup / sprite-half onto the slave (producer/consumer with the master's BSP). | d32xr `r_phase2.c:346`. Bigger change to the sync core (freeze history) → careful. | REC should drop (master does less); W tells if balanced |
-| **2.5** | **Rebalance the column split** by the `W` measurement: W≈0 ⇒ master-bound, give slave >50%; W≈EX ⇒ slave-bound, give master more. | perf-notes 2.1 "two pointers meet in the middle" | row-19 `W` before/after |
-
-> **RECONCILED 2026-06-24 — 2.4 is PARTLY DONE (SHIPPED), 2.5 is SHIPPED:**
-> - **2.4 → PARTLY DONE.** The "whole phases" model is shipped for two of the three
->   phases: **planes** (P, `r_plane.c:1206`) and **sprite-half** (M, `r_things.c:1185`)
->   are committed and on by default. Only **wall-prep** remains (the `Bp`
->   producer/consumer): STEP-1 master-only defer harness is committed but gated OFF
->   (`sat_wallprep_defer=0`), STEP-2 slave-consumes-while-master-produces overlap is
->   NOT built (the freeze-zone). Pixel-weighting the fixed 50/50 plane/sprite split
->   is a low-priority refinement.
-> - **2.5 → SHIPPED, but INACTIVE in ship config.** The two-pointer meet-in-the-middle
->   work-steal is committed in `core/r_parallel.c` (master forward from 0 / slave
->   backward from `mat-1` in 16-cmd chunks, sync fields :122-123, steal loop :627-660,
->   init :777-782; SYNC struct uncached via the `0x20000000` alias). It is NOT
->   "uncertain — measure". HOWEVER it is **DEAD on the active 1p path**: it lives in
->   the parity renderer, which `sat_plane_parallel=1` disables (`rp_disabled=1`,
->   `r_main.c:1180-1181`). It runs only in the legacy `sat_plane_parallel=0`
->   (non-ship) config. Zero cost when disabled; keep, mutually exclusive with P/M.
 | **2.6** | **Hand-asm the column loop** (tight SH-2 loop, GBR colormap, shift-stride, `dt`+delayed-branch), *tight, not unrolled*. | d32xr `sh2_draw.s`. Risk: I-cache; only worth it if EX is fillrate-bound. | EX per-command |
 | **2.7** | **Overlap the SH-2 hardware divider** (`DIVU`): start a divide, do work, collect the quotient — for scale/perspective math. | d32xr `r_phase2.c:178` (`SH2_DIVU_DVSR/DVDNT`). Saturn SH-2 has the same unit. | REC |
 | **2.8** | **Sky → VDP2 scroll layer** instead of software columns; frees fillrate + command count. | classic Saturn trick; reduces `c` | EX, `c` |

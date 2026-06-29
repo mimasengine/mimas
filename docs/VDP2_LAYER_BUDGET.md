@@ -1,17 +1,20 @@
-> ⚠️ PARTIELLEMENT OBSOLÈTE re: le sol RBG0 (état d'avant 2026-06-27). Le sol SHIPPE en BITMAP 512x256 8bpp (RBG0_BITMAP=1, commits 19768ca/41dd895), PROPRE sur HW : 2 banques — bitmap en A1, K-table en A0, fb en B0, RPT en B1+0x1ff00, B1 sinon LIBRE (pas de map). Les conclusions « sol=software/off », « neige présente », « poke CYC absent » (rbg0_commit_cyc EST dans l'arbre), « RDBS=0x8D » (c'est 0x0D), « ciel XOR sol » et « overlay incompatible » sont RENVERSÉES : l'overlay NBG3 = toggle L+R, un ciel cell peut cohabiter. Sol gaté à potato-0 + 1 joueur. La loi matérielle (§0/§2/§5) reste valable. Voir docs/VDP2_RBG0_CURRENT_STATE.md.
+> ✅ STATUT (2026-06-29) : ce document garde sa **valeur de référence pour la loi matérielle VDP2**
+> (§0 invariants 4 banques × 8 timings + loi de la « snow » par starvation de cycle-pattern ; §2
+> coûts par dot ; §5 exemples réels). Mais ses **conclusions de coexistence sont OBSOLÈTES** : le sol
+> RBG0 a SHIPPÉ en **BITMAP 512×256 8bpp** (RBG0_BITMAP=1, commits 19768ca/41dd895), PROPRE sur HW.
+> La « neige » était une starvation de cycle-pattern, résolue par **bitmap + RDBS=0x0D + cycles A0/A1
+> parqués** (`rbg0_commit_ramctl`/`rbg0_commit_cyc`, DÉJÀ dans l'arbre — PAS slSynch). B1 est LIBRE
+> (pas de map) → le sol + un ciel cell B1 peuvent coexister ; l'overlay NBG3 est un toggle L+R. Sol gaté
+> potato-0 + 1 joueur. Les thèses « ciel XOR sol », « overlay incompatible », « poke CYC absent »,
+> « RDBS=0x8D », « sol=software/snow » sont RENVERSÉES.
+> **Réf. faisant autorité pour la réalité du sol : `docs/VDP2_RBG0_CURRENT_STATE.md`.**
 
-# VDP2 Layer Budget — Mimas (Doom Saturn) : ciel, sol, overlay et les 4 banques VRAM
+# VDP2 Layer Budget — Mimas (Doom Saturn) : la loi des 4 banques VRAM (ciel, sol, overlay)
 
-> Document de décision. Auteur : architecte graphique Saturn (Mimas).
-> Date : 2026-06-26. Public : Romain.
-> Objet : répondre à 8 questions sur le conflit overlay-debug (NBG3) vs sol RBG0,
-> cartographier l'usage VDP2, et décider de la stratégie (notamment le toggle écran-titre).
->
-> **Synthèse en une phrase** : au-dessus du framebuffer obligatoire, le matériel ne permet
-> que **le ciel HW *OU* le sol RBG0 texturé** — jamais les deux — et l'overlay debug (NBG3)
-> ne peut **pas** cohabiter avec le sol RBG0 dans aucune config viable prouvée. La
-> recommandation est donc un **toggle écran-titre** entre configurations, exactement comme
-> Romain le propose.
+> Auteur : architecte graphique Saturn (Mimas). Public : Romain.
+> Objet conservé : cartographier la **loi matérielle** d'usage du VDP2 (4 banques × 8 timings,
+> coûts par dot, exemples réels de jeux). L'analyse de coexistence overlay/sol qu'il contenait est
+> historique et résolue par le sol bitmap shippé — voir `docs/VDP2_RBG0_CURRENT_STATE.md`.
 
 ---
 
@@ -32,40 +35,20 @@
   n'est pas planifiée dans un timing de la banque qui contient réellement ses données,
   la lecture *n'a pas lieu* et la couche se corrompt en **traînées blanches horizontales
   ("snow")** — ce n'est **pas** un repli propre vers la transparence.
-  C'est exactement la neige que Romain a vue sur hardware.
-  Source : `docs/VDP2_ARCHITECTURE.md` sec2, `docs/VDP2_FLOOR_CONSOLIDATION.md:80-84`.
+  C'est exactement la neige que Romain a vue sur hardware (résolue depuis par le sol bitmap +
+  cycles A0/A1 parqués — voir `docs/VDP2_RBG0_CURRENT_STATE.md`).
+  Source : `docs/VDP2_ARCHITECTURE.md` sec2.
 
 ---
 
-## 1. Pourquoi l'overlay et le sol se battent (le conflit B1, expliqué simplement)
+## 1. Note historique — le « conflit B1 » overlay vs sol (RÉSOLU)
 
-L'overlay de debug est la couche **NBG3** (texte cellulaire de `SRL::Debug::Print` /
-`SRL::ASCII`). **SRL la câble en dur dans la banque B1** : la table de tuiles (pattern-name)
-à `VDP2_VRAM_B1+0x1E000` (=`0x25E7E000`), les cellules de police construites vers le bas
-depuis `VDP2_VRAM_B1+0x1D000`. Il n'existe **aucune API SRL** pour la déplacer ailleurs —
-c'est une constante de compilation.
-Sources : `SaturnRingLib/saturnringlib/srl_ascii.hpp:19,67,99`, `srl_vdp2.hpp:1516-1526`.
-
-Le sol RBG0 cellulaire a besoin de **3 lectures séparées**, chacune monopolisant **toute**
-la fenêtre de timing d'une banque : pattern-name (map) + caractères (cells) + coefficient
-(table K). Or **la map d'un BG en rotation DOIT être dans une banque B** (une banque A donne
-`slScrAutoDisp ok=0` → RBG0 affamé → bandes écrasées, `src/dg_saturn.cxx:251-254`). B0 étant
-le framebuffer (intouchable), **la map est forcée en B1** (`RBG0_MAP_VRAM=0x25E70000`,
-`src/dg_saturn.cxx:257`). C'est précisément la banque de NBG3.
-
-Deux niveaux de collision se superposent :
-
-1. **Stockage** : la map RBG0 et la police/map NBG3 veulent la même région haute de B1.
-2. **Cycles** : `rbg0_commit_ramctl()` écrit RDBS=`0x8D`, ce qui marque B1 comme banque de
-   rotation "pattern-name" (code 2). Dès qu'une banque est banque de rotation, ses 8 timings
-   sont **monopolisés** par la lecture rotation ; les lectures PN+char de NBG3 ne peuvent plus
-   y être planifiées → le texte s'affame/se corrompt.
-   Sources : `src/dg_saturn.cxx:251-257,266-273,1275-1287`.
-
-C'est pourquoi le cycle pad-Y a **3 états** (`src/dg_saturn.cxx:266-273`) : la map RBG0 (B1)
-et l'overlay NBG3 sont **mutuellement exclusifs**. Le diagnostic est auto-confirmant : si le
-commit RDBS "prend", l'overlay NBG3 se corrompt. **On ne peut pas lire l'overlay pendant que
-le sol HW est affiché.**
+> **OBSOLÈTE.** Ce document avait posé comme thèse centrale que l'overlay NBG3 (câblé par SRL en
+> banque B1) et un sol RBG0 **cellulaire** (dont la map est forcée en banque B → B1) se disputaient
+> irrémédiablement B1, rendant overlay et sol mutuellement exclusifs. **Cette thèse ne tient plus** :
+> le sol shippé est un RBG0 **bitmap** sans pattern-name → **pas de map** → **B1 reste libre**.
+> L'overlay NBG3 redevient un simple toggle (L+R), et un ciel cell peut même cohabiter en B1.
+> Détail du layout réel : `docs/VDP2_RBG0_CURRENT_STATE.md`.
 
 ---
 
@@ -87,38 +70,9 @@ le sol HW est affiché.**
 | Cell NBG 256-col | 1 PN + 2 char | ~3 |
 | RBG0 (chaque lecture : PN, char, K-per-dot) | toute la banque | **8 (banque entière)** |
 
-### 2.a Occupation ACTUELLE — config shippée (VDP2_HW_SKY=1, RBG0_TEST=0)
-
-C'est le build connu-bon, validé sur hardware. Sources : `src/dg_saturn.cxx:236,249`,
-`docs/VDP2_FLOOR_CONSOLIDATION.md:8`.
-
-| Banque | Stockage (contenu) | Cycles (slots/8) |
-|---|---|---|
-| **A0** `0x25E00000` | Ciel HW (NBG0 bitmap 8bpp 512×256, palette 1, prio 4) | ~2/8 |
-| **A1** `0x25E20000` | *Libre / inutilisé pour l'affichage* | 0/8 |
-| **B0** `0x25E40000` | **Framebuffer (NBG1 bitmap 8bpp 320×200, prio 6)** | ~2/8 |
-| **B1** `0x25E60000` | **Overlay NBG3 texte debug** (police+map, prio 7) | ~1-2/8 |
-
-→ 2 banques pleinement utilisées, **A1 entièrement libre**, beaucoup de slots libres partout.
-Ciel + jeu + overlay coexistent. **Le sol est software (CPU).**
-Sources : `src/dg_saturn.cxx:222,1436-1442,1453,1473`, `docs/VDP2_ARCHITECTURE.md:225-231`.
-
-### 2.b Occupation en CONFIG SOL — RBG0 cellulaire (VDP2_HW_SKY=0, RBG0_TEST=1)
-
-C'est le seul layout 4-banques propre pour un sol texturé. Sources :
-`src/dg_saturn.cxx:250,255-261`, `docs/VDP2_ARCHITECTURE.md:230`.
-
-| Banque | Stockage (contenu) | Cycles (slots/8) |
-|---|---|---|
-| **A0** `0x25E00000` | **Table K (coefficient)** RBG0 — libérée par le ciel software | banque rotation |
-| **A1** `0x25E20000` | **Cellules (char)** RBG0 | banque rotation (8/8) |
-| **B0** `0x25E40000` | **Framebuffer (NBG1)** — inchangé | ~2/8 |
-| **B1** `0x25E70000` | **Map (pattern-name)** RBG0 — **ÉVINCE l'overlay NBG3** | banque rotation (8/8) |
-
-→ Les **4 banques pleines**. Ciel passe en software, sol texturé sur RBG0, **overlay évincé.**
-RDBS commit `0x8D` (`src/dg_saturn.cxx:1480`). **Snow toujours présent sur HW** car le poke
-CYCxx (la moitié qui guérit réellement la neige selon la loi de la panne) **n'est pas
-implémenté** (voir §7).
+> **Note** : l'analyse banque-par-banque de l'occupation réelle (config ciel HW, config sol RBG0
+> bitmap shippé, layout exact A0/A1/B0/B1) vit désormais dans `docs/VDP2_RBG0_CURRENT_STATE.md`.
+> Le tableau de coût ci-dessus reste la **loi** ; les cas concrets sont là-bas.
 
 ### 2.c CRAM (4 Ko, mode CRM16_2048 = 8 palettes de 256)
 
@@ -129,83 +83,18 @@ mettre la table K en CRAM (CRKTE) risque de **collisionner avec la palette 8bpp*
 
 ---
 
-## 3. Peut-on déplacer l'overlay ? — 4 pistes, verdict pour chacune
+## 3. Coexistence overlay / sol / ciel — RÉSOLU (note historique)
 
-### Piste A — NBG0 libéré par le ciel software peut-il accueillir l'overlay ?
-**Réponse à la question 2 de Romain.** En config sol, le ciel HW (A0) passe en software,
-mais **A0 n'est pas "libre"** : il reçoit immédiatement la **table K** du RBG0
-(`RBG0_KTAB_VRAM=0x25E00000`, `src/dg_saturn.cxx:261`). Et même si on parlait de la *couche*
-NBG0 (pas de la banque A0) : SRL câble l'overlay en **NBG3/B1**, pas NBG0 ; il n'y a pas d'API
-pour le remettre sur NBG0. Re-pointer NBG3 vers A0 par appels SGL manuels
-(`slCharNbg3/slPageNbg3/slMapNbg3` avec adresses A0) est *théoriquement* possible (A0 a ~126 Ko
-libres une fois la table K placée au bas, et une table K en mode K_LINE/TwoAxis ne coûte
-**0 cycle**), mais **non testé sur HW** : est-ce qu'un NBG3 partageant A0 avec la table K
-enregistre un cycle pattern valide (`slScrAutoDisp>=0`) ? **À vérifier.**
-**Verdict : possible en théorie, NON PROUVÉ, fragile (hérite du même bug de commit sans slSynch).**
-
-### Piste B — Slots libres de la banque framebuffer (B0) ?
-Le framebuffer 8bpp utilise seulement ~2/8 slots → **6 slots de cycle libres en B0.** Un NBG3
-ne demande qu'~1 slot. **MAIS** : un framebuffer 512×256×8bpp = `0x20000` octets = **exactement
-128 Ko = toute la banque B0 en STOCKAGE.** B0 est donc **plein en stockage** malgré ses slots
-de cycle libres. La police+map de l'overlay (~`0x3000` octets) n'y rentre pas.
-Sources : finding 2 openQuestion, `docs/VDP2_ARCHITECTURE.md` sec3.
-**Verdict : NON. Cycles libres mais zéro stockage libre. (NB : notre framebuffer est 320×200,
-à confirmer s'il consomme réellement tout B0 ou s'il reste une marge de stockage — à vérifier.)**
-
-### Piste C — RBG0 bitmap (sans map) libère-t-il B1 pour l'overlay ?
-Un RBG0 **bitmap** supprime la lecture pattern-name → **pas de banque map** → B1 redevient
-libre pour NBG3. Coût : on perd la sélection de flat par tuile (image statique, 1 banque entière
-de cellules pour un bitmap 8bpp 512×256), et il faut re-uploader le bitmap à chaque changement
-de flat dominant/lumière → **rejeté pour la bande passante** (`docs/VDP2_ARCHITECTURE.md:349`).
-SRL ne supporte que conteneurs 512×256/512×512 pour un bitmap RBG0 (`srl_vdp2.hpp:244-307`).
-**Verdict : libère B1 et ramène l'overlay, MAIS sol statique sans flats dynamiques — compromis
-visuel lourd, à évaluer si un sol mono-texture est acceptable. À vérifier.**
-
-### Piste D — Coefficient (table K) en CRAM via CRKTE ?
-CRKTE (RAMCTL bit15) déplace la table K dans la CRAM → libère une **banque VRAM**. C'est la
-**seule** piste vers "ciel HW + sol RBG0 texturé sur 4 banques". **MAIS** :
-1. CRKTE libère **A0**, pas B1. La **map RBG0 reste en B1 et évince toujours l'overlay**
-   (config F du tableau §4). Donc même avec CRKTE, **overlay + sol restent incompatibles.**
-2. Les 8 palettes CRAM sont déjà occupées → **risque de collision K-vs-palette 8bpp**, non prouvé.
-3. SRL/SGL n'exposent **aucun** chemin K-en-CRAM (`srl_vdp2.hpp:1202-1244` alloue toujours en
-   VRAM) → il faudrait un **poke registre VDP2 brut** hors SRL.
-Sources : `docs/VDP2_ARCHITECTURE.md:140-145,295-296`, `docs/VDP2_FLOOR_CONSOLIDATION.md:545-547`,
-finding 2/5.
-**Verdict : seule voie "ciel+sol" sur 4 banques, mais NE résout PAS l'overlay (B1 toujours pris),
-et NON PROUVÉ (collision CRAM). À vérifier.**
-
-**Conclusion §3** : aucune piste ne fait cohabiter **overlay + sol RBG0** de façon prouvée. La
-seule qui ramène l'overlay avec un sol (Piste C, RBG0 bitmap) sacrifie les flats dynamiques.
-
----
-
-## 4. Ce qu'on peut raisonnablement combiner — MATRICE de configurations
-
-Légende : **fb** = framebuffer (NBG1, B0, obligatoire). **K** = table coefficient.
-**cells/map** = char/pattern-name RBG0. "—" = libre.
-
-| Config | A0 | A1 | B0 | B1 | CRAM | Overlay ? | Verdict |
-|---|---|---|---|---|---|---|---|
-| **A — fb + ciel HW** (SHIP) | ciel HW | — | fb | — | palettes | ✅ (rentre en B1) | **Connu-bon, validé HW.** Sol software. |
-| **D — fb + ciel HW + overlay** (dev) | ciel HW | — | fb | overlay NBG3 | palettes | ✅ | **Build dev actuel.** Ciel+jeu+overlay OK. Sol software. |
-| **B — fb + sol RBG0 cell + ciel SW** | K | cells | fb | map | palettes | ❌ (map en B1) | Seul layout sol texturé propre. **Snow HW** (poke CYC absent). Overlay évincé. |
-| **E — fb + sol RBG0 cell + overlay** | K | cells | fb | map **ET** overlay | palettes | ❌ INFAISABLE | Map et overlay veulent B1. **Impossible.** |
-| **F — fb + sol RBG0 cell, K en CRAM** | — (libre) | cells | fb | map | K + palettes | ❌ (map en B1) | CRKTE libère A0, **pas B1**. Overlay toujours évincé. Non prouvé. |
-| **G — fb + ciel HW + sol RBG0 cell, K en CRAM** | ciel HW | cells | fb | map | K + palettes | ❌ | **Seule voie "ciel+sol"** (4 banques OK). Mais overlay évincé + collision CRAM non prouvée. |
-| **C — fb + sol RBG0 bitmap + ciel HW** | ciel HW | bitmap+cells RBG0 | fb | — ou 2e lecture | K en CRAM ? | ✅ si B1 libre | Sol **statique** (pas de flats dynamiques). Ramène l'overlay. À évaluer. |
-| **H — fb + ciel HW + "sol gradient" (back-screen)** | ciel HW | — | fb | overlay NBG3 | palettes | ✅ | Sol non texturé (dégradé ombré d32xr), **0 banque**, garde ciel+overlay, capte ~+20-33% REC. |
-
-**Ciel + X** (X sans nouvelle banque) : nuages parallaxe NBG2 (eye-candy, +0 REC), HUD en
-couche NBG, color-math (flash de dégâts, fondus, brouillard). **Jamais** un sol texturé (pas de
-banque). Source : finding 5 openQuestions.
-
-**Sol + X** (X sans nouvelle banque) : éclairage par distance per-line K_LINECOL, choix dynamique
-du flat dominant. **Jamais** le ciel HW ni l'overlay. Source : finding 5 openQuestions.
-
-**Max simultané utile (1 joueur)** = **framebuffer + EXACTEMENT UN de {ciel HW, sol RBG0 texturé}
-+ (overlay debug seulement quand le sol est OFF).** "Ciel ET sol" n'est atteignable que via CRKTE
-non prouvé (config G), et **même là sans overlay.** L'alternative sans banque (sol dégradé
-back-screen/line-color, config H) est la seule façon d'approcher "ciel + sol + overlay" ensemble.
+> **OBSOLÈTE.** Ce document explorait 4 pistes (NBG3 vers A0, slots libres de B0, RBG0 bitmap,
+> table K en CRAM/CRKTE) et concluait qu'**aucune** ne faisait cohabiter overlay + sol RBG0 de façon
+> prouvée, d'où une matrice de configs jugeant la plupart « snow / infaisable ». La **piste RBG0
+> bitmap** (qui supprime la map et libère B1) — alors écartée pour la bande passante — est exactement
+> celle qui a **shippé** (RBG0_BITMAP=1, 19768ca/41dd895), propre sur HW : sol bitmap + ciel + overlay
+> (toggle L+R) coexistent. La matrice de verdicts B/E/F/G « snow/infaisable » et la conclusion « pas de
+> coexistence prouvée » sont **caduques**. Layout définitif et configs réelles :
+> `docs/VDP2_RBG0_CURRENT_STATE.md`. La seule combinaison restée morte est **wall-prep→slave** (côté
+> rendu, sans rapport VDP2). La piste « sol dégradé back-screen, 0 banque » (ancienne config H) reste
+> un concept valable mais non poursuivi, le bitmap ayant réglé le besoin.
 
 ---
 
@@ -274,114 +163,31 @@ back-screen/line-color, config H) est la seule façon d'approcher "ciel + sol + 
 
 ---
 
-## 6. Nos cas d'usage Mimas — quelles configs valent le coup
+## 6. État résolu (note historique remplaçant §6-§8)
 
-Rappel clé : **le gain REC (+20-33% fps) vient du SKIP du sol software** (on écrit l'index 0
-sur le span du flat dominant et on ne le dessine pas), **PAS du RBG0 lui-même**. Donc l'axe réel
-est **qualité-du-sol vs coût-en-banques**, et il existe un sol à ~0 banque qui capte ~le même gain.
-Source : `docs/VDP2_ARCHITECTURE.md:355-364`, finding 1 (CAPACITY VERDICT).
-
-| Config | Sol | Ciel | Overlay | Gain REC | Coût/risque | Verdict Mimas |
-|---|---|---|---|---|---|---|
-| **A/D (SHIP)** | software | HW | ✅ | 0 | aucun (validé HW) | **Baseline à garder.** |
-| **H (gradient back-screen)** | dégradé ombré, 0 banque | HW | ✅ | ~+20-33% | sol non texturé, sans flats/hauteurs | **La meilleure piste "tout-en-un"** — garde ciel+overlay, capte le gain, sans commit RAMCTL/CYC. À évaluer en priorité. |
-| **B (sol RBG0 cell)** | texturé | software | ❌ | ~+20-33% | snow HW (poke CYC absent), overlay évincé, fragile | À débloquer seulement si on résout le commit CYC. |
-| **G (ciel+sol, K en CRAM)** | texturé | HW | ❌ | ~+20-33% | non prouvé (collision CRAM), overlay évincé | Recherche, pas pour ship. |
-| **C (sol RBG0 bitmap)** | statique mono-texture | HW | ✅ | ~+20-33% | perd flats dynamiques | À évaluer si le sol statique est acceptable. |
-
-**Recommandation d'usage** : pour un sol qui garde **ciel + overlay**, la config **H** (sol
-dégradé style d32xr, 0 banque) est la plus rentable et la moins fragile. Le sol RBG0 texturé
-(B/G) reste bloqué tant que le poke CYC n'est pas écrit et validé HW.
-
----
-
-## 7. Gestion des conflits + recommandation toggle écran-titre
-
-### L'état réel du code (vérifié contre l'arbre, 2026-06-26)
-- Build shippé/HEAD : `VDP2_RBG0_TEST=0` (`src/dg_saturn.cxx:236`), `VDP2_HW_SKY=1` (`:249`) =
-  ciel HW + sol software + RBG0 off. **Validé HW.**
-- **DISCREPANCE confirmée par grep** : `VDP2_FLOOR_CONSOLIDATION.md` section 0 prétend que
-  `rbg0_commit_cyc()` (le poke CYCxx direct) et le classifieur `sat_sky_px`/`sat_floor_px` dans
-  `r_plane.c` sont "câblés/compilés" dans l'arbre. **Ils n'y sont PAS.** `dg_saturn.cxx` n'a que
-  `rbg0_commit_ramctl()` (moitié RDBS, `:1278-1287`) ; **aucun** `rbg0_commit_cyc`, **aucune**
-  écriture `0x25F80010`, **aucun** poke CYCA0. `r_plane.c` n'a **aucun** `sat_sky_px`/`sat_floor_px`.
-  Ces symboles n'apparaissent que dans les docs et un sample SRL non lié. **Le poke CYC — la
-  moitié qui guérit réellement la neige selon la loi de la panne — est TOUJOURS ABSENT.** La prep
-  "câblée" a été revertée ou n'a jamais atterri. → corriger la mémoire + le doc consolidation en
-  "planifié, PAS dans l'arbre".
-
-### Pourquoi un re-commit mid-game est à proscrire
-Changer le **flag** de skip software (`sat_vdp2_floor` on/off) est cheap et sûr. Mais changer le
-**layout de banques** (ciel↔sol, réassigner A0) demande un re-commit RAMCTL/CYC par frame, qui est
-**fragile et non prouvé** : SGL ne flushe RAMCTL/CYCxx que dans `slSynch`, que Mimas n'exécute
-**jamais** (slSynch cape les fps à ~7-12 et son tick driver son rend muet le SFX direct-SCSP ;
-testé HW = pire, reverté). Le seul chemin de commit viable = **pokes registres directs**, et le
-poke CYC reste non écrit/non prouvé. Source : `docs/VDP2_FLOOR_CONSOLIDATION.md:310-318,150-216`,
-`src/dg_saturn.cxx:1270`.
-
-### Recommandation : TOGGLE ÉCRAN-TITRE (exactement ce que propose Romain)
-Puisque :
-1. l'overlay NBG3 **ne peut cohabiter avec le sol RBG0 dans AUCUNE config prouvée** (§1, §3, §4) ;
-2. un re-commit RAMCTL/CYC **en cours de partie est fragile/non prouvé** (ci-dessus) ;
-
-→ la stratégie correcte est de **choisir la configuration AVANT d'entrer en jeu**, depuis
-l'écran-titre, et de committer le layout **une seule fois** (au pire par map, au chargement —
-jamais par frame). C'est précisément la proposition de Romain, et elle est validée par la loi
-matérielle.
-
-**Configs que le toggle écran-titre proposerait** (par ordre de robustesse) :
-
-1. **"Classic" (A/D)** — Ciel HW + sol software + **overlay debug dispo**. Connu-bon, validé HW.
-   *Défaut recommandé.*
-2. **"Fast floor" (H)** — Ciel HW + sol dégradé back-screen (0 banque) + overlay dispo + gain REC.
-   *À implémenter/évaluer — meilleure piste sans fragilité.*
-3. **"Textured floor" (B)** — Sol RBG0 texturé + ciel software, **overlay OFF**. *À débloquer
-   seulement après écriture+validation HW du poke CYC ; sinon snow.*
-
-Granularité de bascule réaliste = **par map au chargement** (re-commit des banques une fois),
-**pas par frame**. Source : `docs/VDP2_FLOOR_CONSOLIDATION.md:310-318`.
-
-### Et si on voulait quand même overlay + sol ?
-La seule façon prouvée de garder l'overlay AVEC un "sol" amélioré est la config **H** (sol
-dégradé, pas RBG0) : elle ne touche pas B1, donc l'overlay reste. Avec le **sol RBG0 texturé**,
-il faut accepter **overlay OFF** (ou un sol RBG0 *bitmap*, config C, qui libère B1 mais perd les
-flats dynamiques — à évaluer). Aucune piste CRKTE ne sauve l'overlay (la map reste en B1).
-
----
-
-## 8. Verdict & prochaine étape concrète
-
-**Verdicts** :
-- L'overlay NBG3 et le sol RBG0 se battent pour la **banque B1** (map rotation forcée en B-bank,
-  B0 pris par le framebuffer) — conflit de stockage **et** de cycles. Inévitable avec un RBG0
-  cellulaire.
-- **Aucune** config prouvée ne fait cohabiter overlay + sol RBG0 texturé. CRKTE ne sauve pas
-  l'overlay. RBG0 bitmap le sauverait mais tue les flats dynamiques.
-- Le sol RBG0 texturé **ne ship pas** en l'état : le poke CYCxx (cure de la neige) est **absent
-  du code**, et le commit mid-game via slSynch est poison.
-- Le **gain de perf vient du skip du sol software**, pas du RBG0 — donc un **sol dégradé à 0
-  banque (config H)** capte ~le même gain en **gardant ciel + overlay**.
-- **Le toggle écran-titre proposé par Romain est la bonne décision** : config choisie avant le
-  jeu, commit unique, zéro re-commit fragile mid-game.
-
-**Prochaine étape concrète (sans code maintenant)** :
-1. **Corriger les docs/mémoire** : marquer `rbg0_commit_cyc` + `sat_sky_px/sat_floor_px` comme
-   "planifié, PAS dans l'arbre" dans `VDP2_FLOOR_CONSOLIDATION.md` et la mémoire associée.
-2. **Garder le build shippé** (config A/D) comme défaut — il est validé HW.
-3. **Prototyper la config H** (sol dégradé back-screen/line-color, 0 banque) : c'est le meilleur
-   rapport gain/risque et elle préserve ciel+overlay. À chiffrer côté REC.
-4. **Spécifier le toggle écran-titre** : 3 entrées (Classic / Fast floor / Textured floor),
-   commit du layout au choix, par map au chargement.
-5. **À vérifier avant tout sol RBG0 texturé** : (a) le poke CYCxx "prend"-il sans slSynch comme
-   FBCR/PTMR le font pour VDP1 (validé 2026-06-16) ou l'ISR vblank SGL le clobbe-t-il chaque
-   frame ? (b) CRKTE coexiste-t-il avec la palette 8bpp en CRAM ? (c) le framebuffer 320×200
-   laisse-t-il du stockage en B0 ? — toutes ces questions sont **non résolues**.
+> **OBSOLÈTE / RÉSOLU.** Les §6-§8 d'origine recommandaient de **bloquer** le sol RBG0 texturé tant
+> qu'un « poke CYCxx » manquant ne serait pas écrit, signalaient une « DISCREPANCE : `rbg0_commit_cyc`
+> PAS dans l'arbre / RDBS=0x8D », et proposaient un **toggle écran-titre** (Classic / Fast floor /
+> Textured floor) pour ne committer le layout qu'une fois. **Tout cela est dépassé** :
+>
+> - Le sol RBG0 **bitmap** a SHIPPÉ (RBG0_BITMAP=1, 19768ca/41dd895), **propre sur HW**, gaté potato-0
+>   + 1 joueur. La « neige » était une starvation de cycle-pattern, **guérie** par bitmap + RDBS=**0x0D**
+>   (pas 0x8D) + cycles A0/A1 **parqués**. `rbg0_commit_ramctl()` **et** `rbg0_commit_cyc()` sont
+>   **bien dans l'arbre** — la « discrepance / poke absent » est fausse aujourd'hui (et n'a JAMAIS
+>   reposé sur slSynch).
+> - Le rappel utile reste vrai : **le gain REC (+20-33% fps) vient du SKIP du sol software**, pas du
+>   RBG0 lui-même (`docs/VDP2_ARCHITECTURE.md:355-364`). Le RBG0 bitmap apporte en plus un sol texturé
+>   réel sans coût CPU de span.
+> - slSynch reste **abandonné** comme modèle de frame (~16% fps + mute le SFX direct-SCSP, qui possède
+>   le MVOL) — mais il n'a jamais été nécessaire au sol : le commit se fait par pokes RAMCTL/CYC directs.
+>
+> État, layout de banques définitif et conditions de gating : **`docs/VDP2_RBG0_CURRENT_STATE.md`**.
 
 ---
 
 ### Sources principales
 - Code Mimas : `src/dg_saturn.cxx` (lignes citées en ligne), `core/r_plane.c`.
-- Docs repo : `docs/VDP2_ARCHITECTURE.md`, `docs/VDP2_FLOOR_CONSOLIDATION.md`.
+- Docs repo : `docs/VDP2_ARCHITECTURE.md`, `docs/VDP2_RBG0_CURRENT_STATE.md` (réalité du sol RBG0).
 - SRL/SGL : `SaturnRingLib/saturnringlib/srl_vdp2.hpp`, `srl_ascii.hpp`,
   `SaturnRingLib/modules/sgl/INC/sl_def.h`.
 - Références : `../DoomJo/joengine/jo_engine/vdp2.c` + `vdp2_malloc.c`,

@@ -1,4 +1,12 @@
-> ⚠️ STALE re: floors (2026-06-27). Le sol RBG0 SHIPPE en BITMAP 512x256 8bpp et est PROPRE sur HW réel (commits 19768ca/41dd895 ; dg_saturn.cxx:297 RBG0_BITMAP=1) — il n'a PAS « cassé sur HW » et n'a PAS besoin de slSynch. L'ancienne neige du sol CELL était la STARVATION du motif de cycle (3 reads/dot : coeff+map+cell), corrigée par le bitmap (2 reads/dot) + RDBS=0x0D + cycles A0/A1 parqués 0xEEEE. §6.4 / §8 sont stale : le flat dominant SHIPPE sur RBG0 (et non « VDP1 bat RBG0 ») ; VDP1 ne prend que les hauteurs/plafonds SECONDAIRES, encore TODO. Le modèle HW/coût (§1–§5, §7) est intact. Voir docs/VDP2_RBG0_CURRENT_STATE.md.
+> **STATUS (2026-06-29): CURRENT for VDP1 = WALLS-ONLY.** This doc's hardware/cost model
+> (§1–§5, §7) is the live account of what VDP1 *is* and costs. **VDP1 carries opaque
+> textured walls only** (8bpp + CRAM light-banks). The dominant floor flat **shipped on
+> VDP2 RBG0** as a clean 512×256 8bpp bitmap (not VDP1) — for the floor, see
+> [`VDP2_RBG0_CURRENT_STATE.md`](VDP2_RBG0_CURRENT_STATE.md); a VDP1 world/secondary-flat
+> renderer remains an **unshipped bet** ([`VDP1_WORLD_PLAN.md`](VDP1_WORLD_PLAN.md)). For
+> the VDP1↔NBG1 present/sync model, see
+> [`VDP1_PRESENT_SYNC_PLAN.md`](VDP1_PRESENT_SYNC_PLAN.md). The "facing-a-wall fps cliff"
+> is a **VDP2 RBG0-transform** cost, analysed there — not a VDP1 overdraw problem.
 
 # VDP1 — architecture, limits, and what Mimas should put on it
 
@@ -19,12 +27,10 @@ made false — see §5.
   fill has huge headroom at our frame times (§3).
 - **The 8bpp move was a structural win, not a tweak:** half the VRAM/texture (11→22
   cache slots), lighter texel fetch, exact multiplicative lighting via CRAM banks.
-  Several old "VDP1 is VRAM/fill-starved" claims are now obsolete (§5).
-  > **RECONCILED 2026-06-24:** the "flipped from `…B` to finishing with headroom
-  > (`VD1 …D`)" claim was DISPROVEN on real hardware. `dg_saturn.cxx:780`: EDSR reads
-  > **`B` always on HW** — VDP1 never finishes a wall list within one frame; the EDSR
-  > fill-calibration metric was useless and was removed. The structural 8bpp win stands;
-  > the specific `…D`-headroom proof point does not (see §3a/§5/§8).
+  Several old "VDP1 is VRAM/fill-starved" claims are now obsolete (§5). (Note: `EDSR.CEF`
+  reads **`B` always** on real hardware — VDP1 does not finish the wall list within a
+  frame — so there is no "finishes with headroom" proof point; the binding constraints are
+  overdraw + the command/cache budget, not raw fill, §3.)
 - **Keep on VDP1:** opaque textured walls (8bpp + CRAM light-banks), flat fallback for
   far/over-budget walls. **Keep OFF VDP1:** half-transparency (6× fill — catastrophic),
   gouraud lighting (additive, wrong on palette banks), floors (visplanes ≠ quads → VDP2
@@ -76,20 +82,17 @@ next plot trigger (`PTMR`).
 
 Mimas drives this **asynchronously, without `slSynch`** (see
 [[doomsrl-vdp1-async]]): the SH-2 builds a list, pokes `PTMR`, and **returns**; VDP1
-rasterizes in parallel; a manual framebuffer change at vblank (`FBCR=0x0003`, gated on
-`EDSR.CEF`) presents the finished frame without tearing and without an fps tax. The
-command list is **double-buffered** (a fixed root command whose 1-halfword link is the
-only per-frame write = an atomic, race-free bank flip), and textures live in a
-**persistent per-texnum cache** so VDP1 never reads a half-rebuilt texture.
+rasterizes in parallel and the finished frame is presented at vblank. The command list is
+**double-buffered** (a fixed root command whose 1-halfword link is the only per-frame
+write = an atomic, race-free bank flip), and textures live in a **persistent per-texnum
+cache** so VDP1 never reads a half-rebuilt texture.
 
-> **RECONCILED 2026-06-24:** the manual framebuffer change above (`VDP1_MANUAL_CHANGE`)
-> is currently **disabled** in the ship build — `dg_saturn.cxx:125` sets
-> `VDP1_MANUAL_CHANGE=0` (1-cycle auto present via FBCR), reverted by a bisect of commit
-> `3faaa95`. The manual-present path is compiled-in but OFF. Ship state = 1-cycle auto;
-> confirm whether re-enabling manual present is a pending experiment or permanently shelved.
+> **Present/sync mechanism is owned by [`VDP1_PRESENT_SYNC_PLAN.md`](VDP1_PRESENT_SYNC_PLAN.md)**
+> — the live account of the VDP1↔NBG1 present (auto vs. manual `FBCR` change, the `EDSR.CEF`
+> gate, tearing). Treat that doc as authoritative for present details.
 
-This async, no-`slSynch`, double-buffered, manual-present driver is the **foundation** —
-it is what makes VDP1 usable at all in a renderer that dropped SGL's frame sync. Keep it.
+This async, no-`slSynch`, double-buffered driver is the **foundation** — it is what makes
+VDP1 usable at all in a renderer that dropped SGL's frame sync. Keep it.
 
 ---
 
@@ -112,15 +115,9 @@ Two numbers govern our design:
 **(a) Raw fill is *not* our limiter.** A full 320×224 view = 71,680 px. At the textured
 rate that's **~5 ms**; flat-filled, **~2.5 ms**. At a 100 ms (10 fps) frame VDP1 has the
 *entire* 100 ms to draw — room for **~20 full textured screens**. So normal wall
-coverage (≈1 screen + modest overdraw) uses a few percent of VDP1's time.
-
-> **RECONCILED 2026-06-24 (SUPERSEDED claim).** The original text here said "after 8bpp
-> the renderer reads `VD1 …D` (finished, ~90 cmd headroom) instead of the old `…B`." HW
-> measurement disproved it: `dg_saturn.cxx:780` documents EDSR reads **`B` always on real
-> hardware** — VDP1 does not finish the wall list within one frame — and the EDSR
-> fill-calibration metric was removed as useless. The qualitative point below (overdraw +
-> the cmd/cache budget, not raw fill arithmetic, are the binding constraints) **stands**;
-> the "finishes with margin" reading does not. Do not cite `…D` / 90-cmd headroom.
+coverage (≈1 screen + modest overdraw) uses a few percent of VDP1's time. (`EDSR.CEF`
+reads **`B` always** on real HW — VDP1 does not finish the wall list within one frame —
+so the binding constraint is overdraw + the command/cache budget, not raw fill, below.)
 
 **(b) Overdraw is the real limiter.** VDP1's clipping suppresses the *write* but **not
 the iteration**: a distorted sprite still steps over **every pixel of its projected
@@ -180,7 +177,7 @@ CRAM-light-bank build **invalidated**. Treat these as corrected:
 |---|---|
 | "VDP1 is currently unused" (`PERF_REFERENCES`, `RENDERER_AUDIT`) | VDP1 carries **all walls** (one- + two-sided upper/lower), software walls skipped |
 | "Only ~11 wall textures fit → far rooms starve → sky-through-walls" | **22 slots** (16 KB narrow + 32 KB wide); wide-tech 256-wide textures now fit; slot starvation largely solved |
-| "VDP1 chronically overruns — `EDSR.CEF` reads `…B` always — fill is the binding constraint" | **RECONCILED 2026-06-24:** HW shows EDSR still reads **`B` always** (`dg_saturn.cxx:780`) — VDP1 does *not* finish the wall list in one frame; the EDSR metric was removed as useless. The earlier "`…D`, ~90 cmd headroom" claim is SUPERSEDED. The binding constraint is **the command cap + flat-fallback no-sky guarantee + overdraw**, not raw fill arithmetic. Estimate accuracy + cache slots still matter. |
+| "VDP1 chronically overruns — `EDSR.CEF` reads `…B` always — fill is the binding constraint" | HW confirms EDSR reads **`B` always** (`dg_saturn.cxx:780`) — VDP1 does *not* finish the wall list in one frame; the EDSR fill-calibration metric was removed as useless. But the binding constraint is **the command cap + flat-fallback no-sky guarantee + overdraw**, not raw fill arithmetic. Estimate accuracy + cache slots still matter. |
 | "Light walls via VDP1 gouraud" / "bake the lit colormap per texnum" | **Neither.** Texels are raw indices; light = CRAM bank via `CMDCOLR` (exact, multiplicative, no re-bake, no "saute" pop) |
 | "Damage/pickup flash re-bakes the whole wall cache (slowdown)" | Flash **re-tints CRAM banks only** (`wtex_rebuild_banks`) — no texture re-bake, no spike |
 | "RGB textured fill is the cost floor" | 8bpp texels read **2/word** (vs 1/word at RGB555) → **lighter texel fetch** *and* half the VRAM; flat fallback is ~2× cheaper still |
@@ -218,6 +215,10 @@ capacity.
 2. **Overdraw from unclamped near walls** (§3b) — mitigated by the software close-wall
    fallback + vertical cull. The CPU fallback **re-adds** software cost for the 1–2
    screen-filling walls, the most expensive software walls — an accepted trade (rare).
+   (Note: the "facing-a-wall fps cliff" is **not** this VDP1 overdraw — it is the per-frame
+   **VDP2 RBG0 transform** cost, analysed in
+   [`VDP1_PRESENT_SYNC_PLAN.md`](VDP1_PRESENT_SYNC_PLAN.md) /
+   [`VDP2_RBG0_CURRENT_STATE.md`](VDP2_RBG0_CURRENT_STATE.md).)
 3. **CPU/VDP1 décrochage** — VDP1 walls lag the software floors/sprites by ~1 variable
    frame (VDP1 is kicked late and only swaps when done). Intrinsic to the *hybrid*
    (walls on VDP1, floors on NBG1). The early kick after the BSP walk
@@ -251,27 +252,16 @@ capacity.
    > the level-transition fade (commit `a693a4e`, `dg_fade_bake`) use **CRAM palette
    > re-bake** — i.e. the doc's "fallback" *is* the ship path. Colour-offset is a
    > recommended NEW lever, not current behaviour.
-4. **Floors / ceilings — *full* floors not VDP1; the *dominant flat* yes (and it beats
-   RBG0).** Expressing **all** Doom visplanes as VDP1 quads is impractical and a hard
-   **NO-GO**: they are thousands of runtime arbitrary spans (not tile-quads like
-   PowerSlave), so full per-subsector tessellation = 2 000–8 000 quads/frame, busting the
-   command bank *and* the ~1 300–2 000 quad/30 fps Saturn CPU ceiling. **BUT** the *single
-   dominant flat* (~49–93 % / avg ~64 % of floor fill) **is** a GO-PARTIAL on VDP1, as a
-   stack of horizontal **affine strips** (Mode-7-on-VDP1) shown through the index-0 gap
-   below NBG1 — bounded (~30–72 cmds, 4 KB), and it **beats the VDP2 RBG0 alternative**
-   because it rides the hardware-validated async driver (RBG0's cycle-pattern never
-   commits without `slSynch` and broke on real HW). Full plan +
-   capacity + increments: **[`VDP1_FLOOR_PLAN.md`](VDP1_FLOOR_PLAN.md)**. (This supersedes
-   the earlier flat "VDP1 floors are rejected" stance — *full* is rejected, *dominant
-   partial* is the recommended next floor lever.)
-   > **RECONCILED 2026-06-24:** this §6.4 framing (dominant flat → VDP1) is itself
-   > **SUPERSEDED** by `VDP1_FLOOR_PLAN.md`'s revised TL;DR: the **dominant** flat now goes
-   > to **RBG0**, and **VDP1 takes the SECONDARY** heights + non-sky ceilings (the surfaces
-   > RBG0's one-plane limit can't cover). The two docs disagreed; the floor-plan TL;DR is
-   > authoritative. Status: **PARTIAL / STILL-TODO** — only the RP_PROF profiler (inc-0) and
-   > an own-everything skip *stub* (`sat_floor_vdp1_stub` returns 1, emits zero strips) are
-   > built; **no floor strip is emitted today** and the go/no-go peak (`Vp`) has not been
-   > read on HW.
+4. **Floors / ceilings — full floors not VDP1; the dominant flat shipped on RBG0.**
+   Expressing **all** Doom visplanes as VDP1 quads is impractical and a hard **NO-GO**:
+   they are thousands of runtime arbitrary spans (not tile-quads like PowerSlave), so full
+   per-subsector tessellation = 2 000–8 000 quads/frame, busting the command bank *and* the
+   ~1 300–2 000 quad/30 fps Saturn CPU ceiling. **The dominant floor flat shipped on VDP2
+   RBG0**, not VDP1 — a clean 512×256 8bpp bitmap (see
+   [`VDP2_RBG0_CURRENT_STATE.md`](VDP2_RBG0_CURRENT_STATE.md)). A VDP1 renderer for the
+   *secondary* heights / non-sky ceilings that RBG0's one-plane limit can't cover remains an
+   **unshipped bet** ([`VDP1_WORLD_PLAN.md`](VDP1_WORLD_PLAN.md)) — no floor strip is emitted
+   on VDP1 today.
 5. **Weapon / HUD — leave software.** They were on VDP1 (validated the pipeline) but the
    layer inversion forced them back to software (all RGB sprites share one priority, so
    the weapon couldn't stay *above* NBG1 while walls went *below* it). Software
@@ -341,22 +331,19 @@ VDP1 because flat is the cheap primitive.
 
 - **VDP1 has ample raw-fill headroom** at our frame times (§3a). The binding constraints
   are **overdraw** (bounded by the software close-wall fallback + world-anchored vertical
-  cull) and the **command cap + flat-fallback no-sky guarantee**.
-  > **RECONCILED 2026-06-24:** struck the "finishes with margin (`VD1 …D`) since 8bpp"
-  > claim — HW shows EDSR reads **`B` always** (`dg_saturn.cxx:780`); the metric was
-  > removed. The limiter is the command cap + flat-fallback no-sky guarantee + overdraw,
-  > NOT a "finishes early" reading.
+  cull) and the **command cap + flat-fallback no-sky guarantee**. (`EDSR.CEF` reads `B`
+  always on HW, `dg_saturn.cxx:780` — there is no "finishes early" reading.)
 - **The 8bpp + CRAM-light-bank model is the correct one for this hardware** — exact
   multiplicative light, no re-bake, half VRAM, lighter fetch — and it retired the
   gouraud and lit-bake approaches for good.
-- **Keep ON VDP1:** opaque textured walls + flat fallback (both **SHIPPED**). **Next floor
-  lever (STILL-TODO):** the floor offload ([`VDP1_FLOOR_PLAN.md`](VDP1_FLOOR_PLAN.md)) —
-  but per that plan's revised TL;DR the **dominant** flat goes to **RBG0** and **VDP1 takes
-  the secondary** heights/ceilings; only the profiler + a skip-stub exist, no strips
-  emitted yet. **Keep OFF:** half-transparency (6×), gouraud lighting, the flash (→ VDP2
-  colour-offset, **STILL-TODO** — shipped flash/fades use CRAM re-bake), *full* multi-height
-  floors (busts the quad/CPU budget), weapon/HUD (software). World sprites are a deferred
-  maybe (occlusion cost > the small `M` win).
+- **Keep ON VDP1:** opaque textured walls + flat fallback (both **SHIPPED**). The
+  **dominant floor flat shipped on VDP2 RBG0**, not VDP1
+  ([`VDP2_RBG0_CURRENT_STATE.md`](VDP2_RBG0_CURRENT_STATE.md)); a VDP1 renderer for the
+  *secondary* heights/ceilings RBG0 can't cover remains an **unshipped bet**
+  ([`VDP1_WORLD_PLAN.md`](VDP1_WORLD_PLAN.md)). **Keep OFF:** half-transparency (6×),
+  gouraud lighting, the flash (→ VDP2 colour-offset, **STILL-TODO** — shipped flash/fades
+  use CRAM re-bake), *full* multi-height floors (busts the quad/CPU budget), weapon/HUD
+  (software). World sprites are a deferred maybe (occlusion cost > the small `M` win).
 - **Housekeeping:** VDP1 currently carries **only walls** — nothing mis-routed. The dead
   **weapon/HUD VDP1 code** (`sat_vdp1_wpn_draw`, `vdp1_hud_emit`, `wpn_cache`, the
   `WPN_TEX`/`VDP1_HUD_TEX` reservations) is unhooked-but-resident; `WPN_TEX_BASE`

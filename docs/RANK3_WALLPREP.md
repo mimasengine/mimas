@@ -1,5 +1,14 @@
 # RANK 3 — Wall-prep slave offload (design)
 
+> **STATUS: SETTLED-NEGATIVE.** Wall-prep→slave is **DEAD, confirmed 3×** on HW (memory-bound,
+> not offloadable — see §6/§6b). This doc is the canonical record of that negative. The §3 win
+> estimate and the §4 inc-2/inc-3 staged plan below are the **tested hypothesis**, kept for
+> provenance — they are NOT a live roadmap (inc-2 is NO-GO). NOTE: only `sat_wallprep_slave` is
+> dead; the dual-SH2 **plane work-steal `sat_plane_steal` SHIPPED default-on** (parent `4857f87`)
+> and stays. For the live render-path picture see
+> [`VDP2_RBG0_CURRENT_STATE.md`](VDP2_RBG0_CURRENT_STATE.md) (RBG0 floor — the real `P` lever)
+> and [`VDP1_PRESENT_SYNC_PLAN.md`](VDP1_PRESENT_SYNC_PLAN.md) (VDP1↔NBG1 present).
+
 > **Source.** Study→design→verify workflow (2026-06-26), grounded in d32xr
 > (`saturn-refs/d32xr`) + the Mimas scaffold, with 3 adversarial verifiers. Goal:
 > move the **`Bp` wall-prep bucket (~21 ms, `R_StoreWallRange`/`R_RenderSegLoop`)** off
@@ -49,6 +58,9 @@ serial flush with the master's BSP walk**. The existing scaffold already fits:
 
 ## 3. Realistic win & the honest catch
 
+> **(Tested hypothesis — DISPROVEN by §6. The slave is +5.8 ms SLOWER at wall-prep, so the
+> projected ~8 ms win never materialised. Kept for provenance.)**
+
 **Win ≈ `min(Bw, Bp)` ≈ the BSP-walk time hidden under the flush ≈ ~7–8 ms.** Master B-phase
 drops from `(BSPwalk ~8 + flush ~21) = ~29 ms` to `max(8, 21) = ~21 ms` (the master finishes
 its walk at ~8 ms, then waits ~13 ms for the slave). That's ~8 ms, **potato-persistent**:
@@ -60,6 +72,10 @@ its walk at ~8 ms, then waits ~13 ms for the slave). That's ~8 ms, **potato-pers
 > overlap. The win is capped at the BSP-walk it hides, not the whole flush.
 
 ## 4. Staged plan (each behind the pad toggle `sat_wallprep_slave`, default 0)
+
+> **(Tested hypothesis. inc-1 was built & validated; inc-2/inc-3 are NO-GO — §6 measured the
+> slave +5.8 ms slower, killing inc-2 before the build. Kept as the proposed plan that the HW
+> numbers refuted.)**
 
 ### inc-1 — slave runs the flush, NON-overlapped (correctness harness, **ZERO fps win**)
 - `r_parallel.c`: add `rp_wallprep_slave`/`rp_wallprep_body`/`RP_DispatchWallPrep`/
@@ -154,7 +170,10 @@ slower LWRAM/cart-DRAM + master-shares-game-logic).
 
 **Final disposition:** RANK 3 (and the whole slave-reuse avenue) is **dead, confirmed 3×** (inc-1
 +5.8 ms; warm-cache refuted). The slave is already optimally used (compute-bound floor fill + masked);
-the B phase is memory-bound and unoffloadable. Remove `sat_wallprep_slave` + `sat_plane_steal` from
-`core/` (cleanliness for DoomJo); keep the `cc` (CCR) readout — `cc01` confirms cache enabled/4-way.
-The real floor lever is the **dominant-flat VDP2/RBG0 skip** (attacks `P` on a third HW unit). The
+the B phase is memory-bound and unoffloadable. Remove **`sat_wallprep_slave`** from `core/`
+(cleanliness for DoomJo) — **but KEEP `sat_plane_steal`: the plane work-steal is the one slave-reuse
+win and SHIPPED default-on** (parent `4857f87`). Keep the `cc` (CCR) readout — `cc01` confirms cache
+enabled/4-way. The real floor lever is the **dominant-flat VDP2/RBG0 skip** (attacks `P` on a third
+HW unit) — shipped as the clean 512×256 8bpp RBG0 bitmap floor; see
+[`VDP2_RBG0_CURRENT_STATE.md`](VDP2_RBG0_CURRENT_STATE.md). The
 instrumentation paid off twice: it killed inc-2 *and* the warm-cache idea before either expensive build.

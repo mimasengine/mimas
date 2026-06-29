@@ -2,11 +2,15 @@
 
 Status: **Phase 0 SHIPPED 2026-06-23** (port `99ced62` + core `b3acd9f`) — Doom II
 and all >4MB IWADs now load and play from CD with **no cart**, proven playable on
-Doom II MAP01 (Ymir). Phase 1 (robust streaming / bounded LRU cache) is the current
-work. See **§0** for what shipped vs. what remains. Below: the original synthesis of
-6 parallel investigations (Doom core memory model, Mimas RAM map,
-SlaveDriver/PowerSlave, d32xr, FastDoom, web survey of PSX-Doom / RP2040-Doom /
-Saturn GFS).
+Doom II MAP01 (Ymir). Phase 1 (bounded LRU cache) shipped split-screen-only (§0).
+Per-level repack Steps 1–4 + compressed cart load-once are also **code-complete**
+(§7.9–7.12, 2026-06-24): the `.DRP` emitter/codec, disc-build integration, the
+`P_SetupLevel` per-map blob loader, and the per-map compressed cart store all landed
+(several still uncommitted in the core/port working tree). **Current work = hardware
+validation** of the cart staging + CD-vs-CDDA path (does not reproduce on Ymir, see
+§7.12). Below: the original synthesis of 6 parallel investigations (Doom core memory
+model, Mimas RAM map, SlaveDriver/PowerSlave, d32xr, FastDoom, web survey of
+PSX-Doom / RP2040-Doom / Saturn GFS).
 
 ---
 

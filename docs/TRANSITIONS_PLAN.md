@@ -1,12 +1,6 @@
 # Level Start/End Transitions (Fades) — Design Note
 
-Status: **Option 1 SHIPPED + COMMITTED — core 4f06d65 (`d_main.c` hooks) + port a693a4e (`DG_FadeOut`/`DG_FadeIn` in `dg_saturn.cxx`). No longer uncommitted.**
-> RECONCILED 2026-06-24: the fade is live in the ship build. `DG_FadeOut`/`DG_FadeIn`
-> (`src/dg_saturn.cxx:1561-1570`) drive `dg_fade_bake` (`:1522`, `FADE_STEPS=16` at `:1520`),
-> ramping `pending_cram` (+ `pending_wbank`) for the no-`slSynch` vblank handler to copy to CRAM;
-> hooked in `core/d_main.c` (`DG_FadeOut` :265 leaving-level, `DG_FadeIn` :437-441 after
-> `I_FinishUpdate`). Only the HW-read-quality items below remain — a short validation checklist,
-> not a blocking status. Options 2/3/4 stay as rejected/fallback documentation.
+Status: **SHIPPED — software CRAM palette fade (Option 1). core 4f06d65 (`d_main.c` hooks) + port a693a4e (`DG_FadeOut`/`DG_FadeIn` in `dg_saturn.cxx`).** The fade is live in the ship build: `DG_FadeOut`/`DG_FadeIn` (`src/dg_saturn.cxx:1561-1570`) drive `dg_fade_bake` (`:1522`, `FADE_STEPS=16` at `:1520`), ramping `pending_cram` (+ `pending_wbank`) for the vblank handler to copy to CRAM; hooked in `core/d_main.c` (`DG_FadeOut` :265 leaving-level, `DG_FadeIn` :437-441 after `I_FinishUpdate`). The other options below are kept only as a historical rejected-alternatives note. (`slSynch` was abandoned project-wide; the direct-CRAM vblank path is the proven mechanism — see `docs/VDP1_PRESENT_SYNC_PLAN.md` for the present model.)
 The vanilla screen-melt (`f_wipe`) is disabled in CD-streaming mode because it
 crashes (see *Why the melt is gone*); it's now replaced by the **software CRAM
 palette dip-to-black** (option 1): `DG_FadeOut`/`DG_FadeIn` in `src/dg_saturn.cxx`
@@ -16,13 +10,9 @@ no-`slSynch` path), driven from the gamestate transition in `core/d_main.c`
 (streaming only): fade the current frame out, draw the new gamestate while CRAM
 is black, fade in after the blit. Works BOTH directions (fade-in needs no
 captured screen, so entering a level transitions too — the melt never could).
-FADE_STEPS=16 (~0.27 s each way). Validation checklist (no code work outstanding):
-HW-confirm the VDP1 wall layer dims cleanly during the blocking fade; tune
-FADE_STEPS to taste.
-> RECONCILED 2026-06-24: the wall-bank ramp inside `dg_fade_bake` is gated
-> `#if VDP1_WALL_TEST` (`src/dg_saturn.cxx:1533-1552`), so in the non-VDP1 **ship**
-> build only `pending_cram` ramps — the "VDP1 wall layer behaves during the fade"
-> open item applies ONLY to the experimental VDP1-wall build.
+FADE_STEPS=16 (~0.27 s each way). The wall-bank ramp inside `dg_fade_bake` is
+gated `#if VDP1_WALL_TEST` (`src/dg_saturn.cxx:1533-1552`), so in the ship build
+only `pending_cram` ramps.
 
 ---
 
@@ -48,16 +38,14 @@ direction was already skipped because the new level's `PU_LEVEL` couldn't be
 freed to make room). Shareware/cart and DoomJo (`sat_streaming_mode==0`) keep
 the melt, byte-identical.
 
-So any replacement transition must:
+The shipped replacement (Option 1) satisfies the constraints that drove the design:
 
-1. **Use NO large contiguous zone buffer** (the 70 KB run isn't reliably there).
-2. **Commit WITHOUT `slSynch`.** Mimas runs a no-`slSynch` VDP2 architecture;
-   the RBG0-floor experiment proved RAMCTL/cycle-pattern register changes are
-   *never committed* without `slSynch`, and a one-shot `slSynch` made HW worse
-   (see `docs/VDP2_ARCHITECTURE.md` / the rbg0-floor memory). The CRAM palette,
-   by contrast, **is** written directly every vblank and works fine.
-3. Be **cheap** (perf is the project target) and work in **2-player** split.
-4. Ideally handle **both** directions — the melt never managed a start-of-level
+1. **Uses NO large contiguous zone buffer** (the 70 KB run isn't reliably there).
+2. **Commits WITHOUT `slSynch`.** `slSynch` was abandoned project-wide (it costs
+   ~16% fps and mutes SCSP SFX); the CRAM palette is written directly every
+   vblank and works fine, so the fade piggybacks on that proven path.
+3. Is **cheap** (perf is the project target) and works in **2-player** split.
+4. Handles **both** directions — the melt never managed a start-of-level
    transition here at all.
 
 ---
@@ -74,9 +62,7 @@ N frames.
 
 ---
 
-## Options (ranked)
-
-### 1. Software palette fade (CRAM lerp) — RECOMMENDED
+## The shipped approach: software palette fade (CRAM lerp)
 
 Ramp the live palette toward black for fade-out, and from black up to the level
 palette for fade-in, over ~8–16 tics. Implementation: scale `colors[]` (or
@@ -101,40 +87,20 @@ existing vblank CRAM copy does the rest.
 - **Restore:** at fade-in end, re-assert the true level palette
   (`palette_changed = true`) so nothing is left dimmed.
 
-### 2. VDP2 hardware colour-offset ramp — cheaper, needs HW proof
+### Rejected / fallback alternatives (historical)
 
-SRL exposes `VDP2::SetColorOffsetA/B(ColorOffset&)` and
-`ScrollScreen::UseColorOffset(channel)` (`SaturnRingLib/.../srl_vdp2.hpp:1538,
-1626, 684`; see the `VDP2 - ColorCalc` sample). Assign NBG1 (the Doom
-framebuffer) to offset channel A and ramp the signed RGB offset 0 → −255 (fade to
-black) and back.
+These were considered before Option 1 shipped and are kept only for the record:
 
-- **Memory:** zero. **CPU:** one register write per step (cheaper than the CRAM
-  copy — the palette is untouched).
-- **RISK — must validate on HW first:** does SRL's colour-offset path commit
-  **without `slSynch`**? If the SGL wrapper defers the register the way RAMCTL
-  did, the offset won't take on real hardware. Mitigation: write the VDP2
-  colour-offset registers **directly from the vblank handler**, exactly as the
-  CRAM bank copy already does, bypassing any `slSynch`-gated SGL path.
-- Leaves the palette/light banks alone, so no wall-bank resync needed — but it
-  also fades NBG3 (debug) / sprite layers only if they're routed to the same
-  offset channel; pick channels so the whole composited Doom image dims together.
-
-### 3. Keep the melt with a boot-reserved static buffer — REJECTED
-
-Reserve 140 KB permanently outside the zone for the two wipe screens. Removes the
-fragmentation failure but **costs 140 KB of permanent RAM** in a build that is
-already memory-starved, and the melt still needs *both* old and new screens, so
-it can't do a start-of-level fade-in (no room alongside the freshly loaded
-level). Uneconomical; listed only to document the why-not.
-
-### 4. Software framebuffer darken through the colormap — FALLBACK only
-
-Blit the existing framebuffer through progressively darker colormap rows
-(colormaps are resident, no alloc). Works without `slSynch` and without a buffer,
-but costs a **full-screen LUT pass per fade frame** (CPU) — strictly worse than
-option 1, which gets the same dimming for free at the CRAM lookup. Keep as a
-fallback if a CRAM/offset fade proves unworkable.
+- **VDP2 hardware colour-offset ramp** (`VDP2::SetColorOffsetA/B`,
+  `ScrollScreen::UseColorOffset`, `SaturnRingLib/.../srl_vdp2.hpp:1538, 1626,
+  684`): cheaper in CPU but risked the SGL wrapper deferring the register behind
+  `slSynch`; not needed once the direct-CRAM fade shipped.
+- **Keep the melt with a boot-reserved static buffer:** rejected — costs 140 KB
+  of permanent RAM in a memory-starved build, and still can't do a start-of-level
+  fade-in.
+- **Software framebuffer darken through the colormap:** a full-screen LUT pass
+  per fade frame, strictly worse than the CRAM lerp which gets the same dimming
+  for free at the CRAM lookup; fallback only.
 
 ---
 
@@ -149,12 +115,8 @@ fallback if a CRAM/offset fade proves unworkable.
 - **Duration:** target ~0.25–0.5 s (8–16 tics) — long enough to read as a
   transition, short enough not to stall play at the boundary.
 
-## Open questions / validation
+## Remaining polish (optional)
 
-- HW-confirm option 2 commits without `slSynch`; if not, fall to the
-  direct-register or option-1 path.
-- Confirm the level/light-bank palette is fully restored after a fade-in (no
-  residual dimming on walls or HUD).
 - Decide whether the intermission (`WI_Drawer`) and finale (`F_Drawer`) want
   their own fades or just the level boundary.
 - 2-player: both halves dip together (acceptable for a level boundary) — confirm
@@ -167,10 +129,9 @@ fallback if a CRAM/offset fade proves unworkable.
 - Proven no-`slSynch` CRAM path: `src/dg_saturn.cxx:753-757` (vblank copy),
   `:2445-2450` (bake from `colors[]`). Fade impl: `DG_FadeOut`/`DG_FadeIn` `:1561-1570`,
   `dg_fade_bake` `:1522`, `FADE_STEPS=16` `:1520` (wall-bank ramp gated `#if VDP1_WALL_TEST` `:1533-1552`).
-- SRL colour-offset/calc: `SaturnRingLib/saturnringlib/srl_vdp2.hpp`
-  (`ColorOffset` :1538, `SetColorOffsetA` :1626, `UseColorOffset` :684);
-  sample `SaturnRingLib/Samples/VDP2 - ColorCalc/`.
 - Saturn idiom (vblank-driven colour ramps for transitions): SlaveDriver
   `saturn-refs/SlaveDriver-Engine/{V_BLANK.C,SCL_FUNC.C}` (and the `FLASH/`
   variant).
-- no-`slSynch` VDP2 trap: `docs/VDP2_ARCHITECTURE.md`, the rbg0-floor memory.
+- VDP2 RBG0-floor reality / no-`slSynch` register-commit lesson:
+  `docs/VDP2_RBG0_CURRENT_STATE.md`. VDP1↔NBG1 present model:
+  `docs/VDP1_PRESENT_SYNC_PLAN.md`.

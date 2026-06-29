@@ -1,8 +1,20 @@
 # REC Benchmarks — table de référence vivante (Ymir + hardware)
 
+> **STATUT 2026-06-29 — banc de mesure VIVANT, données HW autoritatives.** Les
+> verdicts de gain se lisent en **section C (HW)**. Deux questions historiquement
+> ouvertes dans ce doc sont **TRANCHÉES** : (a) le **sol dominant a été shippé sur
+> VDP2 RBG0** (bitmap 512×256 8bpp propre, gated potato-0/1-joueur — réf
+> autoritative [`VDP2_RBG0_CURRENT_STATE.md`](VDP2_RBG0_CURRENT_STATE.md)), donc le
+> « pari sol-offload RBG0 vs VDP1 » n'est plus une délibération ; (b) les **plans
+> dual-SH2 sont SETTLED** — le work-steal plane « TAS » est SHIPPÉ default-on
+> (core `73f8cdc`/parent `4857f87`), wall-prep→slave CONFIRMÉ MORT. VDP1 ne porte
+> que les **murs** ; sa synchro présent vit dans
+> [`VDP1_PRESENT_SYNC_PLAN.md`](VDP1_PRESENT_SYNC_PLAN.md). VDP1-world (sols sur
+> VDP1) reste un **pari NON shippé** ([`VDP1_WORLD_PLAN.md`](VDP1_WORLD_PLAN.md)).
+
 Table comparative partagée entre sessions pour suivre l'évolution de **REC** (et de
 la frame) build après build. À mettre à jour à chaque capture. Plan des leviers =
-`docs/REC_REDUCTION.md` ; analyse = mémoire `doomsrl-perf`.
+`docs/REC_REDUCTION.md`.
 
 > **⚠️ Loi de mesure.** Ymir **sous-estime massivement** le coût memory-bound (DRAM
 > lente, pointer-chasing BSP/visplane). Sur Ymir REC/Bw/P sont 3–10× trop bas et un
@@ -11,7 +23,7 @@ la frame) build après build. À mettre à jour à chaque capture. Plan des levi
 > la **mécanique** (compte de commandes `c`, EX, slave idle%, splits rows 11/12).
 > **Tout verdict de gain REC se lit sur hardware**, jamais sur Ymir.
 
-## Légende des colonnes (overlay rows — voir mémoire `doomsrl-overlay-rows`)
+## Légende des colonnes (overlay rows — voir mémoire `mimas-overlay-rows`)
 
 | Col | Source | Sens |
 |---|---|---|
@@ -69,8 +81,8 @@ QW1 **on** (toujours) · QW2 **on** (`SAT_POTATO_INLINE_SPANS=1`). Blit 50/50 pa
 
 > **RECONCILED 2026-06-24 :** L1 n'est plus un `#define SAT_VISPLANE_HASH` mais un
 > **toggle RUNTIME `sat_visplane_hash`** (défaut 1, A/B live au pad-Y, core ea452d8).
-> QW1/QW2/L1 sont tous **SHIPPÉS + default-on** ; la table HW §C reste le **seul livrable
-> de mesure restant** pour les verdicts de gain.
+> QW1/QW2/L1 sont tous **SHIPPÉS + default-on** ; les verdicts de gain se lisent en
+> table HW §C.
 
 Validation de **L1 byte-identity** : Romain s'est replacé aux mêmes spots.
 
@@ -165,7 +177,7 @@ HW ≈ 2–4× les chiffres Ymir (et Bw/P encore plus, memory-bound).
 
 ---
 
-## C. Hardware — post-QW1/QW2 + L1/L2 — **À REMPLIR (la fenêtre « pas d'accès HW » est passée)**
+## C. Hardware — post-QW1/QW2 + L1/L2 — **REMPLI (C.1 36 photos + C.2 A/B 18 photos)**
 
 > **RECONCILED 2026-06-24.** La note « pas d'accès HW avant ~2026-06-21 » est **datée
 > dépassée** : QW2 (`SAT_POTATO_INLINE_SPANS=1`), L1 (devenu le toggle **runtime**
@@ -202,24 +214,18 @@ se reset au même endroit) — c'est le protocole à appliquer au prochain run.
    « high Dr => spare VDP1 budget ». Donc **`Dr` HAUT = headroom, `Dr` BAS = VDP1 déborde la frame.**
    Les murs sont des quads **texturés sur VDP1** (`vdp1_last_cmds`, ~142 au pot0). ⇒ **pot0 `Dr`
    ~25–42 % = VDP1 DÉBORDE déjà ~60–75 % des frames rien qu'avec les murs** = VDP1 **tendu au pot0**
-   (≠ idle). pot2-fl `Dr` 82–91 % = murs **plats** (~33 cmds) → VDP1 finit. **Conséquence pour
-   `VDP1_WORLD_PLAN`** : ajouter ~158 quads sol par-dessus des murs qui débordent déjà = VDP1 devient
-   le **goulot unique** au pot0, sauf si (a) les quads sol sont très bon marché ET (b) retirer le
-   span-fill soft libère assez de bus pour accélérer VDP1. ⇒ **le sol dominant a meilleur compte sur
-   VDP2/RBG0** (3ᵉ unité, ne charge ni master ni VDP1). Le `<80 %` du plan §7.4 est un **plancher de
-   confort** : pot0 est dessous.
+   (≠ idle). pot2-fl `Dr` 82–91 % = murs **plats** (~33 cmds) → VDP1 finit. Le `Dr` bas au pot0
+   confirme que **VDP1 n'avait pas de marge pour un sol** → le sol dominant est parti sur **VDP2 RBG0**
+   (3ᵉ unité, ne charge ni master ni VDP1 ; shippé, voir [`VDP2_RBG0_CURRENT_STATE.md`](VDP2_RBG0_CURRENT_STATE.md)).
 3. **Magnitudes HW > Ymir** (loi confirmée) : PK `Bp` HW ~74–77 ms (Ymir ~54) ; PK `P` HW jusqu'à
    ~83 ms au pot0 (Ymir ~44). Memory-bound → les phases DRAM (Bw/P/Bp-loop) sont **plus chères sur
    HW**, comme prédit.
 4. **`TEX nt125 w10776 d42K mp91` constant** sur tout le set → **le plancher columnlump ~42 KB est
    confirmé sur HW** (sanity check de cohérence des lectures OK).
-5. **FLR `Vp` (pic candidat-quad sol VDP1) ≈ 150–170** (`d%` ~49–76 %, `n` ~16–34) — **À CONFIRMER
-   relecture**. ⚠️ **CORRECTION** : ce n'est **PAS** un NO-GO. Le seuil `≤120` venait du plan
-   **SUPERSEDED** `VDP1_FLOOR_PLAN.md` (sol partageant la banque mur). Le plan **autoritatif**
-   `VDP1_WORLD_PLAN.md` (§0.2/§7.1/§7.3) dimensionne une **banque F dédiée (cap 248)** pile pour
-   **`Vp ≈ 158`** → la lecture HW ~150–170 **TOMBE SUR LE POINT DE DESIGN du plan**, elle ne l'infirme
-   pas. `d%` HW (~49–76 %) **confirme** le « un seul flat » (→ RBG0). Donc côté commandes le sol VDP1
-   **tient** ; le vrai gate du plan est **`Dr%`** (finding #2), pas `Vp`.
+5. **FLR `Vp` (pic candidat-quad sol) ≈ 150–170** (`d%` ~49–76 %, `n` ~16–34) — **À CONFIRMER
+   relecture**. Le `d%` HW élevé (~49–76 %) **confirme le « un seul flat dominant »** → exactement le
+   profil servi par le sol RBG0 mono-matrice (shippé). Donnée conservée comme caractérisation du sol ;
+   le détail VDP1-world reste dans [`VDP1_WORLD_PLAN.md`](VDP1_WORLD_PLAN.md) (pari non shippé).
 6. **Anomalie : une photo montre PK `Bp ≈ 306` ms** (spot tech lumineux, 24 fps) = le **leak <300 ms
    qui survit au garde `RP_REC_SANE`** (déjà signalé §A.ter). → **durcir le profiler** (clamp <120 ms
    ou re-stamp FRT par phase) avant de se fier aux PK absolus.
@@ -265,8 +271,9 @@ montagnes, `sky23813`, `FLR Vs17 Vp156 d95% n21`, joueur 76/83/198). Lecture hau
   temps maître.
 - **B. `P` (remplissage sol) = LE levier dominant.** ~60 ms d'une frame pot0 de ~130 ms ≈ **46–48 %**.
   pot0→pot1 (sols off) : `P` 60→17 ms (**−70 %**) → fps **+50–65 %** (7.6→11.6, 8.5→11.8). La gamme
-  complète pot0→pot2-fl : avg **7.6→13.4 (+76 %, ~×1.8)**. **Valide le pari sol-offload** : les sols
-  sont la moitié de la frame, content-stable aux 2 spots.
+  complète pot0→pot2-fl : avg **7.6→13.4 (+76 %, ~×1.8)**. **Chiffre la valeur du sol-offload** : les
+  sols sont la moitié de la frame, content-stable aux 2 spots — gain réalisé par le **sol RBG0 shippé**
+  ([`VDP2_RBG0_CURRENT_STATE.md`](VDP2_RBG0_CURRENT_STATE.md)).
 - **C. `h0` vs `h1` (L1 visplane-hash) = NUL.** Au pot0 nukage : h1 avg7.6/P61.7 vs h0 avg7.5–7.9/
   P61.3–62.0 — **identique**. Cour pot1 : h0 11.9/P18.9 vs h1 11.6/P18.9 — **identique**. À `n≈20`
   visplanes, `R_FindPlane` O(n²) ≈ 400 cmp/frame = négligeable vs ~130 ms. **L1 ne donne AUCUN gain
@@ -277,14 +284,14 @@ montagnes, `sky23813`, `FLR Vs17 Vp156 d95% n21`, joueur 76/83/198). Lecture hau
   **texturés VDP1** (`vdp1_last_cmds` ~142 au pot0), pas du soft. ⇒ **pot0 `Dr` 25–42 % = VDP1
   DÉBORDE la frame ~60–75 % du temps rien qu'avec les murs = tendu** ; pot1 38–46 % (sols hors-master
   → moins de contention bus → VDP1 finit un peu plus, même charge mur) ; `pot2-fl` **82–91 %** = murs
-  plats (~33 cmds) → VDP1 finit large. **Implication plan** : VDP1 déborde DÉJÀ les murs au pot0 ;
-  empiler ~158 quads sol texturés → VDP1 = goulot unique, sauf quads très bon marché + gain bus du
-  span-fill retiré. C'est ÇA « léger en capacité restante » — et ça **favorise le sol dominant sur
-  VDP2/RBG0** (n'ajoute rien au master NI au VDP1) ; VDP1-world ne reste que pour les **petits
-  visplanes résiduels** que RBG0 (mono-matrice, 1 flat) ne peut pas servir.
+  plats (~33 cmds) → VDP1 finit large. **Implication** : VDP1 n'avait pas de marge pour absorber le sol
+  → le sol dominant est parti sur **VDP2 RBG0** (n'ajoute rien au master NI au VDP1 ; shippé). La synchro
+  présent VDP1↔NBG1 est traitée à part dans [`VDP1_PRESENT_SYNC_PLAN.md`](VDP1_PRESENT_SYNC_PLAN.md).
 - **E. `SLVidle ≥ 29 %` dans TOUS les modes** (29 % pot0 → 62 % pot2-fl). **L'esclave a toujours du
   slack ; le maître est partout le long pole.** ⇒ **tout ce qui n'accélère QUE l'esclave ne peut
-  PAS monter le fps** — conséquence directe pour L2 (ci-dessous).
+  PAS monter le fps** — conséquence directe pour L2 (ci-dessous). **PLANES SETTLED** : ce slack esclave
+  a été exploité par le **work-steal plane « TAS » (SHIPPÉ default-on**, core `73f8cdc`/parent
+  `4857f87`) ; le **wall-prep→slave est CONFIRMÉ MORT** (memory-bound, tenté 3×), row-split parqué.
 - **F. `rL = 2.1` stable** (`lw1497 hw692`, chaque photo, 2 spots) — re-confirmé.
 - **G. blit `b ≈ 5.3–5.9 ms` stable** (~4 % de la frame) — non-goulot, **réglé** (Romain : toggles
   blit « plus utiles » → OK, geler).
@@ -307,10 +314,9 @@ trafic explicitement bas en Mimas, murs→VDP1) ; or finding E : **l'esclave n'e
 (`n≈20`) ; le coût maître réel est le FILL `P` (écrit le framebuffer en **HWRAM = déjà rapide**,
 lit les flats). ⇒ **`rL=2.1` est réel mais L2 déplacerait de la mémoire HORS du chemin critique
 maître → gain fps prédit ≈ 0** à E1M1. La justification §C.1 finding #1 (« rL=2.1 justifie L2 »)
-était **nécessaire mais incomplète** : il manquait E (esclave idle, master-bound). **L2 ne
-redevient intéressant qu'en ENABLER du plan VDP1-world** (si le trafic cmd grossit quand les sols
-passent VDP1) — à revoir avec le plan. *(Nail-it-shut optionnel : 1 build pointant `RP_CMD_BUF_ADDR`
-+ `plane_pool` en HWRAM, mesurer MST au nukage → delta ≈ 0 attendu.)*
+était **nécessaire mais incomplète** : il manquait E (esclave idle, master-bound). *(Nail-it-shut
+optionnel : 1 build pointant `RP_CMD_BUF_ADDR` + `plane_pool` en HWRAM, mesurer MST au nukage → delta
+≈ 0 attendu.)*
 
 **Raffinements vérifiés dans le code (2026-06-26, workflow 4 lecteurs + 5 vérif. adverses) → voir
 [`CRITICAL_PATH.md`](CRITICAL_PATH.md) :**
@@ -320,11 +326,12 @@ passent VDP1) — à revoir avec le plan. *(Nail-it-shut optionnel : 1 build poi
   splitté sur les 2 SH-2**, ~62 ms chacun ⇒ retirer les sols libère ~62 ms **master ET slave**.
 - **Le master n'attend JAMAIS VDP1** (build shippé : `VDP1_MANUAL_CHANGE 0` → `FBCR=0x0000` 1-cycle
   auto, kick fire-and-forget). ⇒ **`Dr` bas = DÉCHIRURE de la couche murs, jamais un stall fps.** Donc
-  sortir les sols vers VDP1 **encaisse bien le gain fps** (master perd le fill) ; le coût est **la
-  qualité (tearing), pas le fps** — gradué par le `Dr` post-sol. (Corrige mon « present gated EDSR ».)
+  retirer le fill sol du master **encaisse bien le gain fps** indépendamment de l'unité de présentation ;
+  le sol shippé sur RBG0 ne charge pas VDP1. Le tearing/présent VDP1↔NBG1 est traité dans
+  [`VDP1_PRESENT_SYNC_PLAN.md`](VDP1_PRESENT_SYNC_PLAN.md). (Corrige mon « present gated EDSR ».)
 - **`Dr` confirmé** (3ᵉ lecture, verdict *confirmed*) : haut = headroom, bas = overrun. Chemin
-  critique post-sol = **`Bp` wall-prep ~21 ms** (offloadable au slave, scaffold gated off) puis le
-  BSP `Bw` ~7-8 ms (sériel, plancher dur).
+  critique post-sol = **`Bp` wall-prep ~21 ms** (le wall-prep→slave a été **CONFIRMÉ MORT**,
+  memory-bound, tenté 3× — voir finding E) puis le BSP `Bw` ~7-8 ms (sériel, plancher dur).
 
 ---
 

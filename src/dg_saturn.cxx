@@ -312,7 +312,7 @@ static int  sky_horizon_row = SKY_HORIZON_ROW;  /* live HW-sky horizon row (pad 
    convincing yet, so it is GATED OFF (0) -- the code stays for the RUNG C rework (per-line
    distance gradient, future session, see memory rbg0-floor-distance-light).  Footprint when on:
    0 VRAM banks / 0 CRAM / 0 cycles (rides the K-table + color-calc registers).  Set 1 to revisit. */
-#define RBG0_LINECOL_TEST 0
+#define RBG0_LINECOL_TEST 1
 /* RBG0 per-frame ROTATION-PARAMETER-TABLE transfer (the real root cause, proven by LIBSGL.A disasm,
    docs/RBG0_STRUCTURED_GARBAGE.md): slScrMatSet only fills SGL's CACHED RAM buffer (_RotScrParA) +
    sets a dirty flag; the RAM->VRAM DMA of the RPT is done ONLY by the _BlankIn ISR, armed ONLY by
@@ -422,6 +422,7 @@ extern "C" int            sat_vdp2_floor;   /* core: skip software floor (=> VDP
 extern "C" int            sat_vdp2_floor_h; /* core: player's floor height (fixed_t) */
 extern "C" int            sat_vdp2_floor_pic;/* core: player's floor flat (picnum) */
 extern "C" unsigned char *sat_vdp2_floor_cmap;/* core: colormap for the floor's sector light (0=full bright) */
+extern "C" int            sat_vdp2_floor_band;/* core: floor sector LIGHT BAND 0..15 (15=bright); drives the base level */
 extern "C" int            sat_potato_floors;/* core: solid-colour floors/ceilings */
 extern "C" int            sat_potato_walls; /* core: solid-colour walls (opaque, flat only) */
 extern "C" int            sat_wall_nocpu;   /* core: banded/flat -> skip close-wall CPU fallback */
@@ -995,6 +996,32 @@ extern "C" int rp_timeout_count;
 extern "C" unsigned int rp_master_ms;   /* master frame ms -> prefixes r_parallel.c's row-18 SLV line */
 static unsigned int dg_frame_count = 0;
 static int vdp1_last_cmds = 0;
+/* RBG0 floor view (pad Y): 0 = HW floor (sector-dimmed baked flat), 1 = software floor.  The HW floor
+   ships BAKE-ONLY (no distance gradient) for now. */
+static int rbg0_floor_view = 0;
+static int rbg0_linecol_mode  = 0;   /* gradient OFF by default -- WIP, see below */
+/* === SECTOR-DRIVEN BLACK VEIL gradient -- WORK IN PROGRESS, parked (rbg0_linecol_mode = 0) ===========
+   The shipping HW floor is the per-sector DIMMED bake only.  This line-color "black veil" distance
+   gradient is kept but DISABLED: over the FAR it lays a black veil (line-color at a high ratio so the
+   floor is fully replaced -> black, no green residual), shape = short transition (base->black) then a
+   long pure-black band, COVERAGE = [hz, bd] with bd = hz + (15-band)*zonek + zoneoff scaling with the
+   room light band (band 15/outdoor -> NONE), gated by a VDP2 color-calc window so the near stays clean.
+   It still didn't read right across rooms (black tint / coverage tuning), so it's parked -- flip
+   rbg0_linecol_mode + re-add the pad toggles to resume.  See memory [[rbg0-floor-distance-light]]. */
+static int rbg0_lc_far   = 7;        /* = the computed boundary bd (display only) */
+static int rbg0_lc_trans = 24;       /* TRANSITION length in rows: base->black, then pure black (R+L/R) */
+static int rbg0_zonek    = 7;        /* zone slope: bd = hz + (15-band)*zonek + zoneoff (C+L/R); b15 -> none */
+static int rbg0_zoneoff  = 0;        /* zone offset rows, shifts the whole veil down/up (C+Up/Down) */
+static int rbg0_linecol_ratio = 14;  /* veil DEPTH, default = max 14 (R+Up/Down, capped at 14 per user) */
+/* Base floor brightness is now DRIVEN BY THE WAD per-sector light (sat_vdp2_floor_cmap = zlight[li][0]
+   from the room's lightlevel, set in r_plane.c) -- the fixed-level bake is cancelled.  rbg0_floor_dim
+   is now a manual signed OFFSET added on top of that sector level (0 = exactly the software room shade;
+   <0 brighter, >0 darker).  L+Up/Down live; re-bakes when the sector light OR the offset changes. */
+static int rbg0_floor_dim = 0;
+/* SATURN 2026-06-29: baked CONTRAST of the RBG0 floor texels (0 = flat/uniform dim = old behaviour).
+   >0 spreads each texel's colormap level around the flat's MEAN luma: bright texels get a lower level
+   (brighter), dark texels a higher level (darker) -> the texture detail POPS.  Live via L + pad-C. */
+static int rbg0_floor_contrast = 0;   /* base bake cancelled -> 0 (no texture-contrast pop); L+L/R re-enables */
 
 /* SATURN PERF (2026-06-29): RELIABLE ms split of DG_DrawFrame (= I_FinishUpdate = overlay 'bl').
    The FRT-based sat_blit_ms wraps at ~73ms so it under-reads a stalled blit (the b6.x artifact);
@@ -1140,24 +1167,9 @@ static void fps_update(void)
                 sat_plane_rowsplit ? 2 : sat_plane_tas);   /* plane mode: 0 static / 1 TAS / 2 row-split */
 #endif
         SRL::Debug::Print(0, 1, r1);
-        {
-            /* SATURN PERF (2026-06-29): reliable ms split of DG_DrawFrame (= overlay 'bl').
-               1s-window sums: pre = sky/palette/fps before the blit; bl = the dual-CPU blit
-               (the suspected VDP1-contention stall on close walls); cl = the index-0 clear;
-               f = frames.  Divide by f for per-frame ms.  bl here should track row-13 'bl'
-               (D_Display split) -- if bl dominates, the close-wall stall IS the blit. */
-            static char rDF[45];
-            sprintf(rDF, "DF pre%u bl%u cl%u f%u",
-                    df_pre_sum, df_blit_sum, df_post_sum, df_frames);
-            SRL::Debug::Print(0, 11, rDF);
-            df_pre_sum = df_blit_sum = df_post_sum = df_frames = 0;
-            /* RB = 'pre' sub-split (sky / rbg0 upload / transform / RPT write) to pin the stall. */
-            static char rRB[45];
-            sprintf(rRB, "RB sky%u up%u xf%u rp%u",
-                    rbg_sky_sum, rbg_upl_sum, rbg_xfm_sum, rbg_rpt_sum);
-            SRL::Debug::Print(0, 12, rRB);
-            rbg_sky_sum = rbg_upl_sum = rbg_xfm_sum = rbg_rpt_sum = 0;
-        }
+        /* (WIP: the 'FL' floor-tuning readout row was removed with the gradient toggles.) */
+        df_pre_sum = df_blit_sum = df_post_sum = df_frames = 0;
+        rbg_sky_sum = rbg_upl_sum = rbg_xfm_sum = rbg_rpt_sum = 0;
         {
             /* SATURN VALIDATION row: RAM-lever sizing (all high-water, Ymir-honest).
                hp = newlib heap peak/cap (#4: trim HEAP_SIZE to peak+margin).
@@ -1372,18 +1384,43 @@ extern "C" unsigned char *sat_vdp2_floor_data(void);
    at index cy*8+cx, pixels row-major; the map (rbg0_proto_init) references char# = idx*2. */
 static void rbg0_upload_flat(int picnum)
 {
-    static int loaded = -2;
+    static int loaded = -2, loaded_q = -2, loaded_c = -2;
     if (picnum < 0) return;
-    /* SATURN 2026-06-29: upload RAW palette indices (no colormap baking) -> re-upload ONLY when the
-       FLAT changes, never on a light change.  Per-sector light is applied per-frame by switching the
-       RBG0 palette BANK (slBMPaletteRbg0 in DG_DrawFrame) to a pre-shaded wall light-bank.  This kills
-       the ~106ms full-texture re-upload that a glow/flicker sector triggered EVERY frame (the floor's
-       colormap pointer changed each tic, breaking the old cmap guard). */
-    if (picnum == loaded && !rbg0_tex_dirty) return;
+    /* SATURN 2026-06-29 (revert to BAKED dimming, QUANTIZED): the RBG0 bitmap palette-BANK switch does
+       NOT work on HW -- slBMPaletteRbg0 only writes an SGL shadow that reaches the chip solely in
+       _BlankIn under a slSynch gate we never open (no per-frame slSynch), and a 256-colour ROTATION
+       bitmap's R0BMP page-select isn't honoured at runtime either (disasm-proven, workflow wf_4ff6c62b).
+       So bake the sector light INTO the texels (the proven pre-3af4b6c path that dimmed on HW), but
+       quantize to the 7 wall levels {0,5,10,16,21,26,31} and re-upload ONLY when the FLAT or the
+       QUANTIZED level changes -> a glow/flicker sector re-uploads only on a band CROSSING (rare), not
+       EVERY frame (the décrochage stall).  BMPNB stays at the init bank 1; the texels carry the shade. */
+    /* FIXED uniform dim baked over the WHOLE floor (live-tunable via pad-C -> rbg0_floor_dim).
+       Per-sector shading can't reach the chip (bank-switch dead; zlight[li][0]=nearest clamps to 0=full
+       bright), so bake ONE dim colormap level into the texels.  0 = full bright .. 31 = near black. */
+    /* Base flat dimmed PER SECTOR (lower lux in darker rooms) + the manual offset.  band 15 (bright) ->
+       level 0, band 0 (dark) -> ~30.  Re-bakes (via the qlevel guard) on a band change = a brief blip
+       when you cross into a differently-lit room; the BLACK VEIL (line-color) layers the far darkening on top. */
+    int band = sat_vdp2_floor_band; if (band < 0) band = 0; else if (band > 15) band = 15;
+    int qlevel = (15 - band) * 2 + rbg0_floor_dim;
+    if (qlevel < 0) qlevel = 0; else if (qlevel > 31) qlevel = 31;
+    if (picnum == loaded && qlevel == loaded_q && rbg0_floor_contrast == loaded_c && !rbg0_tex_dirty) return;
     const unsigned char *flat = sat_vdp2_floor_data();
     if (!flat) return;
-    loaded = picnum;
+    loaded = picnum; loaded_q = qlevel; loaded_c = rbg0_floor_contrast;
     rbg0_tex_dirty = 0;
+    /* BRIGHTNESS (qlevel) + CONTRAST: build a per-original-index shade LUT, so the inner loop stays a
+       single table lookup (cm_q[flat[..]]) -- same cost as the old straight colormap row.  mid = the
+       flat's MEAN luma = the contrast pivot; level = qlevel spread by contrast around it (bright texels
+       -> lower level/brighter, dark -> higher/darker).  contrast 0 -> cm_q[i]=colormaps[qlevel*256+i]
+       (the old uniform-dim behaviour exactly). */
+    int mid; { long s = 0; for (int i = 0; i < 64*64; ++i) { int o = flat[i]; s += colors[o].r + colors[o].g + colors[o].b; } mid = (int)(s >> 12); }
+    unsigned char cm_q[256];
+    for (int i = 0; i < 256; ++i) {
+        int lum = colors[i].r + colors[i].g + colors[i].b;            /* 0..765 */
+        int lvl = qlevel + rbg0_floor_contrast * (mid - lum) / 256;   /* spread the level around the mean */
+        if (lvl < 0) lvl = 0; else if (lvl > 31) lvl = 31;
+        cm_q[i] = colormaps[lvl * 256 + i];
+    }
 #if RBG0_BITMAP
     /* Build each 512-wide bitmap row in a STACK buffer (cached), then bulk-memcpy to the
        uncached VRAM (A1).  Avoids 131072 slow per-byte uncached writes (= the slowdown) and
@@ -1413,7 +1450,7 @@ static void rbg0_upload_flat(int picnum)
                 case 6: fx = v;      fy = u;      break;  /* transpose      */
                 case 7: fx = 63 - v; fy = 63 - u; break;  /* anti-transpose */
             }
-            row[x] = flat[fy * 64 + fx];   /* RAW index; light applied via palette-bank switch */
+            row[x] = cm_q[flat[fy * 64 + fx]];   /* BAKE the quantized sector shade into the texel */
         }
         for (int t = 1; t < 8; ++t) memcpy(row + t * 64, row, 64); /* tile 64 -> 512          */
         memcpy(bmp + y * 512, row, 512);                           /* bulk write to VRAM      */
@@ -1427,7 +1464,7 @@ static void rbg0_upload_flat(int picnum)
             for (int ry = 0; ry < 8; ++ry)
                 for (int rx = 0; rx < 8; ++rx)
                 {
-                    c[ry * 8 + rx] = flat[(cy * 8 + ry) * 64 + (cx * 8 + rx)];   /* RAW index */
+                    c[ry * 8 + rx] = cm_q[flat[(cy * 8 + ry) * 64 + (cx * 8 + rx)]];   /* baked quantized shade */
                 }
         }
 #endif
@@ -1442,15 +1479,124 @@ static void rbg0_upload_flat(int picnum)
    CCCTL 0xEC) are INSIDE the 0x0E..0xFE block-flush; the RATIO reg CCRR (0x10C) is OUTSIDE it ->
    direct-poke.  Pad C toggles the ratio (off<->dark).  NEXT (future session): RUNG C = a per-line
    line-color table (in spare VRAM) for the real DISTANCE gradient instead of this flat darken. */
-static int rbg0_linecol_on = 0;     /* default OFF: the committed floor is unchanged; C opts in */
+/* A0 spare (past the 2KB K-table); the 256-entry per-line line-colour table.  VDP2 VRAM at
+   0x25Exxxxx is uncached, so direct halfword writes reach VRAM with no purge. */
+#define LINECOL_TBL_VRAM ((void *)0x25E01000)   /* 512B: per-line line-colour table */
+#define LINEWIN_TBL_VRAM ((void *)0x25E01400)   /* 1KB:  per-line color-calc WINDOW table (A0 spare past it) */
+/* Veil params (rbg0_lc_trans/zonek/zoneoff/ratio) are declared early (near rbg0_linecol_mode) for the
+   overlay.  See those decls + the pad handler for the live R/C+d-pad controls. */
+/* rbg0_linecol_mode: 0 off / 1 uniform / 2 step / 3 wash (declared early for the overlay).
+   Build a per-LINE line-colour table so the floor dims by DISTANCE (rows near the horizon are
+   farther -> darker).  Each entry: MSB 0x8000 = "insert this line colour" (blended into RBG0 by
+   CCRR); 0x0000 = no insert = full bright.  The horizon row = viewwindowy+centery, floor bottom =
+   viewwindowy+viewheight (read live).  Composes with the palette-bank sector light.
+   Set the table-mode SGL regs here too -- at init they're committed by the one-shot slSynch; at
+   runtime only the VRAM table + CCRR (direct-poke) change, so no per-frame commit is needed. */
+/* Rewrite the per-line line-colour table (uncached VRAM).  NO SGL calls -> runtime-safe (called
+   on the pad-C toggle).  Calling SGL line-col/color-calc funcs at runtime caused the one-frame
+   BLACK FLASH; they live in rbg0_linecol_apply (init only). */
+static void rbg0_linecol_rebuild(void)
+{
+    int m = rbg0_linecol_mode;
+    volatile unsigned short *t = (volatile unsigned short *)LINECOL_TBL_VRAM;
+    /* Work in RASTER scanlines -- the line-colour table is raster-indexed and the framebuffer is shown
+       1:1 (walls reach raster 223).  hz = the sky/floor horizon you can SEE and tune (sky_horizon_row),
+       NOT Doom's centery: that screen-vs-raster mismatch is what FLIPPED the gradient before.  This row
+       is valid at init too, so the boot table is correct (no more boot-flat). */
+    int hz   = sky_horizon_row;          /* raster row of the horizon (top of the floor / far)  */
+    int bot  = 224;                      /* screen bottom (raster) = nearest floor row          */
+    int span = bot - hz; if (span < 1) span = 1;
+    /* CRITICAL: the entry 0x0000 is NOT "no insert" -- it inserts CRAM index 0 = BLACK (0x8000 is the
+       table-MODE bit, set once by slLineColTable, NOT a per-entry skip flag).  So every scanline blends
+       RBG0 toward its table colour; there is no true pristine row.  The brightness ramp therefore runs
+       bank nb (~the floor's own brightness, NEAR/bottom -> minimal change) .. bank 7 (near-black,
+       FAR/horizon).  NEAR is kept as close to the base as the mechanism allows (bank nb, a grey at the
+       floor's level -> small wash); FAR darkens, where the foreshortened floor hides the wash. */
+    int G = 96, bestd = 1 << 30; const int target = 160;   /* sum ~= 53/channel: a MID neutral grey so the
+                                                              insert ONSET (low banks) ~matches the dim base
+                                                              -> seamless; bank 7 crushes it to near-black. */
+    for (int i = 1; i < 256; ++i) {
+        int r = colors[i].r, g = colors[i].g, b = colors[i].b;
+        int mx = r>g ? (r>b?r:b) : (g>b?g:b);
+        int mn = r<g ? (r<b?r:b) : (g<b?g:b);
+        if (mx - mn <= 28) { int dd = (r + g + b) - target; if (dd < 0) dd = -dd; if (dd < bestd) { bestd = dd; G = i; } }
+    }
+    /* SECTOR-DRIVEN BLACK VEIL.  Zone = [hz, bd]; bd scales with the room light band (bright -> thin veil,
+       band 15 -> bd=hz = NONE).  Shape: a short TRANSITION (base shade -> black, rbg0_lc_trans rows from
+       the boundary) then a long pure-black band to the horizon.  At the high ratio the floor is fully
+       replaced by these colours, so the veil reads BLACK (no green residual). */
+    int band = sat_vdp2_floor_band; if (band < 0) band = 0; else if (band > 15) band = 15;
+    int bd = hz + (15 - band) * rbg0_zonek + rbg0_zoneoff;
+    if (bd < hz) bd = hz; else if (bd > bot) bd = bot;
+    rbg0_lc_far = bd;                                    /* publish the computed boundary for the overlay */
+    int seclvl = (15 - band) * 2 + rbg0_floor_dim; if (seclvl < 0) seclvl = 0; else if (seclvl > 31) seclvl = 31;
+    int onset = 1 + seclvl * 6 / 31;                     /* veil onset bank ~ the dimmed base brightness (smooth) */
+    if (onset < 1) onset = 1; else if (onset > 7) onset = 7;
+    int T = rbg0_lc_trans; if (T < 1) T = 1;
+    (void)span;
+    for (int y = 0; y < 256; ++y)
+    {
+        unsigned short entry = 0x0000;                  /* clean zone (windowed) + off-floor */
+        if (m && y >= hz && y < bd)
+        {
+            int dist = bd - y;                          /* 0 at the boundary .. (bd-hz) at the horizon */
+            if (dist < T)                               /* short transition: base shade -> black */
+            {
+                int bank = onset + (8 - onset) * dist / T;
+                if (bank < 1) bank = 1; else if (bank > 8) bank = 8;
+                entry = (bank >= 8) ? (unsigned short)0x0000 : (unsigned short)(bank * 256 + G);
+            }
+            /* else dist >= T: long PURE-BLACK band -> entry stays 0x0000 */
+        }
+        t[y] = entry;
+    }
+}
+/* Per-line COLOR-CALC WINDOW table: 2 u16/line {startX,endX}, 256 lines = 1KB in A0 spare just past the
+   512B line-color table.  Rows ABOVE the boundary = full-width range (INSIDE -> color-calc ON = gradient);
+   rows from the boundary DOWN = empty range start>end (OUTSIDE -> color-calc OFF = clean baked floor).
+   Uncached VRAM the VDP2 reads itself -> runtime-writable with NO SGL call / NO flash (like the line-color
+   table).  Armed once at init by slScrLineWindow0 + slScrWindowMode(scnCCAL, win0_IN). */
+static void rbg0_ccwin_rebuild(void)
+{
+    volatile unsigned short *w = (volatile unsigned short *)LINEWIN_TBL_VRAM;
+    int hz = sky_horizon_row;
+    int band = sat_vdp2_floor_band; if (band < 0) band = 0; else if (band > 15) band = 15;
+    int bd = hz + (15 - band) * rbg0_zonek + rbg0_zoneoff;   /* SAME boundary as the veil; b15 -> hz = no veil */
+    if (bd < 0) bd = 0; else if (bd > 256) bd = 256;
+    for (int y = 0; y < 256; ++y)
+    {
+        if (y < bd) { w[2*y] = 0x0000; w[2*y + 1] = 0x03FF; }   /* INSIDE: full width  -> color-calc ON  */
+        else        { w[2*y] = 0x03FF; w[2*y + 1] = 0x0000; }   /* empty (start>end)   -> color-calc OFF */
+    }
+}
+/* Set the RBG0 color-calc RATIO via the SGL SHADOW (slColRate), NOT a raw CCRR poke.  The SGL
+   vblank IRQ re-pushes the ratio from its shadow EVERY vblank, so a direct 0x10C poke got reverted
+   within the frame -> the flicker.  Updating the shadow makes the IRQ push OUR value -> it persists
+   with NO per-frame poke.  Called on the pad-C toggle + at init. */
+static inline void rbg0_linecol_ccrr(void)
+{
+    /* The blend depth lives on the LINE-COLOR (LNCL) layer, NOT RBG0 -- slColRateLNCL, per ReyeMe's
+       working ScaryGame recipe.  slColRate writes the SGL shadow -> the vblank IRQ persists it. */
+    slColRateLNCL((int16_t)(rbg0_linecol_mode ? rbg0_linecol_ratio : 0));
+}
+/* INIT ONLY: build the table + enable the line-color screen & color-calc on RBG0.  These SGL
+   calls are committed by the init one-shot slSynch; doing them at runtime caused the black flash.
+   Recipe verified against ReyeMe's ScaryGame LoadLineColorTable (per-line line-color over RBG0). */
 static void rbg0_linecol_apply(void)
 {
-    slLine1ColSet((void *)RBG0_KTAB_VRAM, (unsigned short)0x8000);  /* one near-black line color (MSB=insert) */
-    slLineColDisp(LNCLON);                                          /* enable the line-color screen           */
-    slColorCalc(0);                                                 /* CC_RATE | CC_TOP: ratio mode, top pixel */
-    slColorCalcOn(RBG0ON);                                          /* RBG0 ONLY -> NBG1/HUD untouched         */
-    *(volatile unsigned short *)0x25F8010C =                        /* CCRR: RBG0 color-calc ratio (outside flush) */
-        (unsigned short)(rbg0_linecol_on ? 24 : 0);
+    rbg0_linecol_rebuild();
+    rbg0_ccwin_rebuild();                                /* per-line color-calc WINDOW table         */
+    slLineColTable(LINECOL_TBL_VRAM);                    /* per-LINE table mode (LCTA + LCCLMD)      */
+    slLineColDisp(RBG0ON);                               /* RBG0 line-color INSERT bit (NOT LNCLON=back) */
+    slColorCalc(CC_RATE | CC_2ND | RBG0ON);              /* line color = blended-in 2nd operand      */
+    slColorCalcOn(RBG0ON);                               /* RBG0 ONLY -> NBG1/HUD untouched          */
+    /* Gate the color-calc to the per-line WINDOW: rows inside window 0 (above the boundary) blend;
+       rows outside (the near zone) show the clean baked floor.  ptr bit31 = LWE0 enable.  Window regs
+       (WCTLD 0xD6, LWTA0 0xD8) ride the init block-flush; the per-vblank ISR (0x00..0x8E) never touches
+       them, so it persists with NO slSynch.  win0_IN = raw WCTLD byte 0x03 (NOT the Window_In enum). */
+    slScrLineWindow0((void *)(0x80000000u | (unsigned long)LINEWIN_TBL_VRAM));
+    slScrWindowMode(scnCCAL, win0_IN);
+    rbg0_linecol_ccrr();
 }
 #endif
 
@@ -2315,7 +2461,7 @@ extern "C" void DG_FadeIn(void)     /* rise the freshly-drawn frame from black *
    so a dense LEFT view -- accumulated first -- can't hog every VDP1 slot.  When the cap is hit the
    hook REJECTS the wall and the core renders it in SOFTWARE (no sky) -- so the cap is also the
    VDP1->CPU starvation handoff. */
-#define WALL_ACC_MAX 128   /* 144->128: the DG_DrawFrame ms-split instrumentation grew .text/.bss; reclaim ~0.7KB pool back above the proven 7040B boot floor (~44B/wall). 1p peaks ~57 << 128, soft overflow -> CPU, zero 1p in-game change. Revert toward 160 when the diagnostic instrumentation is removed. */
+#define WALL_ACC_MAX 128   /* 96->128: floor-tuning UI stripped, pool back to ~8.5KB -> restore wall capacity. 1p peaks ~57 << 128, soft overflow -> CPU. Keep pool >=6704B PROVEN-BOOT on HW. */
 /* vx/vxr = the view's framebuffer x-range [vx, vxr] this wall belongs to (split-screen: 0..159 for
    the left view, 160..319 for the right).  x1/x2 are stored ALREADY offset by viewwindowx, so the
    emit works in absolute framebuffer coords; vx/vxr drive the per-view user-clip window. */
@@ -3196,15 +3342,29 @@ extern "C" void DG_DrawFrame(void)
     if (rbg0_mode == 0 && sat_vdp2_floor)   /* sat_vdp2_floor folds in the pot0 + 1p gate (set above) */
     {
         uint32_t rb_t0 = DG_GetTicksMs();
-        rbg0_upload_flat(sat_vdp2_floor_pic);
-        /* SATURN 2026-06-29: apply the floor's sector light by switching the RBG0 bitmap PALETTE BANK
-           (not by re-baking the texture).  Reuse the wall light-banks (1=bright .. 2-7=dark, kept
-           re-shaded by wtex_rebuild_banks) via the same colormap-level->bank LUT the walls use, so the
-           HW floor dims EXACTLY like the VDP1 walls + software sprites.  slBMPaletteRbg0 updates the
-           SGL register shadow; SGL's vblank IRQ re-pushes it (like RBG0ON) -> no slSynch, ~0 cost. */
-        if (sat_vdp2_floor_cmap)
-            slBMPaletteRbg0(wall_light_colr(sat_vdp2_floor_cmap) >> 8);
+        rbg0_upload_flat(sat_vdp2_floor_pic);   /* per-sector light is now BAKED (quantized) into the texels */
+        /* (The RBG0 bitmap palette-bank switch was removed: slBMPaletteRbg0/BMPNB never reach the chip
+           on the no-slSynch path -- the floor stayed full-bright.  Dimming is baked in rbg0_upload_flat.) */
         uint32_t rb_t1 = DG_GetTicksMs();
+#if RBG0_LINECOL_TEST
+        /* AUTO floor-horizon: the horizon row tracks the player's floor height (HW-calibrated linear fit,
+           anchored on (fh=128,hz=120) & (fh=-56,hz=96) -> hz = 96 + (fh+56)*3/23, fh in world units;
+           higher floor -> horizon lower on screen).  Moves the HW-sky boundary (and the parked gradient
+           table) automatically.  Manual L+Up/Down still nudges within a sector. */
+        { static int lc_fh = 0x7fffffff, lc_band = -1;
+          if (sat_vdp2_floor_h != lc_fh) {
+              lc_fh = sat_vdp2_floor_h;
+              int fhw = sat_vdp2_floor_h >> 16;
+              int hz  = 96 + ((fhw + 56) * 3) / 23;
+              if (hz < 8) hz = 8; else if (hz > 128) hz = 128;
+              if (hz != sky_horizon_row) { sky_horizon_row = hz; sky_cell_build_map(); }
+              rbg0_linecol_rebuild(); rbg0_ccwin_rebuild(); /* veil + window: horizon and/or sector band changed */
+              lc_band = sat_vdp2_floor_band;
+          } else if (sat_vdp2_floor_band != lc_band) {      /* same height, different room light -> update veil+window */
+              lc_band = sat_vdp2_floor_band;
+              rbg0_linecol_rebuild(); rbg0_ccwin_rebuild();
+          } }
+#endif
         rbg0_set_transform();
         uint32_t rb_t2 = DG_GetTicksMs();
 #if RBG0_RPT_TRANSFER == 1
@@ -3552,8 +3712,11 @@ static void poll_pad(void)
     /* Pad Y = the floor A/B comparator: 0 = VDP2 hardware floor (RBG0) <-> 1 = software floor.
        Mode 2 (no floor) is dropped from the cycle during tuning (user) -- only the two floors
        that matter for the side-by-side.  (Y also taps 'y' to Doom -- harmless.) */
-    if ((changed & PER_DGT_TY) && !(cur & PER_DGT_TY))
-        rbg0_mode = (rbg0_mode + 1) % 2;
+    if ((changed & PER_DGT_TY) && !(cur & PER_DGT_TY)) {
+        rbg0_floor_view = (rbg0_floor_view + 1) % 2;          /* 0 HW (baked, no gradient) / 1 software */
+        rbg0_mode       = rbg0_floor_view;                    /* 0 = HW floor, 1 = software floor */
+        /* (gradient is WIP/parked -> rbg0_linecol_mode stays 0; not in the toggle for now) */
+    }
 #if !RBG0_LINECOL_TEST && !RBG0_TUNE_PAD
     /* Pad C cycles the plane-split mode (overlay row1 'pm'): 0 = static half-split, 1 = TAS plane
        work-steal, 2 = ROW-SPLIT (the universal balancer -- both SH-2 split the screen ROWS, so a
@@ -3579,7 +3742,7 @@ static void poll_pad(void)
         lr_was = lr_now;
     }
 #endif
-#if VDP2_CELL_SKY
+#if VDP2_CELL_SKY && !RBG0_LINECOL_TEST
     /* Pad L + Up/Down nudges the HW-sky horizon (the row where the sky turns transparent so the
        floor shows below it), 8px (one cell row) per press.  Up raises the horizon up the screen,
        Down lowers it.  (L taps ',' and Up/Down also move the player -- minor during tuning.)
@@ -3598,15 +3761,9 @@ static void poll_pad(void)
         }
     }
 #endif
-#if RBG0_LINECOL_TEST
-    /* Pad C toggles the floor line-color darken A/B (RBG0_LINECOL_TEST).  Direct-poke CCRR
-       (0x10C, outside the block-flush) -- the only register that changes at runtime; the SGL
-       enables are already committed at init.  (C also taps run to Doom -- harmless.) */
-    if ((changed & PER_DGT_TC) && !(cur & PER_DGT_TC)) {
-        rbg0_linecol_on = !rbg0_linecol_on;
-        *(volatile unsigned short *)0x25F8010C = (unsigned short)(rbg0_linecol_on ? 24 : 0);
-    }
-#endif
+    /* (WIP: the L/R/C live floor-tuning toggles for the parked distance-gradient were removed for the
+       bake-only ship.  rbg0_floor_dim/contrast + the veil params keep their baked defaults.  Re-add
+       these handlers + the pad_map movement gate below to resume tuning the gradient.) */
 #if RBG0_TUNE_PAD
     /* PARKED live floor tuning (RBG0_TUNE_PAD) -- the found values are baked as defaults:
        L + C     = cycle the TEXTURE orientation over the 8 D4 symmetries (rotation + mirror).
@@ -3715,6 +3872,8 @@ static void poll_pad(void)
         if (changed & pad_map[i].mask)
         {
             int pressed = !(cur & pad_map[i].mask);
+            /* (WIP: the L/R/C tuning-movement freeze for the parked floor-gradient tuner was removed
+               with the toggles -- the player moves normally now.) */
 #if RBG0_TUNE_PAD
             /* PARKED (RBG0_TUNE_PAD): while L (texture) or R (plane) is held the d-pad tunes the
                floor (above) -- do NOT also forward it to Doom, so the player stays put.  (Press

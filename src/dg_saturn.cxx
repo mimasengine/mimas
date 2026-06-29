@@ -996,6 +996,19 @@ extern "C" unsigned int rp_master_ms;   /* master frame ms -> prefixes r_paralle
 static unsigned int dg_frame_count = 0;
 static int vdp1_last_cmds = 0;
 
+/* SATURN PERF (2026-06-29): RELIABLE ms split of DG_DrawFrame (= I_FinishUpdate = overlay 'bl').
+   The FRT-based sat_blit_ms wraps at ~73ms so it under-reads a stalled blit (the b6.x artifact);
+   these use the 32-bit DG_GetTicksMs.  pre = sky/palette/fps_update before the blit; blit = the
+   dual-CPU copy (incl. any VDP1-contention/present stall we're hunting on close walls); post =
+   the index-0 view clear.  Summed over the fps 1s window, printed by fps_update on row 11. */
+extern "C" uint32_t DG_GetTicksMs(void);
+static unsigned int df_pre_sum, df_blit_sum, df_post_sum, df_frames;
+/* SATURN PERF (2026-06-29): sub-split of the DF 'pre' phase to pin the facing-wall stall.
+   sky = sky scroll + cmap + slScrAutoDisp; up = rbg0_upload_flat (131KB rebuild, normally guarded);
+   xf = rbg0_set_transform (slScrMatConv/slScrMatSet matrix); rp = the RPT VRAM memcpy. 1s-window
+   sums, printed by fps_update on row 12. Whichever dominates IS the ~110ms facing-wall stall. */
+static unsigned int rbg_sky_sum, rbg_upl_sum, rbg_xfm_sum, rbg_rpt_sum;
+
 /* SATURN PERF (2026-06-24): windowed REC stats exported by core/r_parallel.c (set on the
    ship path's rp_p3_prof_show), surfaced on the 1/s overlay tick + reset by RP_ProfReset
    when the config under test changes.  Defined unconditionally in r_parallel.c so they
@@ -1127,6 +1140,24 @@ static void fps_update(void)
                 sat_plane_rowsplit ? 2 : sat_plane_tas);   /* plane mode: 0 static / 1 TAS / 2 row-split */
 #endif
         SRL::Debug::Print(0, 1, r1);
+        {
+            /* SATURN PERF (2026-06-29): reliable ms split of DG_DrawFrame (= overlay 'bl').
+               1s-window sums: pre = sky/palette/fps before the blit; bl = the dual-CPU blit
+               (the suspected VDP1-contention stall on close walls); cl = the index-0 clear;
+               f = frames.  Divide by f for per-frame ms.  bl here should track row-13 'bl'
+               (D_Display split) -- if bl dominates, the close-wall stall IS the blit. */
+            static char rDF[45];
+            sprintf(rDF, "DF pre%u bl%u cl%u f%u",
+                    df_pre_sum, df_blit_sum, df_post_sum, df_frames);
+            SRL::Debug::Print(0, 11, rDF);
+            df_pre_sum = df_blit_sum = df_post_sum = df_frames = 0;
+            /* RB = 'pre' sub-split (sky / rbg0 upload / transform / RPT write) to pin the stall. */
+            static char rRB[45];
+            sprintf(rRB, "RB sky%u up%u xf%u rp%u",
+                    rbg_sky_sum, rbg_upl_sum, rbg_xfm_sum, rbg_rpt_sum);
+            SRL::Debug::Print(0, 12, rRB);
+            rbg_sky_sum = rbg_upl_sum = rbg_xfm_sum = rbg_rpt_sum = 0;
+        }
         {
             /* SATURN VALIDATION row: RAM-lever sizing (all high-water, Ymir-honest).
                hp = newlib heap peak/cap (#4: trim HEAP_SIZE to peak+margin).
@@ -1342,14 +1373,16 @@ extern "C" unsigned char *sat_vdp2_floor_data(void);
 static void rbg0_upload_flat(int picnum)
 {
     static int loaded = -2;
-    static const unsigned char *loaded_cmap = (const unsigned char *)1;
-    const unsigned char *cmap = sat_vdp2_floor_cmap;
     if (picnum < 0) return;
-    if (picnum == loaded && cmap == loaded_cmap && !rbg0_tex_dirty) return;
+    /* SATURN 2026-06-29: upload RAW palette indices (no colormap baking) -> re-upload ONLY when the
+       FLAT changes, never on a light change.  Per-sector light is applied per-frame by switching the
+       RBG0 palette BANK (slBMPaletteRbg0 in DG_DrawFrame) to a pre-shaded wall light-bank.  This kills
+       the ~106ms full-texture re-upload that a glow/flicker sector triggered EVERY frame (the floor's
+       colormap pointer changed each tic, breaking the old cmap guard). */
+    if (picnum == loaded && !rbg0_tex_dirty) return;
     const unsigned char *flat = sat_vdp2_floor_data();
     if (!flat) return;
     loaded = picnum;
-    loaded_cmap = cmap;
     rbg0_tex_dirty = 0;
 #if RBG0_BITMAP
     /* Build each 512-wide bitmap row in a STACK buffer (cached), then bulk-memcpy to the
@@ -1380,8 +1413,7 @@ static void rbg0_upload_flat(int picnum)
                 case 6: fx = v;      fy = u;      break;  /* transpose      */
                 case 7: fx = 63 - v; fy = 63 - u; break;  /* anti-transpose */
             }
-            unsigned char px = flat[fy * 64 + fx];
-            row[x] = cmap ? cmap[px] : px;
+            row[x] = flat[fy * 64 + fx];   /* RAW index; light applied via palette-bank switch */
         }
         for (int t = 1; t < 8; ++t) memcpy(row + t * 64, row, 64); /* tile 64 -> 512          */
         memcpy(bmp + y * 512, row, 512);                           /* bulk write to VRAM      */
@@ -1395,8 +1427,7 @@ static void rbg0_upload_flat(int picnum)
             for (int ry = 0; ry < 8; ++ry)
                 for (int rx = 0; rx < 8; ++rx)
                 {
-                    unsigned char px = flat[(cy * 8 + ry) * 64 + (cx * 8 + rx)];
-                    c[ry * 8 + rx] = cmap ? cmap[px] : px;
+                    c[ry * 8 + rx] = flat[(cy * 8 + ry) * 64 + (cx * 8 + rx)];   /* RAW index */
                 }
         }
 #endif
@@ -2284,7 +2315,7 @@ extern "C" void DG_FadeIn(void)     /* rise the freshly-drawn frame from black *
    so a dense LEFT view -- accumulated first -- can't hog every VDP1 slot.  When the cap is hit the
    hook REJECTS the wall and the core renders it in SOFTWARE (no sky) -- so the cap is also the
    VDP1->CPU starvation handoff. */
-#define WALL_ACC_MAX 144   /* 160->144: the row-split code grew .text, reclaim ~0.7KB pool back to the proven ~7KB boot margin (1p peaks ~57 << 144, soft overflow -> CPU, zero in-game change) */
+#define WALL_ACC_MAX 128   /* 144->128: the DG_DrawFrame ms-split instrumentation grew .text/.bss; reclaim ~0.7KB pool back above the proven 7040B boot floor (~44B/wall). 1p peaks ~57 << 128, soft overflow -> CPU, zero 1p in-game change. Revert toward 160 when the diagnostic instrumentation is removed. */
 /* vx/vxr = the view's framebuffer x-range [vx, vxr] this wall belongs to (split-screen: 0..159 for
    the left view, 160..319 for the right).  x1/x2 are stored ALREADY offset by viewwindowx, so the
    emit works in absolute framebuffer coords; vx/vxr drive the per-view user-clip window. */
@@ -3062,6 +3093,8 @@ extern "C" void DG_DrawFrame(void)
         SRL::Debug::Print(0, 1, "FRAME1 OK               ");
     }
 
+    uint32_t df0 = DG_GetTicksMs();   /* SATURN PERF: DG_DrawFrame ms split (entry) */
+
     /* SATURN sky -> VDP2: (re)upload on level/episode change; position the layer.
        SKY_FIXED keeps it static; otherwise scroll by viewangle (90deg = 256 sky
        px via SKY_ANGLESHIFT, slowed by SKY_PARALLAX_SHIFT; VDP2 wraps the plane). */
@@ -3152,6 +3185,8 @@ extern "C" void DG_DrawFrame(void)
                 if (framebuffer[i] == 0) framebuffer[i] = nb;
     }
 
+    rbg_sky_sum += DG_GetTicksMs() - df0;   /* SATURN PERF: 'sky' = sky scroll + cmap + slScrAutoDisp */
+
 #if VDP2_RBG0_TEST
     /* When the floor toggle is on: upload the player's floor texture to RBG0 (only when the
        flat changes), then re-write its rotation params from the matrix each frame.
@@ -3160,8 +3195,18 @@ extern "C" void DG_DrawFrame(void)
        So the transform never reaches VRAM without RBG0_RPT_TRANSFER below. */
     if (rbg0_mode == 0 && sat_vdp2_floor)   /* sat_vdp2_floor folds in the pot0 + 1p gate (set above) */
     {
+        uint32_t rb_t0 = DG_GetTicksMs();
         rbg0_upload_flat(sat_vdp2_floor_pic);
+        /* SATURN 2026-06-29: apply the floor's sector light by switching the RBG0 bitmap PALETTE BANK
+           (not by re-baking the texture).  Reuse the wall light-banks (1=bright .. 2-7=dark, kept
+           re-shaded by wtex_rebuild_banks) via the same colormap-level->bank LUT the walls use, so the
+           HW floor dims EXACTLY like the VDP1 walls + software sprites.  slBMPaletteRbg0 updates the
+           SGL register shadow; SGL's vblank IRQ re-pushes it (like RBG0ON) -> no slSynch, ~0 cost. */
+        if (sat_vdp2_floor_cmap)
+            slBMPaletteRbg0(wall_light_colr(sat_vdp2_floor_cmap) >> 8);
+        uint32_t rb_t1 = DG_GetTicksMs();
         rbg0_set_transform();
+        uint32_t rb_t2 = DG_GetTicksMs();
 #if RBG0_RPT_TRANSFER == 1
         slSynch();   /* Test A: per-frame slSynch -> _BlankIn transfers the RPT.  Confirms the cause
                         (the floor should warp into perspective), but caps fps + mutes SCSP SFX. */
@@ -3172,6 +3217,10 @@ extern "C" void DG_DrawFrame(void)
         memcpy((void *)0x25E7FF00,          (const void *)0x260FFE1C, 0x30);
         memcpy((void *)(0x25E7FF00 + 0x68), (const void *)0x260FFE84, 0x30);
 #endif
+        uint32_t rb_t3 = DG_GetTicksMs();   /* SATURN PERF: split upl/xfm/rpt to pin the stall */
+        rbg_upl_sum += rb_t1 - rb_t0;
+        rbg_xfm_sum += rb_t2 - rb_t1;
+        rbg_rpt_sum += rb_t3 - rb_t2;
     }
 #endif
 
@@ -3238,6 +3287,7 @@ extern "C" void DG_DrawFrame(void)
             hud2p_apply_flash();                        /* per-half damage/pickup flash */
         }
     }
+    uint32_t df1 = DG_GetTicksMs();        /* SATURN PERF: ms split -- end of pre, start of blit */
     unsigned short blit_t0 = frt_read();   /* SATURN PERF: time the blit (-> sat_blit_ms10) */
 #if DUAL_CPU_BLIT
     if (blit_cfg[blit_mode].dual)
@@ -3281,6 +3331,7 @@ extern "C" void DG_DrawFrame(void)
         unsigned short blit_t1 = frt_read();
         sat_blit_ms10 = ((unsigned int)(unsigned short)(blit_t1 - blit_t0) * ns_per_frt) / 100000u;
     }
+    uint32_t df2 = DG_GetTicksMs();        /* SATURN PERF: ms split -- end of blit, start of clear */
     /* LAYER INVERSION: clear the 3D VIEW to index 0 so next frame the SKIPPED wall columns stay
        transparent -> the VDP1 walls (below NBG1) show through.  The HUD rows are left intact
        (1p: status bar 192..223 owned by ST_Drawer; 2p: panels 160..223 owned by hud2p; 3/4p:
@@ -3289,6 +3340,13 @@ extern "C" void DG_DrawFrame(void)
         extern int sat_local_players;
         int clear_rows = (sat_local_players >= 3) ? 224 : (sat_local_players == 2 ? 160 : 192);
         memset(framebuffer, 0, clear_rows * 320);
+    }
+    {   /* SATURN PERF: bank the reliable ms split (printed once/sec by fps_update, row 11) */
+        uint32_t df3 = DG_GetTicksMs();
+        df_pre_sum  += df1 - df0;
+        df_blit_sum += df2 - df1;
+        df_post_sum += df3 - df2;
+        df_frames++;
     }
     return;
 #endif

@@ -300,6 +300,10 @@ static int  sky_horizon_row = SKY_HORIZON_ROW;  /* live HW-sky horizon row (pad 
      wall gap above the horizon shows the backdrop/sky, not the floor bleeding through. */
 #define RBG0_FLOOR_DOMINANT 1
 #define RBG0_FLOOR_WINDOW   1
+/* RBG0_FLOOR_AUTO_HORIZON: drive BOTH the HW-sky transparent boundary AND the floor window from the
+   ACTUAL rendered floor top (core sat_vdp2_floor_top_y), so the sky always comes down exactly to the
+   floor window -> no sky/floor decalage at any vantage.  0 = static SKY_HORIZON_ROW (legacy). */
+#define RBG0_FLOOR_AUTO_HORIZON 1
 /* RBG0 register-commit method (re-examining the "slSynch is poison" conviction, 2026-06-26):
    1 = ONE-SHOT slSynch at init -> SGL flushes its FULL VDP2 register shadow to the chip (commits
        every RBG0 register correctly), ZERO per-frame cost.  Tests whether slSynch one-shot is the
@@ -431,6 +435,7 @@ extern "C" int            sat_vdp2_floor_pic;/* core: player's floor flat (picnu
 extern "C" unsigned char *sat_vdp2_floor_cmap;/* core: colormap for the floor's sector light (0=full bright) */
 extern "C" int            sat_vdp2_floor_band;/* core: floor sector LIGHT BAND 0..15 (15=bright); drives the base level */
 extern "C" int            sat_vdp2_floor_dominant;/* core: 1 = HW floor follows the DOMINANT visible flat (re-picked on sector change) vs the floor under the eye */
+extern "C" int            sat_vdp2_floor_top_y;   /* core: TOP screen row of the floor punched this frame (its real horizon); 0x3FFF if none */
 extern "C" int            sat_potato_floors;/* core: solid-colour floors/ceilings */
 extern "C" int            sat_potato_walls; /* core: solid-colour walls (opaque, flat only) */
 extern "C" int            sat_wall_nocpu;   /* core: banded/flat -> skip close-wall CPU fallback */
@@ -2240,7 +2245,7 @@ static void sky_cell_build_map(void)
             map[my * 64 + mx] = (unsigned short)((cellidx * 2) | 0x1000);       /* char#=idx*2, palette bank 1 */
         }
 #if RBG0_FLOOR_WINDOW
-    rbg0_floor_window_apply(sky_horizon_row);   /* keep the floor's display window on the SAME (live) horizon as the HW sky */
+    rbg0_floor_window_apply(sky_horizon_row & ~7);   /* window snapped to the sky's 8px cell boundary -> sky+floor meet exactly (no decalage) */
 #endif
 }
 
@@ -3460,6 +3465,18 @@ extern "C" void DG_DrawFrame(void)
               lc_band = sat_vdp2_floor_band;
               rbg0_linecol_rebuild(); rbg0_ccwin_rebuild();
           } }
+#endif
+#if RBG0_FLOOR_AUTO_HORIZON && VDP2_CELL_SKY && !RBG0_LINECOL_TEST
+        /* Drive the HW-sky transparent boundary AND the floor window from the ACTUAL rendered floor top
+           (core sat_vdp2_floor_top_y) so the sky comes down exactly to the floor -> no sky/floor decalage
+           at any vantage.  Both ride the sky's 8px cell grid (sky_cell_build_map rebuilds the sky boundary
+           AND re-pushes the floor window, snapped to match); rebuild only when the cell row changes.  Fall
+           back to the static horizon when no floor is in view this frame (sentinel 0x3FFF). */
+        { static int ah_last_cell = -1;
+          int ft = sat_vdp2_floor_top_y;
+          int hz = (ft > 0 && ft < 0x3FFF) ? ft : SKY_HORIZON_ROW;
+          if (hz < 8) hz = 8; else if (hz > 128) hz = 128;
+          if ((hz >> 3) != ah_last_cell) { ah_last_cell = hz >> 3; sky_horizon_row = hz; sky_cell_build_map(); } }
 #endif
         rbg0_set_transform();
         uint32_t rb_t2 = DG_GetTicksMs();

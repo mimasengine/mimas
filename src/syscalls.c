@@ -40,21 +40,19 @@ char **environ = __env;
 
 /* SATURN: the newlib libc heap is a dedicated static array, kept SEPARATE from
    SRL's TLSF pool (which owns the whole linker __heap_start..__heap_end region --
-   see srl_memory.hpp).  Its dominant consumer is W_AddFile's lumpinfo array:
-   numlumps * sizeof(lumpinfo_t), and lumpinfo_t is 28 B (name[8] + 5x 4-byte
-   fields), NOT 16 B as an earlier note claimed.  Shareware DOOM1.WAD = 1259
-   lumps = 35 KB (fit the old 48 KB cap); the full Ultimate Doom IWAD = 2306
-   lumps = 64.6 KB OVERFLOWED it -> "Couldn't realloc lumpinfo".  Raised to 72 KB
-   so the full IWAD directory fits.  This grows .bss, shrinking the TLSF pool
-   above _end by the same amount (~81 KB pool at the original 48 KB heap; each KB
-   added here costs the TLSF pool 1 KB).  SRL's TLSF working set in this
-   framebuffer-only port is small, so the shrink is ample (boot console prints
-   TLSF used/free to confirm).  Sized here for Doom II = 2919 lumps = 81.7 KB ->
-   88 KB heap (~6 KB margin; TLSF pool ~41 KB).  Shareware = 1259 lumps = 35 KB,
-   Ultimate Doom = 2306 = 64.6 KB both still fit.  A still-bigger IWAD (TNT 3101
-   lumps = 87 KB) would push TLSF lower -- at that point move lumpinfo to the
-   roomy LWRAM Doom zone instead.  Watch row-22 `hp` stays < HEAP_SIZE. */
-#define HEAP_SIZE (88 * 1024)
+   see srl_memory.hpp).  Every KB of this .bss array costs the TLSF pool above _end
+   1 KB, so it is sized as tight as is safe.
+
+   HISTORY: its dominant consumer USED to be W_AddFile's lumpinfo array (numlumps *
+   28 B; Doom II = 81.7 KB), which forced an 88 KB heap and starved the TLSF pool to
+   ~4 KB -- too tight (the 3p minimap's code then boot-looped the pool).  FIX: lumpinfo
+   was MOVED to the roomy ~1MB LWRAM Doom zone (ExtendLumpInfo in core/w_wad.c, the move
+   anticipated by the old note here), so the libc heap no longer scales with the IWAD and
+   ALL IWADs are still supported.  What remains here is incidental (printf/stdio buffers,
+   ~6 KB peak), so the heap is trimmed 88 -> 32 KB, returning ~56 KB to the TLSF pool.
+   Watch row-22 `hp` (dg_heap_peak) stays < HEAP_SIZE on a full E1 run; trim further toward
+   the measured peak if you want even more pool, or raise back if a hidden libc alloc appears. */
+#define HEAP_SIZE (32 * 1024)
 static char heap[HEAP_SIZE] __attribute__((aligned(8)));
 static char *heap_end = heap;
 

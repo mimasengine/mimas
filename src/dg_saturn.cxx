@@ -436,6 +436,7 @@ extern "C" unsigned char *sat_vdp2_floor_cmap;/* core: colormap for the floor's 
 extern "C" int            sat_vdp2_floor_band;/* core: floor sector LIGHT BAND 0..15 (15=bright); drives the base level */
 extern "C" int            sat_vdp2_floor_dominant;/* core: 1 = HW floor follows the DOMINANT visible flat (re-picked on sector change) vs the floor under the eye */
 extern "C" int            sat_vdp2_floor_top_y;   /* core: TOP screen row of the floor punched this frame (its real horizon); 0x3FFF if none */
+extern "C" int            sat_view_floor_h;       /* core: floorheight of the player's view sector (drives the player-height horizon, not the dominant) */
 extern "C" int            sat_potato_floors;/* core: solid-colour floors/ceilings */
 extern "C" int            sat_potato_walls; /* core: solid-colour walls (opaque, flat only) */
 extern "C" int            sat_wall_nocpu;   /* core: banded/flat -> skip close-wall CPU fallback */
@@ -3447,36 +3448,32 @@ extern "C" void DG_DrawFrame(void)
         /* (The RBG0 bitmap palette-bank switch was removed: slBMPaletteRbg0/BMPNB never reach the chip
            on the no-slSynch path -- the floor stayed full-bright.  Dimming is baked in rbg0_upload_flat.) */
         uint32_t rb_t1 = DG_GetTicksMs();
+#if RBG0_FLOOR_AUTO_HORIZON && VDP2_CELL_SKY
+        /* FLOOR HORIZON -- pure geometry, NOTHING to do with colours (extracted out of the line-color
+           block).  horizon = max(player_height_horizon, floor_top), in screen rows:
+             - player_height_horizon = 96 + (fhw+56)*3/23, HW-calibrated on the PLAYER's view-sector floor
+               height (sat_view_floor_h, NOT the dominant) -- the UPPER bound; the floor never goes above it;
+             - floor_top (sat_vdp2_floor_top_y) only pulls it DOWN, and only when the real floor doesn't
+               reach that horizon.
+           One sky_horizon_row holds the result; sky_cell_build_map rebuilds the sky boundary AND the floor
+           window from it TOGETHER -> the sky ALWAYS comes down exactly to the floor (no decalage), whoever
+           limited last.  Rebuild only when the 8px sky-cell row changes. */
+        { int fhw = sat_view_floor_h >> 16;
+          int hz  = 96 + ((fhw + 56) * 3) / 23;            /* player-height horizon (upper bound) */
+          int ft  = sat_vdp2_floor_top_y;
+          if (hz < 8) hz = 8; else if (hz > 128) hz = 128;
+          if (ft > 0 && ft < 0x3FFF && ft > hz) hz = ft;   /* clip LOWER iff the floor ends below the player horizon */
+          if ((hz >> 3) != (sky_horizon_row >> 3)) { sky_horizon_row = hz; sky_cell_build_map(); } }
+#endif
 #if RBG0_LINECOL_TEST
-        /* AUTO floor-horizon: the horizon row tracks the player's floor height (HW-calibrated linear fit,
-           anchored on (fh=128,hz=120) & (fh=-56,hz=96) -> hz = 96 + (fh+56)*3/23, fh in world units;
-           higher floor -> horizon lower on screen).  Moves the HW-sky boundary (and the parked gradient
-           table) automatically.  Manual L+Up/Down still nudges within a sector. */
-        { static int lc_fh = 0x7fffffff, lc_band = -1;
-          if (sat_vdp2_floor_h != lc_fh) {
-              lc_fh = sat_vdp2_floor_h;
-              int fhw = sat_vdp2_floor_h >> 16;
-              int hz  = 96 + ((fhw + 56) * 3) / 23;
-              if (hz < 8) hz = 8; else if (hz > 128) hz = 128;
-              if (hz != sky_horizon_row) { sky_horizon_row = hz; sky_cell_build_map(); }
-              rbg0_linecol_rebuild(); rbg0_ccwin_rebuild(); /* veil + window: horizon and/or sector band changed */
-              lc_band = sat_vdp2_floor_band;
-          } else if (sat_vdp2_floor_band != lc_band) {      /* same height, different room light -> update veil+window */
-              lc_band = sat_vdp2_floor_band;
+        /* Line-color fog/veil tables ONLY (per-distance darkening -- PARKED, rbg0_linecol_mode=0).  This
+           block is now PURELY colours; the horizon is owned by the floor-horizon block above.  Rebuild the
+           tables when the (externally-set) horizon or the sector light band changes. */
+        { static int lc_hz = -1, lc_band = -1;
+          if (sky_horizon_row != lc_hz || sat_vdp2_floor_band != lc_band) {
+              lc_hz = sky_horizon_row; lc_band = sat_vdp2_floor_band;
               rbg0_linecol_rebuild(); rbg0_ccwin_rebuild();
           } }
-#endif
-#if RBG0_FLOOR_AUTO_HORIZON && VDP2_CELL_SKY && !RBG0_LINECOL_TEST
-        /* Drive the HW-sky transparent boundary AND the floor window from the ACTUAL rendered floor top
-           (core sat_vdp2_floor_top_y) so the sky comes down exactly to the floor -> no sky/floor decalage
-           at any vantage.  Both ride the sky's 8px cell grid (sky_cell_build_map rebuilds the sky boundary
-           AND re-pushes the floor window, snapped to match); rebuild only when the cell row changes.  Fall
-           back to the static horizon when no floor is in view this frame (sentinel 0x3FFF). */
-        { static int ah_last_cell = -1;
-          int ft = sat_vdp2_floor_top_y;
-          int hz = (ft > 0 && ft < 0x3FFF) ? ft : SKY_HORIZON_ROW;
-          if (hz < 8) hz = 8; else if (hz > 128) hz = 128;
-          if ((hz >> 3) != ah_last_cell) { ah_last_cell = hz >> 3; sky_horizon_row = hz; sky_cell_build_map(); } }
 #endif
         rbg0_set_transform();
         uint32_t rb_t2 = DG_GetTicksMs();

@@ -293,6 +293,13 @@ static void sky_cell_init(void);        /* forward decl: defined below, called f
 static void sky_cell_build_map(void);   /* forward decl: rebuilds the sky map (live horizon tune) */
 static int  sky_horizon_row = SKY_HORIZON_ROW;  /* live HW-sky horizon row (pad L + Up/Down); bake into SKY_HORIZON_ROW when tuned */
 #endif
+/* SATURN (Romain 2026-06-30): RBG0 floor improvements -- candidate defaults, flip to 0 to A/B-test.
+   RBG0_FLOOR_DOMINANT -> drives core sat_vdp2_floor_dominant: the HW floor follows the DOMINANT
+     visible flat (re-picked ONLY when the player changes sector) instead of the floor under the eye.
+   RBG0_FLOOR_WINDOW   -> clips RBG0's DISPLAY to BELOW the horizon (VDP2 window W1) so a torn VDP1
+     wall gap above the horizon shows the backdrop/sky, not the floor bleeding through. */
+#define RBG0_FLOOR_DOMINANT 1
+#define RBG0_FLOOR_WINDOW   1
 /* RBG0 register-commit method (re-examining the "slSynch is poison" conviction, 2026-06-26):
    1 = ONE-SHOT slSynch at init -> SGL flushes its FULL VDP2 register shadow to the chip (commits
        every RBG0 register correctly), ZERO per-frame cost.  Tests whether slSynch one-shot is the
@@ -423,6 +430,7 @@ extern "C" int            sat_vdp2_floor_h; /* core: player's floor height (fixe
 extern "C" int            sat_vdp2_floor_pic;/* core: player's floor flat (picnum) */
 extern "C" unsigned char *sat_vdp2_floor_cmap;/* core: colormap for the floor's sector light (0=full bright) */
 extern "C" int            sat_vdp2_floor_band;/* core: floor sector LIGHT BAND 0..15 (15=bright); drives the base level */
+extern "C" int            sat_vdp2_floor_dominant;/* core: 1 = HW floor follows the DOMINANT visible flat (re-picked on sector change) vs the floor under the eye */
 extern "C" int            sat_potato_floors;/* core: solid-colour floors/ceilings */
 extern "C" int            sat_potato_walls; /* core: solid-colour walls (opaque, flat only) */
 extern "C" int            sat_wall_nocpu;   /* core: banded/flat -> skip close-wall CPU fallback */
@@ -1746,6 +1754,26 @@ static void rbg0_commit_cyc(void)
     }
 }
 
+#if RBG0_FLOOR_WINDOW
+/* Apply / MOVE the RBG0 floor display window (clip RBG0 to BELOW row hz, via window W1).  At init the
+   WPSx1/WCTLC shadow ride rbg0_commit_cyc's 0x0E..0xFE block-flush; to MOVE it at runtime (live
+   horizon tune) the per-vblank ISR (0x00..0x8E) never re-pushes the window regs, so we copy W1's
+   recomputed position + WCTLC straight from the SGL shadow to the chip (the runtime equivalent of the
+   block-flush).  Called from sky_cell_build_map so the floor window tracks the SAME horizon as the
+   HW sky.  Cheap: only runs when the horizon actually changes. */
+static void rbg0_floor_window_apply(int hz)
+{
+    if (hz < 0) hz = 0; else if (hz > 223) hz = 223;
+    slScrWindow1(0, (uint16_t)hz, 319, 223);   /* W1 = [0,hz]..[319,223] -> WPSx1 in the SGL shadow */
+    slScrWindowModeRbg0(win1_IN);              /* RBG0 displayed INSIDE W1 (WCTLC) */
+    volatile uint8_t *const shadow = (volatile uint8_t *)((uintptr_t)&VDP2_RAMCTL - 0x0E);
+    volatile uint8_t *const chip   = (volatile uint8_t *)0x25F80000;
+    for (int off = 0xC8; off <= 0xCE; off += 2)                       /* WPSX1/WPSY1/WPEX1/WPEY1 */
+        *(volatile uint16_t *)(chip + off) = *(volatile uint16_t *)(shadow + off);
+    *(volatile uint16_t *)(chip + 0xD4) = *(volatile uint16_t *)(shadow + 0xD4);  /* WCTLC (RBG0 window ctrl) */
+}
+#endif
+
 #if VDP2_CELL_SKY
 /* Force the VRAM cycle pattern so the NBG0 cell sky reads its cells from bank B1, EVERY frame.
    HW bug (Ymir-invisible): when RBG0 is ON, SGL's per-frame slScrAutoDisp `ape` allocator places
@@ -2034,6 +2062,16 @@ extern "C" void DG_Init(void)
     /* Commit the RBG0 bank assignment (RDBS) straight to the chip -- the piece SGL would
        push inside slSynch.  After slScrAutoDisp so RBG0ON is already live; once is enough
        (the SGL vblank handler re-pushes BGON/scroll, not RAMCTL). */
+#if RBG0_FLOOR_WINDOW
+    /* Clip the RBG0 floor's DISPLAY to BELOW the horizon via VDP2 window W1, so a torn VDP1 wall gap
+       above the horizon shows the backdrop/sky instead of the floor bleeding through.  W1 (not W0)
+       leaves W0 free for the line-color CCAL window.  Set here -- WPSx1 (0xC8-0xCE) + WCTLC ride
+       rbg0_commit_cyc's 0x0E..0xFE block-flush below, and the per-vblank ISR (0x00..0x8E) never
+       touches them -> persists with NO slSynch (same proof as the CCAL line-window above).  MOVED at
+       runtime by rbg0_floor_window_apply() (called from sky_cell_build_map) so the window tracks the
+       live, pad-tunable sky horizon. */
+    rbg0_floor_window_apply(SKY_HORIZON_ROW);
+#endif
 #if RBG0_BITMAP
     /* BITMAP fix (disasm + SlaveDriver): reserve the RDBS (A1=char/A0=coeff) + park the A0/A1
        rotation cycle slots BY HAND -- slBitMapRbg0 never did (no rbank_set).  Then flush the
@@ -2060,6 +2098,7 @@ extern "C" void DG_Init(void)
 #if VDP2_RBG0_TEST
     /* Floor on RBG0 at boot (rbg0_mode 0); pad Y cycles the 3 RBG0/debug modes. */
     sat_vdp2_floor = 1;
+    sat_vdp2_floor_dominant = RBG0_FLOOR_DOMINANT;   /* HW floor pick: dominant visible flat (sector-change) vs under-eye */
 #endif
     sat_apply_potato();   /* boot Potato level; pad Z cycles it live */
 
@@ -2200,6 +2239,9 @@ static void sky_cell_build_map(void)
             int cellidx = (my < thresh) ? ((mx & 31) * 16 + my) : SKY_NB_CELL;  /* sky above the horizon; transparent filler at/below it */
             map[my * 64 + mx] = (unsigned short)((cellidx * 2) | 0x1000);       /* char#=idx*2, palette bank 1 */
         }
+#if RBG0_FLOOR_WINDOW
+    rbg0_floor_window_apply(sky_horizon_row);   /* keep the floor's display window on the SAME (live) horizon as the HW sky */
+#endif
 }
 
 /* One-shot NBG0 cell config + PN map (cells change per level; map rebuilds on a live horizon tune). */

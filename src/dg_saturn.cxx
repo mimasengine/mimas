@@ -152,7 +152,7 @@ extern "C" char *gamedescription;
    last COMPLETE frame and only swaps when the draw finished (EDSR CEF), triggered from the
    existing OnVblank -- i.e. vsync the VDP1 presentation WITHOUT slSynch (no fps tax, no SCSP
    sound conflict, no latency: the CPU never waits).  1 = on (anti-tear), 0 = old auto swap. */
-#define VDP1_MANUAL_CHANGE 0   /* BISECT: 0 = revert 3faaa95's manual-change present -> 1-cycle auto (test if the VDP1 walls come back, with tearing) */
+#define VDP1_MANUAL_CHANGE 0   /* GATED OFF (back to 1-cycle auto): the present-sync experiment (brick A gated present + brick B NBG1 couple, pad L+Z / R+Z) did NOT close the VDP1<->software seam in motion -- the latency mismatch is structural (docs/VDP1_PRESENT_SYNC_PLAN.md).  Set 1 to recompile the whole machinery (kept in #if VDP1_MANUAL_CHANGE for later). */
 
 extern "C" byte *I_VideoBuffer;
 extern "C" int   gametic;
@@ -990,6 +990,19 @@ volatile int game_phase = 0;
    VDP1-floor offload (high Dr => spare VDP1 budget for floor strips). */
 static int vdp1_prev_done = 1;
 static unsigned int vd1_win_done = 0, vd1_win_tot = 0;   /* VDP1 done-rate over the window */
+#if VDP1_MANUAL_CHANGE
+/* Corrected draw-gated present (docs/VDP1_PRESENT_SYNC_PLAN.md, brick A).  Declared up here (not by
+   the driver below) so the row-2 overlay can show the mode.  Runtime A/B via pad L+Z:
+   0 = 1-cycle auto (BOOT DEFAULT: tears, but Ymir-visible and == shipped behaviour);
+   1 = gated manual present (tear-free; the VDP1 walls lag ~1 vblank = decrochage, the accepted trade).
+   _pending/_wait drive the per-frame CEF-gated swap + the stuck watchdog. */
+static volatile int vdp1_present_manual  = 0;
+static volatile int vdp1_present_pending = 0;
+static volatile int vdp1_present_wait    = 0;
+static volatile int vdp1_couple_nbg1     = 0;   /* brick B: defer the NBG1 blit to land with the VDP1 present (separate toggle pad R+Z) */
+#define VDP1_PRESENT_STUCK_MAX 16   /* vblanks pending w/o CEF -> force-swap (Ymir never latches manual-mode CEF) */
+#define VDP1_COUPLE_MAX_VBL    4    /* couple: wait at most this many vblanks for CEF before blitting anyway */
+#endif
 
 #if SHOW_FPS
 extern "C" int rp_timeout_count;
@@ -1227,9 +1240,14 @@ static void fps_update(void)
                headroom signal (high Dr => spare budget for floor strips).  b:__TIME__ =
                build stamp (build.ps1 touches this file so it refreshes). */
             unsigned int dr = vd1_win_tot ? (vd1_win_done * 100u / vd1_win_tot) : 0;
-            static char r2v[45];
-            snprintf(r2v, sizeof r2v, "VD1 %d%c Dr%u%% b:" __TIME__,
-                    vdp1_last_cmds, vdp1_prev_done ? 'D' : 'B', dr);
+            char pmode_c = 'A', couple_c = '-';
+#if VDP1_MANUAL_CHANGE
+            pmode_c  = vdp1_present_manual ? 'M' : 'A';   /* P A=auto(tear) / M=gated(tear-free, ~1vbl lag) */
+            couple_c = vdp1_couple_nbg1 ? 'C' : '-';      /* C = NBG1 blit coupled to the VDP1 present (brick B) */
+#endif
+            static char r2v[52];
+            snprintf(r2v, sizeof r2v, "VD1 %d%c Dr%u%% P%c%c b:" __TIME__,
+                    vdp1_last_cmds, vdp1_prev_done ? 'D' : 'B', dr, pmode_c, couple_c);
             SRL::Debug::Print(0, 2, r2v);
             /* row 4: WINDOWED REC distribution p50/p95/max (tenths-ms) -- robust to the
                single-outlier max (a lone CD hitch) AND to an arbitrary threshold.  p50 =
@@ -2950,30 +2968,31 @@ static void vdp1_walls_flush(void)
 #endif
 
 #if VDP1_MANUAL_CHANGE
-/* Set by the kick after a plot is triggered: "a new frame is being drawn; present it (swap
-   the VDP1 framebuffers) once its draw completes."  Read/cleared by the vblank handler. */
-static volatile int vdp1_present_pending = 0;
-
-/* Wait one field (init only): used to space the two startup erases a frame apart so each
-   manual change actually executes (FBCR latches but runs at the next field). */
-static void vdp1_wait_field(void)
-{
-    while (TVSTAT & 0x0008) ;        /* leave the current vblank   */
-    while (!(TVSTAT & 0x0008)) ;     /* wait for the next vblank-in */
-}
-
-/* OnVblank: present the VDP1 frame ONLY when its draw has finished (EDSR CEF = bit1).  In
-   1-cycle mode VDP1 swapped its framebuffers every vblank, even mid-draw -> the multi-vblank
-   wall list was shown half-rasterised = tearing.  FBCR = FCM|FCT (0x3) is a manual change:
-   swap the buffers (show the completed frame) and erase the new back buffer.  FCM (mode) is
-   sticky, FCT (trigger) self-clears -> between presents nothing swaps = the last complete
-   frame is held.  No fps/latency cost: we don't wait, the swap is just deferred to draw-done. */
+/* OnVblank handler: present the finished VDP1 frame.  Corrected handshake (brick A): the kick
+   drained the stale EDSR.CEF right after PTMR, so a SET CEF here belongs to THIS plot -> the swap
+   is locked 1:1 to the kick's bank flip (kills the sticky-CEF "walls vanish").  FBCR = FCM|FCT
+   (0x3) is a manual change: swap to the complete frame + erase the new back buffer; FCM is sticky
+   so the first present also ENTERS manual mode (no auto-swap after).  Watchdog: after
+   VDP1_PRESENT_STUCK_MAX vblanks with no CEF (Ymir never models manual-mode draw-end; or a
+   pathological HW stall) force the swap so the walls never freeze.  Registered unconditionally at
+   init; a no-op while AUTO (vdp1_present_manual == 0).  No fps/latency cost: the CPU never waits. */
 static void vdp1_vblank_present(void)
 {
-    if (vdp1_present_pending && (VDP1_EDSR & 0x0002))
+    if (vdp1_couple_nbg1)
+        return;                              /* coupled present is done in DG_DrawFrame, not here */
+    if (!vdp1_present_manual || !vdp1_present_pending)
+        return;
+    if (VDP1_EDSR & 0x0002)                  /* this plot's draw is done */
     {
-        VDP1_FBCR = 0x0003;          /* manual change: swap + erase the new back buffer */
+        VDP1_FBCR            = 0x0003;       /* swap + erase the new back buffer */
         vdp1_present_pending = 0;
+        vdp1_present_wait    = 0;
+    }
+    else if (++vdp1_present_wait >= VDP1_PRESENT_STUCK_MAX)
+    {
+        VDP1_FBCR            = 0x0003;       /* watchdog force-swap (may tear once) -> never frozen */
+        vdp1_present_pending = 0;
+        vdp1_present_wait    = 0;
     }
 }
 #endif
@@ -3011,18 +3030,13 @@ static void vdp1_wpn_init(void)
     VDP1_EWDR = 0x0000;                              /* erase to 0 = transparent */
     VDP1_EWLR = 0x0000;
     VDP1_EWRR = (unsigned short)(((320 >> 3) << 9) | 223);
-#if VDP1_MANUAL_CHANGE
-    /* Manual-change double-buffer (anti-tear).  Clear BOTH framebuffers first: each change
-       erases the buffer that becomes the new back buffer, so two changes (a field apart) wipe
-       both -> no boot garbage in the index-0 (sky/ceiling) gaps.  Then stay in manual mode;
-       the per-frame swap is driven by vdp1_vblank_present on draw-complete. */
-    VDP1_PTMR = 0x0000;                              /* no draw; first plot kicked per-frame */
-    VDP1_FBCR = 0x0003; vdp1_wait_field();           /* change + erase back buffer #1 */
-    VDP1_FBCR = 0x0003; vdp1_wait_field();           /* change + erase back buffer #2 (both clear) */
-    SRL::Core::OnVblank += vdp1_vblank_present;
-#else
-    VDP1_FBCR = 0x0000;                              /* 1-cycle auto erase+draw+swap (tears) */
+    VDP1_FBCR = 0x0000;                              /* BOOT in 1-cycle auto (known-good, Ymir-safe, == ship) */
     VDP1_PTMR = 0x0002;
+#if VDP1_MANUAL_CHANGE
+    /* Register the gated-present handler; it is a NO-OP until pad L+Z sets vdp1_present_manual=1.
+       The first gated present (FBCR=0x0003) then flips FCM=1 to ENTER manual mode at that point
+       (no startup two-field erase needed: 1-cycle auto wipes both buffers via EWDR=0 anyway). */
+    SRL::Core::OnVblank += vdp1_vblank_present;
 #endif
 }
 
@@ -3049,6 +3063,25 @@ extern "C" void sat_vdp1_wpn_begin(void)
     cmd[7] = VIEW_Y_OFFSET;                          /* local Y origin -> walls centred like NBG1 */
     vdp1_cmd_at(VDP1_BANK[vdp1_wbank], 0, cmd);
     vdp1_wnext   = 1;
+#if VDP1_MANUAL_CHANGE
+    /* In-list full-screen colour-0 erase (manual-change only).  Without slSynch the VDP1 HW
+       back-buffer erase (FBCR=0x0003 / EWLR-EWRR) does NOT fire reliably -> old walls accumulate
+       on the sky/floor (VDP1 prio 5 sits over them).  A FUNC_Polygon writing index 0 over the whole
+       framebuffer clears the back buffer at the start of each plot (~1 full-screen flat fill).
+       AUTO mode keeps the free HW per-cycle erase (no polygon, no cost). */
+    if (vdp1_present_manual)
+    {
+        memset(cmd, 0, sizeof cmd);
+        cmd[0]  = 0x0004;                            /* FUNC_Polygon (flat)               */
+        cmd[2]  = 0x00C0;                            /* SPD (write all, incl 0) | ECD-off */
+        cmd[3]  = 0x0000;                            /* CMDCOLR 0 -> framebuffer index 0  */
+        cmd[6]  = 0;   cmd[7]  = 0;                  /* A (0,0)   (VIEW_Y_OFFSET = 0)     */
+        cmd[8]  = 319; cmd[9]  = 0;                  /* B (319,0)                         */
+        cmd[10] = 319; cmd[11] = 223;                /* C (319,223)                       */
+        cmd[12] = 0;   cmd[13] = 223;                /* D (0,223)                         */
+        vdp1_cmd_at(VDP1_BANK[vdp1_wbank], vdp1_wnext++, cmd);
+    }
+#endif
 #if VDP1_WALL_TEST
     vdp1_walls_flush();   /* textured walls -- behind the weapon, in front of NBG1 */
 #endif
@@ -3179,7 +3212,14 @@ static void vdp1_wpn_kick(void)
     *((volatile unsigned short *)VDP1_ROOT_ADDR + 1) = (unsigned short)link;
     VDP1_PTMR = 0x0002;              /* start the draw (clears EDSR CEF until it finishes) */
 #if VDP1_MANUAL_CHANGE
-    vdp1_present_pending = 1;        /* arm: vdp1_vblank_present swaps once this draw completes */
+    if (vdp1_present_manual)
+    {
+        /* CEF-proven-this-frame: PTMR just cleared CEF; drain any stale latch (bounded) so the
+           NEXT CEF=1 the vblank handler observes belongs to THIS plot, not the previous one. */
+        for (int g = 0; (VDP1_EDSR & 0x0002) && g < 2000; ++g) { }
+        vdp1_present_pending = 1;    /* arm the gated swap */
+        vdp1_present_wait    = 0;    /* (re)start the stuck watchdog */
+    }
 #endif
     vdp1_wactive = 0;
 }
@@ -3191,6 +3231,20 @@ static void vdp1_wpn_kick(void)
 static int vdp1_kicked_this_frame = 0;
 extern "C" void sat_walls_kick(void)
 {
+#if VDP1_MANUAL_CHANGE
+    /* Gated-present HOLD: while a plot is in flight (armed, not yet presented) do NOT rebuild the
+       shared wall-texture VRAM cache (NOT double-buffered) that the live plot is still reading --
+       drop this frame's accumulated walls and keep showing the last complete frame.  The vblank
+       watchdog guarantees present_pending clears, so the walls never freeze.  (No-op while AUTO.) */
+    if (vdp1_present_manual && vdp1_present_pending)
+    {
+#if VDP1_WALL_TEST
+        wall_acc_n = 0;             /* discard this frame's BSP-accumulated walls */
+#endif
+        vdp1_kicked_this_frame = 1; /* suppress the DG_DrawFrame fallback kick */
+        return;
+    }
+#endif
     sat_vdp1_wpn_begin();
     vdp1_wpn_kick();
     vdp1_kicked_this_frame = 1;
@@ -3447,6 +3501,25 @@ extern "C" void DG_DrawFrame(void)
             hud2p_apply_flash();                        /* per-half damage/pickup flash */
         }
     }
+#if VDP1_MANUAL_CHANGE
+    /* Brick B -- couple NBG1 to the VDP1 frame (separate toggle R+Z; layers over PA or PM).  Hold
+       the just-rendered software framebuffer: wait (bounded) for THIS frame's wall plot to finish,
+       latch the manual present, then fence so the blit lands on the swap vblank -> VDP1-N and
+       NBG1-N go live on the SAME field (kills the decrochage).  The wait is the deterministic fps
+       cost.  Bounded by VDP1_COUPLE_MAX_VBL so a never-finishing plot (or Ymir, no CEF) can't hang. */
+    if (vdp1_couple_nbg1 && gamestate == GS_LEVEL)
+    {
+        unsigned int t0 = vbl_count;
+        while (!(VDP1_EDSR & 0x0002) && (vbl_count - t0) < VDP1_COUPLE_MAX_VBL) { }
+        if (vdp1_present_manual && vdp1_present_pending)
+        {
+            VDP1_FBCR            = 0x0003;   /* latch the manual change now (executes next vblank) */
+            vdp1_present_pending = 0;
+            vdp1_present_wait    = 0;
+        }
+        { unsigned int tf = vbl_count; while (vbl_count == tf) { } }   /* fence to the swap vblank */
+    }
+#endif
     uint32_t df1 = DG_GetTicksMs();        /* SATURN PERF: ms split -- end of pre, start of blit */
     unsigned short blit_t0 = frt_read();   /* SATURN PERF: time the blit (-> sat_blit_ms10) */
 #if DUAL_CPU_BLIT
@@ -3704,8 +3777,29 @@ static void poll_pad(void)
        -> 2 + VDP1 walls flat / low-detail), for A/B testing quality vs fps without a rebuild. */
     if ((changed & PER_DGT_TZ) && !(cur & PER_DGT_TZ))
     {
-        potato_level = (potato_level + 1) % 7;
-        sat_apply_potato();
+#if VDP1_MANUAL_CHANGE
+        if (!(cur & PER_DGT_TL))             /* L+Z: A/B the VDP1 present (row 2 'P A'<->'P M') */
+        {
+            vdp1_present_manual = !vdp1_present_manual;
+            if (!vdp1_present_manual)
+            {
+                VDP1_FBCR            = 0x0000;   /* back to 1-cycle auto swap */
+                vdp1_present_pending = 0;
+                vdp1_present_wait    = 0;
+            }
+        }
+        else if (!(cur & PER_DGT_TR))        /* R+Z: A/B the NBG1<->VDP1 couple (brick B; row 2 2nd char 'C'/'-') */
+        {
+            vdp1_couple_nbg1     = !vdp1_couple_nbg1;
+            vdp1_present_pending = 0;        /* drop any in-flight gated arm so the two paths don't fight */
+            vdp1_present_wait    = 0;
+        }
+        else
+#endif
+        {
+            potato_level = (potato_level + 1) % 7;   /* Z alone: cycle the Potato level */
+            sat_apply_potato();
+        }
     }
 
 #if VDP2_RBG0_TEST

@@ -293,6 +293,32 @@ static void sky_cell_init(void);        /* forward decl: defined below, called f
 static void sky_cell_build_map(void);   /* forward decl: rebuilds the sky map (live horizon tune) */
 static int  sky_horizon_row = SKY_HORIZON_ROW;  /* live HW-sky horizon row (pad L + Up/Down); bake into SKY_HORIZON_ROW when tuned */
 #endif
+/* VDP2_SPLIT_HW_SKY (Part 5 -- docs/RBG0_SKY_SPLIT_ANALYSIS.md §5): 1 = in a co-op split give ONE
+   ELECTED view the hardware NBG0 sky (the others keep the software sky), CONFINED to that view's band
+   by VDP2 window W0 and SCROLLED by that view's viewangle.  NBG0 is a single scroll layer, so only one
+   view can own it; the core (sat_sky_view/sat_vdp2_sky, r_plane.c + d_main.c) leaves that view's sky
+   region index-0, and the W0 window keeps NBG0 from bleeding into the software views (incl. their VDP1
+   torn wall gaps).  Layer priority already resolves the sky/floor overlap in the elected band
+   (RBG0 floor 6 > NBG1 3D view 5 > NBG0 sky 4), so no extra window is needed for that.
+   Static election: the elected view = P1 (view 0) -- couples with P1's HW floor in 2p; dynamic
+   election by sat_sky_px_view[] + hysteresis is the documented next step (coverage already captured).
+   W0 note: RBG0_LINECOL_TEST arms a per-line CCAL window on W0, but the fog is PARKED
+   (rbg0_linecol_mode=0 -> ratio 0 -> no visible blend), so repurposing W0 as an NBG0 RECT window is
+   visually free.  Requires VDP2_CELL_SKY.  This flag COMPILES the feature in; it is ON at runtime by
+   default (hwsky_split_on = 1 -> the elected split view gets the HW sky) and toggled live with the pad
+   chord L + C so it can be A/B'd against the software split sky on Ymir/HW without a rebuild.  Set this
+   flag to 0 to remove the machinery entirely (e.g. a validated ship build that doesn't want
+   it). */
+#define VDP2_SPLIT_HW_SKY 1
+#if VDP2_SPLIT_HW_SKY && !VDP2_CELL_SKY
+#error "VDP2_SPLIT_HW_SKY needs VDP2_CELL_SKY (the NBG0 cell sky layer)"
+#endif
+#if VDP2_SPLIT_HW_SKY
+static int hwsky_split_on = 1;   /* Part 5 LIVE toggle (pad L+C): 1 = HW sky for the elected split view (DEFAULT ON), 0 = software split sky.  Toggle OFF with L+C if it snows/misaligns on HW (cosmetic size/anchor still WIP -- docs §10). */
+#endif
+/* Frames a challenger must out-cover the leader (by margin) before the elected HW-sky view switches
+   (dynamic election only; unused by the static default).  ~0.5s at 60fps avoids per-frame scroll jumps. */
+#define SKY_ELECT_HYST 30
 /* SATURN (Romain 2026-06-30): RBG0 floor improvements -- candidate defaults, flip to 0 to A/B-test.
    RBG0_FLOOR_DOMINANT -> drives core sat_vdp2_floor_dominant: the HW floor follows the DOMINANT
      visible flat (re-picked ONLY when the player changes sector) instead of the floor under the eye.
@@ -304,6 +330,52 @@ static int  sky_horizon_row = SKY_HORIZON_ROW;  /* live HW-sky horizon row (pad 
    ACTUAL rendered floor top (core sat_vdp2_floor_top_y), so the sky always comes down exactly to the
    floor window -> no sky/floor decalage at any vantage.  0 = static SKY_HORIZON_ROW (legacy). */
 #define RBG0_FLOOR_AUTO_HORIZON 1
+/* RBG0_SPLIT_P1HW: in 2-player split, drive the HW floor for P1 (left half) while P2 keeps its
+   software floor.  0 = split stays fully software (legacy). */
+#define RBG0_SPLIT_P1HW 1
+#define RBG0_SPLIT_TUNE  0   /* 1 = live split-floor tuning knobs (R/L/C + d-pad) + VPW overlay + d-pad movement freeze; 0 = baked (ship) */
+static int rbg0_floor_win_xend = 319;   /* RBG0 floor window X extent: 319 = full (1p), 159 = P1 left half (2p split) */
+/* RBG0 split VIEWPORT PROJECTION (slWindow) -- only used when sat_split_p1hw (1-player never calls slWindow,
+   so its slInitSystem-default projection is untouched).  centerX + window width reproject the floor onto
+   P1's LEFT half (vanishing point x=80, FOV on 160px) so it aligns with P1's software walls.  centerY (the
+   vanishing-point ROW) and the near-plane depthLimit come from slInitSystem's default which is NOT in the
+   SGL sources (binary) -> TUNE these two on Ymir.  Full-screen restore uses the 1p defaults (160,112). */
+/* Runtime so they can be cal'd LIVE in split (R + d-pad, see poll_pad) without a rebuild; bake the found
+   values back here once tuned.  centerX/width reproject the floor onto P1's half; centerY + depthLimit are
+   the slInitSystem defaults (not in the SGL sources) so they need dialing on Ymir. */
+static int rbg0_win_cx    = 80;    /* P1 viewport centre X (vanishing point); 1p full-screen = 160 */
+static int rbg0_win_cy    = 80;    /* P1 viewport centre Y (horizon row) -- TUNE live (R + Up/Down in split) */
+static int rbg0_win_depth = 256;   /* slWindow near-plane depthLimit -- TUNE live (R + Left/Right in split); too small clips the floor */
+static int rbg0_split_hz  = 80;    /* SPLIT floor horizon = the W1 clip top ("floor limit by height"), live R+Up/Down.  The 1p
+                                      height-formula (96+(fhw+56)*3/23) is calibrated for the 224-tall 1p view; P1's split viewport
+                                      is 160 tall (horizon ~80) so it over-clips -> in split we use THIS value instead.  Bake when tuned. */
+static int rbg0_split_pitch = -1216; /* SPLIT plane pitch (inclination), live L+Up/Down.  Baked from live tuning.  = 1p's rbg0_pitch_adj (0x100):
+                                       the plane tilt is viewport-independent, so P1 uses the SAME tilt as 1p once
+                                       the projection (Cx/Cy/screen-dist) is derived right.  SPLIT-ONLY -> 1p keeps
+                                       rbg0_pitch_adj untouched.  Likely compensates the off-centre projection; revisit
+                                       once the rotation/centre is fixed (it should then match the 1p pitch). */
+static int rbg0_split_cx = 80;      /* SPLIT rotation centre X (VDP2 RPT Cx, int16 @0x3C), via slDispCenterR.  Full
+                                       screen is 160; 80 = centre of P1's left half -> vanishing point at P1's
+                                       centre.  Live R+Left/Right. */
+static int rbg0_split_sd = 7;       /* SPLIT screen-distance ratio, Q4 (16 = 1.0x default): baked from live tuning.  Halving
+                                       MsScreenDist via slSetScreenDist widens the floor's FOV to P1's 160px
+                                       viewport so texel ratio + rotation speed match the SW view.  Done NATIVELY
+                                       through slScrMatConv (stable) -- post-scaling ΔX/ΔY in VRAM flickers at any
+                                       !=1x, so this is the only clean lever.  Live L+Left/Right. */
+static int rbg0_split_yaw = 0;      /* SPLIT floor YAW offset (ANGLE), live C+Left/Right.  0 once the projection is
+                                       correct (the old 4864 compensated the restore-corruption bug, now fixed).  Aligns the
+                                       forward-scroll direction (baked from live tuning).  NOTE: if this only holds
+                                       at one facing (drifts as you turn), the floor rotation is scaled (see the x2
+                                       rotation-speed issue) and this offset is not a true constant. */
+static int rbg0_split_cy  = 80;     /* SPLIT rotation centre Y = centery of P1's 160-tall viewport (slDispCenterR
+                                       sets Py=Cy too -> consistent).  Live C+Up/Down. */
+static int rbg0_split_scroll = 16;  /* SPLIT scroll-rate scale, Q4 (16 = 1.0x): scales slTranslate X/Y so forward/back
+                                       scrolls at the SW rate (sd changed the focal but not the K-table -> scroll too
+                                       fast; the flat repeats, so scaling the world offset is invisible).  Live C+Up/Down. */
+static int rbg0_split_yawsc = 16;   /* SPLIT yaw-RATE scale, Q4 (16 = 1.0x = correct per disasm; the x2 was from the
+                                       old Cy=112+pitch band-aid, not the yaw).  Live C+Up/Down.  Rotation tracks
+                                       viewangle at this rate.  Live C+Up/Down.  8 (halve) targets the "rotation x2
+                                       too fast when turning" -- which is sd/FOV-INDEPENDENT, so it's the yaw rate. */
 /* RBG0 register-commit method (re-examining the "slSynch is poison" conviction, 2026-06-26):
    1 = ONE-SHOT slSynch at init -> SGL flushes its FULL VDP2 register shadow to the chip (commits
        every RBG0 register correctly), ZERO per-frame cost.  Tests whether slSynch one-shot is the
@@ -429,6 +501,9 @@ extern "C" int            menuactive;       /* boolean: menu overlay up */
 extern "C" int            automapactive;    /* boolean: automap up */
 extern "C" int            sat_vdp2_sky;     /* core: skip software sky (=> VDP2) */
 extern "C" int            sat_frame_has_sky;/* core: a sky visplane was in view this frame */
+extern "C" int            sat_sky_view;         /* core Part 5: elected split view for the HW sky (-1 = none => all software) */
+extern "C" unsigned int   sat_sky_px_view[4];   /* core Part 5: per-view SKY pixel coverage (election metric) */
+extern "C" unsigned int   sat_sky_view_angle;   /* core Part 5: elected view's viewangle (angle_t) for the NBG0 scroll */
 extern "C" int            sat_vdp2_floor;   /* core: skip software floor (=> VDP2 RBG0) */
 extern "C" int            sat_vdp2_floor_h; /* core: player's floor height (fixed_t) */
 extern "C" int            sat_vdp2_floor_pic;/* core: player's floor flat (picnum) */
@@ -437,6 +512,8 @@ extern "C" int            sat_vdp2_floor_band;/* core: floor sector LIGHT BAND 0
 extern "C" int            sat_vdp2_floor_dominant;/* core: 1 = HW floor follows the DOMINANT visible flat (re-picked on sector change) vs the floor under the eye */
 extern "C" int            sat_vdp2_floor_top_y;   /* core: TOP screen row of the floor punched this frame (its real horizon); 0x3FFF if none */
 extern "C" int            sat_view_floor_h;       /* core: floorheight of the player's view sector (drives the player-height horizon, not the dominant) */
+extern "C" int            sat_split_p1hw;          /* core: set here -> d_main punches the HW floor only for P1 in split */
+extern "C" void           sat_setup_view_p1(void);/* core: re-anchor the view globals on P1 for the split RBG0 transform */
 extern "C" int            sat_potato_floors;/* core: solid-colour floors/ceilings */
 extern "C" int            sat_potato_walls; /* core: solid-colour walls (opaque, flat only) */
 extern "C" int            sat_wall_nocpu;   /* core: banded/flat -> skip close-wall CPU fallback */
@@ -1077,6 +1154,15 @@ extern "C" int RP_ProfPercentile(int pct);                       /* windowed REC
 extern "C" void RP_ProfReset(void);
 extern "C" int gamemap;   /* core doomstat: drives the per-map window reset */
 
+/* Phase-0 wall CPU-fallback profiler (core r_segs.c): per-frame tally by cause, folded to
+   windowed peaks in vdp1_wpn_kick, shown on overlay row 24 (FBK).  clamp = SPAN/below-floor
+   (the Phase-1 world-anchored VDP1 clamp target); mag = face-on magnified residue; starve =
+   VDP1 bank full (Phase-1 worsens); px = clampable fill-work proxy (span*cols = the master
+   software cost Phase-1 removes).  A big clamp/px => build the clamp; mostly mag/starve => reconsider. */
+extern "C" int sat_fb_clamp_t, sat_fb_mag_t, sat_fb_starve_t, sat_fb_px;
+static int fb_cur_clamp = 0, fb_cur_mag = 0, fb_cur_px = 0;             /* last rendered frame */
+static int fb_pk_clamp  = 0, fb_pk_mag  = 0, fb_pk_starve = 0, fb_pk_px = 0;  /* windowed peaks (reset on config change) */
+
 /* SATURN PERF (2026-06-24): one-shot memory-latency calibration.  The memory-bound
    ceiling is the root cause of REC cost but is unmeasurable directly (no SH7604 PMU),
    so cold-read a 32 KB block from each work-RAM bank and FRT-time it.  rL = LWRAM/HWRAM
@@ -1155,6 +1241,7 @@ static void fps_update(void)
                ) {
                 RP_ProfReset();
                 vd1_win_done = vd1_win_tot = 0;
+                fb_pk_clamp = fb_pk_mag = fb_pk_starve = fb_pk_px = 0;   /* Phase-0: clean fallback A/B window */
                 l_map=gamemap; l_pot=(int)potato_level; l_blit=blit_mode;
 #if SAT_FLOOR_PERFSIM
                 l_perfsim=floor_perfsim_mode;
@@ -1223,6 +1310,13 @@ static void fps_update(void)
                     sat_local_players, wmode, sat_spl_v0, sat_spl_v1,
                     sat_spl_v2, sat_spl_v3, sat_spl_kick, wtex_bakes);
             SRL::Debug::Print(0, 16, rS);   /* split only -> kept lower */
+#if RBG0_SPLIT_P1HW && RBG0_SPLIT_TUNE
+            {                               /* DIAG: shows why the HW split floor (de)activates + the live R+dpad cal */
+                static char rVP[64];
+                snprintf(rVP, sizeof rVP, "hz%d cx%d pit%d sd%d yw%d sc%d", rbg0_split_hz, rbg0_split_cx, rbg0_split_pitch, rbg0_split_sd, rbg0_split_yaw, rbg0_split_scroll);
+                SRL::Debug::Print(0, 22, rVP);   /* row 22: free (0-21 + 23 used by other overlays) */
+            }
+#endif
             /* streaming texture cache (core/r_cache.c): a=active (0 in split/non-stream),
                <pool>K size, e=live composites, b=builds this level, x=evictions.  a1 + b>0
                = the LRU is doing work; a0 = inactive (2p split / shareware / cart mode). */
@@ -1305,6 +1399,15 @@ static void fps_update(void)
             snprintf(r20, sizeof r20, "PAR ss%d Q%d Qp%d q4%d%%      ",
                     sat_prof_ss_n, sat_prof_ss_q, sat_prof_ss_qpk, sat_prof_ss_q4pct);
             SRL::Debug::Print(0, 20, r20);
+            /* row 24: Phase-0 wall CPU-fallback sizer.  c = clampable tiers cur/pk (SPAN + below-floor
+               = the Phase-1 world-anchored VDP1 clamp target); m = face-on magnified residue cur/pk;
+               s = starved (VDP1 bank full) pk; K = clampable fill proxy cur/pk in kilo-pixels (the
+               master software fill Phase-1 removes).  Big c + K => build the clamp; mostly m/s => reconsider. */
+            static char rFB[45];
+            snprintf(rFB, sizeof rFB, "FBK c%d/%d m%d/%d s%d K%d/%d   ",
+                     fb_cur_clamp, fb_pk_clamp, fb_cur_mag, fb_pk_mag, fb_pk_starve,
+                     fb_cur_px >> 10, fb_pk_px >> 10);
+            SRL::Debug::Print(0, 24, rFB);
             /* row 18: memory-latency calibration (one-shot cold 32 KB read per bank, FRT
                ticks).  rL = LWRAM/HWRAM ratio -- >1.0 means LWRAM (cmd buf + visplanes) is
                the slow bank, = the memory-bound penalty + the L2-relocate upside, measured
@@ -1390,19 +1493,42 @@ static void rbg0_set_transform(void)
        lies flat = the floor, then translate to the camera height/position.  slScrMatConv
        folds the perspective in; slScrMatSet writes the rpara to VRAM (no slSynch needed).
        Values are a first test -- tune the height (z) + position once it's on screen. */
+    static FIXED rbg0_sd_default = 0;
+    if (!rbg0_sd_default) rbg0_sd_default = MsScreenDist;   /* SGL default screen distance, captured ONCE (before any slSetScreenDist) */
     slPushMatrix();
     {
-        slRotX((ANGLE)(0x4000 + RBG0_PITCH + rbg0_pitch_adj)); /* 90deg + pitch (+ live R+up/down nudge) */
-        slRotZ((ANGLE)(-(int)(viewangle >> 16) + RBG0_YAW_OFF)); /* yaw track + baked 90deg flat orientation */
-        /* viewx/viewy are fixed_t (16.16) in map units; slTranslate's FIXED is also 16.16,
-           so passing them directly scrolls the floor by the player's map position (1 unit ->
-           1 texel for a 64-unit flat).  Z = eye height above the player's floor (viewz -
-           floor height) so the plane sits EXACTLY on the floor the player stands on, and
-           follows it up/down stairs.  Signs/scale tune with the real texture. */
-        slTranslate(-viewx, -viewy, -(viewz - sat_vdp2_floor_h) + rbg0_z_adj); /* +live R+left/right level */
+        slRotX((ANGLE)(0x4000 + RBG0_PITCH + (sat_split_p1hw ? rbg0_split_pitch : rbg0_pitch_adj))); /* 90deg + pitch */
+        slRotZ((ANGLE)(-(sat_split_p1hw ? ((int)(viewangle >> 16) * rbg0_split_yawsc >> 4) : (int)(viewangle >> 16))
+                       + RBG0_YAW_OFF + (sat_split_p1hw ? rbg0_split_yaw : 0))); /* yaw track (split: rate-scale C+U/D) + 90deg + offset (C+L/R) */
+        slTranslate(sat_split_p1hw ? (FIXED)(((int64_t)(-viewx) * rbg0_split_scroll) >> 4) : (FIXED)(-viewx),
+                    sat_split_p1hw ? (FIXED)(((int64_t)(-viewy) * rbg0_split_scroll) >> 4) : (FIXED)(-viewy),
+                    -(viewz - sat_vdp2_floor_h) + rbg0_z_adj); /* X/Y scroll (split: rate-scaled C+U/D to match SW) + Z height, WORLD space */
         slCurRpara(RA);
-        slScrMatConv();
-        slScrMatSet();
+#if RBG0_SPLIT_P1HW
+        /* SATURN split: slDispCenterR sets the RBG0 ROTATION-SCROLL display centre (SGL SCROLL.TXT:480 "Sets
+           rotation center coordinates of rotation scroll screen") -- the CORRECT API for the floor's vanishing
+           point.  slWindow's CtX is the VDP1 *polygon* vanishing point, NOT RBG0 -> that's why cx via slWindow
+           was inert; and patching Cx alone left XST computed for centre 160 -> inconsistent -> half-texel
+           jitter.  slScrMatSet (below) then bakes XST/DX/matrix/Px/Cx ALL consistent for this centre, and the
+           extended 0x54 RPT copy transfers them together.  cx=80 = centre of P1's left half; 1p uses 160.
+           CtY=112 keeps the vertical identical (hz/pitch stay valid). */
+        if (sat_split_p1hw) {
+            slDispCenterR((FIXED)(rbg0_split_cx << 16), (FIXED)(rbg0_split_cy << 16));  /* rotation CENTRE: Cx=cx, Cy (Px/Py follow) */
+            slSetScreenDist((FIXED)(((int64_t)rbg0_sd_default * rbg0_split_sd) >> 4));  /* focal for the 160px viewport */
+            slScrMatConv();
+            slScrMatSet();
+            /* NO restore here!  Restoring Cx/dist BEFORE the DG_DrawFrame memcpy shipped a Frankenstein RPT
+               (Xst baked for centre 80 but Cx/Px reset to 160) -> that broke the rotation (1p, which never
+               restores, was clean).  1p sets its OWN centre/dist in the else branch instead, so the split's
+               consistent centre-80 table reaches VRAM intact. */
+        } else
+#endif
+        {
+            slDispCenterR((FIXED)(160 << 16), (FIXED)(112 << 16));   /* 1p: explicit full-screen centre */
+            slSetScreenDist(rbg0_sd_default);                        /* 1p: default screen distance */
+            slScrMatConv();
+            slScrMatSet();
+        }
     }
     slPopMatrix();
 }
@@ -1770,13 +1896,55 @@ static void rbg0_commit_cyc(void)
 static void rbg0_floor_window_apply(int hz)
 {
     if (hz < 0) hz = 0; else if (hz > 223) hz = 223;
-    slScrWindow1(0, (uint16_t)hz, 319, 223);   /* W1 = [0,hz]..[319,223] -> WPSx1 in the SGL shadow */
+    slScrWindow1(0, (uint16_t)hz, (uint16_t)rbg0_floor_win_xend, 223);   /* W1 = [0,hz]..[xend,223]; xend=159 = P1's left half in split */
     slScrWindowModeRbg0(win1_IN);              /* RBG0 displayed INSIDE W1 (WCTLC) */
     volatile uint8_t *const shadow = (volatile uint8_t *)((uintptr_t)&VDP2_RAMCTL - 0x0E);
     volatile uint8_t *const chip   = (volatile uint8_t *)0x25F80000;
     for (int off = 0xC8; off <= 0xCE; off += 2)                       /* WPSX1/WPSY1/WPEX1/WPEY1 */
         *(volatile uint16_t *)(chip + off) = *(volatile uint16_t *)(shadow + off);
     *(volatile uint16_t *)(chip + 0xD4) = *(volatile uint16_t *)(shadow + 0xD4);  /* WCTLC (RBG0 window ctrl) */
+}
+#endif
+
+#if VDP2_SPLIT_HW_SKY
+/* Part 5: confine the single NBG0 sky layer to the ELECTED split view's band via VDP2 window W0, so it
+   never bleeds into the software views (their opaque sky, and their VDP1 torn wall gaps).  Band geometry
+   MIRRORS d_main.c's split loop: 2p = vertical half (x 0..159 | 160..319, full height); 3/4p = quadrant
+   (x vpx.., y vpy..).  W0 must be a RECT window here; RBG0_LINECOL_TEST armed it as a per-line CCAL
+   window (LWE0=1), but the fog is parked (rbg0_linecol_mode=0 -> ratio 0 -> no visible blend), so
+   switching W0 to rect is visually free.  The window regs (WPSx0 0xC0-0xC6, WCTLA 0xD0, LWTA0 0xD8-0xDA)
+   ride the block-flush at init but the per-vblank ISR (0x00..0x8E) never re-pushes them, so a runtime
+   MOVE needs the shadow->chip poke -- same recipe as rbg0_floor_window_apply for W1/WCTLC. */
+static void nbg0_sky_window_apply(int view)
+{
+    int n = sat_local_players; if (n < 2) n = 2; else if (n > 4) n = 4;
+    int twop = (n == 2);
+    static const short vpx[4] = { 0, 160, 0, 160 };
+    static const short vpy[4] = { 0, 0, 112, 112 };
+    if (view < 0) view = 0; else if (view > 3) view = 3;
+    int x0 = twop ? ((view & 1) ? 160 : 0) : vpx[view];
+    int y0 = twop ? 0 : vpy[view];
+    int x1 = x0 + 159;
+    int y1 = twop ? 223 : (y0 + 111);
+    slScrLineWindow0((void *)0);                              /* LWE0=0: W0 = RECT (drop the parked CCAL line window) */
+    slScrWindow0((uint16_t)x0, (uint16_t)y0, (uint16_t)x1, (uint16_t)y1);
+    slScrWindowModeNbg0(win0_IN);                            /* WCTLA: NBG0 displayed INSIDE W0 (its band) */
+    volatile uint8_t *const shadow = (volatile uint8_t *)((uintptr_t)&VDP2_RAMCTL - 0x0E);
+    volatile uint8_t *const chip   = (volatile uint8_t *)0x25F80000;
+    for (int off = 0xC0; off <= 0xC6; off += 2)              /* WPSX0/WPSY0/WPEX0/WPEY0 */
+        *(volatile uint16_t *)(chip + off) = *(volatile uint16_t *)(shadow + off);
+    *(volatile uint16_t *)(chip + 0xD0) = *(volatile uint16_t *)(shadow + 0xD0);  /* WCTLA (NBG0/NBG1 window ctrl) */
+    *(volatile uint16_t *)(chip + 0xD8) = *(volatile uint16_t *)(shadow + 0xD8);  /* LWTA0U (LWE0 line-window enable) */
+    *(volatile uint16_t *)(chip + 0xDA) = *(volatile uint16_t *)(shadow + 0xDA);  /* LWTA0L */
+}
+/* Part 5: drop the NBG0 window -> full-screen sky again (1-player, or split HW-sky disabled).  Leaves W0
+   in rect mode (the parked CCAL fog does not care); only WCTLA is cleared so NBG0 is shown everywhere. */
+static void nbg0_sky_window_clear(void)
+{
+    slScrWindowModeNbg0(0);                                  /* WCTLA = 0: NBG0 no window (full screen) */
+    volatile uint8_t *const shadow = (volatile uint8_t *)((uintptr_t)&VDP2_RAMCTL - 0x0E);
+    volatile uint8_t *const chip   = (volatile uint8_t *)0x25F80000;
+    *(volatile uint16_t *)(chip + 0xD0) = *(volatile uint16_t *)(shadow + 0xD0);  /* WCTLA */
 }
 #endif
 
@@ -2527,11 +2695,11 @@ extern "C" void DG_FadeIn(void)     /* rise the freshly-drawn frame from black *
    so a dense LEFT view -- accumulated first -- can't hog every VDP1 slot.  When the cap is hit the
    hook REJECTS the wall and the core renders it in SOFTWARE (no sky) -- so the cap is also the
    VDP1->CPU starvation handoff. */
-#define WALL_ACC_MAX 128   /* 96->128: floor-tuning UI stripped, pool back to ~8.5KB -> restore wall capacity. 1p peaks ~57 << 128, soft overflow -> CPU. Keep pool >=6704B PROVEN-BOOT on HW. */
+#define WALL_ACC_MAX 128   /* restored to 128: lumpinfo moved to the LWRAM Doom zone + HEAP_SIZE trimmed 88->32KB (syscalls.c) freed ~56KB to the TLSF pool, so the 3p-minimap pool pressure is gone and full wall capacity is back. 1p peaks ~57 << 128. */
 /* vx/vxr = the view's framebuffer x-range [vx, vxr] this wall belongs to (split-screen: 0..159 for
    the left view, 160..319 for the right).  x1/x2 are stored ALREADY offset by viewwindowx, so the
    emit works in absolute framebuffer coords; vx/vxr drive the per-view user-clip window. */
-static struct { short x1, yl1, yh1, x2, yl2, yh2, slot, v0, v1, vx, vxr; int texnum, u1, u2;
+static struct { short x1, yl1, yh1, x2, yl2, yh2, slot, v0, v1, vx, vxr, vyt, vyb; int texnum, u1, u2;
                 unsigned char mode, special, view; const unsigned char *cmap; } wall_acc[WALL_ACC_MAX];
 static int wall_acc_n;
 
@@ -2544,7 +2712,7 @@ extern "C" int sat_wall_vdp1(int x1, int yl1, int yh1, int x2, int yl2, int yh2,
                              int texnum, int u1, int u2, int v0, int v1,
                              const unsigned char *cmap)
 {
-    extern int viewwindowx, viewwidth, viewwindowy;   /* core: per-view origin + width (R_SetViewWindow) */
+    extern int viewwindowx, viewwidth, viewwindowy, viewheight;   /* core: per-view origin + size (R_SetViewWindow) */
     extern int sat_split_active;         /* core: 1 while rendering the split half-views */
     extern int sat_split_view, sat_local_players;     /* core: current view index + live player count */
     extern int sat_wall_textured;        /* core: this seg's linedef is a special (door/switch) */
@@ -2569,6 +2737,8 @@ extern "C" int sat_wall_vdp1(int x1, int yl1, int yh1, int x2, int yl2, int yh2,
     wall_acc[i].v0 = (short)v0; wall_acc[i].v1 = (short)v1; wall_acc[i].cmap = cmap;
     wall_acc[i].vx  = (short)vx;
     wall_acc[i].vxr = (short)(vx + (viewwidth << detailshift) - 1);
+    wall_acc[i].vyt = (short)vy;                        /* this view's framebuffer y-band [vy, vy+h-1] -- */
+    wall_acc[i].vyb = (short)(vy + viewheight - 1);     /* clips the VDP1 walls vertically (3/4p quadrants) */
     wall_acc[i].view = (unsigned char)sat_split_view;   /* 4-way budget bin (0..3) */
     wall_acc[i].special = (unsigned char)(sat_wall_textured ? 1 : 0);   /* force textured in pot2 */
     return 0;                            /* queued for VDP1 */
@@ -2658,12 +2828,10 @@ static int wall_ext = 96;  /* extend past a screen edge before the squish fallba
                               they never reach here; this only handles normal/grazing walls (low mag,
                               small extrapolation -> squish is rare/mild). */
 
-/* Flat quad screen-y clamp (low-detail / Z mode): a flat fill has NO texture, so clamping its
-   geometry to the screen is FREE (no v -> no swim) and bounds the VDP1 fill; the layer
-   inversion hides any silhouette overspill.  (Too-close TEXTURED walls are handled upstream
-   by the core CPU fallback, not here.)  3D view is rows 0..191 (320x224). */
-#define WALL_FLAT_YLO  (-8)
-#define WALL_FLAT_YHI  223   /* SATURN: screen bottom -- wall y is now ABSOLUTE (viewwindowy added), so bottom-row split views reach 223 */
+/* Flat quad screen-y clamp: a flat fill has NO texture, so clamping its geometry is FREE (no v ->
+   no swim) and bounds the VDP1 fill.  The clamp band is now THIS VIEW's [vyt, vyb] (read per-wall
+   from wall_acc), not the full screen -- see wall_emit_flat (fixes the 3/4p vertical bleed).
+   (Too-close TEXTURED walls are handled upstream by the core CPU fallback, not here.) */
 
 static int wall_vbands(int wi)   /* number of vertical texture-height bands this wall needs */
 {
@@ -2722,7 +2890,7 @@ static inline int wrmul_(long long num, int recip)   /* ~= num/den, rounded, sig
 static void wall_emit_band(int x1, int x2, int yl1, int yh1, int yl2, int yh2,
                            int u1, int u2, int texw,
                            unsigned short charAddr, unsigned short charSize, unsigned short colr,
-                           int vx, int vxr)
+                           int vx, int vxr, int vyt, int vyb)
 {
     int xspan = x2 - x1, du = u2 - u1;
     unsigned short cmd[16];
@@ -2779,8 +2947,8 @@ static void wall_emit_band(int x1, int x2, int yl1, int yh1, int yl2, int yh2,
                 int wx2 = x2 < vxr ? x2 + 1 : vxr;
                 memset(cmd, 0, sizeof cmd);
                 cmd[0] = 0x0008;                         /* FUNC_UserClip = wall window */
-                cmd[6]  = (short)wx1; cmd[7]  = 0;       /* upper-left  (XA,YA) */
-                cmd[10] = (short)wx2; cmd[11] = 223;     /* lower-right (XC,YC) */
+                cmd[6]  = (short)wx1;  cmd[7]  = (short)vyt;  /* upper-left  (XA,YA) = view band top   */
+                cmd[10] = (short)wx2;  cmd[11] = (short)vyb;  /* lower-right (XC,YC) = view band bottom */
                 vdp1_cmd_at(VDP1_BANK[vdp1_wbank], vdp1_wnext++, cmd);
                 winset = 1;
                 if (vdp1_wnext >= WALL_CMD_CAP) break;
@@ -2805,6 +2973,13 @@ static void wall_emit_band(int x1, int x2, int yl1, int yh1, int yl2, int yh2,
             int chys = yh1 + WDIV((long long)(yh2 - yh1) * (cxs - x1), xspan, inv_xspan);
             int cyle = yl1 + WDIV((long long)(yl2 - yl1) * (cxe - x1), xspan, inv_xspan);
             int chye = yh1 + WDIV((long long)(yh2 - yh1) * (cxe - x1), xspan, inv_xspan);
+            /* SATURN: this squish fallback has NO user-clip (CMDPMOD 0x00E0), so -- like the flat
+               path -- clamp its y to THIS view's band, else a grazing near wall (sharp-angle
+               pillar) bleeds vertically into the quadrant above/below (3/4p P1->P3, P2->P4). */
+            if (cyls < vyt) cyls = vyt; else if (cyls > vyb) cyls = vyb;
+            if (cyle < vyt) cyle = vyt; else if (cyle > vyb) cyle = vyb;
+            if (chys < vyt) chys = vyt; else if (chys > vyb) chys = vyb;
+            if (chye < vyt) chye = vyt; else if (chye > vyb) chye = vyb;
             memset(cmd, 0, sizeof cmd);
             cmd[0] = 0x0002; cmd[2] = 0x00E0;                 /* DISTORSP | COLOR_4 8bpp | SPD | ECD-off */
             cmd[3] = colr;                                    /* CMDCOLR = CRAM light-bank base */
@@ -2833,6 +3008,7 @@ static void wall_emit(int wi)
     int yl1 = wall_acc[wi].yl1, yh1 = wall_acc[wi].yh1;
     int yl2 = wall_acc[wi].yl2, yh2 = wall_acc[wi].yh2;
     int vx = wall_acc[wi].vx, vxr = wall_acc[wi].vxr;   /* this wall's viewport x-range (split-screen) */
+    int vyt = wall_acc[wi].vyt, vyb = wall_acc[wi].vyb; /* and y-band (split-screen vertical clip)      */
     int u1 = wall_acc[wi].u1, u2 = wall_acc[wi].u2;
     int texw = texturewidthmask[wall_acc[wi].texnum] + 1;
     int v0 = wall_acc[wi].v0, v1 = wall_acc[wi].v1, vspan = v1 - v0;
@@ -2843,7 +3019,7 @@ static void wall_emit(int wi)
         int th = (H > 255) ? 255 : (H > 0 ? H : 1);
         unsigned short ca = (unsigned short)((base - VDP1_VRAM_BASE) >> 3);
         unsigned short cs = (unsigned short)(((padW >> 3) << 8) | th);
-        wall_emit_band(x1, x2, yl1, yh1, yl2, yh2, u1, u2, texw, ca, cs, colr, vx, vxr);
+        wall_emit_band(x1, x2, yl1, yh1, yl2, yh2, u1, u2, texw, ca, cs, colr, vx, vxr, vyt, vyb);
         return;
     }
 
@@ -2866,7 +3042,7 @@ static void wall_emit(int wi)
         unsigned int taddr = base + (unsigned int)vmod * (unsigned int)padW * 1u;  /* 8bpp */
         unsigned short ca = (unsigned short)((taddr - VDP1_VRAM_BASE) >> 3);
         unsigned short cs = (unsigned short)(((padW >> 3) << 8) | rows);
-        wall_emit_band(x1, x2, yl1b, yh1b, yl2b, yh2b, u1, u2, texw, ca, cs, colr, vx, vxr);
+        wall_emit_band(x1, x2, yl1b, yh1b, yl2b, yh2b, u1, u2, texw, ca, cs, colr, vx, vxr, vyt, vyb);
         v = vb; ++nb;
     }
 }
@@ -2880,13 +3056,15 @@ static void wall_emit_flat(int wi)
     int x1 = wall_acc[wi].x1, x2 = wall_acc[wi].x2;
     int yl1 = wall_acc[wi].yl1, yh1 = wall_acc[wi].yh1;
     int yl2 = wall_acc[wi].yl2, yh2 = wall_acc[wi].yh2;
-    /* clamp the flat quad to the screen -- FREE for a flat fill (no texture = no swim) and it
-       bounds the VDP1 fill for a tall/near wall.  The layer inversion hides any silhouette
-       overspill (software ceiling/floor draw on top). */
-    if (yl1 < WALL_FLAT_YLO) yl1 = WALL_FLAT_YLO; else if (yl1 > WALL_FLAT_YHI) yl1 = WALL_FLAT_YHI;
-    if (yl2 < WALL_FLAT_YLO) yl2 = WALL_FLAT_YLO; else if (yl2 > WALL_FLAT_YHI) yl2 = WALL_FLAT_YHI;
-    if (yh1 < WALL_FLAT_YLO) yh1 = WALL_FLAT_YLO; else if (yh1 > WALL_FLAT_YHI) yh1 = WALL_FLAT_YHI;
-    if (yh2 < WALL_FLAT_YLO) yh2 = WALL_FLAT_YLO; else if (yh2 > WALL_FLAT_YHI) yh2 = WALL_FLAT_YHI;
+    int vyt = wall_acc[wi].vyt, vyb = wall_acc[wi].vyb;
+    /* clamp the flat quad to THIS VIEW's y-band (was the full screen 0..223) -- FREE for a flat
+       fill (no texture = no swim), bounds the VDP1 fill for a tall/near wall, AND stops a near
+       wall in one quadrant from filling down into the view below it (the 3/4p vertical bleed,
+       P1->P3 / P2->P4).  The layer inversion hides any silhouette overspill. */
+    if (yl1 < vyt) yl1 = vyt; else if (yl1 > vyb) yl1 = vyb;
+    if (yl2 < vyt) yl2 = vyt; else if (yl2 > vyb) yl2 = vyb;
+    if (yh1 < vyt) yh1 = vyt; else if (yh1 > vyb) yh1 = vyb;
+    if (yh2 < vyt) yh2 = vyt; else if (yh2 > vyb) yh2 = vyb;
     /* palette polygon: CMDCOLR is written directly to the framebuffer (MSB=0 -> palette pixel),
        so (light-bank<<8 | dominant index) goes through CRAM = lit by the bank + flashes via CRAM. */
     unsigned short colr = wall_light_colr(wall_acc[wi].cmap);
@@ -2919,6 +3097,7 @@ static void wall_emit_banded(int wi)
     int yl1 = wall_acc[wi].yl1, yh1 = wall_acc[wi].yh1;
     int yl2 = wall_acc[wi].yl2, yh2 = wall_acc[wi].yh2;
     int vx = wall_acc[wi].vx, vxr = wall_acc[wi].vxr;
+    int vyt = wall_acc[wi].vyt, vyb = wall_acc[wi].vyb;
     int u1 = wall_acc[wi].u1, u2 = wall_acc[wi].u2;
     int texw = texturewidthmask[wall_acc[wi].texnum] + 1;
     int v0 = wall_acc[wi].v0;
@@ -2935,7 +3114,7 @@ static void wall_emit_banded(int wi)
     taddr = base + (unsigned int)vmod * (unsigned int)padW;
     ca = (unsigned short)((taddr - VDP1_VRAM_BASE) >> 3);
     cs = (unsigned short)(((padW >> 3) << 8) | rows);
-    wall_emit_band(x1, x2, yl1, yh1, yl2, yh2, u1, u2, texw, ca, cs, colr, vx, vxr);
+    wall_emit_band(x1, x2, yl1, yh1, yl2, yh2, u1, u2, texw, ca, cs, colr, vx, vxr, vyt, vyb);
 }
 
 /* the VDP1 wall mode (0=textured 1=banded 2=flat).  Global per level (set in sat_apply_potato);
@@ -3242,7 +3421,15 @@ static void vdp1_wpn_kick(void)
     /* accumulate the done-rate only on frames that actually plotted a world list
        (skip title/intermission empty banks, which always read 'D' and would inflate Dr). */
     if (vdp1_wactive) { vd1_win_tot++; if (vdp1_prev_done) vd1_win_done++; }
+    /* Phase-0 fallback profiler: snapshot the just-rendered frame's tally into cur + windowed peaks
+       (r_segs.c accumulated the counters across this frame's segs), then reset below. */
+    fb_cur_clamp = sat_fb_clamp_t; fb_cur_mag = sat_fb_mag_t; fb_cur_px = sat_fb_px;
+    if (sat_fb_clamp_t  > fb_pk_clamp)  fb_pk_clamp  = sat_fb_clamp_t;
+    if (sat_fb_mag_t    > fb_pk_mag)    fb_pk_mag    = sat_fb_mag_t;
+    if (sat_fb_starve_t > fb_pk_starve) fb_pk_starve = sat_fb_starve_t;
+    if (sat_fb_px       > fb_pk_px)     fb_pk_px     = sat_fb_px;
 #endif
+    sat_fb_clamp_t = sat_fb_mag_t = sat_fb_starve_t = sat_fb_px = 0;   /* reset each frame (also when SHOW_FPS off) */
     if (vdp1_wactive)
     {
         unsigned short end[16];
@@ -3363,12 +3550,39 @@ extern "C" void DG_DrawFrame(void)
 #if VDP2_CELL_SKY
     if (skytexture > 0 && skytexture != sky_loaded_tex)
         sky_cell_upload();   /* re-pack the sky into B1 cells on level/episode change */
+#if VDP2_SPLIT_HW_SKY
+    /* Part 5 (docs/RBG0_SKY_SPLIT_ANALYSIS.md §5): in a co-op split, elect ONE view to receive the HW
+       NBG0 sky (windowed to its band); the other views keep their software sky.  Static election = P1
+       (view 0) -- couples with P1's HW floor in 2p; dynamic election (sat_sky_px_view[] + hysteresis,
+       SKY_ELECT_HYST) is the documented next step, coverage already captured by d_main.  The core reads
+       sat_sky_view in the NEXT frame's split loop (leaving that view's sky region index-0); the window
+       + scroll below aim the single NBG0 layer at the SAME view THIS frame -- steady-state the choice is
+       constant, so there is no phase skew.  Re-poke the W0 window only when the elected band changes. */
+    int hwsky_split = (hwsky_split_on && sat_local_players >= 2 && gamestate == GS_LEVEL && !automapactive);
+    sat_sky_view = hwsky_split ? 0 : -1;
+    {
+        static int sky_win_view = -2;   /* last NBG0-window state: -2 uninit, -1 full screen, 0..3 band */
+        int want = hwsky_split ? sat_sky_view : -1;
+        if (want != sky_win_view)
+        {
+            if (want < 0) nbg0_sky_window_clear();
+            else          nbg0_sky_window_apply(want);
+            sky_win_view = want;
+        }
+    }
+#endif
 #if SKY_FIXED
     slScrPosNbg0(toFIXED(0.0), toFIXED(-(double)VIEW_Y_OFFSET));   /* static backdrop */
 #else
     {
-        /* scroll the cell plane by viewangle; the 2x-tiled sky wraps seamlessly at the 512px page */
-        int sx = -(int)(viewangle >> (SKY_ANGLESHIFT + SKY_PARALLAX_SHIFT));
+        /* scroll the cell plane by viewangle; the 2x-tiled sky wraps seamlessly at the 512px page.  In a
+           split with an elected HW-sky view, scroll by THAT view's angle (sat_sky_view_angle) rather
+           than the global viewangle (which is the LAST-rendered view's). */
+        unsigned int skyang = viewangle;
+#if VDP2_SPLIT_HW_SKY
+        if (hwsky_split) skyang = sat_sky_view_angle;
+#endif
+        int sx = -(int)(skyang >> (SKY_ANGLESHIFT + SKY_PARALLAX_SHIFT));
         slScrPosNbg0((FIXED)(sx << 16), toFIXED(-(double)VIEW_Y_OFFSET));
     }
 #endif
@@ -3403,10 +3617,19 @@ extern "C" void DG_DrawFrame(void)
            frame (fully-enclosed room) -> the VDP1 walls' torn index-0 gaps then show the dark
            backdrop instead of the bright sky, so the tearing is far less visible.
            Also drop it in 2-player: NBG0 is a single layer scrolled by one viewangle and
-           cannot serve two split views -> the split renders the SOFTWARE sky instead. */
+           cannot serve two split views -> the split renders the SOFTWARE sky instead
+           (unless VDP2_SPLIT_HW_SKY elects one view for the HW sky -- see the block just below). */
         extern int sat_local_players;
         int show_sky = (gamestate == GS_LEVEL) && !automapactive && sat_frame_has_sky
                        && sat_local_players <= 1;
+#if VDP2_SPLIT_HW_SKY
+        /* Part 5: keep NBG0 on for the ELECTED split view whenever IT has visible sky this frame -- key
+           on the elected view's OWN coverage (sat_sky_px_view[]), not the global sat_frame_has_sky which
+           reflects only the last-rendered view.  The W0 window confines NBG0 to that view's band. */
+        if (sat_local_players >= 2 && sat_sky_view >= 0 && sat_sky_view < 4
+            && sat_sky_px_view[sat_sky_view] > 0)
+            show_sky = 1;
+#endif
 #if VDP2_RBG0_TEST
         /* RBG0/debug 3-mode cycle (rbg0_mode, pad Y) -- see the rbg0_mode decl:
            0 = VDP2 floor, no dbg   (RBG0 on, NBG3 off, sw floor skipped)
@@ -3416,9 +3639,16 @@ extern "C" void DG_DrawFrame(void)
            (potato 0) and in 1-player; in any potato level OR split-screen it falls back to the
            SOFTWARE floor (sat_vdp2_floor=0 -> the sw floor draws; RBG0 display off). */
         int rbg0_active   = (potato_level == 0) && (sat_local_players <= 1);
-        sat_vdp2_floor    = (rbg0_mode == 1 || !rbg0_active) ? 0 : 1;  /* skip the sw floor only when the HW floor shows */
+        int rbg0_split_p1 = RBG0_SPLIT_P1HW && (potato_level == 0) && (sat_local_players == 2);   /* SATURN split: P1 floor in HW (left half), P2 software */
+        int rbg0_on       = rbg0_active || rbg0_split_p1;
+        { static int prev_split_p1 = -1;                        /* SATURN: force ONE flat re-upload on the 1p<->split */
+          if (rbg0_split_p1 != prev_split_p1) {                 /* transition (the stale-pic root cause is fixed in core */
+              rbg0_tex_dirty = 1; prev_split_p1 = rbg0_split_p1; } }  /* r_plane.c: sat_dom_last_sec dangled across level loads) */
+        sat_split_p1hw    = rbg0_split_p1;                       /* core (d_main): punch the HW floor only for P1 in split */
+        rbg0_floor_win_xend = rbg0_split_p1 ? 159 : 319;         /* window X: P1's left half in split, full screen in 1p */
+        sat_vdp2_floor    = (rbg0_mode == 1 || !rbg0_on) ? 0 : 1;  /* 1p drives the punch; split is overridden per-view in d_main */
         uint16_t sky_bit  = ((VDP2_HW_SKY || VDP2_CELL_SKY) && show_sky) ? NBG0ON : 0;   /* HW sky: show_sky carries GS_LEVEL/!automap/has_sky/1p. NOT potato-gated -- a backdrop is cheap and offloads the SW sky most at low detail; sat_vdp2_sky=1 leaves index-0, so NBG0 must stay on whenever the core skips the sky */
-        uint16_t rbg0_bit = (RBG0_DISPLAY && rbg0_mode == 0 && rbg0_active) ? RBG0ON : 0;   /* HW floor: pot0 + 1p only */
+        uint16_t rbg0_bit = (RBG0_DISPLAY && rbg0_mode == 0 && rbg0_on) ? RBG0ON : 0;   /* HW floor: pot0 + (1p or 2p-split-P1) */
         uint16_t nbg3_bit = (RBG0_NBG3 && nbg3_show) ? NBG3ON : 0;  /* NBG3 overlay: display = pad L+R (default off); B1 cycle reserved at init */
         slScrAutoDisp((uint16_t)(sky_bit | NBG1ON | nbg3_bit | rbg0_bit));
 #if VDP2_CELL_SKY && VDP2_SKY_FORCE_CYC
@@ -3458,12 +3688,24 @@ extern "C" void DG_DrawFrame(void)
            One sky_horizon_row holds the result; sky_cell_build_map rebuilds the sky boundary AND the floor
            window from it TOGETHER -> the sky ALWAYS comes down exactly to the floor (no decalage), whoever
            limited last.  Rebuild only when the 8px sky-cell row changes. */
-        { int fhw = sat_view_floor_h >> 16;
-          int hz  = 96 + ((fhw + 56) * 3) / 23;            /* player-height horizon (upper bound) */
+        { static int last_xend = -1;
           int ft  = sat_vdp2_floor_top_y;
-          if (hz < 8) hz = 8; else if (hz > 128) hz = 128;
-          if (ft > 0 && ft < 0x3FFF && ft > hz) hz = ft;   /* clip LOWER iff the floor ends below the player horizon */
-          if ((hz >> 3) != (sky_horizon_row >> 3)) { sky_horizon_row = hz; sky_cell_build_map(); } }
+          int hz;
+#if RBG0_SPLIT_P1HW
+          if (sat_split_p1hw)
+              hz = rbg0_split_hz;   /* split: 1p height-formula mis-calibrated for P1's 160-tall viewport -> live split horizon (R+Up/Down) */
+          else
+#endif
+          {
+              int fhw = sat_view_floor_h >> 16;
+              hz = 96 + ((fhw + 56) * 3) / 23;             /* 1p player-height horizon (upper bound) */
+              if (hz < 8) hz = 8; else if (hz > 128) hz = 128;
+              if (ft > 0 && ft < 0x3FFF && ft > hz) hz = ft;   /* clip LOWER iff the floor ends below the player horizon */
+          }
+          /* re-run sky_cell_build_map (sky boundary + floor window) when the horizon cell OR the window X
+             extent changes (the latter on a 1p<->split toggle) so the window tracks P1's half. */
+          if ((hz >> 3) != (sky_horizon_row >> 3) || rbg0_floor_win_xend != last_xend)
+              { last_xend = rbg0_floor_win_xend; sky_horizon_row = hz; sky_cell_build_map(); } }
 #endif
 #if RBG0_LINECOL_TEST
         /* Line-color fog/veil tables ONLY (per-distance darkening -- PARKED, rbg0_linecol_mode=0).  This
@@ -3475,6 +3717,7 @@ extern "C" void DG_DrawFrame(void)
               rbg0_linecol_rebuild(); rbg0_ccwin_rebuild();
           } }
 #endif
+        if (sat_split_p1hw) sat_setup_view_p1();   /* split: re-anchor the view globals on P1 before the RBG0 transform */
         rbg0_set_transform();
         uint32_t rb_t2 = DG_GetTicksMs();
 #if RBG0_RPT_TRANSFER == 1
@@ -3484,7 +3727,13 @@ extern "C" void DG_DrawFrame(void)
         /* Test B (the real fix): reproduce _BlankIn's RPT DMA, NO slSynch.  Source = SGL's RAM RPT
            buffer read via the UNCACHED 0x26 alias (so slScrMatSet's cached stores are seen); dest =
            the RPT VRAM at VDP2_VRAM_B1 + 0x1ff00.  0x30 bytes/plane (RA, then RB at +0x68). */
-        memcpy((void *)0x25E7FF00,          (const void *)0x260FFE1C, 0x30);
+        /* RA RPT: copy the FULL parameter set slScrMatSet writes -- XST..KY (0x54 bytes) -- so the off-centre
+           reprojection from slDispCenterR (consistent Xst/Px/Cx/matrix) reaches VRAM as ONE consistent block.
+           The old 0x30 copy left Px/Cx/Mx/kx at their init values -> a "Frankenstein" table (start computed
+           for centre 80 but Cx still 160) -> the half-texel per-frame jitter.  Stop BEFORE KAST (@0x54): the
+           coefficient-table address is written once at init (slKtableRA), NOT by slScrMatSet -- copying it
+           would clobber the K-table.  RB (unused) stays 0x30. */
+        memcpy((void *)0x25E7FF00,          (const void *)0x260FFE1C, 0x54);
         memcpy((void *)(0x25E7FF00 + 0x68), (const void *)0x260FFE84, 0x30);
 #endif
         uint32_t rb_t3 = DG_GetTicksMs();   /* SATURN PERF: split upl/xfm/rpt to pin the stall */
@@ -3892,6 +4141,16 @@ static void poll_pad(void)
         lr_was = lr_now;
     }
 #endif
+#if VDP2_SPLIT_HW_SKY
+    /* Pad L + C toggles the Part 5 HW split sky (docs/RBG0_SKY_SPLIT_ANALYSIS.md §5): OFF (default) =
+       every split view draws the software sky; ON = the elected view (P1) gets the hardware NBG0 sky,
+       windowed to its band.  Only meaningful in a co-op split (inert in 1p: hwsky_split needs
+       sat_local_players>=2).  Edge-triggered on C while L is held (R NOT held, so it never collides
+       with the L+R nbg3 chord); the incidental ',' (L) and run (C) taps to Doom are harmless.  This is
+       the live A/B for the HW path, which is not yet validated on real Saturn. */
+    if (!(cur & PER_DGT_TL) && (changed & PER_DGT_TC) && !(cur & PER_DGT_TC))
+        hwsky_split_on = !hwsky_split_on;
+#endif
 #if VDP2_CELL_SKY && !RBG0_LINECOL_TEST
     /* Pad L + Up/Down nudges the HW-sky horizon (the row where the sky turns transparent so the
        floor shows below it), 8px (one cell row) per press.  Up raises the horizon up the screen,
@@ -3933,6 +4192,40 @@ static void poll_pad(void)
         if ((changed & PER_DGT_KD) && !(cur & PER_DGT_KD)) rbg0_pitch_adj -= 0x80;        /* -pitch           */
         if ((changed & PER_DGT_KL) && !(cur & PER_DGT_KL)) rbg0_z_adj += (4 << 16);       /* +level (4 units) */
         if ((changed & PER_DGT_KR) && !(cur & PER_DGT_KR)) rbg0_z_adj -= (4 << 16);       /* -level           */
+    }
+#endif
+#if RBG0_SPLIT_P1HW && !RBG0_TUNE_PAD && RBG0_SPLIT_TUNE
+    /* SATURN split viewport TUNING (R + d-pad, split only): live-cal the RBG0 reprojection for P1.
+       Up/Down = centre Y (horizon row, +-2); Left/Right = near-plane depth (+-16).  Values on the VPW
+       overlay row.  Bake the found values into rbg0_win_cy / rbg0_win_depth once tuned.  (R also taps
+       '.' to Doom + the d-pad moves P1 -- harmless during tuning.) */
+    if (sat_split_p1hw && !(cur & PER_DGT_TR)) {
+        if ((changed & PER_DGT_KU) && !(cur & PER_DGT_KU)) rbg0_split_hz  -= 8;   /* raise the split floor horizon (W1 clip) */
+        if ((changed & PER_DGT_KD) && !(cur & PER_DGT_KD)) rbg0_split_hz  += 8;   /* lower it */
+        if ((changed & PER_DGT_KL) && !(cur & PER_DGT_KL)) rbg0_split_cx -= 4;  /* move centre left  */
+        if ((changed & PER_DGT_KR) && !(cur & PER_DGT_KR)) rbg0_split_cx += 4;  /* move centre right */
+        if (rbg0_split_hz < 8) rbg0_split_hz = 8; else if (rbg0_split_hz > 200) rbg0_split_hz = 200;
+        if (rbg0_split_cx < 0) rbg0_split_cx = 0; else if (rbg0_split_cx > 160) rbg0_split_cx = 160;
+    }
+    /* part 2 (L + d-pad, split only): Up/Down = PLANE PITCH = the inclination (proven matrix knob via
+       slRotX; note it also tilts the 1p floor since rbg0_pitch_adj is shared -> bake into RBG0_PITCH).
+       Left/Right = projection centre X (slWindow).  If PITCH moves the floor but cx/cy/depth do NOT,
+       then slWindow is not reaching the RBG0 rotation -> switch to patching the RPT directly. */
+    if (sat_split_p1hw && !(cur & PER_DGT_TL)) {
+        if ((changed & PER_DGT_KU) && !(cur & PER_DGT_KU)) rbg0_split_pitch += 0x40;  /* steeper */
+        if ((changed & PER_DGT_KD) && !(cur & PER_DGT_KD)) rbg0_split_pitch -= 0x40;  /* flatter */
+        if ((changed & PER_DGT_KL) && !(cur & PER_DGT_KL)) rbg0_split_sd -= 1;   /* smaller dist => wider FOV (Q4) */
+        if ((changed & PER_DGT_KR) && !(cur & PER_DGT_KR)) rbg0_split_sd += 1;   /* larger dist => narrower FOV   */
+        if (rbg0_split_sd < 3) rbg0_split_sd = 3; else if (rbg0_split_sd > 24) rbg0_split_sd = 24;
+    }
+    /* part 3 (C + d-pad, split only): Left/Right = floor ORIENTATION (yaw offset -> "forward scrolls left");
+       Up/Down = yaw-RATE scale (fixes rotation-x2-too-fast when turning; cy is baked). */
+    if (sat_split_p1hw && !(cur & PER_DGT_TC)) {
+        if ((changed & PER_DGT_KL) && !(cur & PER_DGT_KL)) rbg0_split_yaw -= 0x100;  /* rotate floor CCW */
+        if ((changed & PER_DGT_KR) && !(cur & PER_DGT_KR)) rbg0_split_yaw += 0x100;  /* rotate floor CW  */
+        if ((changed & PER_DGT_KU) && !(cur & PER_DGT_KU)) rbg0_split_scroll += 1;   /* faster scroll (Q4) */
+        if ((changed & PER_DGT_KD) && !(cur & PER_DGT_KD)) rbg0_split_scroll -= 1;   /* slower scroll (Q4) */
+        if (rbg0_split_scroll < 2) rbg0_split_scroll = 2; else if (rbg0_split_scroll > 48) rbg0_split_scroll = 48;
     }
 #endif
 #elif SAT_FLOOR_PERFSIM
@@ -4024,10 +4317,16 @@ static void poll_pad(void)
             int pressed = !(cur & pad_map[i].mask);
             /* (WIP: the L/R/C tuning-movement freeze for the parked floor-gradient tuner was removed
                with the toggles -- the player moves normally now.) */
-#if RBG0_TUNE_PAD
-            /* PARKED (RBG0_TUNE_PAD): while L (texture) or R (plane) is held the d-pad tunes the
-               floor (above) -- do NOT also forward it to Doom, so the player stays put.  (Press
-               L/R FIRST, then tap the d-pad, to avoid a held direction sticking in Doom.) */
+#if RBG0_SPLIT_P1HW && RBG0_SPLIT_TUNE
+            /* SATURN split HW-floor tuning: while L or R is held the d-pad tunes the floor (above) ->
+               do NOT also forward it to Doom, so the view stays put during calibration.  Split only
+               (sat_split_p1hw) -> normal play keeps full d-pad movement. */
+            if (sat_split_p1hw && (!(cur & PER_DGT_TL) || !(cur & PER_DGT_TR) || !(cur & PER_DGT_TC)) &&
+                (pad_map[i].mask == PER_DGT_KU || pad_map[i].mask == PER_DGT_KD ||
+                 pad_map[i].mask == PER_DGT_KL || pad_map[i].mask == PER_DGT_KR))
+                continue;
+#elif RBG0_TUNE_PAD
+            /* PARKED (RBG0_TUNE_PAD): while L/R held the d-pad tunes the floor -- don't forward to Doom. */
             if ((!(cur & PER_DGT_TL) || !(cur & PER_DGT_TR)) &&
                 (pad_map[i].mask == PER_DGT_KU || pad_map[i].mask == PER_DGT_KD ||
                  pad_map[i].mask == PER_DGT_KL || pad_map[i].mask == PER_DGT_KR))

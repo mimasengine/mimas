@@ -292,6 +292,96 @@ concurrente sur `dg_saturn.cxx`) :
 
 ---
 
+## 10. État d'implémentation (2026-07-01)
+
+### Bug ciel software en split (2p/3p/4p) — **CORRIGÉ**
+Cause : en split la demi-largeur de viewport **double** `pspriteiscale` (→ ~2·FRACUNIT), donc la
+projection verticale du ciel dépasse la texture (128 px de haut) et le drawer `&127` **reboucle** → une
+2ᵉ bande de montagnes (à l'envers) apparaît en haut de chaque vue. **L'échelle 2× est CORRECTE** (elle
+reproduit les proportions 1p) — ne **PAS** la changer (plus petit = ciel écrasé, plus grand = étiré ;
+les deux ont été essayés et rejetés). Fix = garder l'échelle et **CLAMPER** le débord haut au lieu de
+reboucler : `R_DrawSkyColumn` / `R_DrawSkyColumnLow` (`core/r_draw.c`), sélectionnés dans le branch
+ciel de `R_DrawPlanes` uniquement quand `sat_split_active` (`core/r_plane.c`). Dans le débord
+(texel < 0) on échantillonne la **bande haute de la colonne** `[0..SKY_GRAIN_MAX]` via un hash
+par-`(x,row)` → **grain fin** (mêmes couleurs, densité par-colonne préservée) « comme si l'image était
+plus haute ». 1p inchangé (`colfunc`, byte-identique) ; DoomJo jamais en split. `SKY_GRAIN_MAX` (=7)
+règle le grain (0 = clamp plat).
+
+### §5 Ciel HW multijoueur — **IMPLÉMENTÉ**, compilé (`VDP2_SPLIT_HW_SKY 1`), **ON au runtime par défaut** (à valider HW)
+**Toggle live = pad `L + C`** (`hwsky_split_on`, **défaut 1** = la vue élue prend le ciel HW ; `L+C`
+repasse en software si ça neige/désaligne sur HW). L'A/B se fait à chaud sans rebuild.
+`VDP2_SPLIT_HW_SKY 0` retire toute la machinerie.
+- **Socle core (compilé, inerte par défaut)** : `sat_sky_view` (=-1), `sat_sky_px_view[4]`,
+  `sat_sky_view_angle` (`core/r_plane.c`) ; la boucle split (`core/d_main.c`) pose
+  `sat_vdp2_sky = (i == sat_sky_view)`, capture la couverture ciel + l'angle par vue.
+  `sat_sky_view == -1` → toutes les vues en software (comportement actuel), DoomJo-safe, C pur.
+- **Plateforme (gaté `VDP2_SPLIT_HW_SKY`, défaut 0)** : `nbg0_sky_window_apply/clear`
+  (`src/dg_saturn.cxx`) fenêtrent NBG0 sur la bande de la vue élue (**W0**, poke shadow→chip comme
+  `rbg0_floor_window_apply`), scroll par `sat_sky_view_angle`, relâchent le gate
+  `sat_local_players<=1`. Élection **statique = vue 0 (P1)** ; l'élection dynamique
+  (`sat_sky_px_view[]` + hystérésis `SKY_ELECT_HYST`) est le pas suivant (couverture déjà capturée).
+
+### Correction du budget fenêtres (§3.a / §5 étaient optimistes)
+Les **deux** fenêtres VDP2 sont déjà occupées dans le build courant :
+- **W1** = fenêtre d'affichage RBG0 (WCTLC, `rbg0_floor_window_apply` : clip sol sous l'horizon +
+  demi-gauche P1 en split).
+- **W0** = fenêtre color-calc CCAL par-ligne (`RBG0_LINECOL_TEST=1`), **mais le fog est PARQUÉ**
+  (`rbg0_linecol_mode = 0` → ratio 0 → aucun blend visible) → W0 est réutilisable en fenêtre **RECT**
+  pour NBG0. Le ciel HW élu prend donc **W0** (NBG0), le sol garde **W1** (RBG0).
+- Les **priorités** règlent déjà le recouvrement sol/ciel dans la bande élue :
+  **RBG0 6 > NBG1 (vue 3D) 5 > NBG0 ciel 4** — le sol couvre le trou index-0 sous l'horizon, le ciel
+  perce au-dessus. Pas besoin d'une 3ᵉ fenêtre.
+
+### Alignement / skybox (les vues voient-elles le même ciel ?)
+- **Le ciel SOFTWARE est déjà un skybox ancré au monde.** La colonne échantillonnée =
+  `(viewangle + xtoviewangle[x]) >> ANGLETOSKYSHIFT`, avec `ANGLETOSKYSHIFT` **constant, identique pour
+  toutes les vues et tous les modes** (1p/2p/3p/4p). Donc même orientation → **mêmes montagnes** ; le
+  « point de départ » est déjà défini et partagé. Chaque vue est une **fenêtre** sur le même panorama
+  360°, mise à l'échelle de SA fenêtre (donc plus petite en split — cohérent avec le monde 3D compressé
+  2× de la demi-vue). Deux joueurs côte à côte visant le nord ont un demi-ciel pixel-identique. **Rien
+  à corriger côté software.**
+- **Le ciel HW (NBG0) est l'intrus** : il défile sur un AUTRE ancrage (parallaxe `SKY_PARALLAX_SHIFT`,
+  taux ≠ software) et se dessine en **1:1** (non mis à l'échelle de la fenêtre) → il paraît « beaucoup
+  plus gros » ET **saute au toggle `L+C`** (rotation/échelle non alignées avec les vues software).
+
+### Reste cosmétique du ciel HW (TAILLE + ANCRAGE) — À FAIRE (optionnel ; gain = offload fps)
+Pour que le ciel HW ÉGALE le software (taille + ancrage + grain) :
+1. **Taille** : réduire NBG0 ~2× en split via `slScrScaleNbg0` (indépendant de NBG1), restaurer 1:1 en
+   1p. **Risque HW** : la réduction augmente les fetch cell/ligne → pression sur le budget **CYCB1** du
+   ciel cell 8bpp (déjà le point qui NEIGE sur HW réel, invisible en Ymir — voir `rbg0-hw-sky-feasible`).
+   À prouver sur Saturn (tunable pad conseillé). H et V diffèrent (~1.6 / 2.0) → zoom non-uniforme.
+2. **Ancrage** : refaire le scroll NBG0 sur le MÊME taux/ancrage que le software (`>> ANGLETOSKYSHIFT`,
+   sans parallaxe) pour que HW et software soient **interchangeables sans saut** au toggle.
+3. **Grain** : pas de per-pixel côté HW ; équivalent = **cuire** une bande haute grainée dans les cells
+   du ciel (le « ciel plus haut » pré-calculé une fois par niveau) — dépend de (1).
+
+**Alternative software (question « x2 »)** : mettre le ciel software 2p en **1:1** (taille 1p, « skybox
+pleine taille ») au lieu du 2× compressé actuel — changement d'une ligne (clamp+grain gèrent déjà le
+wrap). Compromis : montagnes plus grandes mais **étirées en hauteur** (le FOV demi-largeur reste 2×
+horizontal) et moins raccord au monde 3D compressé. À exposer via un **tunable pad** si on veut trancher
+à l'œil (le compressé actuel = cohérent monde ; le 1:1 = skybox plein cadre).
+
+### État par mode (HW sky)
+- **1p** : ciel HW cell = **OK** (shippé — `rbg0-hw-sky-feasible`).
+- **2p** : software = **OK** (livré, validé à l'œil) ; HW = **mécanique OK** (P1 = moitié gauche, W0),
+  cosmétique taille/ancrage à faire, **non validé HW**.
+- **3p / 4p** : la mécanique HW **fonctionne aussi** — élection = vue 0 (**P1, quadrant HAUT-GAUCHE**),
+  fenêtre W0 = quadrant `[0,0]..[159,111]` (le **clip Y** de la fenêtre n'est exercé QU'en 3p/4p → 1er
+  endroit où chercher un bug de fenêtre), RBG0 sol **OFF** en 3/4p (`rbg0_split_p1` est 2p-only → pas de
+  contention sol/ciel, plus simple qu'en 2p). Mêmes réserves : **non validé HW** ; taille/ancrage encore
+  plus visibles dans le petit quadrant. Les autres quadrants restent software.
+
+---
+
+### Références code (vérifiées 2026-06-29 ; ajouts 2026-07-01)
+
+| Sujet (ajouts 2026-07-01) | Fichier |
+|---|---|
+| Fix wrap ciel split (clamp + grain) | `core/r_draw.c` : `R_DrawSkyColumn`/`R_DrawSkyColumnLow`, `R_SkyGrainTexel`, `SKY_GRAIN_MAX` |
+| Sélection drawer ciel (split only) | `core/r_plane.c` : branch ciel de `R_DrawPlanes`, gate `sat_split_active` |
+| Socle core Part 5 | `core/r_plane.c` : `sat_sky_view`/`sat_sky_px_view[]`/`sat_sky_view_angle` ; `core/d_main.c` : boucle split |
+| Plateforme Part 5 + toggle | `src/dg_saturn.cxx` : `VDP2_SPLIT_HW_SKY`, `hwsky_split_on` (toggle pad **L+C**), `nbg0_sky_window_apply`/`_clear` |
+
 ### Références code (vérifiées 2026-06-29)
 
 | Sujet | Fichier:ligne |

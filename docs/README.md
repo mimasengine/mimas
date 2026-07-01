@@ -18,6 +18,8 @@ Reorg 2026-06-29: four fully-obsolete cell-era RBG0 plans were **deleted**
 - [VDP1_ARCHITECTURE.md](VDP1_ARCHITECTURE.md) — **REFERENCE.** The VDP1 chip cost model (fill/overdraw), VRAM ledger, 8bpp+CRAM-light-bank doctrine, IN/OUT routing, multiplayer budget.
 - [VDP1_4BPP_STUDY.md](VDP1_4BPP_STUDY.md) — **REFERENCE.** Decision study: keep walls 8bpp (CRAM-bank lighting); 4bpp is storage-only. CL16Bnk vs CL16Look, measured WAD quantization.
 - [VDP1_WORLD_PLAN.md](VDP1_WORLD_PLAN.md) — **PLAN (archived bet).** The unshipped per-subsector VDP1 floors/ceilings design-of-record + VDP1 VRAM ledger + anti-swim derivation.
+- [VDP1_CAPACITY_STUDY.md](VDP1_CAPACITY_STUDY.md) — **REFERENCE (2026-07-02).** Consolidated CPU+VDP1 capacity ledger (1j/2j/4j), the sprite-deport question, and the leftover-capacity effects catalog. Holds the two owner corrections (Dr% is present-noise not a fill gauge; sprite priority is config).
+- [WALL_SUBDIVISION_STUDY.md](WALL_SUBDIVISION_STUDY.md) — **PLAN (Phase 0 shipped).** SlaveDriver-style sub-quad subdivision for walls: the world-anchored vertical clamp that replaces the CPU near-wall fallback (walls don't vertically swim — linear), the command/build-`k` tension, and the Option-2→Option-1 roadmap + the shipped `FBK`/PERFSIM profilers.
 
 ## VDP2 — floor, layers, configs
 - [VDP2_ARCHITECTURE.md](VDP2_ARCHITECTURE.md) — **REFERENCE.** VDP2 chip + VRAM access-cycle ("snow") model + per-layer bandwidth + bank-free register features (colour offset, line-colour, colour-calc).

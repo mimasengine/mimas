@@ -517,6 +517,12 @@ extern "C" void           sat_setup_view_p1(void);/* core: re-anchor the view gl
 extern "C" int            sat_potato_floors;/* core: solid-colour floors/ceilings */
 extern "C" int            sat_potato_walls; /* core: solid-colour walls (opaque, flat only) */
 extern "C" int            sat_wall_nocpu;   /* core: banded/flat -> skip close-wall CPU fallback */
+/* Phase-1 wall clamp A/B flag ([[wall-clamp-world-anchored]], docs/WALL_SUBDIVISION_STUDY.md):
+   1 = SPAN-close one-sided walls STAY on VDP1 (clamped swim-free in wall_emit_band) instead of the
+   CPU fallback -- the Option-2 lever.  HW A/B: build 0 then 1, watch overlay row-6 FBK 'c' drop to
+   ~0 + check the near walls don't swim + read fps (row 0).  Default 0 = byte-identical shipping. */
+#define SAT_WALL_CLAMP 1
+extern "C" int            sat_wall_clamp;   /* core r_segs.c global; set from SAT_WALL_CLAMP at init */
 extern "C" int            sat_local_players; /* core: LIVE local-coop player count (1 = single) */
 extern "C" int            sat_split_vdp1;    /* core: split keeps walls on VDP1 (views 0/1); pad-X A/B */
 extern "C" int            sat_plane_tas;     /* core: TAS.B plane work-steal A/B (pad-C 'pm1') */
@@ -634,6 +640,7 @@ static void sat_apply_potato(void)
     sat_potato_floors   = potato_modes[L].floors;
     sat_potato_walls    = (potato_modes[L].wmode == 2);  /* DoomJo software-wall flat parity (flat only) */
     sat_wall_nocpu      = (potato_modes[L].wmode >= 1);  /* banded OR flat -> skip the close-wall CPU fallback */
+    sat_wall_clamp      = SAT_WALL_CLAMP;                 /* Phase-1 A/B: SPAN one-sided walls -> VDP1 clamp vs CPU */
     wall_potato_mode    = potato_modes[L].wmode;         /* Mimas VDP1 3-way (tex/banded/flat) */
     sat_split_lowdetail = potato_modes[L].ld;
     sat_floor_ld        = potato_modes[L].fld;           /* pot0.5: textured floors at half-rate fill */
@@ -1299,7 +1306,7 @@ static void fps_update(void)
             static char rV[45];
             sprintf(rV, "TEX nt%d w%d d%dK mp%d",
                     sat_tex_numtex, sat_tex_sumwidth, sat_tex_dirbytes >> 10, sat_tex_mptex);
-            SRL::Debug::Print(0, 8, rV);     /* memory levers grouped on rows 6-8 */
+            /* [overlay lean] SRL::Debug::Print(0, 8, rV);  -- mem levers, off for wall/floor work */
             /* split-block breakdown + LIVE mode: P = player count (sat_local_players), W = wall
                mode V/S/- (V=VDP1 walls all views, S=all software, -=1p inert), v0..v3 = each
                R_RenderPlayerView ms, k = the VDP1 kick, bk = wall-texture re-bakes (last frame;
@@ -1309,7 +1316,7 @@ static void fps_update(void)
             snprintf(rS, sizeof rS, "SPL P%d %c v0%u v1%u v2%u v3%u k%u bk%u",
                     sat_local_players, wmode, sat_spl_v0, sat_spl_v1,
                     sat_spl_v2, sat_spl_v3, sat_spl_kick, wtex_bakes);
-            SRL::Debug::Print(0, 16, rS);   /* split only -> kept lower */
+            /* [overlay lean] SRL::Debug::Print(0, 16, rS);  -- split config, off for now */
 #if RBG0_SPLIT_P1HW && RBG0_SPLIT_TUNE
             {                               /* DIAG: shows why the HW split floor (de)activates + the live R+dpad cal */
                 static char rVP[64];
@@ -1329,14 +1336,14 @@ static void fps_update(void)
             sprintf(rTC, "TXC a%d %dK e%d b%d x%d lf%dK",
                     sat_texcache_active, sat_texcache_poolkb, sat_texcache_entries,
                     sat_texcache_builds, sat_texcache_evicts, sat_texcache_carve_lf);
-            SRL::Debug::Print(0, 6, rTC);
+            /* [overlay lean] SRL::Debug::Print(0, 6, rTC);  -- TXC streaming, off (row 6 now = FBK) */
             /* LWRAM zone pressure (the Z_Malloc OOM lever): fr = total reclaimable
                (free+purgeable); mx = largest CONTIGUOUS run after a purge.  At an
                'Z_Malloc: failed on N' crash: mx < N while fr >> N => FRAGMENTATION;
                fr < N => true EXHAUSTION. */
             static char rZ[45];
             sprintf(rZ, "ZON fr%dK mx%dK", Z_FreeMemory() >> 10, Z_LargestAllocatable() >> 10);
-            SRL::Debug::Print(0, 7, rZ);
+            /* [overlay lean] SRL::Debug::Print(0, 7, rZ);  -- ZON zone-free, off (re-enable for OOM debug) */
         }
         /* master frame ms (the synchronous bottleneck) -> prefixes r_parallel.c's row-18
            SLV line; set the shared value here (the AVG row is gone, fps is on row 0). */
@@ -1399,7 +1406,7 @@ static void fps_update(void)
             snprintf(r20, sizeof r20, "PAR ss%d Q%d Qp%d q4%d%%      ",
                     sat_prof_ss_n, sat_prof_ss_q, sat_prof_ss_qpk, sat_prof_ss_q4pct);
             SRL::Debug::Print(0, 20, r20);
-            /* row 24: Phase-0 wall CPU-fallback sizer.  c = clampable tiers cur/pk (SPAN + below-floor
+            /* row 6: Phase-0 wall CPU-fallback sizer.  c = clampable tiers cur/pk (SPAN + below-floor
                = the Phase-1 world-anchored VDP1 clamp target); m = face-on magnified residue cur/pk;
                s = starved (VDP1 bank full) pk; K = clampable fill proxy cur/pk in kilo-pixels (the
                master software fill Phase-1 removes).  Big c + K => build the clamp; mostly m/s => reconsider. */
@@ -1407,7 +1414,7 @@ static void fps_update(void)
             snprintf(rFB, sizeof rFB, "FBK c%d/%d m%d/%d s%d K%d/%d   ",
                      fb_cur_clamp, fb_pk_clamp, fb_cur_mag, fb_pk_mag, fb_pk_starve,
                      fb_cur_px >> 10, fb_pk_px >> 10);
-            SRL::Debug::Print(0, 24, rFB);
+            SRL::Debug::Print(0, 6, rFB);   /* moved 24->6: joins the sizer block (TXC/ZON/mem now off) */
             /* row 18: memory-latency calibration (one-shot cold 32 KB read per bank, FRT
                ticks).  rL = LWRAM/HWRAM ratio -- >1.0 means LWRAM (cmd buf + visplanes) is
                the slow bank, = the memory-bound penalty + the L2-relocate upside, measured
@@ -1416,7 +1423,7 @@ static void fps_update(void)
             static char r18[45];
             snprintf(r18, sizeof r18, "MEM lw%u hw%u rL%u.%u        ",
                     mem_lw_ticks, mem_hw_ticks, rL10/10, rL10%10);
-            SRL::Debug::Print(0, 18, r18);
+            /* [overlay lean] SRL::Debug::Print(0, 18, r18);  -- MEM rL (rL~2.1 noted), off for now */
 #if SAT_FLOOR_PERFSIM
             /* row 19: pad-Y floor perf-sim mode.  Read REC (row 4) / P (row 5) in each mode;
                the delta vs mode 0 = the floor-offload saving (same for RBG0/VDP1/gradient). */
@@ -2953,12 +2960,39 @@ static void wall_emit_band(int x1, int x2, int yl1, int yh1, int yl2, int yh2,
                 winset = 1;
                 if (vdp1_wnext >= WALL_CMD_CAP) break;
             }
+            /* Phase-1 world-anchored vertical clamp (sat_wall_clamp): bound a near/tall wall's
+               off-screen overdraw + VDP1 coord range so it stays on VDP1 (not the CPU fallback).
+               A wall column has ~constant z -> screen-y is LINEAR in v, so clamping the tile to
+               [0,223] AND trimming the texel range (charAddr/rows) at the clamp is SWIM-FREE
+               (unlike floors).  Per-tile (narrow x -> ~uniform), same approximation class as the
+               grazing branch below.  No-op for in-view tiles => shipping byte-identical when off. */
+            unsigned short cA = charAddr, cS = charSize;
+            if (sat_wall_clamp)
+            {
+                int ctop = (yls < yle) ? yls : yle;        /* tile top/bottom screen-y (both ends) */
+                int cbot = (yhs > yhe) ? yhs : yhe;
+                int rw   = charSize & 0xFF, cpr = charSize >> 8;   /* band texel rows + char-units/row */
+                int hgt  = cbot - ctop;
+                if (hgt > 0 && rw > 0 && (ctop < 0 || cbot > 223))
+                {
+                    int cut0 = (ctop < 0)   ? (int)((long long)(-ctop)     * rw / hgt) : 0;  /* texels above y=0   */
+                    int cut1 = (cbot > 223) ? (int)((long long)(cbot - 223) * rw / hgt) : 0; /* texels below y=223 */
+                    int nr   = rw - cut0 - cut1;
+                    if (nr < 1) nr = 1;
+                    cA = (unsigned short)(charAddr + cut0 * cpr);
+                    cS = (unsigned short)((charSize & 0xFF00) | (nr & 0xFF));
+                }
+                if (yls < 0) yls = 0; else if (yls > 223) yls = 223;   /* clamp the 4 corners to the view */
+                if (yle < 0) yle = 0; else if (yle > 223) yle = 223;
+                if (yhs < 0) yhs = 0; else if (yhs > 223) yhs = 223;
+                if (yhe < 0) yhe = 0; else if (yhe > 223) yhe = 223;
+            }
             /* grow the quad 1px top+bottom -> close vertical seams; the overspill into the
                (software NBG1) floor/ceiling is hidden by the layer inversion. */
             memset(cmd, 0, sizeof cmd);
             cmd[0] = 0x0002; cmd[2] = 0x04E0;  /* DISTORSP | Window_In | COLOR_4 8bpp | SPD | ECD-off */
             cmd[3] = colr;                                 /* CMDCOLR = CRAM light-bank base */
-            cmd[4] = charAddr; cmd[5] = charSize;
+            cmd[4] = cA; cmd[5] = cS;
             cmd[6]  = (short)xs; cmd[7]  = (short)(yls - 1);   /* A col0  top */
             cmd[8]  = (short)xe; cmd[9]  = (short)(yle - 1);   /* B colW  top */
             cmd[10] = (short)xe; cmd[11] = (short)(yhe + 1);   /* C colW  bot */

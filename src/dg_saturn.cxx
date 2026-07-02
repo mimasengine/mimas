@@ -523,6 +523,16 @@ extern "C" int            sat_wall_nocpu;   /* core: banded/flat -> skip close-w
    ~0 + check the near walls don't swim + read fps (row 0).  Default 0 = byte-identical shipping. */
 #define SAT_WALL_CLAMP 1
 extern "C" int            sat_wall_clamp;   /* core r_segs.c global; set from SAT_WALL_CLAMP at init */
+
+/* Option-1 FIRST CUT A/B (see-the-potential): 1 = deport SECONDARY floors/ceilings to VDP1 as flat
+   quads (drains the software span phase P; the dominant flat stays on RBG0/software).  Emitter is
+   defined near vdp1_walls_flush.  Defects deferred (1 quad/visplane, fixed bank, seam painter). */
+#define SAT_VDP1_FLOOR 1
+#if SAT_VDP1_FLOOR
+extern "C" int            sat_vdp1_floor;
+extern "C" int          (*sat_floor_vdp1_hook)(int, int, int, int, const unsigned char *, const unsigned char *, int);
+extern "C" int            sat_floor_vdp1_emit(int, int, int, int, const unsigned char *, const unsigned char *, int);
+#endif
 extern "C" int            sat_local_players; /* core: LIVE local-coop player count (1 = single) */
 extern "C" int            sat_split_vdp1;    /* core: split keeps walls on VDP1 (views 0/1); pad-X A/B */
 extern "C" int            sat_plane_tas;     /* core: TAS.B plane work-steal A/B (pad-C 'pm1') */
@@ -641,6 +651,10 @@ static void sat_apply_potato(void)
     sat_potato_walls    = (potato_modes[L].wmode == 2);  /* DoomJo software-wall flat parity (flat only) */
     sat_wall_nocpu      = (potato_modes[L].wmode >= 1);  /* banded OR flat -> skip the close-wall CPU fallback */
     sat_wall_clamp      = SAT_WALL_CLAMP;                 /* Phase-1 A/B: SPAN one-sided walls -> VDP1 clamp vs CPU */
+#if SAT_VDP1_FLOOR
+    sat_vdp1_floor      = 1;                              /* Option-1 first cut: secondary floors -> VDP1 flat quads */
+    sat_floor_vdp1_hook = sat_floor_vdp1_emit;
+#endif
     wall_potato_mode    = potato_modes[L].wmode;         /* Mimas VDP1 3-way (tex/banded/flat) */
     sat_split_lowdetail = potato_modes[L].ld;
     sat_floor_ld        = potato_modes[L].fld;           /* pot0.5: textured floors at half-rate fill */
@@ -2301,8 +2315,13 @@ extern "C" void DG_Init(void)
     /* inc-1: register the floor-skip hook (claims secondary floors/ceilings).  Left OFF
        (sat_vdp1_floor = 0) so the boot render is normal software floors; pad Y toggles it
        live to A/B the index-0 coverage (owned surfaces go black until the strip emitter). */
+#if SAT_VDP1_FLOOR
+    sat_floor_vdp1_hook = sat_floor_vdp1_emit;   /* Option-1 first cut: secondary floors -> VDP1 flat quads */
+    sat_vdp1_floor      = 1;
+#else
     sat_floor_vdp1_hook = sat_floor_vdp1_stub;
     sat_vdp1_floor      = 0;
+#endif
 #endif
 
     SRL::Debug::Print(0, 1, "INIT DOOM...");
@@ -3166,6 +3185,77 @@ static int wall_potato(int wi)
    (The previous "greedy" flush charged the worst-case tile estimate without that reservation, so an
    over-estimate -- VD1 finished at ~147/248 yet far walls vanished -- dropped them to mode 0 = sky.)
    Painted far->near (painter's algorithm). */
+#if SAT_VDP1_FLOOR
+/* ============================================================================================
+   Option-1 FIRST CUT (see-the-potential): every SECONDARY (non-sky, non-dominant) visplane ->
+   ONE flat-colour VDP1 quad, emitted BELOW the walls -> drains the software span phase P.  The
+   R_DrawPlanes hook accumulates during the frame; vdp1_floors_flush emits before the walls. */
+extern int firstflat; extern int *flattranslation; extern int detailshift;
+extern "C" int R_FlatPotatoColor(int lumpnum);
+extern "C" int sat_vdp2_floor_pic;   /* dominant flat id (sat_vdp2_floor_h externed above) */
+
+#define MAX_FLOOR_ACC 80      /* floors emit first; cap leaves >=168 cmds for the walls (never starve a wall) */
+#define FLOOR_STRIP_W 48      /* columns per strip: follow the silhouette (top/bottom) in vertical strips */
+static struct floor_q { short x1, x2, ytl, ytr, ybl, ybr; unsigned short col; } floor_acc[MAX_FLOOR_ACC];
+static int floor_acc_n = 0;
+
+extern "C" int sat_floor_vdp1_emit(int picnum, int height, int minx, int maxx,
+                                   const unsigned char *top, const unsigned char *bottom, int lightlevel)
+{
+    (void)lightlevel;
+    if (height == sat_vdp2_floor_h && picnum == sat_vdp2_floor_pic) return 0;   /* dominant stays (RBG0/software) */
+    if (maxx < minx) return 0;
+    int ds = detailshift, lump = firstflat + flattranslation[picnum];
+    unsigned short col = (unsigned short)(0x0100 | (R_FlatPotatoColor(lump) & 0xFF));   /* CRAM bank 1 | flat dominant */
+    /* A1 step 1 (textured-floor foundation): emit the visplane as VERTICAL STRIPS following its
+       per-column silhouette (top[x]/bottom[x]) instead of ONE bbox quad -> no more green/blue bleed.
+       HOLE FIX (owner): count the strips first; if they won't FIT the accumulator, DON'T claim it
+       (return 0) -> the CPU software renderer draws the whole visplane, so an over-budget floor is
+       FILLED, never left as an index-0 hole.  Still FLAT colour; texture + swim bands are step 2. */
+    int need = 0;
+    for (int xl = minx; xl <= maxx; )
+    {
+        int xr = xl + FLOOR_STRIP_W; if (xr > maxx) xr = maxx;
+        if (top[xl] <= bottom[xl] && top[xr] <= bottom[xr]) ++need;
+        if (xr >= maxx) break;
+        xl = xr;
+    }
+    if (need == 0 || floor_acc_n + need > MAX_FLOOR_ACC) return 0;   /* won't fit -> CPU fills it (no hole) */
+    for (int xl = minx; xl <= maxx; )
+    {
+        int xr = xl + FLOOR_STRIP_W; if (xr > maxx) xr = maxx;
+        if (top[xl] <= bottom[xl] && top[xr] <= bottom[xr])   /* both edges have floor -> a valid strip quad */
+        {
+            struct floor_q *f = &floor_acc[floor_acc_n++];
+            f->x1  = (short)(xl << ds); f->x2  = (short)(xr << ds);
+            f->ytl = (short)top[xl];    f->ytr = (short)top[xr];
+            f->ybl = (short)bottom[xl]; f->ybr = (short)bottom[xr];
+            f->col = col;
+        }
+        if (xr >= maxx) break;
+        xl = xr;
+    }
+    return 1;   /* claimed -> core skips the software span + leaves index 0 (VDP1 shows through NBG1) */
+}
+
+static void vdp1_floors_flush(void)   /* emit accumulated floor quads (call BEFORE the walls) */
+{
+    unsigned short cmd[16];
+    for (int i = 0; i < floor_acc_n; ++i)
+    {
+        if (vdp1_wnext >= WALL_CMD_CAP) break;
+        memset(cmd, 0, sizeof cmd);
+        cmd[0] = 0x0004; cmd[2] = 0x00C0; cmd[3] = floor_acc[i].col;   /* FUNC_Polygon flat | SPD | ECD-off */
+        cmd[6]  = (unsigned short)floor_acc[i].x1; cmd[7]  = (unsigned short)floor_acc[i].ytl;   /* A far-left  */
+        cmd[8]  = (unsigned short)floor_acc[i].x2; cmd[9]  = (unsigned short)floor_acc[i].ytr;   /* B far-right */
+        cmd[10] = (unsigned short)floor_acc[i].x2; cmd[11] = (unsigned short)floor_acc[i].ybr;   /* C near-right*/
+        cmd[12] = (unsigned short)floor_acc[i].x1; cmd[13] = (unsigned short)floor_acc[i].ybl;   /* D near-left */
+        vdp1_cmd_at(VDP1_BANK[vdp1_wbank], vdp1_wnext++, cmd);
+    }
+    floor_acc_n = 0;
+}
+#endif  /* SAT_VDP1_FLOOR */
+
 static void vdp1_walls_flush(void)
 {
     wtex_bakes = 0;                      /* count this frame's texture re-bakes (the `k` driver) */
@@ -3344,6 +3434,9 @@ extern "C" void sat_vdp1_wpn_begin(void)
     }
 #endif
 #if VDP1_WALL_TEST
+#if SAT_VDP1_FLOOR
+    vdp1_floors_flush();  /* Option-1 first cut: secondary floors, UNDER the walls (painter order) */
+#endif
     vdp1_walls_flush();   /* textured walls -- behind the weapon, in front of NBG1 */
 #endif
     vdp1_wactive = 1;

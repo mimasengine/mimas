@@ -141,6 +141,35 @@ extern "C" char *gamedescription;
    Skipped surfaces show the backdrop (placeholder) -- only the perf numbers matter.  Set 0 to remove. */
 #define SAT_FLOOR_PERFSIM 1
 
+/* Floor/ceiling TEXTURING on VDP1 (Option-1 step 2).  Pad Y (alone) cycles the mode LIVE (the
+   in-session A/B law -- never judge build-vs-build):
+     0 FLAT-FB   flat quads, full-bright potato colour     = the step-1 baseline (byte-identical)
+     1 FLAT-LIT  + per-trapezoid CRAM distance-light bank  = restores Doom's light diminishing
+     2 TEXTURED  + world-64x64-tile DISTORSP near-field    = real flat texels near, lit flat far
+     3 TEX+CPU   textured near; planes reaching PAST the texture band render as the ORIGINAL
+                 software spans (full quality, master cost) instead of the lit flat -- the A/B
+                 for "flat far-field vs CPU far-field" (tall-room ceilings)
+     4 SOFTWARE  reference picture: walls AND floors/ceilings software (RBG0 keeps the dominant
+                 flat) -- the ground-truth image + the cost of the whole VDP1 world offload
+     5 SW+WALLS  RBG0 dominant + SOFTWARE floors/ceilings + VDP1 walls + the TEXTURED wall-lag
+                 catch-up band (core fclaim 3): the pre-Option-1 shipping config, with the
+                 moving-junction black sliver covered by real plane texels
+   When 1, pad Y is THIS cycle and the SAT_FLOOR_PERFSIM binding yields (set 0 to give Y back). */
+#define SAT_FLOOR_TEX 1
+#define FTEX_MIPDIST  768          /* world units: textured nearer, lit-flat (or CPU, mode 3) farther.
+                                      Extended 256->384->768 (owner: "affichons plus"): affordable
+                                      because tiles past FTEX_MIP1/2DIST sample the 32x32 / 16x16
+                                      DECIMATED mips (palette indices can't be averaged), so the
+                                      minification fetch stays bounded. */
+#if SAT_FLOOR_TEX
+static int sat_ftex_mode = 2;      /* boot in full mode (the point of the branch); Y cycles 0..4 */
+static int ftexd_tiles, ftexd_skips, ftexd_trunc, ftexd_bakes, ftexd_px;   /* last flush (overlay) */
+extern "C" short *sat_floor_punch_edge;   /* core r_plane.c: mode-3 per-column VDP1/CPU split */
+static short ftex_punch_edge_buf[320];    /* the platform buffer behind it (armed at init)    */
+extern "C" void (*sat_floors_done_hook)(void);  /* core r_plane.c: fires at END of R_DrawPlanes */
+extern "C" void sat_vdp1_floors_done(void);     /* fwd: builds+flips the F floor bank (1p)      */
+#endif
+
 /* VDP1 command double-buffer.  0 = single bank, 1 = double bank.  Single-bank TESTED = BAD:
    the VDP1 reads a bank we're already overwriting (and a texture we're re-baking) the next
    frame -> "every other line shows sky" corruption.  Kept at 1 (double-buffer = correct). */
@@ -164,6 +193,12 @@ extern "C" int   r_visplane_peak;
 extern "C" int   sat_floor_vq_cur, sat_floor_vq_peak;  /* VDP1-floor inc-0 estimate, shown on row 2 */
 extern "C" unsigned int sat_sky_px, sat_floor_px;  /* sky-vs-floor coverage classifier (row 13) */
 extern "C" int sat_plane_vscale;      /* deported-plane VERTICAL decrochage fill scale (pad R+Up/Down) */
+extern "C" int sat_plane_border_max;  /* px cap on BOTH decrochage borders (core r_main.c, default 40 =
+                                         legacy).  Set low (10) for SAT_FLOOR_TEX so a fast turn cannot
+                                         blanket a textured plane in potato colour; pad R+Left/Right. */
+extern "C" int sat_plane_fill_mode;   /* core r_plane.c: 0 = uniform-B perimeter (legacy), 1 = SWEPT
+                                         per-column band from the claimed-region history (owner's
+                                         red-band design) -- fills exactly the mask-vs-VDP1 gap. */
 extern "C" int sat_plane_border_v;    /* live vertical fill-border px this frame (overlay readout) */
 /* SATURN VALIDATION (Ymir-readable, deterministic): RAM-lever sizing telemetry. */
 extern "C" int   r_visplane_coverage_peak;  /* #1: peak sum of live-plane spans (top-bytes) */
@@ -1393,6 +1428,18 @@ static void fps_update(void)
                     vdp1_last_cmds, vdp1_prev_done ? 'D' : 'B', dr);
 #endif
             SRL::Debug::Print(0, 2, r2v);
+#if SAT_FLOOR_TEX
+            /* row 12 (free): FTX = floor-texture state.  m = pad-Y mode (0 flat-FB / 1 flat-lit /
+               2 textured), t = tiles drawn last frame, s = skipped (z-guard / blow-up / no cache
+               slot), x = truncations (budget or grid caps -- flat underlay covered, never a hole),
+               bk = flat cache bakes (misses; steady >0 = 6 slots thrash).  With Dr% (row 2) these
+               are the GO/NO-GO counters of the textured-floor step. */
+            static char r12[45];
+            snprintf(r12, sizeof r12, "FTX m%d t%d s%d x%d bk%d p%dK  ",
+                     sat_ftex_mode, ftexd_tiles, ftexd_skips, ftexd_trunc, ftexd_bakes,
+                     ftexd_px >> 10);
+            SRL::Debug::Print(0, 12, r12);
+#endif
             /* row 4: WINDOWED REC distribution p50/p95/max (tenths-ms) -- robust to the
                single-outlier max (a lone CD hitch) AND to an arbitrary threshold.  p50 =
                typical, p95 = sustained worst, mx = absolute worst (located on row 9).
@@ -1407,7 +1454,8 @@ static void fps_update(void)
                VERTICAL decrochage-fill knob (pad R+Up/Down).  vs = scale (sat_plane_vscale), bV = this frame's
                actual vertical fill-border px. */
             static char r8[32];
-            snprintf(r8, sizeof r8, "PVfill vs %d  bV %d   ", sat_plane_vscale, sat_plane_border_v);
+            snprintf(r8, sizeof r8, "PVfill vs %d  bV %d bM %d   ",
+                     sat_plane_vscale, sat_plane_border_v, sat_plane_border_max);
             SRL::Debug::Print(0, 8, r8);
             /* row 10: per-PHASE INDEPENDENT peaks (each phase's own worst across the
                window, possibly different frames) -- the basis to size each offload
@@ -2339,6 +2387,19 @@ extern "C" void DG_Init(void)
 #if SAT_VDP1_FLOOR
     sat_floor_vdp1_hook = sat_floor_vdp1_emit;   /* Option-1 first cut: secondary floors -> VDP1 flat quads */
     sat_vdp1_floor      = 1;
+#if SAT_FLOOR_TEX
+    sat_floors_done_hook = sat_vdp1_floors_done;  /* build+flip the F floor bank right after
+                                                     R_DrawPlanes (same frame as walls+mask) */
+    sat_floor_punch_edge = ftex_punch_edge_buf;   /* arm the mode-3 partial-claim column edges */
+    sat_plane_border_max = 10;   /* legacy-path cap, kept as the R+Left/Right knob + row 8 bM */
+    sat_plane_fill_mode  = 2;    /* SWEPT decrochage fill (owner's red-band design): the CPU paints
+                                    ONLY the per-column band between the plane's current span and
+                                    its claimed region sat_plane_lag frames ago -- no more uniform
+                                    perimeter blanketing small textured planes during a turn.
+                                    2 = the band is drawn with the REAL flat texels (R_MapPlane
+                                    mapping, per-row zlight) -> the cover itself is textured and
+                                    essentially invisible; 1 = flat potato band (A/B); 0 legacy. */
+#endif
 #else
     sat_floor_vdp1_hook = sat_floor_vdp1_stub;
     sat_vdp1_floor      = 0;
@@ -2582,7 +2643,9 @@ static inline unsigned short pal_rgb555(int idx)
    Two pools keyed by size: 16 x 16KB (narrow, <=128x128) + 6 x 32KB (wide, up to 256x128) = 22
    slots (was 11).  Same VRAM region 0x25C05000..0x25C75000 (16*16KB + 6*32KB = 448KB, unchanged). */
 #define WTEX_BASE      0x25C05000u
-#define WTEX_NARROW_N  16
+#define WTEX_NARROW_N  15   /* 16 -> 15 (2026-07-03): one narrow slot (16KB) ceded to the floor-texture
+                               tail (bigger F banks + mip storage).  Walls historically ran on 8 narrow
+                               slots; watch the wtex_bakes (`bk`) counter if wall re-bakes climb. */
 #define WTEX_NARROW_SZ 0x4000u                                      /* 16KB -> 128x128 @ 8bpp */
 #define WTEX_WIDE_N    6
 #define WTEX_WIDE_SZ   0x8000u                                      /* 32KB -> 256x128 @ 8bpp */
@@ -2743,6 +2806,13 @@ extern "C" void DG_FadeIn(void)     /* rise the freshly-drawn frame from black *
    hook REJECTS the wall and the core renders it in SOFTWARE (no sky) -- so the cap is also the
    VDP1->CPU starvation handoff. */
 #define WALL_ACC_MAX 128   /* restored to 128: lumpinfo moved to the LWRAM Doom zone + HEAP_SIZE trimmed 88->32KB (syscalls.c) freed ~56KB to the TLSF pool, so the 3p-minimap pool pressure is gone and full wall capacity is back. 1p peaks ~57 << 128. */
+#define WALL_PX_BUDGET 90000  /* accumulated wall fill (screen px) beyond which further walls are
+                                 REJECTED to the software fallback -- BSP visits near-first, so
+                                 the sacrificed walls are the FARTHEST (owner 2026-07-03: "les
+                                 plus eloignes drop au CPU"), deterministically, instead of the
+                                 plot overrun cutting whatever sits at the list tail.  FBK `s`
+                                 counts the rejects. */
+static int wall_px_acc;    /* fill claimed so far this frame (reset with wall_acc_n) */
 /* vx/vxr = the view's framebuffer x-range [vx, vxr] this wall belongs to (split-screen: 0..159 for
    the left view, 160..319 for the right).  x1/x2 are stored ALREADY offset by viewwindowx, so the
    emit works in absolute framebuffer coords; vx/vxr drive the per-view user-clip window. */
@@ -2774,6 +2844,15 @@ extern "C" int sat_wall_vdp1(int x1, int yl1, int yh1, int x2, int yl2, int yh2,
     int nv = sat_local_players; if (nv < 1) nv = 1; else if (nv > 4) nv = 4;
     int cap = sat_split_active ? ((sat_split_view + 1) * (WALL_ACC_MAX / nv)) : WALL_ACC_MAX;
     if (wall_acc_n >= cap) return 1;     /* VDP1 list full -> caller draws this wall in SOFTWARE */
+    {   /* fill budget: past it, the remaining (FARTHEST -- BSP is near-first) walls go to the
+           software fallback instead of overloading the plot until it overruns the vblank */
+        int aw = (x2 - x1 + 1) << detailshift;
+        int h1 = yh1 - yl1 + 1; if (h1 < 0) h1 = 0;
+        int h2 = yh2 - yl2 + 1; if (h2 < 0) h2 = 0;
+        int a  = aw * ((h1 + h2) >> 1);
+        if (wall_px_acc + a > WALL_PX_BUDGET) return 1;   /* -> CPU */
+        wall_px_acc += a;
+    }
     int vx = viewwindowx, vy = viewwindowy;
     int i = wall_acc_n++;
     /* low-detail: x arrives as the HALVED column (0..viewwidth-1); the framebuffer is full width,
@@ -3194,6 +3273,20 @@ static int wall_potato(int wi)
 extern int firstflat; extern int *flattranslation; extern int detailshift; extern int viewz;
 extern "C" int R_FlatPotatoColor(int lumpnum);
 extern "C" int sat_vdp2_floor_pic;   /* dominant flat id (sat_vdp2_floor_h externed above) */
+#if SAT_FLOOR_TEX
+/* View state + light tables for the textured near-field + the distance-light bank.  All core C
+   globals; still valid at flush time (sat_vdp1_wpn_begin runs after R_RenderPlayerView set them). */
+extern "C" int            viewcos, viewsin;            /* fixed_t view basis (r_main.c) */
+extern "C" int            centerxfrac, centeryfrac;    /* fixed_t screen centre */
+extern "C" int            projection;                  /* fixed_t (= centerxfrac) */
+extern "C" int            centerx, centery;            /* view cols/rows */
+extern "C" int            viewwidth, viewheight;
+extern "C" int            yslope[];                    /* fixed_t[SCREENHEIGHT] (r_plane.c) */
+extern "C" int            extralight;
+extern "C" unsigned char *fixedcolormap;               /* lighttable_t*: invuln/light-amp override */
+extern "C" unsigned char *zlight[16][128];             /* [LIGHTLEVELS][MAXLIGHTZ] (r_main.h) */
+extern "C" void          *W_CacheLumpNum(int lump, int tag);
+#endif
 
 #define MAX_FLOOR_ACC 80      /* floors emit first; cap leaves >=168 cmds for the walls (never starve a wall) */
 #define SAT_CEIL_FILL 8       /* TOPIC B (owner's rotation-decrochage idea): px a CEILING flat is grown DOWN into
@@ -3208,15 +3301,130 @@ extern "C" int sat_vdp2_floor_pic;   /* dominant flat id (sat_vdp2_floor_h exter
                                  correct fill is on the SOFTWARE plane (NBG1 latency = aligned): see the plane-colour
                                  border in R_DrawPlanes, driven by sat_plane_border (r_main.c yaw history).  0 = off. */
 #define FLOOR_STRIP_W 48      /* columns per strip: follow the silhouette (top/bottom) in vertical strips */
-static struct floor_q { short x1, x2, ytl, ytr, ybl, ybr; unsigned short col; } floor_acc[MAX_FLOOR_ACC];
+static struct floor_q { short x1, x2, ytl, ytr, ybl, ybr; unsigned short col;
+#if SAT_FLOOR_TEX
+                        short lump;              /* flat lump: texture cache key (step 2) */
+                        int   hz;                /* height - viewz, signed fixed_t (light + projection) */
+                        unsigned char ln, ceil;  /* zlight light row 0..15; 1 = ceiling */
+#endif
+                      } floor_acc[MAX_FLOOR_ACC];
 static int floor_acc_n = 0;
+#if SAT_FLOOR_TEX
+/* View-state SNAPSHOT taken when the frame's first trapezoid is accumulated (in R_DrawPlanes).
+   The flush runs at the NEXT wall kick -- sat_walls_done_hook fires right after the BSP walk,
+   BEFORE R_DrawPlanes fills floor_acc -- so floor_acc always holds the PREVIOUS frame's
+   silhouettes.  Projecting tiles with the LIVE view globals mixed two frames' transforms
+   (mis-clipped, shimmering tiles in motion -- audit wf_82497c03).  All tile math uses this
+   snapshot so silhouettes, projection and light agree frame-wise; the remaining 1-frame lag
+   vs the NBG1 mask is the same class as the walls' and is covered by the decrochage border. */
+static int ftex_vx, ftex_vy, ftex_vcos, ftex_vsin;    /* viewx/y, viewcos/viewsin        */
+static int ftex_cxf, ftex_cyf, ftex_proj;             /* centerxfrac/centeryfrac, projection */
+static int ftex_ctx, ftex_cty;                        /* centerx, centery                */
+static const unsigned char *ftex_fcmap;               /* fixedcolormap                   */
+
+static inline int fxmul(int a, int b) { return (int)(((long long)a * b) >> 16); }
+static inline int fxdiv(int a, int b) { return (int)(((long long)a << 16) / b); }
+
+#define FTEX_CHUNK     40           /* max fb px per clip-rect chunk (see ftex_chunk_for) */
+#define FTEX_WEDGE_MAX 6            /* px the sloped-chord wedge may reach within one chunk */
+
+/* chunk width for this trapezoid, ADAPTIVE: narrow enough that the chord rise inside one
+   chunk stays <= FTEX_WEDGE_MAX px (steep junction lines get narrow chunks -> the flat
+   wedge triangles the owner flagged shrink everywhere).  Shared by the tile emitter and
+   the mode-3 punch filler so the punched band and the tiles' UserClips agree BY
+   CONSTRUCTION -- keep both call sites formula-identical. */
+static int ftex_chunk_for(const struct floor_q *f)
+{
+    int w = f->x2 - f->x1; if (w < 1) return FTEX_CHUNK;
+    int dT = f->ytr - f->ytl; if (dT < 0) dT = -dT;
+    int dB = f->ybr - f->ybl; if (dB < 0) dB = -dB;
+    int dm = dT > dB ? dT : dB;                  /* max chord rise over the full width */
+    if (dm <= FTEX_WEDGE_MAX) return FTEX_CHUNK;
+    {
+        int c = FTEX_WEDGE_MAX * w / dm;
+        if (c > FTEX_CHUNK) c = FTEX_CHUNK; else if (c < 8) c = 8;
+        return c;
+    }
+}
+
+/* mode 3 (partial claim): write this trapezoid's per-column punch edge = the SAME chunk
+   interior the tile emitter will clip to (MUST mirror ftex_emit_trapezoid's math).  For a
+   floor the edge is the chunk's interior TOP (punch [edge..bottom], software above); for a
+   ceiling its interior BOTTOM (punch [top..edge], software below) -- so the far field AND
+   the far-side wedge triangles render as real software texels. */
+static void ftex_fill_punch(const struct floor_q *f)
+{
+    int ds = detailshift;
+    int ph = f->hz < 0 ? -f->hz : f->hz;
+    if (ph == 0) return;
+    int cyTa = 0, cyBa = viewheight - 1;
+    int W2 = (viewwidth << ds) >> 1;
+    int mrows = (int)((((long long)ph * W2) / FTEX_MIPDIST) >> 16);
+    if (mrows < 1) mrows = 1;
+    if (!f->ceil) { int ymip = ftex_cty + mrows; if (cyTa < ymip) cyTa = ymip; }
+    else          { int ymip = ftex_cty - mrows; if (cyBa > ymip) cyBa = ymip; }
+    if (cyTa < 0) cyTa = 0;
+    if (cyBa > viewheight - 1) cyBa = viewheight - 1;
+    if (cyTa >= cyBa) return;                    /* fully beyond MIPDIST -> stays all-software */
+    int w = f->x2 - f->x1;
+    if (w < 1) return;
+    int chunk = ftex_chunk_for(f);
+    int prevT = f->ytl, prevB = f->ybl;
+    for (int xa = f->x1; xa < f->x2; )
+    {
+        int xb = xa + chunk; if (xb > f->x2) xb = f->x2;
+        int tb2 = f->ytl + (int)((long)(f->ytr - f->ytl) * (xb - f->x1) / w);
+        int bb2 = f->ybl + (int)((long)(f->ybr - f->ybl) * (xb - f->x1) / w);
+        int cT = prevT > tb2 ? prevT : tb2;
+        int cB = prevB < bb2 ? prevB : bb2;
+        if (cT < cyTa) cT = cyTa;
+        if (cB > cyBa) cB = cyBa;
+        if (cT < cB)
+        {
+            short e = f->ceil ? (short)cB : (short)cT;
+            for (int col = xa >> ds; col <= (xb >> ds) && col < 320; ++col)
+                ftex_punch_edge_buf[col] = e;
+        }
+        prevT = tb2; prevB = bb2; xa = xb;
+    }
+}
+#endif
 
 extern "C" int sat_floor_vdp1_emit(int picnum, int height, int minx, int maxx,
                                    const unsigned char *top, const unsigned char *bottom, int lightlevel)
 {
-    (void)lightlevel;
     if (height == sat_vdp2_floor_h && picnum == sat_vdp2_floor_pic) return 0;   /* dominant stays (RBG0/software) */
     if (maxx < minx) return 0;
+#if SAT_FLOOR_TEX
+    if (sat_ftex_mode == 4) return 0;    /* mode 4 SOFTWARE: every non-dominant plane -> CPU spans */
+    if (sat_ftex_mode == 5) return 3;    /* mode 5: RBG0 dominant + SOFTWARE planes + VDP1 walls;
+                                            the core paints the textured wall-lag catch-up band
+                                            (rows the plane held sat_plane_lag frames ago, now
+                                            wall-punched) -- no VDP1 floor list at all */
+    if (sat_ftex_mode == 3)
+    {
+        /* mode 3 TEX+CPU (PARTIAL claim): only bail to full software when the plane lies
+           ENTIRELY beyond the textured band (its NEAREST point is farther than FTEX_MIPDIST)
+           -- no VDP1 slot wasted on a plane that would tile nothing.  Partially-near planes
+           are accumulated and claimed with code 2 below (near band VDP1, rest software). */
+        int ph3 = height - viewz; if (ph3 < 0) ph3 = -ph3;
+        int isc = (height > viewz);
+        int dmax = 0;                                        /* max |near-edge row - centery| */
+        for (int xx = minx; xx <= maxx; ++xx)
+        {
+            if (top[xx] > bottom[xx]) continue;              /* occluded gap column */
+            int e = isc ? (int)top[xx] : (int)bottom[xx];    /* the NEAR (eye-side) edge */
+            int d = e - centery; if (d < 0) d = -d;
+            if (d > dmax) dmax = d;
+        }
+        if (dmax <= 0) return 0;                             /* nothing below/above horizon */
+        {
+            int row = centery + (isc ? -dmax : dmax);
+            if (row < 0) row = 0; else if (row > viewheight - 1) row = viewheight - 1;
+            if (fxmul(ph3, yslope[row]) > (FTEX_MIPDIST << 16)) return 0;   /* fully far -> CPU */
+        }
+    }
+#endif
     int ds = detailshift, lump = firstflat + flattranslation[picnum];
     unsigned short col = (unsigned short)(0x0100 | (R_FlatPotatoColor(lump) & 0xFF));   /* CRAM bank 1 | flat dominant */
     /* A1 step 1 (textured-floor foundation): emit the visplane as VERTICAL STRIPS following its
@@ -3232,6 +3440,22 @@ extern "C" int sat_floor_vdp1_emit(int picnum, int height, int minx, int maxx,
        Gaps (top>bottom, occluded) are skipped -- the core's index-0 fill skips them too (no hole). */
     int gtop = 1;                              /* +1 outward (masked by punch/wall): covers the residual ~1px corridor fit */
     int is_ceil = (height > viewz);
+#if SAT_FLOOR_TEX
+    /* zlight row = the same base pick R_DrawPlanes makes just before planezlight
+       ((lightlevel >> LIGHTSEGSHIFT) + extralight, LIGHTSEGSHIFT=4, clamp LIGHTLEVELS-1);
+       the distance index is resolved per trapezoid / per tile at flush time. */
+    int zl_row = (lightlevel >> 4) + extralight;
+    if (zl_row < 0) zl_row = 0; else if (zl_row > 15) zl_row = 15;
+    if (floor_acc_n == 0)          /* first accumulation this frame -> snapshot the view state */
+    {
+        ftex_vx  = viewx;       ftex_vy  = viewy;
+        ftex_vcos = viewcos;    ftex_vsin = viewsin;
+        ftex_cxf = centerxfrac; ftex_cyf = centeryfrac;  ftex_proj = projection;
+        ftex_ctx = centerx;     ftex_cty = centery;      ftex_fcmap = fixedcolormap;
+    }
+#else
+    (void)lightlevel;
+#endif
     /* Topic B (SAT_CEIL_FILL: grow ceilings DOWN into the wall for the rotation gap) is RETIRED -- it bled the
        ceiling colour BELOW the wall into the sky wherever the upper wall was thinner than the grow (all window
        tops).  The plane-colour software border (sat_plane_border, r_main.c) now fills that gap at the correct
@@ -3311,14 +3535,302 @@ extern "C" int sat_floor_vdp1_emit(int picnum, int height, int minx, int maxx,
             f->ytl = (short)yTL;  f->ytr = (short)yTR;
             f->ybl = (short)yBL;  f->ybr = (short)yBR;
             f->col = col;
+#if SAT_FLOOR_TEX
+            f->lump = (short)lump;
+            f->hz   = height - viewz;
+            f->ln   = (unsigned char)zl_row;
+            f->ceil = (unsigned char)is_ceil;
+#endif
             x0 = x1;
         }
     }
     if (floor_acc_n == save_n) return 0;   /* nothing emitted -> software */
+#if SAT_FLOOR_TEX
+    if (sat_ftex_mode == 3)
+    {
+        /* PARTIAL claim: per-column split edge = the tiles' chunk-clip interiors (identical
+           math via ftex_chunk_for/ftex_fill_punch) -> the core punches only the tiled band;
+           the far field AND the far-side wedge triangles render as software texels. */
+        for (int xx = minx; xx <= maxx && xx < 320; ++xx)
+            ftex_punch_edge_buf[xx] = is_ceil ? (short)-1 : (short)0x7FFF;   /* = no punch */
+        for (int i = save_n; i < floor_acc_n; ++i)
+            ftex_fill_punch(&floor_acc[i]);
+        return 2;
+    }
+#endif
     return 1;   /* claimed -> core skips the software span + leaves index 0 (VDP1 shows through NBG1) */
 }
 
-static void vdp1_floors_flush(void)   /* emit accumulated floor quads (call BEFORE the walls) */
+#if SAT_FLOOR_TEX
+/* ============================================================================================
+   Option-1 STEP 2: textured floors/ceilings -- world-anchored 64x64 flat tiles on VDP1.
+   VDP1 has NO per-vertex UV: a textured primitive is always the FULL char rect mapped onto a
+   screen quad.  So the only faithful floor texturing is the SlaveDriver model: draw the
+   PROJECTIONS of texture-space rectangles.  Flats are world-axis-aligned 64x64, so one world
+   tile = one DISTORSP whose 4 screen corners are the projected tile corners -- view rotation
+   lives in the quad's screen shape; anchoring is WORLD-anchored by construction (u = world x,
+   v = -world y, the span drawer's ds_xfrac/ds_yfrac convention -- never screen-anchored, the
+   SAT_YCLAMP lesson).
+   Near/far: tiles only where view distance <= FTEX_MIPDIST (texture detail is visible, tile
+   count and texel minification are bounded); farther keeps the step-1 lit-flat trapezoid
+   (SlaveDriver mips there, we flat there).  Silhouette: tiles are hardware-clipped
+   (FUNC_UserClip + Window_In) to the INTERIOR bbox of each silhouette trapezoid; the sloped-
+   edge wedges outside the clip keep showing the flat UNDERLAY drawn in pass 1 -> never a hole,
+   never a bleed past the silhouette (the ceiling-vs-sky wedge lesson).  Painter-safe: visplane
+   regions are screen-disjoint and every tile is clipped to its own trapezoid.
+   Split screen: one flush, one view transform -> tiles (and the distance light) are 1p-only. */
+#define FTEX_ZGUARD    (8 << 16)    /* min view-axis z of a projected tile corner (den guard) */
+#define FTEX_NEARCLIP  (32 << 16)   /* near clip of the textured band (SlaveDriver TILENEARCLIP=F(33)) */
+#define FTEX_MIP1DIST  (256 << 16)  /* beyond: sample the 32x32 decimated mip (1/4 the fetch)  */
+#define FTEX_MIP2DIST  (512 << 16)  /* beyond: the 16x16 mip, + HSS (SlaveDriver MIPDIST law)  */
+#define FTEX_MAXU      12           /* tile-grid columns per clip rect -- beyond = truncate (underlay shows) */
+#define FTEX_MAXV      16           /* tile-grid rows per clip rect */
+#define FTEX_SLOTS     7            /* 7 x 6KB flat cache slots (64x64 + its two mips) */
+#define FTEX_SLOT_SZ   0x1800u      /* +0x0000 = 64x64 (4KB), +0x1000 = 32x32 mip, +0x1400 = 16x16 mip */
+#define FTEX_SLOT_BASE 0x25C71000u  /* the tail freed by the wtex 16->15 narrow shrink            */
+#define FTEX_FBANK0    0x25C7C000u  /* F bank pair (256 cmds each): the WHOLE floor layer --      */
+#define FTEX_FBANK1    0x25C7E000u  /* localcoord + fresh underlays + tiles + tail JUMP->walls -- */
+#define FTEX_F_CAP     252          /* built AFTER R_DrawPlanes (same frame as walls+mask, kills
+                                       the forward/backward slip); the previous frame's F bridges
+                                       the pre-planes window (no flicker).  The old 126-cmd T cap
+                                       silently starved coverage -> 252.  Bank F of
+                                       VDP1_WORLD_PLAN §7.1, chained WALLS->FLOORS so an
+                                       overrunning plot cuts floors, never walls. */
+#define FTEX_PX_BUDGET 60000        /* ADAPTIVE distance fallback: tiles are emitted nearest-first
+                                       and stop once their summed CLIPPED areas reach this many
+                                       px -- heavy scenes shorten the textured range by themselves
+                                       instead of overrunning the VDP1 vblank (which cuts the tail
+                                       of the list).  Light scenes reach the full FTEX_MIPDIST. */
+
+/* VRAM tail ledger (wtex now ends 0x25C71000 after the 16->15 narrow shrink; VRAM ends
+   0x25C80000): 7 flat slots x 0x1800 = 0x25C71000..0x25C7B800, 2KB slack, F banks 2 x 8KB at
+   0x25C7C000..0x25C80000.  The old VDP1_HUD_TEX region (0x25C78000, dead code -- vdp1_hud_emit
+   is never called) is inside the slot run; if the VDP1 HUD is ever revived it must move. */
+static inline unsigned int ftex_slot_addr(int slot)
+{ return FTEX_SLOT_BASE + (unsigned int)slot * FTEX_SLOT_SZ; }
+static struct { int lump; unsigned int lru; unsigned char locked; } ftex_cache[FTEX_SLOTS];
+static unsigned int ftex_tick;
+static int ftex_tiles, ftex_skips, ftex_trunc, ftex_bakes;   /* this flush (snapshotted for row 12) */
+static int ftex_px;                      /* tile fill spent this flush (bbox px, budget currency) */
+static unsigned int ftex_tile_base;      /* F bank being written this frame (F0/F1)             */
+static int          ftex_next;           /* write cursor in the F bank                          */
+static unsigned int ftex_wjump_addr;     /* byte addr of THIS frame's wall-bank closing JUMP    */
+static unsigned int ftex_last_flink;     /* CMDLINK of the last finished F bank (0 = none): the
+                                            kick bridges the new walls to it until the flush --
+                                            VDP1 replots every vblank (1-cycle auto), an empty
+                                            bridge = the flat/textured FLICKER.  WALLS FIRST in
+                                            list order: when a heavy plot overruns the vblank,
+                                            the FLOORS get cut, never the walls (the walls-
+                                            vanish regression of the floors-first chain). */
+static int          ftex_flushed;        /* this frame's F already built (hook ran; DG call no-ops) */
+
+/* flat lump -> VDP1 VRAM slot (LRU + per-frame lock, the wtex discipline: a slot referenced by
+   an already-emitted command is never re-uploaded mid-frame).  Upload = raw 8bpp palette
+   indices, 16-bit packed exactly like the wall bake (hi byte = even texel, big-endian SH-2);
+   light is NOT baked -- it rides the CMDCOLR CRAM bank, so no re-upload on light/flash. */
+static int ftex_resolve(int lump)
+{
+    for (int i = 0; i < FTEX_SLOTS; ++i)
+        if (ftex_cache[i].lump == lump)
+        { ftex_cache[i].locked = 1; ftex_cache[i].lru = ftex_tick; return i; }
+    int victim = -1; unsigned int best = 0xFFFFFFFFu;
+    for (int i = 0; i < FTEX_SLOTS; ++i)
+        if (!ftex_cache[i].locked && ftex_cache[i].lru <= best)
+        { best = ftex_cache[i].lru; victim = i; }
+    if (victim < 0) return -1;                        /* all slots in use this frame -> stay flat */
+    const unsigned char *src = (const unsigned char *)W_CacheLumpNum(lump, 8 /* PU_CACHE */);
+    if (!src) return -1;
+    {
+        unsigned int base = ftex_slot_addr(victim);
+        volatile unsigned short *t = (volatile unsigned short *)base;
+        for (int i = 0; i < 64 * 64 / 2; ++i)
+            t[i] = (unsigned short)(((unsigned int)src[2 * i] << 8) | src[2 * i + 1]);
+        /* mips: 32x32 (+0x1000) and 16x16 (+0x1400), POINT-DECIMATED -- palette indices
+           cannot be averaged; skip-sampling keeps the hue family exact.  Far tiles sample
+           these instead of the 64x64 so the minification fetch stays bounded (MIP1/2DIST). */
+        volatile unsigned short *m1 = (volatile unsigned short *)(base + 0x1000u);
+        for (int y = 0; y < 32; ++y)
+            for (int xw = 0; xw < 16; ++xw)
+                m1[y * 16 + xw] = (unsigned short)
+                    (((unsigned int)src[(y * 2) * 64 + xw * 4] << 8) | src[(y * 2) * 64 + xw * 4 + 2]);
+        volatile unsigned short *m2 = (volatile unsigned short *)(base + 0x1400u);
+        for (int y = 0; y < 16; ++y)
+            for (int xw = 0; xw < 8; ++xw)
+                m2[y * 8 + xw] = (unsigned short)
+                    (((unsigned int)src[(y * 4) * 64 + xw * 8] << 8) | src[(y * 4) * 64 + xw * 8 + 4]);
+    }
+    ftex_cache[victim].lump = lump; ftex_cache[victim].locked = 1;
+    ftex_cache[victim].lru = ftex_tick;
+    ftex_bakes++;
+    return victim;
+}
+
+/* CRAM light bank for a floor point at view-axis distance `dist` (fixed): the SAME pick the
+   software span makes (r_plane.c: zlight[row][distance >> LIGHTZSHIFT], LIGHTZSHIFT=20,
+   MAXLIGHTZ=128), quantized to the 7 CRAM banks by wall_light_colr -> VDP1 floors, VDP1 walls
+   and the software residue agree on the band by construction. */
+static inline unsigned short ftex_zcolr(int zrow, int dist)
+{
+    int zi = dist >> 20;
+    if (zi > 127) zi = 127; else if (zi < 0) zi = 0;
+    const unsigned char *cm = ftex_fcmap ? ftex_fcmap : zlight[zrow][zi];
+    return wall_light_colr(cm);
+}
+
+/* Emit the tiles of ONE clip rect (a column chunk of a trapezoid): hardware-clip to it, then
+   draw every 64x64 world tile of its [NEARCLIP..] footprint that projects into it, into the
+   dedicated T tile bank.  Returns 0 when the tile bank is full (caller stops).  Anything
+   skipped/truncated stays covered by the pass-1 flat underlay -- never a hole. */
+static int ftex_emit_rect(const struct floor_q *f, int slot, int cx1, int cx2, int cyT, int cyB)
+{
+    unsigned short cmd[16];
+    int ds = detailshift;
+    int ph = f->hz < 0 ? -f->hz : f->hz;
+
+    /* world footprint of the clip rect (convex: 2 constant-distance lines x 2 view rays) ->
+       texel bbox.  Inverse projection: lateral = dist * (col - centerx)/projection. */
+    int yfar = f->ceil ? cyB : cyT, ynear = f->ceil ? cyT : cyB;
+    int dF = fxmul(ph, yslope[yfar]);
+    int dN = fxmul(ph, yslope[ynear]);
+    if (dN < FTEX_NEARCLIP) dN = FTEX_NEARCLIP;
+    if (dF <= dN) return 1;
+    int umin = 0, umax = 0, vmin = 0, vmax = 0;
+    for (int k = 0; k < 4; ++k)
+    {
+        int dist = (k < 2) ? dF : dN;
+        int cx   = (k & 1) ? cx2 : cx1;
+        int txl  = fxmul(dist, fxdiv(((cx >> ds) - ftex_ctx) << 16, ftex_proj));
+        int wx   = ftex_vx + fxmul(dist, ftex_vcos) + fxmul(txl, ftex_vsin);
+        int wy   = ftex_vy + fxmul(dist, ftex_vsin) - fxmul(txl, ftex_vcos);
+        int u = wx >> 16, v = (-wy) >> 16;
+        if (k == 0) { umin = umax = u; vmin = vmax = v; }
+        else { if (u < umin) umin = u; if (u > umax) umax = u;
+               if (v < vmin) vmin = v; if (v > vmax) vmax = v; }
+    }
+    int tu0 = umin & ~63, tv0 = vmin & ~63;
+    int nu = (umax - tu0) / 64 + 1, nv = (vmax - tv0) / 64 + 1;
+    if (nu > FTEX_MAXU) { nu = FTEX_MAXU; ftex_trunc++; }
+    if (nv > FTEX_MAXV) { nv = FTEX_MAXV; ftex_trunc++; }
+
+    /* project the (nu+1)x(nv+1) tile-corner grid two rows at a time (each node ONCE) */
+    struct fnode { short sx, sy; unsigned char ok; int tz; } rows[2][FTEX_MAXU + 1];
+    int winset = 0;
+    unsigned int slotbase = ftex_slot_addr(slot);
+    for (int r = 0; r <= nv; ++r)
+    {
+        struct fnode *cur = rows[r & 1];
+        int wy_ = -((tv0 + (r << 6)) << 16);         /* world y of this texel-grid row (v = -y) */
+        for (int c = 0; c <= nu; ++c)
+        {
+            int wx_ = (tu0 + (c << 6)) << 16;
+            int tx = wx_ - ftex_vx, ty = wy_ - ftex_vy;
+            int tz = fxmul(tx, ftex_vcos) + fxmul(ty, ftex_vsin);
+            cur[c].ok = 0; cur[c].tz = tz;
+            if (tz < FTEX_ZGUARD) continue;          /* behind/too close -> tile falls to underlay */
+            int scale = fxdiv(ftex_proj, tz);
+            long long sxl = ((long long)ftex_cxf
+                          + (((long long)(fxmul(tx, ftex_vsin) - fxmul(ty, ftex_vcos)) * scale) >> 16)) >> 16;
+            long long syl = ((long long)ftex_cyf - (((long long)f->hz * scale) >> 16)) >> 16;
+            int sx = (int)(sxl << ds), sy = (int)syl;
+            if (sx < -1024 || sx > 1344 || sy < -512 || sy > 736) continue;  /* bound VDP1 iteration */
+            cur[c].sx = (short)sx; cur[c].sy = (short)sy; cur[c].ok = 1;
+        }
+        if (r == 0) continue;
+        struct fnode *top = rows[(r - 1) & 1];
+        for (int c = 0; c < nu; ++c)
+        {
+            struct fnode *A = &top[c], *B = &top[c + 1], *C = &cur[c + 1], *D = &cur[c];
+            if (!A->ok || !B->ok || !C->ok || !D->ok) { ftex_skips++; continue; }
+            int mnx = A->sx, mxx = A->sx, mny = A->sy, mxy = A->sy;
+            if (B->sx < mnx) mnx = B->sx; if (B->sx > mxx) mxx = B->sx;
+            if (C->sx < mnx) mnx = C->sx; if (C->sx > mxx) mxx = C->sx;
+            if (D->sx < mnx) mnx = D->sx; if (D->sx > mxx) mxx = D->sx;
+            if (B->sy < mny) mny = B->sy; if (B->sy > mxy) mxy = B->sy;
+            if (C->sy < mny) mny = C->sy; if (C->sy > mxy) mxy = C->sy;
+            if (D->sy < mny) mny = D->sy; if (D->sy > mxy) mxy = D->sy;
+            if (mxx < cx1 || mnx > cx2 || mxy < cyT || mny > cyB) continue;  /* outside the clip */
+            if (ftex_next >= FTEX_F_CAP || ftex_px > FTEX_PX_BUDGET) { ftex_trunc++; return 0; }
+            if (!winset)
+            {
+                memset(cmd, 0, sizeof cmd);
+                cmd[0]  = 0x0008;                    /* FUNC_UserClip = this chunk's interior rect */
+                cmd[6]  = (unsigned short)cx1; cmd[7]  = (unsigned short)cyT;
+                cmd[10] = (unsigned short)cx2; cmd[11] = (unsigned short)cyB;
+                vdp1_cmd_at(ftex_tile_base, ftex_next++, cmd);
+                winset = 1;
+                if (ftex_next >= FTEX_F_CAP) { ftex_trunc++; return 0; }
+            }
+            int tzm = (int)((((long long)A->tz + B->tz) + ((long long)C->tz + D->tz)) >> 2);
+            memset(cmd, 0, sizeof cmd);
+            cmd[0] = 0x0002;                         /* DISTORSP | Window_In | 8bpp bank | SPD | ECD-off */
+            if (tzm > FTEX_MIP2DIST)                 /* per-tile LOD: decimated mips bound the fetch */
+            { cmd[2] = 0x14E0;                       /* + HSS on the farthest band */
+              cmd[4] = (unsigned short)((slotbase + 0x1400u - VDP1_VRAM_BASE) >> 3); cmd[5] = 0x0210; }
+            else if (tzm > FTEX_MIP1DIST)
+            { cmd[2] = 0x04E0;
+              cmd[4] = (unsigned short)((slotbase + 0x1000u - VDP1_VRAM_BASE) >> 3); cmd[5] = 0x0420; }
+            else
+            { cmd[2] = 0x04E0;
+              cmd[4] = (unsigned short)((slotbase - VDP1_VRAM_BASE) >> 3);           cmd[5] = 0x0840; }
+            cmd[3] = ftex_zcolr(f->ln, tzm);         /* per-tile CRAM distance-light bank */
+            cmd[6]  = (unsigned short)A->sx; cmd[7]  = (unsigned short)A->sy;   /* A = tex (0,0)   */
+            cmd[8]  = (unsigned short)B->sx; cmd[9]  = (unsigned short)B->sy;   /* B = tex (64,0)  */
+            cmd[10] = (unsigned short)C->sx; cmd[11] = (unsigned short)C->sy;   /* C = tex (64,64) */
+            cmd[12] = (unsigned short)D->sx; cmd[13] = (unsigned short)D->sy;   /* D = tex (0,64)  */
+            vdp1_cmd_at(ftex_tile_base, ftex_next++, cmd);
+            ftex_tiles++;
+            {   /* budget currency = the CLIPPED area: an unclipped near-tile bbox (its off-clip
+                   overhang can exceed 300k px) drained the whole budget by itself and left whole
+                   nearby planes flat (owner capture 2026-07-03) */
+                int ax1 = mnx > cx1 ? mnx : cx1, ax2 = mxx < cx2 ? mxx : cx2;
+                int ay1 = mny > cyT ? mny : cyT, ay2 = mxy < cyB ? mxy : cyB;
+                ftex_px += (ax2 - ax1) * (ay2 - ay1);
+            }
+        }
+    }
+    return 1;
+}
+
+/* Textured near-field of ONE silhouette trapezoid: clamp to the MIPDIST band, then walk it
+   in FTEX_CHUNK-px column chunks, each with a CHORD-interpolated interior clip rect (the
+   flat wedge at a sloped edge shrinks from slope*width to slope*chunk). */
+static void ftex_emit_trapezoid(const struct floor_q *f, int slot)
+{
+    int ds = detailshift;
+    int ph = f->hz < 0 ? -f->hz : f->hz;
+    if (ph == 0) return;
+    int cyTa = 0, cyBa = viewheight - 1;
+    /* near/far split at FTEX_MIPDIST: rows closer to the horizon than ymip keep the lit flat */
+    int W2 = (viewwidth << ds) >> 1;                 /* == yslope's (viewwidth<<detailshift)/2 */
+    int mrows = (int)((((long long)ph * W2) / FTEX_MIPDIST) >> 16);
+    if (mrows < 1) mrows = 1;
+    if (!f->ceil) { int ymip = ftex_cty + mrows; if (cyTa < ymip) cyTa = ymip; }
+    else          { int ymip = ftex_cty - mrows; if (cyBa > ymip) cyBa = ymip; }
+    if (cyTa < 0) cyTa = 0;
+    if (cyBa > viewheight - 1) cyBa = viewheight - 1;
+    if (cyTa >= cyBa) return;                        /* fully beyond MIPDIST -> flat only */
+
+    int w = f->x2 - f->x1;
+    if (w < 1) return;
+    int chunk = ftex_chunk_for(f);                   /* adaptive: wedge <= FTEX_WEDGE_MAX px */
+    int prevT = f->ytl, prevB = f->ybl;              /* chord values at the chunk's left edge */
+    for (int xa = f->x1; xa < f->x2; )
+    {
+        int xb = xa + chunk; if (xb > f->x2) xb = f->x2;
+        int tb2 = f->ytl + (int)((long)(f->ytr - f->ytl) * (xb - f->x1) / w);   /* chordTop(xb) */
+        int bb2 = f->ybl + (int)((long)(f->ybr - f->ybl) * (xb - f->x1) / w);   /* chordBot(xb) */
+        int cT = prevT > tb2 ? prevT : tb2;          /* interior: max of the chord tops    */
+        int cB = prevB < bb2 ? prevB : bb2;          /* interior: min of the chord bottoms */
+        if (cT < cyTa) cT = cyTa;
+        if (cB > cyBa) cB = cyBa;
+        if (cT < cB && !ftex_emit_rect(f, slot, xa, xb, cT, cB)) return;   /* T bank full */
+        prevT = tb2; prevB = bb2; xa = xb;
+    }
+}
+#endif /* SAT_FLOOR_TEX */
+
+#if !SAT_FLOOR_TEX
+static void vdp1_floors_flush(void)   /* legacy step-1: flat quads into the wall bank */
 {
     unsigned short cmd[16];
     for (int i = 0; i < floor_acc_n; ++i)
@@ -3334,6 +3846,115 @@ static void vdp1_floors_flush(void)   /* emit accumulated floor quads (call BEFO
     }
     floor_acc_n = 0;
 }
+#else
+/* Build THIS frame's WHOLE floor layer in the F bank -- localcoord + fresh flat underlays +
+   textured tiles + a tail JUMP into this frame's wall bank -- then make it live with ONE
+   atomic root-link flip.  Runs from sat_floors_done_hook at the END of R_DrawPlanes, so the
+   floors go live the SAME frame as the walls and the mask (kills the forward/backward
+   wall-vs-plane slip: floors were previously one frame late).  Until it runs, the kick keeps
+   the PREVIOUS frame's F bridged to the fresh walls (no flicker, no floor-less window);
+   floors sit BEFORE the walls in list order, so the walls repaint any stale-bridge floor
+   overhang at the junctions.  The DG_DrawFrame call is only a fallback (ftex_flushed). */
+static void vdp1_ftex_flush(void)
+{
+    extern int sat_local_players;
+    unsigned short cmd[16];
+    if (ftex_flushed) return;
+    ftex_flushed = 1;
+    int fbk = vdp1_bank;                             /* this frame's parity (set by the kick) */
+    int fmode = (sat_local_players <= 1) ? sat_ftex_mode : 0;
+    ftexd_tiles = ftex_tiles; ftexd_skips = ftex_skips;      /* row-12 snapshot of last frame */
+    ftexd_trunc = ftex_trunc; ftexd_bakes = ftex_bakes; ftexd_px = ftex_px;
+    ftex_tiles = ftex_skips = ftex_trunc = ftex_bakes = 0; ftex_px = 0;
+    if (!ftex_wjump_addr) return;                    /* no wall list this frame (menu) */
+    if (fmode == 4 || floor_acc_n == 0)
+    {
+        /* software mode / nothing claimed: point the walls' closing JUMP at the empty bank
+           and forget the last F, so the next kick bridges to nothing as well. */
+        *((volatile unsigned short *)ftex_wjump_addr + 1) =
+            (unsigned short)((VDP1_BANKE_ADDR - VDP1_VRAM_BASE) >> 3);
+        ftex_last_flink = 0;
+        ftex_wjump_addr = 0;
+        floor_acc_n = 0;
+        return;
+    }
+    ftex_tick++;
+    for (int i = 0; i < FTEX_SLOTS; ++i) ftex_cache[i].locked = 0;
+    ftex_tile_base = fbk ? FTEX_FBANK1 : FTEX_FBANK0;
+    ftex_next = 0;
+    memset(cmd, 0, sizeof cmd);
+    cmd[0] = 0x000A; cmd[7] = VIEW_Y_OFFSET;         /* slot 0: local coord (the list roots here) */
+    vdp1_cmd_at(ftex_tile_base, ftex_next++, cmd);
+    /* fresh flat underlays (exact silhouettes) -- full coverage under the tiles */
+    for (int i = 0; i < floor_acc_n && ftex_next < FTEX_F_CAP; ++i)
+    {
+        unsigned short colr = floor_acc[i].col;
+        if (fmode >= 1)                    /* distance-lit flat: bank from the trapezoid's mid row */
+        {
+            int ymid = (floor_acc[i].ytl + floor_acc[i].ytr + floor_acc[i].ybl + floor_acc[i].ybr) >> 2;
+            if (ymid < 0) ymid = 0; else if (ymid > viewheight - 1) ymid = viewheight - 1;
+            int ph = floor_acc[i].hz < 0 ? -floor_acc[i].hz : floor_acc[i].hz;
+            colr = (unsigned short)(ftex_zcolr(floor_acc[i].ln, fxmul(ph, yslope[ymid]))
+                                    | (floor_acc[i].col & 0xFFu));
+        }
+        memset(cmd, 0, sizeof cmd);
+        cmd[0] = 0x0004; cmd[2] = 0x00C0; cmd[3] = colr;               /* FUNC_Polygon flat | SPD | ECD-off */
+        cmd[6]  = (unsigned short)floor_acc[i].x1; cmd[7]  = (unsigned short)floor_acc[i].ytl;   /* A far-left  */
+        cmd[8]  = (unsigned short)floor_acc[i].x2; cmd[9]  = (unsigned short)floor_acc[i].ytr;   /* B far-right */
+        cmd[10] = (unsigned short)floor_acc[i].x2; cmd[11] = (unsigned short)floor_acc[i].ybr;   /* C near-right*/
+        cmd[12] = (unsigned short)floor_acc[i].x1; cmd[13] = (unsigned short)floor_acc[i].ybl;   /* D near-left */
+        vdp1_cmd_at(ftex_tile_base, ftex_next++, cmd);
+    }
+    /* textured tiles, NEAREST trapezoid first (spend the budget where texture is most visible) */
+    if (fmode >= 2)
+    {
+        unsigned char idx[MAX_FLOOR_ACC]; short key[MAX_FLOOR_ACC];
+        for (int i = 0; i < floor_acc_n; ++i)
+        {
+            int ne = floor_acc[i].ceil ? (floor_acc[i].ytl < floor_acc[i].ytr ? floor_acc[i].ytl
+                                                                              : floor_acc[i].ytr)
+                                       : (floor_acc[i].ybl > floor_acc[i].ybr ? floor_acc[i].ybl
+                                                                              : floor_acc[i].ybr);
+            int d = ne - ftex_cty; if (d < 0) d = -d;
+            idx[i] = (unsigned char)i; key[i] = (short)d;
+        }
+        for (int i = 1; i < floor_acc_n; ++i)        /* insertion sort, largest d (nearest) first */
+        {
+            unsigned char ii = idx[i]; short kk = key[i]; int j = i - 1;
+            while (j >= 0 && key[j] < kk) { key[j + 1] = key[j]; idx[j + 1] = idx[j]; --j; }
+            key[j + 1] = kk; idx[j + 1] = ii;
+        }
+        for (int k = 0; k < floor_acc_n; ++k)
+        {
+            if (ftex_next >= FTEX_F_CAP) { ftex_trunc++; break; }
+            const struct floor_q *f = &floor_acc[idx[k]];
+            int slot = ftex_resolve(f->lump);
+            if (slot < 0) { ftex_skips++; continue; }
+            ftex_emit_trapezoid(f, slot);
+        }
+    }
+    /* tail: END -- the F bank is the last link of the chain (walls -> floors), so it can
+       never loop and an overrunning plot cuts floors, not walls */
+    memset(cmd, 0, sizeof cmd);
+    cmd[0] = 0x8000;
+    vdp1_cmd_at(ftex_tile_base, ftex_next, cmd);
+    /* atomic: this frame's floors go live behind this frame's walls; remembered so the
+       NEXT kick can bridge its fresh walls to these floors until its own flush */
+    ftex_last_flink = (unsigned int)((ftex_tile_base - VDP1_VRAM_BASE) >> 3);
+    *((volatile unsigned short *)ftex_wjump_addr + 1) = (unsigned short)ftex_last_flink;
+    ftex_wjump_addr = 0;
+    floor_acc_n = 0;
+}
+
+/* sat_floors_done_hook target.  In SPLIT the hook fires once per view with a partial
+   accumulator -- defer to the single end-of-frame DG_DrawFrame fallback there. */
+extern "C" void sat_vdp1_floors_done(void)
+{
+    extern int sat_split_active;
+    if (sat_split_active) return;
+    vdp1_ftex_flush();
+}
+#endif /* SAT_FLOOR_TEX */
 #endif  /* SAT_VDP1_FLOOR */
 
 static void vdp1_walls_flush(void)
@@ -3387,7 +4008,11 @@ static void vdp1_walls_flush(void)
         wall_acc[i].mode = 2;                                  /* flat baseline (guaranteed to fit) */
     }
 
-    for (int i = wall_acc_n - 1; i >= 0; --i)            /* paint far->near */
+    /* paint NEAR->FAR (owner 2026-07-03): solid walls' visible column ranges are mutually
+       disjoint in x (solidseg clipping), so quad order barely matters visually (only the 1px
+       seam overlaps) -- but an overrunning plot cuts the LIST TAIL, so near-first sacrifices
+       the FARTHEST walls instead of the nearest.  (Was far->near painter order.) */
+    for (int i = 0; i < wall_acc_n; ++i)
     {
         if      (wall_acc[i].mode == 1) wall_emit(i);
         else if (wall_acc[i].mode == 3) wall_emit_banded(i);
@@ -3395,6 +4020,7 @@ static void vdp1_walls_flush(void)
     }
 
     wall_acc_n = 0;
+    wall_px_acc = 0;   /* the fill budget re-arms with the accumulator */
 }
 #endif
 
@@ -3514,9 +4140,17 @@ extern "C" void sat_vdp1_wpn_begin(void)
     }
 #endif
 #if VDP1_WALL_TEST
-#if SAT_VDP1_FLOOR
-    vdp1_floors_flush();  /* Option-1 first cut: secondary floors, UNDER the walls (painter order) */
+#if SAT_VDP1_FLOOR && SAT_FLOOR_TEX
+    if (sat_ftex_mode == 4)
+        wall_acc_n = 0;   /* mode 4 SOFTWARE reference: the walls were drawn software this frame
+                             (sat_wall_skip=0); drop the VDP1 duplicates so they cannot poke over
+                             the HW sky through NBG1 index-0. */
 #endif
+#if SAT_VDP1_FLOOR && !SAT_FLOOR_TEX
+    vdp1_floors_flush();  /* legacy step-1: flat floors into the wall bank (painter: under walls) */
+#endif
+    /* (SAT_FLOOR_TEX: the whole floor layer lives in the F bank, built fresh at the end of
+       R_DrawPlanes and chained BEFORE this wall bank -- see vdp1_ftex_flush.) */
     vdp1_walls_flush();   /* textured walls -- behind the weapon, in front of NBG1 */
 #endif
     vdp1_wactive = 1;
@@ -3641,14 +4275,36 @@ static void vdp1_wpn_kick(void)
     {
         unsigned short end[16];
         memset(end, 0, sizeof end);
+#if VDP1_WALL_TEST && SAT_VDP1_FLOOR && SAT_FLOOR_TEX
+        /* WALLS FIRST: the wall bank closes with a sysclip+JUMP into the floor bank -- last
+           frame's F until this frame's flush re-points it (the anti-flicker bridge; F always
+           ends with END, so no chain can loop).  When a heavy plot overruns the vblank
+           (1-cycle auto), the tail of the list -- the FLOORS -- gets cut, never the walls
+           (the floors-first chain made walls vanish in complex scenes, owner 2026-07-03).
+           Cost: during the pre-flush bridge, stale floors paint AFTER fresh walls, so a
+           moving junction can show a small stale-floor overhang for those passes. */
+        end[0]  = 0x0009 | 0x1000;                   /* sysclip (non-drawing) + JUMP_ASSIGN */
+        end[1]  = (unsigned short)(ftex_last_flink ? ftex_last_flink
+                                                   : ((VDP1_BANKE_ADDR - VDP1_VRAM_BASE) >> 3));
+        end[10] = 319; end[11] = 223;                /* keep the sysclip values (== root's) */
+        vdp1_cmd_at(VDP1_BANK[vdp1_wbank], vdp1_wnext, end);
+        ftex_wjump_addr = VDP1_BANK[vdp1_wbank] + (unsigned int)vdp1_wnext * 32u;
+        ftex_flushed = 0;
+#else
         end[0] = 0x8000;
         vdp1_cmd_at(VDP1_BANK[vdp1_wbank], vdp1_wnext, end);
+#endif
         link = (VDP1_BANK[vdp1_wbank] - VDP1_VRAM_BASE) >> 3;
         vdp1_bank = vdp1_wbank;
     }
     else
     {
         link = (VDP1_BANKE_ADDR - VDP1_VRAM_BASE) >> 3;
+#if VDP1_WALL_TEST && SAT_VDP1_FLOOR && SAT_FLOOR_TEX
+        ftex_wjump_addr = 0;                         /* no wall list -> nothing to chain onto */
+        ftex_last_flink = 0;                         /* menu/transition: drop the stale floors */
+        ftex_flushed = 1;                            /* no level flush this frame */
+#endif
     }
     /* atomic single-halfword flip of the root command's jump target */
     *((volatile unsigned short *)VDP1_ROOT_ADDR + 1) = (unsigned short)link;
@@ -3957,6 +4613,11 @@ extern "C" void DG_DrawFrame(void)
        R_RenderPlayerView) -> the empty bank clears any stale walls.  Both before the
        palette_changed reset so the wall cache re-tints on a damage/pickup flash. */
     if (!vdp1_kicked_this_frame) { sat_vdp1_wpn_begin(); vdp1_wpn_kick(); }
+#if VDP1_WALL_TEST && SAT_VDP1_FLOOR && SAT_FLOOR_TEX
+    vdp1_ftex_flush();   /* FALLBACK only (ftex_flushed-guarded): the normal build+flip runs
+                            from sat_floors_done_hook at the end of R_DrawPlanes; this covers
+                            split screen (hook defers there) and any path that skipped it. */
+#endif
     vdp1_kicked_this_frame = 0;
 #endif
 
@@ -4322,6 +4983,12 @@ static void poll_pad(void)
     {
         if ((changed & PER_DGT_KU) && !(cur & PER_DGT_KU) && sat_plane_vscale < 16) sat_plane_vscale++;
         if ((changed & PER_DGT_KD) && !(cur & PER_DGT_KD) && sat_plane_vscale > 0)  sat_plane_vscale--;
+        /* R + Left/Right tunes the decrochage border CAP (sat_plane_border_max, r_main.c): the px
+           ceiling both borders saturate at during a fast turn.  With textured VDP1 planes the old
+           40px ceiling blanketed any plane narrower than 80px in potato colour; the low default
+           (10) keeps the texture visible at the price of a thin stale strip.  Row 8 `bM`. */
+        if ((changed & PER_DGT_KR) && !(cur & PER_DGT_KR) && sat_plane_border_max < 40) sat_plane_border_max += 2;
+        if ((changed & PER_DGT_KL) && !(cur & PER_DGT_KL) && sat_plane_border_max > 0)  sat_plane_border_max -= 2;
     }
 
     /* Pad R + C toggles the M5 BSP-staging live A/B (core/p_setup.c P_BspStageApply): swaps
@@ -4336,10 +5003,11 @@ static void poll_pad(void)
         P_BspStageApply(!sat_bsp_stage_on);
 
 #if VDP2_RBG0_TEST
-    /* Pad Y = the floor A/B comparator: 0 = VDP2 hardware floor (RBG0) <-> 1 = software floor.
-       Mode 2 (no floor) is dropped from the cycle during tuning (user) -- only the two floors
-       that matter for the side-by-side.  (Y also taps 'y' to Doom -- harmless.) */
-    if ((changed & PER_DGT_TY) && !(cur & PER_DGT_TY)) {
+    /* Pad R + Y = the floor A/B comparator: 0 = VDP2 hardware floor (RBG0) <-> 1 = software floor.
+       (MOVED from Y-alone: Y-alone now cycles the SAT_FLOOR_TEX mode below -- the chain-head bug
+       that shipped the ftex cycle dormant.  R taps '.' to Doom -- the established diag-chord
+       pattern; no clash with R+C (uses C) or R+Up/Down (d-pad).) */
+    if (!(cur & PER_DGT_TR) && (changed & PER_DGT_TY) && !(cur & PER_DGT_TY)) {
         rbg0_floor_view = (rbg0_floor_view + 1) % 2;          /* 0 HW (baked, no gradient) / 1 software */
         rbg0_mode       = rbg0_floor_view;                    /* 0 = HW floor, 1 = software floor */
         /* (gradient is WIP/parked -> rbg0_linecol_mode stays 0; not in the toggle for now) */
@@ -4457,6 +5125,23 @@ static void poll_pad(void)
         if (rbg0_split_scroll < 2) rbg0_split_scroll = 2; else if (rbg0_split_scroll > 48) rbg0_split_scroll = 48;
     }
 #endif
+#endif
+#if SAT_FLOOR_TEX
+    /* Pad Y (alone, L/R released) cycles the floor-TEXTURE mode LIVE (in-session A/B/C, the
+       inter-build-noise law): 0 = flat full-bright (step-1 ship baseline, byte-identical),
+       1 = flat + CRAM distance light, 2 = + textured near-field world tiles.  Row 12 `FTX m..`
+       shows the state.  (This block was a dead #elif behind VDP2_RBG0_TEST until 2026-07-02 --
+       the ftex cycle shipped dormant; the RBG0 floor A/B moved to R+Y.  L/R released so R+Y
+       (floor A/B) and L+Y can never also advance the mode.  SAT_FLOOR_PERFSIM regains pad Y
+       when SAT_FLOOR_TEX=0.) */
+    if ((cur & PER_DGT_TL) && (cur & PER_DGT_TR)
+        && (changed & PER_DGT_TY) && !(cur & PER_DGT_TY))
+    {
+        sat_ftex_mode = (sat_ftex_mode + 1) % 6;   /* 0 flat-FB / 1 flat-lit / 2 textured /
+                                                      3 tex + CPU far / 4 all-software ref /
+                                                      5 software planes + VDP1 walls + band */
+        sat_wall_skip = (sat_ftex_mode == 4) ? 0 : 1;   /* mode 4: walls render software too */
+    }
 #elif SAT_FLOOR_PERFSIM
     /* Pad Y cycles the 4 floor PERF-SIM modes (read REC/P rows 4/5 in each = the floor-offload
        ceiling, valid for RBG0 / VDP1-strips / gradient alike).  No RBG0/RAMCTL -> overlay stays

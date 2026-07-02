@@ -417,7 +417,7 @@ def compute_subsets(wad_path, info_path):
             npat = struct.unpack_from('<h', t, off+20)[0]
             pats = set()
             for p in range(npat):
-                pidx = struct.unpack_from('<h', t, off+22+p*10+6)[0]
+                pidx = struct.unpack_from('<h', t, off+22+p*10+4)[0]
                 if 0 <= pidx < len(pnames): pats.add(pnames[pidx])
             texpatch[name] = pats
             if name not in texidx:

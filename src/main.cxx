@@ -32,6 +32,16 @@ extern "C" int sat_wallprep_defer;    /* STEP 1: defer wall-prep to a post-BSP f
 extern "C" int sat_split_vdp1;        /* split-screen: keep walls on VDP1 per-view (vs software baseline) */
 extern "C" void sat_mp_input_init(void);  /* wires the local-MP pad-2..4 input hook */
 
+/* SATURN M5 -- RETIRED (2026-07-02).  A 32KB HWRAM arena staged the LWRAM BSP arrays
+   (core/p_setup.c P_StageBSP, still in place and inert with no arena).  The pad R+C
+   in-session A/B on hardware measured BOTH priority orders (nodes-first st17/40 and
+   -SegsFirst st28/40) as NEUTRAL: Bw -0.5..-1.4ms, Bp ~0, fps +-0.1 -- the hot arrays
+   are cache-absorbed, so the rL~2.1 LWRAM penalty is only paid on misses and Bp is
+   dominated by other traffic.  The arena is NOT donated so its 32KB stay in the TLSF
+   window (boot-loop headroom).  To re-run the experiment: re-add a static arena +
+   the two sat_bsp_stage_buf/size assignments in main() and re-check build/Mimas.map
+   (CRITICAL_PATH.md §4 M5 has the full story). */
+
 /* 40 KB dedicated stack for the Doom main loop, in high work RAM. */
 static char doom_stack[40 * 1024] __attribute__((aligned(16)));
 
@@ -65,6 +75,7 @@ int main(void)
     sat_split_vdp1      = 1;  /* split-screen renders walls on VDP1 per-view (pad X toggles to the
                                  software baseline live for HW A/B).  No effect in 1p (split path off). */
     sat_mp_input_init();      /* wire pad-2..4 -> ticcmd for local multiplayer */
+    /* (M5 BSP-staging arena retired -- see the note above doom_stack.) */
     /* sat_local_players defaults to 1 (single-player).  Local co-op is OPT-IN at the title screen:
        a 2nd pad pressing A arms 2..4-player split (dg_saturn.cxx poll_pad -> sat_count_local_pads).
        Default 1 keeps the normal boot single-player and lets the same disc A/B 1p vs Np on HW. */

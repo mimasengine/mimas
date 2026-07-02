@@ -107,6 +107,16 @@ ifneq ($(SAT_POTATO_INLINE_SPANS),)
   POTATO_SPANS_FLAG = -DSAT_POTATO_INLINE_SPANS=$(SAT_POTATO_INLINE_SPANS)
 endif
 
+# M5 BSP-staging order A/B (core/p_setup.c P_StageBSP): empty (default) = source
+# default 0 = nodes -> subsectors -> vertexes -> segs (E1M1 32KB arena: st17/40).
+# 1 = vertexes -> segs -> subsectors -> nodes: stages everything wall-prep +
+# R_AddLine read (~29KB, st29/40) at the price of the nodes staying on LWRAM.
+# HW A/B 2026-07-02 (order 0): Bp -4.5/-9.2 ms on the two wall-heavy spots.
+SAT_BSP_STAGE_SEGS_FIRST ?=
+ifneq ($(SAT_BSP_STAGE_SEGS_FIRST),)
+  BSP_STAGE_FLAG = -DSAT_BSP_STAGE_SEGS_FIRST=$(SAT_BSP_STAGE_SEGS_FIRST)
+endif
+
 # SRL puts modules/dummy/ in the path which stubs out stdio.h (no FILE type).
 # Put the compiler's real newlib headers first so Doom's uses of FILE* work.
 # -Isrc: Doom sources include each other with relative paths.
@@ -124,7 +134,8 @@ SRL_CUSTOM_CCFLAGS = -w -fsigned-char \
     -Icore \
     $(CDDA_FLAG) \
     $(WARP_FLAG) \
-    $(POTATO_SPANS_FLAG)
+    $(POTATO_SPANS_FLAG) \
+    $(BSP_STAGE_FLAG)
 
 # -----------------------------------------------------------------------
 # Include SRL shared makefile

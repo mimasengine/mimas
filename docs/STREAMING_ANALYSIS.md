@@ -729,6 +729,16 @@ Doom II ≈ 64–80 % (vs the zlib proxy in §7.8); good enough to fit the cart 
 
 ### 7.10 Step 1b results — the `.DRP` emitter, codec, and subset-safety (2026-06-24)
 
+> **⚠ ERRATUM 2026-07-02 — the sizes below were measured with a subset bug.**
+> `tools/repack_wad.py:420` read the texture patch index at `mappatch_t+6` (= `stepdir`,
+> always 1) instead of `+4` (= `patch`): every emitted blob omitted nearly all wall-texture
+> patches (~0.5–1.1 MB/map avg), which silently took the full-WAD CD fallback at runtime.
+> **Fixed (`+6`→`+4`); corrected measurements:** worst blob LZSS = Doom II MAP28 **4104 K**
+> (8 K over the 4096 K cart), TNT **4 maps over** (worst MAP20 4655 K), Plutonia **3 maps
+> over** (worst MAP22 4364 K), Ultimate all fit (worst 2755 K). The "all 32 maps fit with
+> ~570 KB headroom" verdict below is **invalid**; the cart-staging over-4MB policy and the
+> fluidity follow-up live in [`STREAMING_FLUIDITY_ROADMAP.md`](STREAMING_FLUIDITY_ROADMAP.md).
+
 `tools/repack_wad.py` now emits `cd/data/DOOMRP.DRP` and self-validates. Measured on the 14.6 MB
 Doom II IWAD (32 maps):
 

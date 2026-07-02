@@ -41,7 +41,8 @@ Reorg 2026-06-29: four fully-obsolete cell-era RBG0 plans were **deleted**
 ## Features — shipped plans & records
 - [MULTIPLAYER_PLAN.md](MULTIPLAYER_PLAN.md) — **RECORD/PLAN.** Local split-screen (2p shipped + compact HUD); perf cost model; open 4p/DM/potato TODOs.
 - [SPLIT_BENCHMARKS.md](SPLIT_BENCHMARKS.md) — **REFERENCE.** 2-player split benchmark table + the RMUL kick fix.
-- [STREAMING_ANALYSIS.md](STREAMING_ANALYSIS.md) — **PLAN/RECORD.** Big-WAD CD streaming on the 2MB cartless Saturn: byte budgets, .DRP repack/LZSS, music-vs-streaming model.
+- [STREAMING_ANALYSIS.md](STREAMING_ANALYSIS.md) — **PLAN/RECORD.** Big-WAD CD streaming on the 2MB cartless Saturn: byte budgets, .DRP repack/LZSS, music-vs-streaming model. (§7.10 sizes carry a 2026-07-02 erratum.)
+- [STREAMING_FLUIDITY_ROADMAP.md](STREAMING_FLUIDITY_ROADMAP.md) — **PLAN (2026-07-02).** The smoothness follow-up: verified GFS cost model (LIBCD.A disasm), the repack patch-field bug + corrected blob sizes, exact per-map memory verdicts (TNT/Plutonia), and the phased plan — de-bounce reads, async GFS_Nw* pump, boot index, memory levers, split-screen specifics.
 - [TEXTURECOLUMNLUMP_PLAN.md](TEXTURECOLUMNLUMP_PLAN.md) — **RECORD.** Measurement + DEFER gate for cutting the texturecolumnlump/composite PU_STATIC floor (per-WAD floor table).
 - [TRANSITIONS_PLAN.md](TRANSITIONS_PLAN.md) — **RECORD.** Shipped level start/end CRAM dip-to-black fades (replaced the crashing screen-melt under streaming).
 - [RENDER_CORRUPTION_ANALYSIS.md](RENDER_CORRUPTION_ANALYSIS.md) — **RECORD.** Resolved Doom II first-frame master-stack corruption (spanstart/spanstop[256] overrun) + the .map forensics.

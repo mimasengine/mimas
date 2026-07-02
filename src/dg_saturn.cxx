@@ -152,13 +152,19 @@ extern "C" char *gamedescription;
    last COMPLETE frame and only swaps when the draw finished (EDSR CEF), triggered from the
    existing OnVblank -- i.e. vsync the VDP1 presentation WITHOUT slSynch (no fps tax, no SCSP
    sound conflict, no latency: the CPU never waits).  1 = on (anti-tear), 0 = old auto swap. */
-#define VDP1_MANUAL_CHANGE 1   /* RE-ENABLED (owner 2026-07-02) for live present-sync A/B: exposes the overlay P-mode chars (row 2 'PA-'/'PM-'/'PAC'/'PMC') + the pad toggles L+Z (auto<->gated-manual, vdp1_present_manual) and R+Z (NBG1 blit couple on/off, vdp1_couple_nbg1).  Boot state is UNCHANGED = auto/uncoupled ('PA-', == 1-cycle-auto ship), so nothing moves until a toggle is pressed.  The earlier verdict (seam is structural, docs/VDP1_PRESENT_SYNC_PLAN.md) stands -- this just puts the experiment knobs back in-hand.  0 = compile the machinery out again. */
+#define VDP1_MANUAL_CHANGE 0   /* PARKED (owner 2026-07-02): present-sync abandoned for good.  Re-tested a final time
+                                  ON TOP of the plane-border decrochage fix -- still useless (PM/PAC unchanged verdict).
+                                  0 compiles the machinery out: no L+Z / R+Z toggles, no row-2 P-mode chars, boot = the
+                                  shipping 1-cycle-auto swap.  Code kept behind this guard for a possible future VDP1-walls
+                                  revisit; flip to 1 to restore the knobs.  Verdict: seam is structural, docs/VDP1_PRESENT_SYNC_PLAN.md. */
 
 extern "C" byte *I_VideoBuffer;
 extern "C" int   gametic;
 extern "C" int   r_visplane_peak;
 extern "C" int   sat_floor_vq_cur, sat_floor_vq_peak;  /* VDP1-floor inc-0 estimate, shown on row 2 */
 extern "C" unsigned int sat_sky_px, sat_floor_px;  /* sky-vs-floor coverage classifier (row 13) */
+extern "C" int sat_plane_vscale;      /* deported-plane VERTICAL decrochage fill scale (pad R+Up/Down) */
+extern "C" int sat_plane_border_v;    /* live vertical fill-border px this frame (overlay readout) */
 /* SATURN VALIDATION (Ymir-readable, deterministic): RAM-lever sizing telemetry. */
 extern "C" int   r_visplane_coverage_peak;  /* #1: peak sum of live-plane spans (top-bytes) */
 extern "C" int   r_visplane_pool_peak;      /* #1: peak bytes used in the span pool (0 if off) */
@@ -174,6 +180,9 @@ extern "C" int   dg_heap_peak;              /* #4: peak newlib sbrk usage (bytes
 extern "C" int   dg_heap_size;              /* #4: newlib heap cap (bytes)                    */
 /* split-screen perf breakdown (ms per piece of the 2p render block) -- diagnose the slowdown */
 extern "C" unsigned int sat_spl_sw, sat_spl_v0, sat_spl_v1, sat_spl_v2, sat_spl_v3, sat_spl_kick;
+extern "C" int   sat_bsp_stage_used, sat_bsp_stage_want;  /* M5 BSP staging, row 1 st readout */
+extern "C" int   sat_bsp_stage_on;                 /* M5 staging live A/B state (pad R+C) */
+extern "C" void  P_BspStageApply(int on);          /* core/p_setup.c: swap LWRAM<->HWRAM sets */
 /* VDP1 wall-texture bakes (cache misses) THIS flush -- diagnoses the `k` cost: if the 2 split
    views thrash the 22 shared slots, bk stays high every frame => re-bake is the kick cost. */
 static int wtex_bakes = 0;
@@ -1296,10 +1305,14 @@ static void fps_update(void)
                 potato_modes[potato_level].name, blit_mode,
                 sat_blit_ms10 / 10, sat_blit_ms10 % 10, sat_plane_steal, sat_wallprep_slave, ccr);
 #else
-        sprintf(r1, "vp%3d %-7s bl%d b%u.%u cc%02x pm%d  ", r_visplane_peak,
+        /* st = M5 BSP staging, ACTIVE/wanted KB this level (st17/40 = nodes+ssec+verts
+           live from HWRAM, segs on LWRAM; st0/40 = staging toggled OFF (pad R+C) or the
+           arena is missing/too small).  Trailing spaces erase ghosts when the row shrinks. */
+        sprintf(r1, "vp%3d %-7s bl%d b%u.%u cc%02x pm%d st%d/%d  ", r_visplane_peak,
                 potato_modes[potato_level].name, blit_mode,
                 sat_blit_ms10 / 10, sat_blit_ms10 % 10, ccr,
-                sat_plane_rowsplit ? 2 : sat_plane_tas);   /* plane mode: 0 static / 1 TAS / 2 row-split */
+                sat_plane_rowsplit ? 2 : sat_plane_tas,   /* plane mode: 0 static / 1 TAS / 2 row-split */
+                sat_bsp_stage_on ? (sat_bsp_stage_used >> 10) : 0, sat_bsp_stage_want >> 10);
 #endif
         SRL::Debug::Print(0, 1, r1);
         /* (WIP: the 'FL' floor-tuning readout row was removed with the gradient toggles.) */
@@ -1369,14 +1382,16 @@ static void fps_update(void)
                headroom signal (high Dr => spare budget for floor strips).  b:__TIME__ =
                build stamp (build.ps1 touches this file so it refreshes). */
             unsigned int dr = vd1_win_tot ? (vd1_win_done * 100u / vd1_win_tot) : 0;
-            char pmode_c = 'A', couple_c = '-';
-#if VDP1_MANUAL_CHANGE
-            pmode_c  = vdp1_present_manual ? 'M' : 'A';   /* P A=auto(tear) / M=gated(tear-free, ~1vbl lag) */
-            couple_c = vdp1_couple_nbg1 ? 'C' : '-';      /* C = NBG1 blit coupled to the VDP1 present (brick B) */
-#endif
             static char r2v[52];
+#if VDP1_MANUAL_CHANGE
+            char pmode_c  = vdp1_present_manual ? 'M' : 'A';   /* P A=auto(tear) / M=gated(tear-free, ~1vbl lag) */
+            char couple_c = vdp1_couple_nbg1 ? 'C' : '-';      /* C = NBG1 blit coupled to the VDP1 present */
             snprintf(r2v, sizeof r2v, "VD1 %d%c Dr%u%% P%c%c b:" __TIME__,
                     vdp1_last_cmds, vdp1_prev_done ? 'D' : 'B', dr, pmode_c, couple_c);
+#else
+            snprintf(r2v, sizeof r2v, "VD1 %d%c Dr%u%% b:" __TIME__,
+                    vdp1_last_cmds, vdp1_prev_done ? 'D' : 'B', dr);
+#endif
             SRL::Debug::Print(0, 2, r2v);
             /* row 4: WINDOWED REC distribution p50/p95/max (tenths-ms) -- robust to the
                single-outlier max (a lone CD hitch) AND to an arbitrary threshold.  p50 =
@@ -1388,6 +1403,12 @@ static void fps_update(void)
                     p50/10, p50%10, p95/10, p95%10,
                     sat_prof_rec_max/10, sat_prof_rec_max%10, sat_prof_dropped);
             SRL::Debug::Print(0, 4, r4);
+            /* row 8 (free -- rows 3/4/5 belong to r_parallel's Bw/Bp critical-path overlay): deported-plane
+               VERTICAL decrochage-fill knob (pad R+Up/Down).  vs = scale (sat_plane_vscale), bV = this frame's
+               actual vertical fill-border px. */
+            static char r8[32];
+            snprintf(r8, sizeof r8, "PVfill vs %d  bV %d   ", sat_plane_vscale, sat_plane_border_v);
+            SRL::Debug::Print(0, 8, r8);
             /* row 10: per-PHASE INDEPENDENT peaks (each phase's own worst across the
                window, possibly different frames) -- the basis to size each offload
                (Bp -> slave wall-prep, P -> VDP1/RBG0 floor).  ~31 cols worst case. */
@@ -3181,6 +3202,11 @@ extern "C" int sat_vdp2_floor_pic;   /* dominant flat id (sat_vdp2_floor_h exter
                                  grown ceiling colour reaches into that gap (revealed through the wall-skipped NBG1
                                  index-0) -> fills it with ceiling colour instead of sky.  No punch-dilate = no CPU-wall
                                  erase.  1 = off.  Caveat: on walls SHORTER than this it can bleed below the wall. */
+#define SAT_FLOOR_HOVER 0     /* ABANDONED (owner 2026-07-02): growing the VDP1 quad past its silhouette put the
+                                 fill on the VDP1 layer = the LAGGED latency, so it did NOT align with the mask
+                                 (fixed nothing) and it leaked at rest (unmasked corners = two triangles).  The
+                                 correct fill is on the SOFTWARE plane (NBG1 latency = aligned): see the plane-colour
+                                 border in R_DrawPlanes, driven by sat_plane_border (r_main.c yaw history).  0 = off. */
 #define FLOOR_STRIP_W 48      /* columns per strip: follow the silhouette (top/bottom) in vertical strips */
 static struct floor_q { short x1, x2, ytl, ytr, ybl, ybr; unsigned short col; } floor_acc[MAX_FLOOR_ACC];
 static int floor_acc_n = 0;
@@ -3206,7 +3232,11 @@ extern "C" int sat_floor_vdp1_emit(int picnum, int height, int minx, int maxx,
        Gaps (top>bottom, occluded) are skipped -- the core's index-0 fill skips them too (no hole). */
     int gtop = 1;                              /* +1 outward (masked by punch/wall): covers the residual ~1px corridor fit */
     int is_ceil = (height > viewz);
-    int gbot = is_ceil ? SAT_CEIL_FILL : 1;    /* ceilings grow DOWN into the wall -> rotation-decrochage fill (Topic B) */
+    /* Topic B (SAT_CEIL_FILL: grow ceilings DOWN into the wall for the rotation gap) is RETIRED -- it bled the
+       ceiling colour BELOW the wall into the sky wherever the upper wall was thinner than the grow (all window
+       tops).  The plane-colour software border (sat_plane_border, r_main.c) now fills that gap at the correct
+       (NBG1) latency, so the VDP1-side over-grow is no longer needed.  gbot = 1 = same tight fit as floors. */
+    int gbot = 1;
     int save_n = floor_acc_n;
     for (int x = minx; x <= maxx; )
     {
@@ -3226,6 +3256,11 @@ extern "C" int sat_floor_vdp1_emit(int picnum, int height, int minx, int maxx,
                (a/b<c/d <=> a*d<c*b, b,d>0).  Identical decisions to the *256 divide version, ~6x cheaper. */
             int tLoN = -0x4000, tLoD = 1, tHiN = 0x4000, tHiD = 1;   /* top slope    range [tLo, tHi] */
             int bLoN = -0x4000, bLoD = 1, bHiN = 0x4000, bHiD = 1;   /* bottom slope range [bLo, bHi] */
+            /* SNAPSHOT of the corridor at the last FEASIBLE column (= x1).  The live tLoN.. keep being
+               narrowed by the column that finally breaks the run, so after the loop they are INFEASIBLE
+               (tLo>tHi) and unusable for the endpoint clamp below -- commit a copy each time x1 advances. */
+            int sTLoN = tLoN, sTLoD = tLoD, sTHiN = tHiN, sTHiD = tHiD;
+            int sBLoN = bLoN, sBLoD = bLoD, sBHiN = bHiN, sBHiD = bHiD;
             int x1 = x0 + 1, xcap = x0 + 96; if (xcap > re) xcap = re;
             for (int xx = x0 + 2; xx <= xcap; ++xx)
             {
@@ -3239,12 +3274,42 @@ extern "C" int sat_floor_vdp1_emit(int picnum, int height, int minx, int maxx,
                 if ((long)tLoN * tHiD > (long)tHiN * tLoD) break;   /* top    Lo > Hi -> infeasible */
                 if ((long)bLoN * bHiD > (long)bHiN * bLoD) break;   /* bottom Lo > Hi -> infeasible */
                 x1 = xx;
+                sTLoN = tLoN; sTLoD = tLoD; sTHiN = tHiN; sTHiD = tHiD;   /* commit feasible corridor at x1 */
+                sBLoN = bLoN; sBLoD = bLoD; sBHiN = bHiN; sBHiD = bHiD;
             }
             if (floor_acc_n >= MAX_FLOOR_ACC) { floor_acc_n = save_n; return 0; }   /* overflow -> CPU whole visplane */
             struct floor_q *f = &floor_acc[floor_acc_n++];
-            f->x1  = (short)(x0 << ds);            f->x2  = (short)(x1 << ds);
-            f->ytl = (short)(top[x0] - gtop);      f->ytr = (short)(top[x1] - gtop);
-            f->ybl = (short)(bottom[x0] + gbot);   f->ybr = (short)(bottom[x1] + gbot);
+            int xL = x0 << ds, xR = x1 << ds;
+            /* WEDGE FIX (owner 2026-07-02): the corridor proves a line THROUGH x0 is within +-1px of every
+               column, but the raw endpoint chord (x0->x1) can slope OUTSIDE [sTLo,sTHi] -> its middle overshoots
+               the true silhouette by several px.  For a ceiling that is UP, into the sky (also index-0 in NBG1)
+               -> a visible grey wedge.  Clamp the x1 endpoints into the committed feasible slope range so the
+               drawn chord stays within +-1px of the real silhouette everywhere. */
+            int dx1 = x1 - x0; if (dx1 < 1) dx1 = 1;
+            int t1 = top[x1];
+            { int tlo = top[x0] + (int)((long)sTLoN * dx1 / sTLoD);    /* top[x0] + sTLo*dx1 */
+              int thi = top[x0] + (int)((long)sTHiN * dx1 / sTHiD);    /* top[x0] + sTHi*dx1 */
+              if (t1 < tlo) t1 = tlo; else if (t1 > thi) t1 = thi; }
+            int b1 = bottom[x1];
+            { int blo = bottom[x0] + (int)((long)sBLoN * dx1 / sBLoD);
+              int bhi = bottom[x0] + (int)((long)sBHiN * dx1 / sBHiD);
+              if (b1 < blo) b1 = blo; else if (b1 > bhi) b1 = bhi; }
+            int yTL = top[x0] - gtop,    yTR = t1 - gtop;
+            int yBL = bottom[x0] + gbot, yBR = b1 + gbot;
+#if SAT_FLOOR_HOVER
+            /* grow SAT_FLOOR_HOVER px past each end ALONG the edge's own slope (extrapolate the trapezoid,
+               staying a clean quad), clamped to a 45deg vertical cap so a near-vertical edge can't spike. */
+            int w = xR - xL; if (w < 1) w = 1;
+            int dT = (yTR - yTL) * SAT_FLOOR_HOVER / w;
+            int dB = (yBR - yBL) * SAT_FLOOR_HOVER / w;
+            if (dT >  SAT_FLOOR_HOVER) dT =  SAT_FLOOR_HOVER; else if (dT < -SAT_FLOOR_HOVER) dT = -SAT_FLOOR_HOVER;
+            if (dB >  SAT_FLOOR_HOVER) dB =  SAT_FLOOR_HOVER; else if (dB < -SAT_FLOOR_HOVER) dB = -SAT_FLOOR_HOVER;
+            xL -= SAT_FLOOR_HOVER; xR += SAT_FLOOR_HOVER;
+            yTL -= dT; yTR += dT; yBL -= dB; yBR += dB;
+#endif
+            f->x1  = (short)xL;   f->x2  = (short)xR;
+            f->ytl = (short)yTL;  f->ytr = (short)yTR;
+            f->ybl = (short)yBL;  f->ybr = (short)yBR;
             f->col = col;
             x0 = x1;
         }
@@ -4249,6 +4314,27 @@ static void poll_pad(void)
         }
     }
 
+    /* Pad R + Up/Down tunes the VERTICAL plane-decrochage fill scale (sat_plane_vscale, r_main.c): Up = MORE
+       vertical fill (bob / stairs / lifts), Down = LESS.  Clamped [0,16].  Live value on overlay row 5.  R is
+       the held modifier (R+C = M5 A/B, uses C -- no clash); the incidental Up/Down player-nudge during tuning
+       is minor, same as the L+Up/Down sky-horizon knob. */
+    if (!(cur & PER_DGT_TR))   /* R held */
+    {
+        if ((changed & PER_DGT_KU) && !(cur & PER_DGT_KU) && sat_plane_vscale < 16) sat_plane_vscale++;
+        if ((changed & PER_DGT_KD) && !(cur & PER_DGT_KD) && sat_plane_vscale > 0)  sat_plane_vscale--;
+    }
+
+    /* Pad R + C toggles the M5 BSP-staging live A/B (core/p_setup.c P_BspStageApply): swaps
+       nodes/subsectors/vertexes/segs between the HWRAM staged copies (on) and the LWRAM
+       originals (off) at the SAME spot in the SAME binary -- the only layout-noise-free way
+       to read M5's true Bw/Bp effect (inter-build .bss shifts alone moved Bp ~6ms at an
+       identical scene, 2026-07-02, so build-vs-build fps comparisons cannot judge M5).
+       Both copies are byte-identical and read-only, so a mid-frame swap is safe.  Row 1
+       'st' drops to 0/.. while OFF.  (R taps '.' and C taps run to Doom -- harmless, the
+       established diag-chord pattern.) */
+    if (!(cur & PER_DGT_TR) && (changed & PER_DGT_TC) && !(cur & PER_DGT_TC))
+        P_BspStageApply(!sat_bsp_stage_on);
+
 #if VDP2_RBG0_TEST
     /* Pad Y = the floor A/B comparator: 0 = VDP2 hardware floor (RBG0) <-> 1 = software floor.
        Mode 2 (no floor) is dropped from the cycle during tuning (user) -- only the two floors
@@ -4263,7 +4349,8 @@ static void poll_pad(void)
        work-steal, 2 = ROW-SPLIT (the universal balancer -- both SH-2 split the screen ROWS, so a
        dominant plane is balanced too, which pm0/pm1 cannot).  Watch w / SLVidle (row 3): pm2 should
        drop the master-wait in dominant-plane rooms.  (C also taps RSHIFT/run -- harmless.) */
-    if ((changed & PER_DGT_TC) && !(cur & PER_DGT_TC))
+    /* (L/R excluded: L+C = HW split sky, R+C = M5 staging A/B -- C alone cycles pmode.) */
+    if ((cur & PER_DGT_TL) && (cur & PER_DGT_TR) && (changed & PER_DGT_TC) && !(cur & PER_DGT_TC))
     {
         static int pmode = 1;   /* boot default = TAS (sat_plane_tas=1); first press -> row-split */
         pmode = (pmode + 1) % 3;

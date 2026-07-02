@@ -103,13 +103,27 @@ Hard caps for all: slave reads LWRAM at rL=2.1 and **shares the bus**; new slave
 ## 4. Hardware-capacity levers (8bpp-class = free; QT = quality tradeoff)
 
 **Free game-changers to chase first:**
-- **M1 — verify/fix SH-2 cache mode (CCR).** Code only ever ORs the purge bit into
-  `CCR@0xFFFFFE92` ([dg_saturn.cxx:700](../src/dg_saturn.cxx#L700)); it **never sets the
-  2-way / cache-enable bits**. If SGL left it sub-optimal, forcing CE+2-way could speed
-  *every* LWRAM read. **Measure CCR on HW first** — potentially the broadest free win.
-- **M5 — stage hot BSP geometry (nodes/segs/subsectors) out of cart-DRAM into work RAM** at
-  load. The column-cache precedent already proved ~25× A-Bus relief ([r_draw.c:138](../core/r_draw.c#L138)).
-  Attacks `Bw`+`Bp` directly.
+- ~~**M1 — verify/fix SH-2 cache mode (CCR).**~~ **SETTLED 2026-07-02: HW overlay reads
+  `cc01`** (CE=1, 4-way) — SGL's boot config is already correct, nothing to fix. The
+  readout stays on overlay row 1 ([dg_saturn.cxx:1293](../src/dg_saturn.cxx#L1293)).
+- **M5 — stage hot BSP geometry (nodes/segs/subsectors) out of the LWRAM zone into work RAM**
+  at load. The column-cache precedent already proved ~25× A-Bus relief ([r_draw.c:138](../core/r_draw.c#L138)).
+  Attacks `Bw`+`Bp` directly. **BUILT + HW-MEASURED 2026-07-02** (`P_StageBSP` in
+  [p_setup.c](../core/p_setup.c)): a 32 KB HWRAM arena (`SAT_BSP_STAGE_SIZE`,
+  [main.cxx](../src/main.cxx)) staged in priority order nodes → subsectors →
+  vertexes → segs. **SETTLED-NEGATIVE + RETIRED (in-session pad R+C A/B, HW): BOTH
+  orders are NEUTRAL** — nodes-first (`st17/40`) and `-SegsFirst` (verts+segs+ssec,
+  `st28/40`) each buy only `Bw` −0.5…−1.4 ms, `Bp` ~0 (87.0 vs 87.5 doorway, 55.0 vs
+  55.0 pillars), fps ±0.1. Root cause: the BSP arrays are cache-absorbed even from
+  LWRAM (rL≈2.1 is only paid on misses) — **`Bp` is NOT array-latency-bound**; it is
+  dominated by other traffic/compute (textures/composites, visplane mark+clip,
+  command emission). The earlier inter-build "+0.8 fps"/"regression" readings were
+  layout noise (~600 B .bss shifts remap 4 KB-cache sets and swing `Bp` ±6 ms at
+  identical scenes — never judge a lever build-vs-build; use a live toggle). The
+  arena donation was removed (src/main.cxx) → **TLSF window back to ~49 KB**; the
+  mechanism (P_StageBSP / P_BspStageApply / pad R+C) stays inert in core as the
+  template for future live A/Bs. Corollary for M2: only promote a struct to HWRAM
+  with actual cache-miss evidence.
 - **M3/M4 — DMA the blit + the framebuffer clear** (`slDMACopy`; raw SCU DMA failed 3×).
   ~5.5 ms + a few ms of pure master time, same pixels.
 - **M2 — promote a hot LWRAM struct (visplane top/bottom, spanstart) to HWRAM** (2.1× per

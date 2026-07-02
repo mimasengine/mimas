@@ -9,6 +9,7 @@
 #   powershell -ExecutionPolicy Bypass -File build.ps1 -Repack         # + per-level repack
 #   powershell -ExecutionPolicy Bypass -File build.ps1 -Cdda           # multi-file CDDA disc
 #   powershell -ExecutionPolicy Bypass -File build.ps1 -WarpMap "1 8"  # boot straight into E1M8
+#   powershell -ExecutionPolicy Bypass -File build.ps1 -SegsFirst      # M5 staging order A/B: verts+segs before nodes
 #
 # -Wad <name> : pick an IWAD from wads_temoins/ and copy it to cd/data/DOOM1.WAD
 #   (the fixed filename the Saturn loads from CD) before building. Accepts a bare
@@ -35,7 +36,8 @@ param(
     [switch]$Cdda,
     [switch]$Mus,
     [string]$WarpMap = "",
-    [string]$WarpSkill = "4"
+    [string]$WarpSkill = "4",
+    [switch]$SegsFirst
 )
 
 $ErrorActionPreference = "Stop"
@@ -216,13 +218,18 @@ try {
     # "1 8" as ONE make-var value through the bash -c.  (dg_saturn.cxx is touched every
     # build, so toggling warp on/off always recompiles it -- no stale-warp.)
     if ($WarpMap -ne "") { $makeArgs += " SAT_WARP_MAP='$WarpMap' SAT_WARP_SKILL='$WarpSkill'" }
+    # M5 staging-order A/B (Makefile SAT_BSP_STAGE_SEGS_FIRST -> core/p_setup.c):
+    # verts -> segs -> subsectors -> nodes instead of nodes-first (overlay: st29/40 vs st17/40).
+    if ($SegsFirst) { $makeArgs += " SAT_BSP_STAGE_SEGS_FIRST=1" }
 
     Write-Host "Building Mimas$(if ($cddaAppend) {' (CDDA)'})..."
     # Touch the file carrying the on-screen build stamp (dg_saturn.cxx -> row 18
     # "b:<__TIME__>") so every build recompiles it with a fresh timestamp -- lets
     # you confirm on hardware that you flashed THIS build even when only core/
     # files changed (which otherwise leaves dg_saturn.o, and its __TIME__, stale).
-    Invoke-Msys2 "cd '$rootMsys' && touch src/dg_saturn.cxx && make $makeTarget $makeArgs"
+    # core/p_setup.c is touched too: the M5 staging-order define lives there and make does
+    # not track CFLAGS changes, so toggling -SegsFirst would otherwise leave a stale .o.
+    Invoke-Msys2 "cd '$rootMsys' && touch src/dg_saturn.cxx core/p_setup.c && make $makeTarget $makeArgs"
 
     # SRL outputs to build/Mimas.bin + build/Mimas.cue
     $binPath = Join-Path $root "build\Mimas.bin"

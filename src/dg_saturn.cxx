@@ -152,7 +152,7 @@ extern "C" char *gamedescription;
    last COMPLETE frame and only swaps when the draw finished (EDSR CEF), triggered from the
    existing OnVblank -- i.e. vsync the VDP1 presentation WITHOUT slSynch (no fps tax, no SCSP
    sound conflict, no latency: the CPU never waits).  1 = on (anti-tear), 0 = old auto swap. */
-#define VDP1_MANUAL_CHANGE 0   /* GATED OFF (back to 1-cycle auto): the present-sync experiment (brick A gated present + brick B NBG1 couple, pad L+Z / R+Z) did NOT close the VDP1<->software seam in motion -- the latency mismatch is structural (docs/VDP1_PRESENT_SYNC_PLAN.md).  Set 1 to recompile the whole machinery (kept in #if VDP1_MANUAL_CHANGE for later). */
+#define VDP1_MANUAL_CHANGE 1   /* RE-ENABLED (owner 2026-07-02) for live present-sync A/B: exposes the overlay P-mode chars (row 2 'PA-'/'PM-'/'PAC'/'PMC') + the pad toggles L+Z (auto<->gated-manual, vdp1_present_manual) and R+Z (NBG1 blit couple on/off, vdp1_couple_nbg1).  Boot state is UNCHANGED = auto/uncoupled ('PA-', == 1-cycle-auto ship), so nothing moves until a toggle is pressed.  The earlier verdict (seam is structural, docs/VDP1_PRESENT_SYNC_PLAN.md) stands -- this just puts the experiment knobs back in-hand.  0 = compile the machinery out again. */
 
 extern "C" byte *I_VideoBuffer;
 extern "C" int   gametic;
@@ -2979,39 +2979,19 @@ static void wall_emit_band(int x1, int x2, int yl1, int yh1, int yl2, int yh2,
                 winset = 1;
                 if (vdp1_wnext >= WALL_CMD_CAP) break;
             }
-            /* Phase-1 world-anchored vertical clamp (sat_wall_clamp): bound a near/tall wall's
-               off-screen overdraw + VDP1 coord range so it stays on VDP1 (not the CPU fallback).
-               A wall column has ~constant z -> screen-y is LINEAR in v, so clamping the tile to
-               [0,223] AND trimming the texel range (charAddr/rows) at the clamp is SWIM-FREE
-               (unlike floors).  Per-tile (narrow x -> ~uniform), same approximation class as the
-               grazing branch below.  No-op for in-view tiles => shipping byte-identical when off. */
-            unsigned short cA = charAddr, cS = charSize;
-            if (sat_wall_clamp)
-            {
-                int ctop = (yls < yle) ? yls : yle;        /* tile top/bottom screen-y (both ends) */
-                int cbot = (yhs > yhe) ? yhs : yhe;
-                int rw   = charSize & 0xFF, cpr = charSize >> 8;   /* band texel rows + char-units/row */
-                int hgt  = cbot - ctop;
-                if (hgt > 0 && rw > 0 && (ctop < 0 || cbot > 223))
-                {
-                    int cut0 = (ctop < 0)   ? (int)((long long)(-ctop)     * rw / hgt) : 0;  /* texels above y=0   */
-                    int cut1 = (cbot > 223) ? (int)((long long)(cbot - 223) * rw / hgt) : 0; /* texels below y=223 */
-                    int nr   = rw - cut0 - cut1;
-                    if (nr < 1) nr = 1;
-                    cA = (unsigned short)(charAddr + cut0 * cpr);
-                    cS = (unsigned short)((charSize & 0xFF00) | (nr & 0xFF));
-                }
-                if (yls < 0) yls = 0; else if (yls > 223) yls = 223;   /* clamp the 4 corners to the view */
-                if (yle < 0) yle = 0; else if (yle > 223) yle = 223;
-                if (yhs < 0) yhs = 0; else if (yhs > 223) yhs = 223;
-                if (yhe < 0) yhe = 0; else if (yhe > 223) yhe = 223;
-            }
+            /* Phase-1 vertical [0,223] clamp REMOVED (owner's red diagnosis 2026-07-02).  With the
+               SPAN routing reverted, a wall that projects off the TOP of the screen renders CORRECTLY
+               as a FULL quad clipped by the VDP1 system clip: DISTORSP maps the texels across the whole
+               (partly off-screen) projection, so the on-screen part shows the right texels -- no squish,
+               no black.  The old clamp trimmed the texel with a SINGLE cut from one corner, which on a
+               sloped-top tile (yls != yle) squished the texture AND left a black wedge under the clamped
+               edge at the wall/screen-edge.  Full-quad + system-clip is the fix (overdraw = idle fill). */
             /* grow the quad 1px top+bottom -> close vertical seams; the overspill into the
                (software NBG1) floor/ceiling is hidden by the layer inversion. */
             memset(cmd, 0, sizeof cmd);
             cmd[0] = 0x0002; cmd[2] = 0x04E0;  /* DISTORSP | Window_In | COLOR_4 8bpp | SPD | ECD-off */
             cmd[3] = colr;                                 /* CMDCOLR = CRAM light-bank base */
-            cmd[4] = cA; cmd[5] = cS;
+            cmd[4] = charAddr; cmd[5] = charSize;
             cmd[6]  = (short)xs; cmd[7]  = (short)(yls - 1);   /* A col0  top */
             cmd[8]  = (short)xe; cmd[9]  = (short)(yle - 1);   /* B colW  top */
             cmd[10] = (short)xe; cmd[11] = (short)(yhe + 1);   /* C colW  bot */
@@ -3190,7 +3170,7 @@ static int wall_potato(int wi)
    Option-1 FIRST CUT (see-the-potential): every SECONDARY (non-sky, non-dominant) visplane ->
    ONE flat-colour VDP1 quad, emitted BELOW the walls -> drains the software span phase P.  The
    R_DrawPlanes hook accumulates during the frame; vdp1_floors_flush emits before the walls. */
-extern int firstflat; extern int *flattranslation; extern int detailshift;
+extern int firstflat; extern int *flattranslation; extern int detailshift; extern int viewz;
 extern "C" int R_FlatPotatoColor(int lumpnum);
 extern "C" int sat_vdp2_floor_pic;   /* dominant flat id (sat_vdp2_floor_h externed above) */
 
@@ -3212,29 +3192,45 @@ extern "C" int sat_floor_vdp1_emit(int picnum, int height, int minx, int maxx,
        HOLE FIX (owner): count the strips first; if they won't FIT the accumulator, DON'T claim it
        (return 0) -> the CPU software renderer draws the whole visplane, so an over-budget floor is
        FILLED, never left as an index-0 hole.  Still FLAT colour; texture + swim bands are step 2. */
-    int need = 0;
-    for (int xl = minx; xl <= maxx; )
+    /* Greedy TRAPEZOIDAL decomposition (owner's math): the visplane silhouette is piecewise-LINEAR
+       (Doom projects wall edges as straight screen lines), so cover it with the MINIMUM trapezoids
+       whose edges follow the real segments.  Grow each trapezoid while top[] AND bottom[] stay within
+       ~1px of the linear chords (corridor of admissible slopes, x256); split at the breakpoint (a new
+       wall edge).  A run that overflows the budget ROLLS BACK -> the CPU draws the whole visplane.
+       Gaps (top>bottom, occluded) are skipped -- the core's index-0 fill skips them too (no hole). */
+    int is_ceil = (height > viewz);            /* ceiling: SKY is above its top edge -> never grow up into it */
+    int gtop = is_ceil ? 0 : 1;                /* grow only the WALL-facing edge (floor top / ceiling bottom) */
+    int save_n = floor_acc_n;
+    for (int x = minx; x <= maxx; )
     {
-        int xr = xl + FLOOR_STRIP_W; if (xr > maxx) xr = maxx;
-        if (top[xl] <= bottom[xl] && top[xr] <= bottom[xr]) ++need;
-        if (xr >= maxx) break;
-        xl = xr;
-    }
-    if (need == 0 || floor_acc_n + need > MAX_FLOOR_ACC) return 0;   /* won't fit -> CPU fills it (no hole) */
-    for (int xl = minx; xl <= maxx; )
-    {
-        int xr = xl + FLOOR_STRIP_W; if (xr > maxx) xr = maxx;
-        if (top[xl] <= bottom[xl] && top[xr] <= bottom[xr])   /* both edges have floor -> a valid strip quad */
+        while (x <= maxx && top[x] > bottom[x]) ++x;                 /* skip gap columns (occluded) */
+        if (x > maxx) break;
+        int rs = x; while (x <= maxx && top[x] <= bottom[x]) ++x;
+        int re = x - 1;                                             /* [rs, re] = one contiguous floor run */
+        int x0 = rs;
+        while (x0 < re)
         {
+            long tmn = -262144, tmx = 262144, bmn = -262144, bmx = 262144;   /* admissible slope*256 range */
+            int x1 = x0 + 1, xcap = x0 + 96; if (xcap > re) xcap = re;
+            for (int xx = x0 + 4; xx <= xcap; xx += 4)              /* sample every 4 cols (bounds the divides) */
+            {
+                long dx = xx - x0;
+                long tl = ((long)(top[xx]    - 1 - top[x0])    * 256) / dx, th = ((long)(top[xx]    + 1 - top[x0])    * 256) / dx;
+                long bl = ((long)(bottom[xx] - 1 - bottom[x0]) * 256) / dx, bh = ((long)(bottom[xx] + 1 - bottom[x0]) * 256) / dx;
+                long na = tmn>tl?tmn:tl, nb = tmx<th?tmx:th, nc = bmn>bl?bmn:bl, nd = bmx<bh?bmx:bh;
+                if (na > nb || nc > nd) break;                      /* corridor empty -> segment ends before xx */
+                tmn=na; tmx=nb; bmn=nc; bmx=nd; x1 = xx;
+            }
+            if (floor_acc_n >= MAX_FLOOR_ACC) { floor_acc_n = save_n; return 0; }   /* overflow -> CPU whole visplane */
             struct floor_q *f = &floor_acc[floor_acc_n++];
-            f->x1  = (short)(xl << ds); f->x2  = (short)(xr << ds);
-            f->ytl = (short)top[xl];    f->ytr = (short)top[xr];
-            f->ybl = (short)bottom[xl]; f->ybr = (short)bottom[xr];
+            f->x1  = (short)(x0 << ds);            f->x2  = (short)(x1 << ds);
+            f->ytl = (short)(top[x0] - gtop);      f->ytr = (short)(top[x1] - gtop);
+            f->ybl = (short)(bottom[x0] + 1);      f->ybr = (short)(bottom[x1] + 1);
             f->col = col;
+            x0 = x1;
         }
-        if (xr >= maxx) break;
-        xl = xr;
     }
+    if (floor_acc_n == save_n) return 0;   /* nothing emitted -> software */
     return 1;   /* claimed -> core skips the software span + leaves index 0 (VDP1 shows through NBG1) */
 }
 

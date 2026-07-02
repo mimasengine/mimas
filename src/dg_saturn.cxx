@@ -3175,6 +3175,12 @@ extern "C" int R_FlatPotatoColor(int lumpnum);
 extern "C" int sat_vdp2_floor_pic;   /* dominant flat id (sat_vdp2_floor_h externed above) */
 
 #define MAX_FLOOR_ACC 80      /* floors emit first; cap leaves >=168 cmds for the walls (never starve a wall) */
+#define SAT_CEIL_FILL 8       /* TOPIC B (owner's rotation-decrochage idea): px a CEILING flat is grown DOWN into
+                                 the wall.  At rest the wall (painter-after, same VDP1 latency) covers it -> invisible.
+                                 In rotation the wall (VDP1) lags the NBG1 mask, opening a sky gap at the junction; the
+                                 grown ceiling colour reaches into that gap (revealed through the wall-skipped NBG1
+                                 index-0) -> fills it with ceiling colour instead of sky.  No punch-dilate = no CPU-wall
+                                 erase.  1 = off.  Caveat: on walls SHORTER than this it can bleed below the wall. */
 #define FLOOR_STRIP_W 48      /* columns per strip: follow the silhouette (top/bottom) in vertical strips */
 static struct floor_q { short x1, x2, ytl, ytr, ybl, ybr; unsigned short col; } floor_acc[MAX_FLOOR_ACC];
 static int floor_acc_n = 0;
@@ -3198,8 +3204,9 @@ extern "C" int sat_floor_vdp1_emit(int picnum, int height, int minx, int maxx,
        ~1px of the linear chords (corridor of admissible slopes, x256); split at the breakpoint (a new
        wall edge).  A run that overflows the budget ROLLS BACK -> the CPU draws the whole visplane.
        Gaps (top>bottom, occluded) are skipped -- the core's index-0 fill skips them too (no hole). */
-    int is_ceil = (height > viewz);            /* ceiling: SKY is above its top edge -> never grow up into it */
-    int gtop = is_ceil ? 0 : 1;                /* grow only the WALL-facing edge (floor top / ceiling bottom) */
+    int gtop = 1;                              /* +1 outward (masked by punch/wall): covers the residual ~1px corridor fit */
+    int is_ceil = (height > viewz);
+    int gbot = is_ceil ? SAT_CEIL_FILL : 1;    /* ceilings grow DOWN into the wall -> rotation-decrochage fill (Topic B) */
     int save_n = floor_acc_n;
     for (int x = minx; x <= maxx; )
     {
@@ -3210,22 +3217,34 @@ extern "C" int sat_floor_vdp1_emit(int picnum, int height, int minx, int maxx,
         int x0 = rs;
         while (x0 < re)
         {
-            long tmn = -262144, tmx = 262144, bmn = -262144, bmx = 262144;   /* admissible slope*256 range */
+            /* Slope corridor, sampled EVERY column, DIVIDE-FREE (the SH-2 has no fast divide): extend
+               while ONE straight edge stays within +-1px of BOTH top[] and bottom[] -- this bounds the
+               chord deviation (no holes on perspective-curved spans, unlike a local 2nd-diff test) and
+               breaks the instant it can't (a box-edge breakpoint -> no straddle -> no triangular sky
+               gap).  Feasible top-edge slopes live in [tLo,tHi], each a fraction N/D (D = column
+               distance); a new column narrows the range and fractions compare by CROSS-MULTIPLY
+               (a/b<c/d <=> a*d<c*b, b,d>0).  Identical decisions to the *256 divide version, ~6x cheaper. */
+            int tLoN = -0x4000, tLoD = 1, tHiN = 0x4000, tHiD = 1;   /* top slope    range [tLo, tHi] */
+            int bLoN = -0x4000, bLoD = 1, bHiN = 0x4000, bHiD = 1;   /* bottom slope range [bLo, bHi] */
             int x1 = x0 + 1, xcap = x0 + 96; if (xcap > re) xcap = re;
-            for (int xx = x0 + 4; xx <= xcap; xx += 4)              /* sample every 4 cols (bounds the divides) */
+            for (int xx = x0 + 2; xx <= xcap; ++xx)
             {
-                long dx = xx - x0;
-                long tl = ((long)(top[xx]    - 1 - top[x0])    * 256) / dx, th = ((long)(top[xx]    + 1 - top[x0])    * 256) / dx;
-                long bl = ((long)(bottom[xx] - 1 - bottom[x0]) * 256) / dx, bh = ((long)(bottom[xx] + 1 - bottom[x0]) * 256) / dx;
-                long na = tmn>tl?tmn:tl, nb = tmx<th?tmx:th, nc = bmn>bl?bmn:bl, nd = bmx<bh?bmx:bh;
-                if (na > nb || nc > nd) break;                      /* corridor empty -> segment ends before xx */
-                tmn=na; tmx=nb; bmn=nc; bmx=nd; x1 = xx;
+                int dx = xx - x0;
+                int tn = (int)top[xx]    - (int)top[x0];            /* top edge:    slope in [(tn-1)/dx, (tn+1)/dx] */
+                int bn = (int)bottom[xx] - (int)bottom[x0];         /* bottom edge: slope in [(bn-1)/dx, (bn+1)/dx] */
+                if ((long)(tn - 1) * tLoD > (long)tLoN * dx) { tLoN = tn - 1; tLoD = dx; }   /* raise top Lo   */
+                if ((long)(tn + 1) * tHiD < (long)tHiN * dx) { tHiN = tn + 1; tHiD = dx; }   /* lower top Hi   */
+                if ((long)(bn - 1) * bLoD > (long)bLoN * dx) { bLoN = bn - 1; bLoD = dx; }   /* raise bot Lo   */
+                if ((long)(bn + 1) * bHiD < (long)bHiN * dx) { bHiN = bn + 1; bHiD = dx; }   /* lower bot Hi   */
+                if ((long)tLoN * tHiD > (long)tHiN * tLoD) break;   /* top    Lo > Hi -> infeasible */
+                if ((long)bLoN * bHiD > (long)bHiN * bLoD) break;   /* bottom Lo > Hi -> infeasible */
+                x1 = xx;
             }
             if (floor_acc_n >= MAX_FLOOR_ACC) { floor_acc_n = save_n; return 0; }   /* overflow -> CPU whole visplane */
             struct floor_q *f = &floor_acc[floor_acc_n++];
             f->x1  = (short)(x0 << ds);            f->x2  = (short)(x1 << ds);
             f->ytl = (short)(top[x0] - gtop);      f->ytr = (short)(top[x1] - gtop);
-            f->ybl = (short)(bottom[x0] + 1);      f->ybr = (short)(bottom[x1] + 1);
+            f->ybl = (short)(bottom[x0] + gbot);   f->ybr = (short)(bottom[x1] + gbot);
             f->col = col;
             x0 = x1;
         }
@@ -3821,9 +3840,9 @@ extern "C" void DG_DrawFrame(void)
 #endif
           {
               int fhw = sat_view_floor_h >> 16;
-              hz = 96 + ((fhw + 56) * 3) / 23;             /* 1p player-height horizon (upper bound) */
+              hz = 96 + ((fhw + 56) * 3) / 23;             /* 1p player-height horizon -- now only the NO-FLOOR fallback */
               if (hz < 8) hz = 8; else if (hz > 128) hz = 128;
-              if (ft > 0 && ft < 0x3FFF && ft > hz) hz = ft;   /* clip LOWER iff the floor ends below the player horizon */
+              if (ft > 0 && ft < 0x3FFF) hz = ft;          /* owner 2026-07-02: the ACTUAL floor top is the SOLE reference (removed the "&& ft > hz" player-height clamp -> the plane length follows the real floor, not min(floor, player-height)) */
           }
           /* re-run sky_cell_build_map (sky boundary + floor window) when the horizon cell OR the window X
              extent changes (the latter on a 1p<->split toggle) so the window tracks P1's half. */

@@ -174,10 +174,27 @@ extern "C" char *gamedescription;
                                       because tiles past FTEX_MIP1/2DIST sample the 32x32 / 16x16
                                       DECIMATED mips (palette indices can't be averaged), so the
                                       minification fetch stays bounded. */
+#define FTEX_NEAR_MIN_ROWS 12      /* ADAPTIVE m3 (owner 2026-07-03 "corriger la ou c'est visible"):
+                                      the CPU near-band machinery (span trim + punch_nrow + the
+                                      texcol residue) only pays where the band is TALL enough for
+                                      the m2 flat patches to show (HW spot-5: s48).  A plane whose
+                                      near band is under this many screen rows claims m2-style
+                                      instead: VDP1 keeps the whole depth, the lit underlay covers
+                                      the few magnified rows the iteration guard skips. */
 #if SAT_FLOOR_TEX
 static int sat_ftex_mode = 3;      /* boot default = mode 3 (owner 2026-07-03): textured tiles in
                                       the serviceable band + CPU spans everywhere VDP1 would be
                                       wasteful or unreliable.  Y cycles 0..5. */
+/* SLAVE F-BUILD (owner GO 2026-07-03): the tile emission (inverse projections + one 64-bit divide
+   per grid node) was the P-phase surcharge the HW mode-captures exposed (P(m2) ~2x P(m4)); it now
+   runs on the slave SH-2 (idle 40-76% there) via the core aux-job API (r_parallel RP_AuxDispatch).
+   Pad L+Y toggles it live (row 12 'sl') for the in-session A/B. */
+extern "C" void RP_AuxDispatch(void (*fn)(void));
+extern "C" void RP_AuxWait(void);
+extern "C" void RP_AuxArm(void (*fn)(void));   /* piggyback: armed at the flush, taken by the
+                                                  masked slave body right after MASK_DONE */
+extern "C" int  RP_AuxKick(void);              /* DG-entry consumer (fallback dispatch)     */
+static int sat_ftex_slave = 1;
 static int ftexd_tiles, ftexd_skips, ftexd_trunc, ftexd_bakes, ftexd_px, ftexd_acc;   /* last flush */
 extern "C" short *sat_floor_punch_edge;   /* core r_plane.c: mode-3 per-column VDP1/CPU split */
 static short ftex_punch_edge_buf[320];    /* the platform buffer behind it (armed at init)    */
@@ -1453,9 +1470,9 @@ static void fps_update(void)
                bk = flat cache bakes (misses; steady >0 = 6 slots thrash).  With Dr% (row 2) these
                are the GO/NO-GO counters of the textured-floor step. */
             static char r12[45];
-            snprintf(r12, sizeof r12, "FTX m%d a%d t%d s%d x%d bk%d p%dK  ",
+            snprintf(r12, sizeof r12, "FTX m%d a%d t%d s%d x%d bk%d p%dK sl%d  ",
                      sat_ftex_mode, ftexd_acc, ftexd_tiles, ftexd_skips, ftexd_trunc,
-                     ftexd_bakes, ftexd_px >> 10);
+                     ftexd_bakes, ftexd_px >> 10, sat_ftex_slave);
             SRL::Debug::Print(0, 12, r12);
 #endif
             /* row 4: WINDOWED REC distribution p50/p95/max (tenths-ms) -- robust to the
@@ -3326,9 +3343,53 @@ static struct floor_q { short x1, x2, ytl, ytr, ybl, ybr; unsigned short col;
                         short lump;              /* flat lump: texture cache key (step 2) */
                         int   hz;                /* height - viewz, signed fixed_t (light + projection) */
                         unsigned char ln, ceil;  /* zlight light row 0..15; 1 = ceiling */
+                        unsigned char nsplit;    /* mode 3: 1 = near band tall enough for the CPU
+                                                    split (FTEX_NEAR_MIN_ROWS); 0 = m2-style claim */
 #endif
                       } floor_acc[MAX_FLOOR_ACC];
 static int floor_acc_n = 0;
+#if SAT_FLOOR_TEX
+/* Slave F-build job header, FROZEN by the flush's master part (slot resolves + underlays) and
+   consumed ONLY by ftex_slave_build on the slave -- so the kick/wjump/bank statics can move on
+   with the next frame while a build is still in flight.  floor_acc entries themselves stay
+   untouched until the next frame's claims, which JOIN the job first (RP_AuxWait). */
+static struct { unsigned int base, wjump; unsigned short wroot; short n;
+                unsigned char idx[MAX_FLOOR_ACC]; short slot[MAX_FLOOR_ACC]; } ftex_job;
+static int ftex_job_ready = 0;   /* master part done -> DG_DrawFrame dispatches the slave build */
+static int ftex_build_mode = 0;  /* fmode snapshot for the emitters (the pad can move mid-frame) */
+static void ftex_slave_build(void);   /* fwd: armed from the flush (RP_AuxArm) */
+
+/* ADAPTIVE-m3 texture gate (owner 2026-07-03: "les lumieres rouges du plafond, trop
+   visible"): the m2-style shallow-band claim shows the FLAT underlay wherever the
+   iteration guard skips a magnified tile -- invisible on a CALM flat, glaring on a BUSY
+   one (light grids, nukage).  Not a special-lump property: measured as the mean palette
+   RGB distance of the texels to the flat's dominant colour, computed ONCE per flat
+   (lazy; the lump set is WAD-constant, so the table survives level changes). */
+#define FTEX_BUSY_THRESH 60           /* mean |dR|+|dG|+|dB| to dominant (0..765): above = busy */
+static unsigned char ftex_busy_tab[256];   /* [lump-firstflat]: 0 unknown / 1 calm / 2 busy */
+static int ftex_flat_busy(int lump)
+{
+    int idx = lump - firstflat;
+    if (idx < 0 || idx >= (int)sizeof ftex_busy_tab) return 0;
+    if (!ftex_busy_tab[idx])
+    {
+        const unsigned char *src = (const unsigned char *)W_CacheLumpNum(lump, 8 /* PU_CACHE */);
+        if (!src) return 0;
+        int dom = R_FlatPotatoColor(lump) & 0xFF;
+        int dr = colors[dom].r, dg = colors[dom].g, db = colors[dom].b;
+        long acc = 0;
+        for (int i = 0; i < 64 * 64; i += 16)          /* 256 spread samples */
+        {
+            int c = src[i];
+            int d = colors[c].r - dr; acc += d < 0 ? -d : d;
+            d = colors[c].g - dg;     acc += d < 0 ? -d : d;
+            d = colors[c].b - db;     acc += d < 0 ? -d : d;
+        }
+        ftex_busy_tab[idx] = (unsigned char)((acc >> 8) > FTEX_BUSY_THRESH ? 2 : 1);
+    }
+    return ftex_busy_tab[idx] == 2;
+}
+#endif
 #if SAT_FLOOR_TEX
 /* View-state SNAPSHOT taken when the frame's first trapezoid is accumulated (in R_DrawPlanes).
    The flush runs at the NEXT wall kick -- sat_walls_done_hook fires right after the BSP walk,
@@ -3405,7 +3466,9 @@ static void ftex_fill_punch(const struct floor_q *f)
         if (cB > cyBa) cB = cyBa;
         if (cT < cB)
         {
-            int nearskip = f->ceil ? (cB <= ftex_cty - dyn) : (cT >= ftex_cty + dyn);
+            int nearskip = f->nsplit
+                ? (f->ceil ? (cB <= ftex_cty - dyn) : (cT >= ftex_cty + dyn))
+                : 0;   /* shallow band (nsplit 0): VDP1 serves the whole depth, punch it all */
             if (!nearskip)
             {
                 short e = f->ceil ? (short)cB : (short)cT;
@@ -3425,6 +3488,7 @@ extern "C" int sat_floor_vdp1_emit(int picnum, int height, int minx, int maxx,
     if (maxx < minx) return 0;
 #if SAT_FLOOR_TEX
     int claim_add = 0;                   /* claim-budget charge, applied ONLY on a successful claim */
+    int fdnear = 0;                      /* |row - centery| of the plane's nearest edge (mode-3 nsplit) */
     if (sat_ftex_mode == 4) return 0;    /* mode 4 SOFTWARE: every non-dominant plane -> CPU spans */
     if (sat_ftex_mode == 5) return 3;    /* mode 5: RBG0 dominant + SOFTWARE planes + VDP1 walls;
                                             the core paints the textured wall-lag catch-up band
@@ -3455,6 +3519,7 @@ extern "C" int sat_floor_vdp1_emit(int picnum, int height, int minx, int maxx,
             parea += (int)bottom[xx] - (int)top[xx] + 1;
         }
         if (dnear <= 0) return 0;                            /* nothing below/above horizon */
+        fdnear = dnear;
         /* COST threshold (owner): a plane whose VDP1 cost estimate -- its screen area, the
            same currency as the tile budget -- exceeds FTEX_PLANE_CPU_PX goes WHOLE to the
            software spans (+ the wall-lag band): one big plane must not eat the shared tile
@@ -3516,6 +3581,9 @@ extern "C" int sat_floor_vdp1_emit(int picnum, int height, int minx, int maxx,
     if (zl_row < 0) zl_row = 0; else if (zl_row > 15) zl_row = 15;
     if (floor_acc_n == 0)          /* first accumulation this frame -> snapshot the view state */
     {
+        RP_AuxWait();              /* a straggling slave F-build still reads floor_acc + this
+                                      snapshot -- join it before scribbling (normally long done:
+                                      the build ends ~35ms into the previous frame's game logic) */
         ftex_vx  = viewx;       ftex_vy  = viewy;
         ftex_vcos = viewcos;    ftex_vsin = viewsin;
         ftex_cxf = centerxfrac; ftex_cyf = centeryfrac;  ftex_proj = projection;
@@ -3625,7 +3693,15 @@ extern "C" int sat_floor_vdp1_emit(int picnum, int height, int minx, int maxx,
         int W2n = (viewwidth << detailshift) >> 1;
         int dyn2 = (int)((((long long)phn * W2n) / FTEX_CPU_NEARDIST) >> 16);
         if (dyn2 < 1) dyn2 = 1;
-        sat_floor_punch_nrow = is_ceil ? (centery - dyn2) : (centery + dyn2);
+        /* ADAPTIVE near split (FTEX_NEAR_MIN_ROWS): a shallow near band claims m2-style --
+           punch_nrow 0 disarms the core's near trim (its pn>0 guards), nsplit disarms the
+           emitters' near clamps, so VDP1 serves the whole depth there.  A BUSY flat (light
+           grid -- high texel contrast, ftex_flat_busy) always keeps the CPU near band: the
+           flat underlay patches the m2-style claim leaves there are glaring on it. */
+        int nspl = (fdnear - dyn2 >= FTEX_NEAR_MIN_ROWS) || ftex_flat_busy(lump);
+        sat_floor_punch_nrow = nspl ? (is_ceil ? (centery - dyn2) : (centery + dyn2)) : 0;
+        for (int i = save_n; i < floor_acc_n; ++i)
+            floor_acc[i].nsplit = (unsigned char)nspl;
         for (int xx = minx; xx <= maxx && xx < 320; ++xx)
             ftex_punch_edge_buf[xx] = is_ceil ? (short)-1 : (short)0x7FFF;   /* = no punch */
         for (int i = save_n; i < floor_acc_n; ++i)
@@ -3888,9 +3964,11 @@ static void ftex_emit_trapezoid(const struct floor_q *f, int slot)
     if (mrows < 1) mrows = 1;
     if (!f->ceil) { int ymip = ftex_cty + mrows; if (cyTa < ymip) cyTa = ymip; }
     else          { int ymip = ftex_cty - mrows; if (cyBa > ymip) cyBa = ymip; }
-    if (sat_ftex_mode == 3)
-    {   /* mode 3: the sub-FTEX_CPU_NEARDIST band belongs to the CPU spans (partial claim) --
-           don't spend tiles or fill there */
+    if (ftex_build_mode == 3 && f->nsplit)
+    {   /* mode 3 WITH near split: the sub-FTEX_CPU_NEARDIST band belongs to the CPU spans
+           (partial claim) -- don't spend tiles or fill there.  nsplit 0 (shallow band,
+           FTEX_NEAR_MIN_ROWS) = m2-style: tiles serve the whole depth.  ftex_build_mode is
+           the flush-time snapshot (the emitters may run on the SLAVE after the pad moved). */
         int dyn2 = (int)((((long long)ph * W2) / FTEX_CPU_NEARDIST) >> 16); if (dyn2 < 1) dyn2 = 1;
         if (!f->ceil) { int yn = ftex_cty + dyn2; if (cyBa > yn) cyBa = yn; }
         else          { int yn = ftex_cty - dyn2; if (cyTa < yn) cyTa = yn; }
@@ -3952,6 +4030,15 @@ static void vdp1_ftex_flush(void)
     ftex_flushed = 1;
     int fbk = vdp1_bank;                             /* this frame's parity (set by the kick) */
     int fmode = (sat_local_players <= 1) ? sat_ftex_mode : 0;
+    {
+        /* UNCONDITIONAL join + purge (review finding: gating these on the LIVE sat_ftex_slave
+           let a pad L+Y toggle-off race a straggling build -- double root flip, stale row-12
+           counters).  Both are near-free when no job is pending / the build is long done. */
+        RP_AuxWait();
+        volatile unsigned char *ccr = (volatile unsigned char *)0xFFFFFE92;
+        *ccr = (unsigned char)(*ccr | 0x10);         /* the row-12 counters + ftex_next below
+                                                        may have been written by the SLAVE */
+    }
     ftexd_tiles = ftex_tiles; ftexd_skips = ftex_skips;      /* row-12 snapshot of last frame */
     ftexd_trunc = ftex_trunc; ftexd_bakes = ftex_bakes; ftexd_px = ftex_px;
     ftexd_acc = floor_acc_n;                                 /* trapezoids claimed this frame */
@@ -3996,6 +4083,7 @@ static void vdp1_ftex_flush(void)
         vdp1_cmd_at(ftex_tile_base, ftex_next++, cmd);
     }
     /* textured tiles, NEAREST trapezoid first (spend the budget where texture is most visible) */
+    ftex_build_mode = fmode;
     if (fmode >= 2)
     {
         unsigned char idx[MAX_FLOOR_ACC]; short key[MAX_FLOOR_ACC];
@@ -4013,6 +4101,31 @@ static void vdp1_ftex_flush(void)
             unsigned char ii = idx[i]; short kk = key[i]; int j = i - 1;
             while (j >= 0 && key[j] < kk) { key[j + 1] = key[j]; idx[j + 1] = idx[j]; --j; }
             key[j + 1] = kk; idx[j + 1] = ii;
+        }
+        if (sat_ftex_slave)
+        {
+            /* SLAVE OFFLOAD: freeze the job header (sorted order + slots resolved HERE -- the
+               zone allocator and the VRAM flat uploads stay master-only) and hand the tile
+               emission to the slave SH-2.  DG_DrawFrame dispatches it (RP_AuxDispatch); the
+               slave finishes with the END + the W->F chain + the SAME single atomic root flip
+               (v7 pair semantics -- the dual-blit rewind joins the job, so the pair still goes
+               live BEFORE the NBG1 mask blit). */
+            for (int k = 0; k < floor_acc_n; ++k)
+            {
+                ftex_job.idx[k]  = idx[k];
+                ftex_job.slot[k] = (short)ftex_resolve(floor_acc[idx[k]].lump);
+            }
+            ftex_job.n     = (short)floor_acc_n;
+            ftex_job.base  = ftex_tile_base;
+            ftex_job.wjump = ftex_wjump_addr;
+            ftex_job.wroot = (unsigned short)wroot;
+            ftex_wjump_addr = 0;
+            ftex_job_ready  = 1;   /* floor_acc_n re-arms at the DG kick (entries stay frozen) */
+            RP_AuxArm(ftex_slave_build);   /* PIGGYBACK: the masked slave body takes the build
+                                              right after MASK_DONE (overlap = master's masked
+                                              tail + DG pre); RP_AuxKick at DG entry is the
+                                              fallback when masked never dispatched */
+            return;
         }
         for (int k = 0; k < floor_acc_n; ++k)
         {
@@ -4036,6 +4149,30 @@ static void vdp1_ftex_flush(void)
     *((volatile unsigned short *)VDP1_ROOT_ADDR + 1) = (unsigned short)wroot;
     ftex_wjump_addr = 0;
     floor_acc_n = 0;
+}
+
+/* SLAVE SH-2 body of the F build (dispatched by DG_DrawFrame via RP_AuxDispatch; the aux
+   wrapper already purged the slave cache and switched to the dedicated 4KB stack).  Consumes
+   ONLY the frozen job header + the floor_acc entries (guarded against next-frame scribbles by
+   the RP_AuxWait joins at the first claim / the flush / every SGL rewind).  All VDP1 VRAM
+   writes are cache-through (0x25C0xxxx has bit 29 set); the emitters' counter statics are
+   slave-owned for the job's duration and re-read by the master after its flush-entry purge. */
+static void ftex_slave_build(void)
+{
+    unsigned short cmd[16];
+    for (int k = 0; k < ftex_job.n; ++k)
+    {
+        if (ftex_next >= FTEX_F_CAP) { ftex_trunc++; break; }
+        int slot = ftex_job.slot[k];
+        if (slot < 0) { ftex_skips++; continue; }
+        ftex_emit_trapezoid(&floor_acc[ftex_job.idx[k]], slot);
+    }
+    memset(cmd, 0, sizeof cmd);                      /* tail END: F stays the chain's last link */
+    cmd[0] = 0x8000;
+    vdp1_cmd_at(ftex_job.base, ftex_next, cmd);
+    *((volatile unsigned short *)ftex_job.wjump + 1) =         /* chain fresh W -> fresh F */
+        (unsigned short)((ftex_job.base - VDP1_VRAM_BASE) >> 3);
+    *((volatile unsigned short *)VDP1_ROOT_ADDR + 1) = ftex_job.wroot;   /* ONE atomic present */
 }
 
 /* sat_floors_done_hook target.  In SPLIT the hook fires once per view with a partial
@@ -4513,6 +4650,20 @@ extern "C" void DG_DrawFrame(void)
         SRL::Debug::Print(0, 1, "FRAME1 OK               ");
     }
 
+#if VDP1_WALL_TEST && SAT_VDP1_FLOOR && SAT_FLOOR_TEX
+    if (ftex_job_ready)
+    {
+        /* Slave F-build: normally already TAKEN by the masked slave body (piggyback armed
+           at the flush -- overlap = master's masked tail + DG pre); RP_AuxKick dispatches
+           it as a plain aux job only when masked never ran this frame.  The pre-blit
+           RP_AuxWait below joins either path, so the coherent pair still flips BEFORE the
+           NBG1 mask blit (v7 ordering).  Only the COUNT re-arms here -- the entries stay
+           frozen for the slave; next frame's first claim also joins before touching them. */
+        ftex_job_ready = 0;
+        RP_AuxKick();
+        floor_acc_n = 0;
+    }
+#endif
     uint32_t df0 = DG_GetTicksMs();   /* SATURN PERF: DG_DrawFrame ms split (entry) */
 
     /* SATURN sky -> VDP2: (re)upload on level/episode change; position the layer.
@@ -4816,6 +4967,14 @@ extern "C" void DG_DrawFrame(void)
     }
 #endif
     uint32_t df1 = DG_GetTicksMs();        /* SATURN PERF: ms split -- end of pre, start of blit */
+#if VDP1_WALL_TEST && SAT_VDP1_FLOOR && SAT_FLOOR_TEX
+    /* JOIN the slave F-build BEFORE the NBG1 mask blit on EVERY blit path (review finding:
+       the boot default is the SINGLE-CPU blit, whose branch never calls rp_sgl_workptr_reset
+       -- without this the slave's root flip landed ~35ms into game logic, AFTER the mask
+       went live, re-introducing the v7 mask-vs-pair slip in motion).  Cost = the build's
+       residual after the DG pre-work, visible in the row-11 blit bucket (b stays copy-only). */
+    RP_AuxWait();
+#endif
     unsigned short blit_t0 = frt_read();   /* SATURN PERF: time the blit (-> sat_blit_ms10) */
 #if DUAL_CPU_BLIT
     if (blit_cfg[blit_mode].dual)
@@ -5264,6 +5423,12 @@ static void poll_pad(void)
                                                       5 software planes + VDP1 walls + band */
         sat_wall_skip = (sat_ftex_mode == 4) ? 0 : 1;   /* mode 4: walls render software too */
     }
+    /* Pad L+Y (R released): live A/B of the SLAVE F-build (row 12 'sl').  sl1 = tile emission
+       on the slave SH-2 (P should drop, b may grow by the join); sl0 = master-inline (the
+       pre-offload path, byte-identical).  Active-low buttons: !(cur&TL) = L held. */
+    if (!(cur & PER_DGT_TL) && (cur & PER_DGT_TR)
+        && (changed & PER_DGT_TY) && !(cur & PER_DGT_TY))
+        sat_ftex_slave ^= 1;
 #elif SAT_FLOOR_PERFSIM
     /* Pad Y cycles the 4 floor PERF-SIM modes (read REC/P rows 4/5 in each = the floor-offload
        ceiling, valid for RBG0 / VDP1-strips / gradient alike).  No RBG0/RAMCTL -> overlay stays

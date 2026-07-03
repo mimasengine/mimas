@@ -3424,6 +3424,7 @@ extern "C" int sat_floor_vdp1_emit(int picnum, int height, int minx, int maxx,
     if (height == sat_vdp2_floor_h && picnum == sat_vdp2_floor_pic) return 0;   /* dominant stays (RBG0/software) */
     if (maxx < minx) return 0;
 #if SAT_FLOOR_TEX
+    int claim_add = 0;                   /* claim-budget charge, applied ONLY on a successful claim */
     if (sat_ftex_mode == 4) return 0;    /* mode 4 SOFTWARE: every non-dominant plane -> CPU spans */
     if (sat_ftex_mode == 5) return 3;    /* mode 5: RBG0 dominant + SOFTWARE planes + VDP1 walls;
                                             the core paints the textured wall-lag catch-up band
@@ -3466,7 +3467,11 @@ extern "C" int sat_floor_vdp1_emit(int picnum, int height, int minx, int maxx,
            are not punched at all: they render as software spans (+ band) instead of being
            promised to a plot pass that cannot finish them. */
         if (ftex_claim_px + (parea << detailshift) > FTEX_PX_BUDGET) return 3;
-        ftex_claim_px += parea << detailshift;
+        claim_add = parea << detailshift;   /* charged at the bottom, on the REAL claim only: the
+                                               sliver/fully-far return-3 paths below and the
+                                               decomposition return-0 rollbacks must not leave the
+                                               shared budget inflated (planes went software but
+                                               still starved later planes flat) */
         {
             int W2s = (viewwidth << detailshift) >> 1;
             int dyn = (int)(((long long)ph3 * W2s / 32) >> 16);   /* row offset of dist==NEARCLIP */
@@ -3609,6 +3614,7 @@ extern "C" int sat_floor_vdp1_emit(int picnum, int height, int minx, int maxx,
     }
     if (floor_acc_n == save_n) return 0;   /* nothing emitted -> software */
 #if SAT_FLOOR_TEX
+    ftex_claim_px += claim_add;            /* the plane really claims -> charge the shared budget */
     if (sat_ftex_mode == 3)
     {
         /* PARTIAL claim: per-column split edge = the tiles' chunk-clip interiors (identical
@@ -3680,14 +3686,12 @@ static int ftex_tiles, ftex_skips, ftex_trunc, ftex_bakes;   /* this flush (snap
 static int ftex_px;                      /* tile fill spent this flush (bbox px, budget currency) */
 static unsigned int ftex_tile_base;      /* F bank being written this frame (F0/F1)             */
 static int          ftex_next;           /* write cursor in the F bank                          */
-static unsigned int ftex_wjump_addr;     /* byte addr of THIS frame's wall-bank closing JUMP    */
-static unsigned int ftex_last_flink;     /* CMDLINK of the last finished F bank (0 = none): the
-                                            kick bridges the new walls to it until the flush --
-                                            VDP1 replots every vblank (1-cycle auto), an empty
-                                            bridge = the flat/textured FLICKER.  WALLS FIRST in
-                                            list order: when a heavy plot overruns the vblank,
-                                            the FLOORS get cut, never the walls (the walls-
-                                            vanish regression of the floors-first chain). */
+static unsigned int ftex_wjump_addr;     /* byte addr of THIS frame's wall-bank closing JUMP.
+                                            WALLS FIRST in list order: when a heavy plot overruns
+                                            the vblank, the FLOORS get cut, never the walls.  The
+                                            root only flips at the flush, to the COMPLETE fresh
+                                            walls+floors pair (no mixed-frame passes -- the old
+                                            stale-floor bridge was the motion flick). */
 static int          ftex_flushed;        /* this frame's F already built (hook ran; DG call no-ops) */
 
 /* flat lump -> VDP1 VRAM slot (LRU + per-frame lock, the wtex discipline: a slot referenced by
@@ -3954,13 +3958,12 @@ static void vdp1_ftex_flush(void)
     ftex_tiles = ftex_skips = ftex_trunc = ftex_bakes = 0; ftex_px = 0;
     ftex_claim_px = 0;                                       /* re-arm the claim-time budget */
     if (!ftex_wjump_addr) return;                    /* no wall list this frame (menu) */
+    unsigned int wroot = (unsigned int)((VDP1_BANK[fbk] - VDP1_VRAM_BASE) >> 3);
     if (fmode == 4 || floor_acc_n == 0)
     {
-        /* software mode / nothing claimed: point the walls' closing JUMP at the empty bank
-           and forget the last F, so the next kick bridges to nothing as well. */
-        *((volatile unsigned short *)ftex_wjump_addr + 1) =
-            (unsigned short)((VDP1_BANKE_ADDR - VDP1_VRAM_BASE) >> 3);
-        ftex_last_flink = 0;
+        /* software mode / nothing claimed: the walls' JUMP already targets the empty bank
+           (the kick wrote it) -- just present the fresh pair. */
+        *((volatile unsigned short *)VDP1_ROOT_ADDR + 1) = (unsigned short)wroot;
         ftex_wjump_addr = 0;
         floor_acc_n = 0;
         return;
@@ -4025,10 +4028,12 @@ static void vdp1_ftex_flush(void)
     memset(cmd, 0, sizeof cmd);
     cmd[0] = 0x8000;
     vdp1_cmd_at(ftex_tile_base, ftex_next, cmd);
-    /* atomic: this frame's floors go live behind this frame's walls; remembered so the
-       NEXT kick can bridge its fresh walls to these floors until its own flush */
-    ftex_last_flink = (unsigned int)((ftex_tile_base - VDP1_VRAM_BASE) >> 3);
-    *((volatile unsigned short *)ftex_wjump_addr + 1) = (unsigned short)ftex_last_flink;
+    /* chain the fresh floors behind the fresh walls (the write bank is NOT displayed -- the
+       root still shows last frame's pair), then present the WHOLE coherent pair with the one
+       atomic root flip. */
+    *((volatile unsigned short *)ftex_wjump_addr + 1) =
+        (unsigned short)((ftex_tile_base - VDP1_VRAM_BASE) >> 3);
+    *((volatile unsigned short *)VDP1_ROOT_ADDR + 1) = (unsigned short)wroot;
     ftex_wjump_addr = 0;
     floor_acc_n = 0;
 }
@@ -4389,33 +4394,37 @@ static void vdp1_wpn_kick(void)
         unsigned short end[16];
         memset(end, 0, sizeof end);
 #if VDP1_WALL_TEST && SAT_VDP1_FLOOR && SAT_FLOOR_TEX
-        /* WALLS FIRST: the wall bank closes with a sysclip+JUMP into the floor bank -- last
-           frame's F until this frame's flush re-points it (the anti-flicker bridge; F always
-           ends with END, so no chain can loop).  When a heavy plot overruns the vblank
-           (1-cycle auto), the tail of the list -- the FLOORS -- gets cut, never the walls
-           (the floors-first chain made walls vanish in complex scenes, owner 2026-07-03).
-           Cost: during the pre-flush bridge, stale floors paint AFTER fresh walls, so a
-           moving junction can show a small stale-floor overhang for those passes. */
+        /* COHERENT-PAIR PRESENT (owner 2026-07-03: alternating perfect/destroyed frames in
+           motion): the root is NOT flipped here.  VDP1 keeps replotting LAST frame's coherent
+           walls+floors pair (its banks are the other parity, untouched) while this frame's W
+           is closed with a JUMP to the empty bank; vdp1_ftex_flush then builds F, points this
+           JUMP at it, and flips the root ONCE to the complete fresh pair.  No plot pass ever
+           mixes frames (the old stale-floor bridge showed offset floors + fresh walls on the
+           pre-flush vblanks = the flick).  Walls also land WITH the mask blit now instead of
+           ~1 frame ahead.  In 1-cycle auto there is no head-start to lose: every vblank
+           restarts the plot from the root. */
         end[0]  = 0x0009 | 0x1000;                   /* sysclip (non-drawing) + JUMP_ASSIGN */
-        end[1]  = (unsigned short)(ftex_last_flink ? ftex_last_flink
-                                                   : ((VDP1_BANKE_ADDR - VDP1_VRAM_BASE) >> 3));
+        end[1]  = (unsigned short)((VDP1_BANKE_ADDR - VDP1_VRAM_BASE) >> 3);
         end[10] = 319; end[11] = 223;                /* keep the sysclip values (== root's) */
         vdp1_cmd_at(VDP1_BANK[vdp1_wbank], vdp1_wnext, end);
         ftex_wjump_addr = VDP1_BANK[vdp1_wbank] + (unsigned int)vdp1_wnext * 32u;
         ftex_flushed = 0;
+        vdp1_bank = vdp1_wbank;                      /* the pair being BUILT (root flips at flush) */
+        VDP1_PTMR = 0x0002;
+        vdp1_wactive = 0;
+        return;                                      /* root untouched: old coherent pair shows */
 #else
         end[0] = 0x8000;
         vdp1_cmd_at(VDP1_BANK[vdp1_wbank], vdp1_wnext, end);
-#endif
         link = (VDP1_BANK[vdp1_wbank] - VDP1_VRAM_BASE) >> 3;
         vdp1_bank = vdp1_wbank;
+#endif
     }
     else
     {
         link = (VDP1_BANKE_ADDR - VDP1_VRAM_BASE) >> 3;
 #if VDP1_WALL_TEST && SAT_VDP1_FLOOR && SAT_FLOOR_TEX
         ftex_wjump_addr = 0;                         /* no wall list -> nothing to chain onto */
-        ftex_last_flink = 0;                         /* menu/transition: drop the stale floors */
         ftex_flushed = 1;                            /* no level flush this frame */
 #endif
     }

@@ -38,6 +38,7 @@ extern "C" {
 #include "r_parallel.h"
 }
 #include "hud2p_panel.h"   /* generated 2-player compact HUD panel + field anchors */
+#include "hud4p_panel.h"   /* generated 3/4-player compact HUD band bevel column + anchors */
 
 /* Set by D_SetGameDescription() from the loaded IWAD's lumps; we surface it on
    the debug overlay (row 21) to confirm which WAD the binary actually detected.
@@ -596,10 +597,13 @@ extern "C" void           sat_setup_view_p1(void);/* core: re-anchor the view gl
 extern "C" int            sat_potato_floors;/* core: solid-colour floors/ceilings */
 extern "C" int            sat_potato_walls; /* core: solid-colour walls (opaque, flat only) */
 extern "C" int            sat_wall_nocpu;   /* core: banded/flat -> skip close-wall CPU fallback */
-/* Phase-1 wall clamp A/B flag ([[wall-clamp-world-anchored]], docs/WALL_SUBDIVISION_STUDY.md):
-   1 = SPAN-close one-sided walls STAY on VDP1 (clamped swim-free in wall_emit_band) instead of the
-   CPU fallback -- the Option-2 lever.  HW A/B: build 0 then 1, watch overlay row-6 FBK 'c' drop to
-   ~0 + check the near walls don't swim + read fps (row 0).  Default 0 = byte-identical shipping. */
+/* Phase-1 wall clamp ([[wall-clamp-world-anchored]], docs/WALL_SUBDIVISION_STUDY.md): 1 = tiers
+   partially below floorclip / above a deported ceiling STAY on VDP1, cut at a WHOLE-TEXEL
+   world-anchored line (straight on screen, exact at both ends -> no squish/swim; the platform's
+   1px pad is inside the cut) + the residual WEDGE down/up to the true per-column clip stays
+   software (core sat_wall_cut_floor/_ceil).  SPAN-close stays CPU (the v0 warp verdict) and
+   magnified stays CPU/subdiv.  Live A/B: pad L+R+Y; row-6 FBK 'W<n><+/->' = kept tiers + state,
+   'c' should melt where W rises. */
 #define SAT_WALL_CLAMP 1
 extern "C" int            sat_wall_clamp;   /* core r_segs.c global; set from SAT_WALL_CLAMP at init */
 
@@ -782,6 +786,17 @@ static void hud2p_blit_panels(void)
     }
 }
 
+/* 3/4-player compact HUD: paint one quadrant's 160x16 band (each row a solid bevel
+   colour -> one memset per row) at (ox, oy); the core then draws that player's
+   widgets on top via ST_DrawQuadHud.  The band is OPAQUE (non-zero indices) so it
+   occludes the VDP1 wall layer below NBG1 -- see hud4p_col in hud4p_panel.h. */
+extern "C" void ST_DrawQuadHud(int pnum, int ox, int oy);   /* core: per-player compact widgets */
+static void hud4p_blit_band(int ox, int oy)
+{
+    for (int y = 0; y < HUD4P_H; ++y)
+        memset(framebuffer + (oy + y) * 320 + ox, hud4p_col[y], HUD4P_W);
+}
+
 /* 2-player flash (per-half software wash): the hardware palette is shared by both
    viewports, so each player's damage/pickup flash is applied by remapping that
    half's framebuffer indices through a LUT = base-palette index nearest to
@@ -845,6 +860,27 @@ static void hud2p_apply_flash(void)
         for (int y = 0; y < 224; ++y)
         {
             unsigned char *row = framebuffer + y * 320 + x0;
+            for (int x = 0; x < 160; ++x) row[x] = lut[row[x]];
+        }
+    }
+}
+
+/* 3/4-player flash: same per-viewport LUT wash, but per QUADRANT (160x112).  In 3p
+   the 4th quadrant is the minimap (no player) -> pass n = player count so it is not
+   remapped.  Reuses the 2p LUTs; only a damaged/flashing quadrant pays the remap. */
+static void hud4p_apply_flash(int n)
+{
+    static const short qx[4] = { 0, 160, 0,   160 };
+    static const short qy[4] = { 0, 0,   112, 112 };
+    if (!hud2p_flash_built) hud2p_flash_build();
+    for (int q = 0; q < n; ++q)
+    {
+        int lvl = ST_PlayerPaletteIndex(q);
+        if (lvl <= 0 || lvl >= HUD2P_NPAL) continue;
+        const unsigned char *lut = hud2p_flash_lut[lvl];
+        for (int y = 0; y < HUD4P_QUAD_H; ++y)
+        {
+            unsigned char *row = framebuffer + (qy[q] + y) * 320 + qx[q];
             for (int x = 0; x < 160; ++x) row[x] = lut[row[x]];
         }
     }
@@ -1260,7 +1296,9 @@ extern "C" int gamemap;   /* core doomstat: drives the per-map window reset */
    VDP1 bank full (Phase-1 worsens); px = clampable fill-work proxy (span*cols = the master
    software cost Phase-1 removes).  A big clamp/px => build the clamp; mostly mag/starve => reconsider. */
 extern "C" int sat_fb_clamp_t, sat_fb_mag_t, sat_fb_starve_t, sat_fb_px;
+extern "C" int sat_fb_wclamp_t;   /* Phase-1: tiers KEPT on VDP1 by the cut+wedge clamp */
 static int fb_cur_clamp = 0, fb_cur_mag = 0, fb_cur_px = 0;             /* last rendered frame */
+static int fb_cur_wclamp = 0;
 static int fb_pk_clamp  = 0, fb_pk_mag  = 0, fb_pk_starve = 0, fb_pk_px = 0;  /* windowed peaks (reset on config change) */
 
 /* SATURN PERF (2026-06-24): one-shot memory-latency calibration.  The memory-bound
@@ -1527,11 +1565,13 @@ static void fps_update(void)
             /* row 6: Phase-0 wall CPU-fallback sizer.  c = clampable tiers cur/pk (SPAN + below-floor
                = the Phase-1 world-anchored VDP1 clamp target); m = face-on magnified residue cur/pk;
                s = starved (VDP1 bank full) pk; K = clampable fill proxy cur/pk in kilo-pixels (the
-               master software fill Phase-1 removes).  Big c + K => build the clamp; mostly m/s => reconsider. */
+               master software fill Phase-1 removes).  W = tiers Phase-1 KEPT on VDP1 (cut+wedge)
+               this frame + the clamp state: c should melt where W rises (L+R+Y toggles). */
             static char rFB[45];
-            snprintf(rFB, sizeof rFB, "FBK c%d/%d m%d/%d s%d K%d/%d   ",
+            snprintf(rFB, sizeof rFB, "FBK c%d/%d m%d/%d s%d K%d/%d W%d%c  ",
                      fb_cur_clamp, fb_pk_clamp, fb_cur_mag, fb_pk_mag, fb_pk_starve,
-                     fb_cur_px >> 10, fb_pk_px >> 10);
+                     fb_cur_px >> 10, fb_pk_px >> 10,
+                     fb_cur_wclamp, sat_wall_clamp ? '+' : '-');
             SRL::Debug::Print(0, 6, rFB);   /* moved 24->6: joins the sizer block (TXC/ZON/mem now off) */
             /* row 18: memory-latency calibration (one-shot cold 32 KB read per bank, FRT
                ticks).  rL = LWRAM/HWRAM ratio -- >1.0 means LWRAM (cmd buf + visplanes) is
@@ -3770,6 +3810,33 @@ static unsigned int ftex_wjump_addr;     /* byte addr of THIS frame's wall-bank 
                                             stale-floor bridge was the motion flick). */
 static int          ftex_flushed;        /* this frame's F already built (hook ran; DG call no-ops) */
 
+/* Mip decimation sample for ONE mip texel whose source block anchors at (x,y), step x step.
+   CALM flats: plain point sample (skip-sampling keeps the hue family exact).  BUSY flats
+   (owner 2026-07-03 "on les voit en software uniquement"): plain decimation DROPS small
+   high-contrast features -- a 3-4-texel ceiling light falls BETWEEN the stride-4 samples,
+   so the far mip bands lost the tech-room lights that every software region kept.  Instead
+   take the block texel FARTHEST from the flat's dominant colour when that distance clears
+   FTEX_MIP_FEAT (a defining feature -- lights stay lit); else the plain point sample.
+   Bake-time only (once per slot upload); the per-frame fetch is unchanged. */
+#define FTEX_MIP_FEAT 120   /* per-texel |dR|+|dG|+|dB| to dominant: above = feature, keep it */
+static unsigned char ftex_mip_pick(const unsigned char *src, int x, int y,
+                                   int step, int busy, int dr, int dg, int db)
+{
+    unsigned char pick = src[y * 64 + x];
+    if (!busy) return pick;
+    int best = FTEX_MIP_FEAT;
+    for (int by = 0; by < step; ++by)
+        for (int bx = 0; bx < step; ++bx)
+        {
+            int c = src[(y + by) * 64 + x + bx], a, d;
+            d = colors[c].r - dr; a  = d < 0 ? -d : d;
+            d = colors[c].g - dg; a += d < 0 ? -d : d;
+            d = colors[c].b - db; a += d < 0 ? -d : d;
+            if (a > best) { best = a; pick = (unsigned char)c; }
+        }
+    return pick;
+}
+
 /* flat lump -> VDP1 VRAM slot (LRU + per-frame lock, the wtex discipline: a slot referenced by
    an already-emitted command is never re-uploaded mid-frame).  Upload = raw 8bpp palette
    indices, 16-bit packed exactly like the wall bake (hi byte = even texel, big-endian SH-2);
@@ -3798,19 +3865,29 @@ static int ftex_resolve(int lump)
         volatile unsigned short *t = (volatile unsigned short *)base;
         for (int i = 0; i < 64 * 64 / 2; ++i)
             t[i] = (unsigned short)(((unsigned int)src[2 * i] << 8) | src[2 * i + 1]);
-        /* mips: 32x32 (+0x1000) and 16x16 (+0x1400), POINT-DECIMATED -- palette indices
-           cannot be averaged; skip-sampling keeps the hue family exact.  Far tiles sample
-           these instead of the 64x64 so the minification fetch stays bounded (MIP1/2DIST). */
+        /* mips: 32x32 (+0x1000) and 16x16 (+0x1400), DECIMATED (palette indices cannot be
+           averaged) via ftex_mip_pick -- point sample on calm flats, feature-max on busy
+           ones.  Far tiles sample these instead of the 64x64 so the minification fetch
+           stays bounded (MIP1/2DIST). */
+        int busy = ftex_flat_busy(lump);
+        int fdr = 0, fdg = 0, fdb = 0;
+        if (busy)
+        {
+            int dom = R_FlatPotatoColor(lump) & 0xFF;
+            fdr = colors[dom].r; fdg = colors[dom].g; fdb = colors[dom].b;
+        }
         volatile unsigned short *m1 = (volatile unsigned short *)(base + 0x1000u);
         for (int y = 0; y < 32; ++y)
             for (int xw = 0; xw < 16; ++xw)
                 m1[y * 16 + xw] = (unsigned short)
-                    (((unsigned int)src[(y * 2) * 64 + xw * 4] << 8) | src[(y * 2) * 64 + xw * 4 + 2]);
+                    (((unsigned int)ftex_mip_pick(src, xw * 4,     y * 2, 2, busy, fdr, fdg, fdb) << 8)
+                                  | ftex_mip_pick(src, xw * 4 + 2, y * 2, 2, busy, fdr, fdg, fdb));
         volatile unsigned short *m2 = (volatile unsigned short *)(base + 0x1400u);
         for (int y = 0; y < 16; ++y)
             for (int xw = 0; xw < 8; ++xw)
                 m2[y * 8 + xw] = (unsigned short)
-                    (((unsigned int)src[(y * 4) * 64 + xw * 8] << 8) | src[(y * 4) * 64 + xw * 8 + 4]);
+                    (((unsigned int)ftex_mip_pick(src, xw * 8,     y * 4, 4, busy, fdr, fdg, fdb) << 8)
+                                  | ftex_mip_pick(src, xw * 8 + 4, y * 4, 4, busy, fdr, fdg, fdb));
     }
     ftex_cache[victim].lump = lump; ftex_cache[victim].locked = 1;
     ftex_cache[victim].lru = ftex_tick;
@@ -4240,11 +4317,19 @@ static void vdp1_walls_flush(void)
         wall_acc[i].mode = 2;                                  /* flat baseline (guaranteed to fit) */
     }
 
-    /* paint NEAR->FAR (owner 2026-07-03): solid walls' visible column ranges are mutually
-       disjoint in x (solidseg clipping), so quad order barely matters visually (only the 1px
-       seam overlaps) -- but an overrunning plot cuts the LIST TAIL, so near-first sacrifices
-       the FARTHEST walls instead of the nearest.  (Was far->near painter order.) */
-    for (int i = 0; i < wall_acc_n; ++i)
+    /* paint FAR->NEAR (owner Ymir 2026-07-03, "les murs arriere devant"): VDP1 plots the bank
+       head->tail and LAST-WRITTEN WINS, so the nearest wall must be emitted LAST to win every
+       overlap.  The hook stores RAW yl/yh (pre per-column clip, dg_saturn:2904), so a far wall
+       seen through a near opening -- or behind the pedestal/stair profile -- has a quad that
+       extends BEHIND the near walls; near-first (the reverted 2026-07-03 order) let the far
+       quad, written later, overpaint them.  The near-first order existed ONLY to make a
+       plot-overrun drop the FARTHEST walls, but that famine is ALREADY handled at ACCUMULATE
+       time and in the RIGHT direction: WALL_PX_BUDGET + the cmd cap route the farthest walls to
+       the SOFTWARE fallback (dg_saturn:2891), which is per-column clipped (NBG1, but clipped to
+       nothing behind a near wall -> no bleed).  So the two concerns are now separated: fill
+       budget = overrun/famine protection (far walls -> CPU), emit order = painter correctness
+       (far last... i.e. near last).  wall_acc is filled near-first by the BSP, so reverse it. */
+    for (int i = wall_acc_n - 1; i >= 0; --i)
     {
         if      (wall_acc[i].mode == 1) wall_emit(i);
         else if (wall_acc[i].mode == 3) wall_emit_banded(i);
@@ -4520,12 +4605,14 @@ static void vdp1_wpn_kick(void)
     /* Phase-0 fallback profiler: snapshot the just-rendered frame's tally into cur + windowed peaks
        (r_segs.c accumulated the counters across this frame's segs), then reset below. */
     fb_cur_clamp = sat_fb_clamp_t; fb_cur_mag = sat_fb_mag_t; fb_cur_px = sat_fb_px;
+    fb_cur_wclamp = sat_fb_wclamp_t;
     if (sat_fb_clamp_t  > fb_pk_clamp)  fb_pk_clamp  = sat_fb_clamp_t;
     if (sat_fb_mag_t    > fb_pk_mag)    fb_pk_mag    = sat_fb_mag_t;
     if (sat_fb_starve_t > fb_pk_starve) fb_pk_starve = sat_fb_starve_t;
     if (sat_fb_px       > fb_pk_px)     fb_pk_px     = sat_fb_px;
 #endif
     sat_fb_clamp_t = sat_fb_mag_t = sat_fb_starve_t = sat_fb_px = 0;   /* reset each frame (also when SHOW_FPS off) */
+    sat_fb_wclamp_t = 0;
     if (vdp1_wactive)
     {
         unsigned short end[16];
@@ -4933,18 +5020,41 @@ extern "C" void DG_DrawFrame(void)
     if (gamestate != GS_LEVEL)
         memset(framebuffer + 200 * 320, 0, 24 * 320);
     {
-        /* SATURN 2p: paint the two compact-HUD panels into the bottom 64 rows
-           (rows 160..223), draw each player's widgets on top (P1 left, P2 right),
-           then apply each player's damage/pickup flash as a per-half wash -- all
-           into the framebuffer before the blit.  (2-player only; the 3/4-player
-           quadrant HUD is a later iteration -> those use full-screen views.) */
-        extern int sat_local_players;
-        if (sat_local_players == 2 && gamestate == GS_LEVEL)
+        /* SATURN split-screen HUD, painted into the framebuffer before the blit.  Gate on
+           the SAME predicate d_main uses to split-render (a real co-op game, in a level,
+           not the full-screen automap) -- else a stale sat_local_players on the demo/attract
+           loop, or an open automap, would get a split HUD painted over a view d_main did NOT
+           split-render.  usergame is externed as int elsewhere in this file (matches core). */
+        extern int sat_local_players, usergame;
+        if (sat_local_players > 1 && usergame && gamestate == GS_LEVEL && !automapactive)
         {
-            hud2p_blit_panels();
-            ST_DrawCompactWidgets(0, 0,   HUD2P_TOP);   /* P1 (left)  */
-            ST_DrawCompactWidgets(1, 160, HUD2P_TOP);   /* P2 (right) */
-            hud2p_apply_flash();                        /* per-half damage/pickup flash */
+            if (sat_local_players == 2)
+            {
+                /* 2p: two 160x64 compact-HUD panels in the bottom 64 rows (P1 left, P2 right),
+                   each player's widgets on top, then a per-half damage/pickup flash. */
+                hud2p_blit_panels();
+                ST_DrawCompactWidgets(0, 0,   HUD2P_TOP);   /* P1 (left)  */
+                ST_DrawCompactWidgets(1, 160, HUD2P_TOP);   /* P2 (right) */
+                hud2p_apply_flash();
+            }
+            else
+            {
+                /* 3/4p: each 160x112 quadrant is a 160x96 view + a 16px compact HUD band at its
+                   bottom (band top = quadrant top + 96).  Paint the opaque band + that player's
+                   widgets, then the per-quadrant flash.  In 3p the 4th quadrant is the minimap
+                   (no player) -> only views 0..n-1 get a band, and the flash is passed n so it
+                   skips the minimap. */
+                static const short qx[4] = { 0, 160, 0,   160 };
+                static const short qy[4] = { 0, 0,   112, 112 };
+                int n = sat_local_players; if (n > 4) n = 4;
+                for (int q = 0; q < n; ++q)
+                {
+                    int oy = qy[q] + (HUD4P_QUAD_H - HUD4P_H);   /* = qy + 96: band at the view bottom */
+                    hud4p_blit_band(qx[q], oy);
+                    ST_DrawQuadHud(q, qx[q], oy);
+                }
+                hud4p_apply_flash(n);
+            }
         }
     }
 #if VDP1_MANUAL_CHANGE
@@ -5021,8 +5131,9 @@ extern "C" void DG_DrawFrame(void)
     uint32_t df2 = DG_GetTicksMs();        /* SATURN PERF: ms split -- end of blit, start of clear */
     /* LAYER INVERSION: clear the 3D VIEW to index 0 so next frame the SKIPPED wall columns stay
        transparent -> the VDP1 walls (below NBG1) show through.  The HUD rows are left intact
-       (1p: status bar 192..223 owned by ST_Drawer; 2p: panels 160..223 owned by hud2p; 3/4p:
-       no HUD -> clear the whole frame). */
+       (1p: status bar 192..223 owned by ST_Drawer; 2p: panels 160..223 owned by hud2p).  3/4p:
+       clear all 224 -- the compact HUD bands + minimap are repainted opaque each frame before
+       the blit, so clearing their rows here (they're interleaved per quadrant) is harmless. */
     {
         extern int sat_local_players;
         int clear_rows = (sat_local_players >= 3) ? 224 : (sat_local_players == 2 ? 160 : 192);
@@ -5429,6 +5540,13 @@ static void poll_pad(void)
     if (!(cur & PER_DGT_TL) && (cur & PER_DGT_TR)
         && (changed & PER_DGT_TY) && !(cur & PER_DGT_TY))
         sat_ftex_slave ^= 1;
+    /* Pad L+R+Y: live A/B of the Phase-1 WALL CLAMP (partially-occluded tiers kept on VDP1 via
+       the world-anchored cut + software wedge, core sat_wall_cut_floor/_ceil).  Row 6
+       W<n><+/-> = tiers kept this frame + state; c/K melt where W rises.  Y family: alone =
+       floor mode, L = slave F-build, R = RBG0 A/B, L+R = wall clamp. */
+    if (!(cur & PER_DGT_TL) && !(cur & PER_DGT_TR)
+        && (changed & PER_DGT_TY) && !(cur & PER_DGT_TY))
+        sat_wall_clamp ^= 1;
 #elif SAT_FLOOR_PERFSIM
     /* Pad Y cycles the 4 floor PERF-SIM modes (read REC/P rows 4/5 in each = the floor-offload
        ceiling, valid for RBG0 / VDP1-strips / gradient alike).  No RBG0/RAMCTL -> overlay stays

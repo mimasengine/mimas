@@ -1,6 +1,14 @@
 # Wall sub-quad subdivision & the CPU-fallback clamp — study + roadmap
 
-> **STATUS: PLAN (Phase 0 SHIPPED, Phase 1 designed).** Deep study of SlaveDriver-style
+> **STATUS: Phase 0 SHIPPED; Phase 1 IMPLEMENTED 2026-07-03 (occlusion cuts, HW validation
+> pending).** The shipped Phase 1 pivoted from the SPAN clamp (§5.A — v0 rejected, "warp
+> affine = moche") to the **below-floor / above-ceiling occlusion cuts**: cut the tier at a
+> WHOLE-TEXEL world-anchored line (straight on screen, exact at both ends) kept clear of
+> min(floorclip)/max(ceilingclip), emit through the unchanged hook (corners `e∓1` absorb the
+> platform's 1px pad, `v0/v1 = vcut`), and leave the residual per-column WEDGE to the software
+> column loop (`sat_wall_cut_floor/_ceil` + `sat_wcl_*` in core/r_segs.c). Gate
+> `sat_wall_clamp` (default ON), live A/B pad L+R+Y, row-6 FBK `W<n><+/->`.
+> Deep study of SlaveDriver-style
 > sub-quad subdivision applied to Mimas's walls: kill the affine squish and **replace/limit the
 > CPU software fallback** for near / partially-below-floor walls. Feeds the roadmap decision
 > (§6). Companion to [`VDP1_CAPACITY_STUDY.md`](VDP1_CAPACITY_STUDY.md),

@@ -70,13 +70,22 @@ are compiled **verbatim** by both this port and **DoomJo** (the Jo Engine port,
 cd core; git add -A; git commit -m "..."; git push; cd ..
 # 2. record the new core revision in this port
 git add core && git commit -m "bump core"
-# 3. pull it into DoomJo the same way: cd ../DoomJo/core; git pull; cd ..; git add core; git commit
+# 3. (optional, owner's call) sync into DoomJo: cd ../DoomJo/core; git pull; cd ..; git add core; git commit
 ```
 
-`core/r_parallel.c` must stay **pure C** (no C++): DoomJo compiles it with
-GCC 9.3 which errors on C++isms (e.g. unnamed parameters) that Mimas's GCC 14
-would only warn about. Its only platform hooks are `slSlaveFunc` (SGL, both
-ports) and an `extern dbg_print` debug shim (each port implements it).
+`core/*.c` (incl. `r_parallel.c`) compile as **C** in Mimas's own build
+(`-std=gnu11`) — that is why core stays C, independent of DoomJo.
+
+**DoomJo compatibility is informative, not a constraint** — the objective is
+optimizing **Mimas**. DoomJo compiles the shared `core/` with GCC 9.3, which
+*errors* on C++isms (e.g. unnamed parameters) and GCC-14-only features that
+Mimas accepts. A Mimas optimization is **never blocked** by DoomJo impact:
+implement the best Mimas version and **flag** what would break DoomJo (C++ism /
+GCC-14 feature / behaviour change) — `core/` is a shared submodule, so DoomJo
+won't build until the break is reconciled (inform, don't self-censor).
+
+`r_parallel.c`'s only platform hooks are `slSlaveFunc` (SGL, both ports) and an
+`extern dbg_print` debug shim (each port implements it).
 
 ## Architecture: C Doom + C++ SRL
 

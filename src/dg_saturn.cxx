@@ -658,6 +658,18 @@ void sat_vdp1_wpn_clip(void);          /* sat_psprite_begin hook: clip the weapo
 void sat_vdp1_wpn_begin(void);
 void sat_vdp1_wpn_draw(patch_t *patch, int lump, int sx, int sy, int flip,
                        const unsigned char *cmap);
+/* world-things-on-VDP1 (SAT_WORLD_THINGS_VDP1 is #defined later, so -- like the weapon decls
+   above -- these stay UNGUARDED; they are only referenced where the macro is on). */
+extern int (*sat_thing_hook)(patch_t *patch, int lump, const unsigned char *cmap,
+                             int x0, int y0, int x1, int y1,
+                             int cx0, int cy0, int cx1, int cy1, int flip); /* core r_things.c */
+void R_EmitWorldThingsVDP1(void);      /* core: emit world sprites to VDP1 at the post-BSP kick */
+extern int sat_things_occ;             /* core: fully-occluded sprites skipped this frame (metric) */
+extern int sat_thing_cap;              /* core: how many (nearest) things go to VDP1/frame (we set = slots) */
+extern int sat_things_hw;              /* core: 1 = world sprites -> VDP1 (M4); 0 = software (M0/M6) */
+int  sat_vdp1_thing_draw(patch_t *patch, int lump, const unsigned char *cmap,
+                         int x0, int y0, int x1, int y1,
+                         int cx0, int cy0, int cx1, int cy1, int flip);     /* our sat_thing_hook impl */
 }
 #endif
 
@@ -694,11 +706,15 @@ void sat_walls_kick(void);                /* platform: flush + kick the VDP1 wal
    shows the resolved composition so a capture always pins the exact state.
    M1 reproduces the historical default (RBG0 dominant + VDP1 leftover + VDP1 walls
    + NBG0 sky) verbatim -- the regression anchor. */
-enum { M0_SOFT, M1_FULL, M2_FLOORS, M3_CEILS, M4_RBG0, M5_CONVEX, M_COUNT };
-static int sat_m = M4_RBG0;                 /* boot = RBG0 dominant floor + VDP1 walls + software leftover/
-                                               ceilings (HW A/B 2026-07-05: +44% vs M1; VDP1 floor/ceiling
-                                               tiles cost ~40ms P+Bp).  M1..M3 (VDP1 deport) parked on Z. */
-static const char *const sat_m_name[M_COUNT] = { "soft", "full", "flr", "ceil", "rbg0", "cvx" };
+enum { M0_SOFT, M1_FULL, M2_FLOORS, M3_CEILS, M4_RBG0, M5_CONVEX, M6_NOSPR, M_COUNT };
+static int sat_m = M4_RBG0;                 /* boot = RBG0 dominant floor + VDP1 walls + VDP1 weapon + VDP1
+                                               world things.  M6 = same but world things SOFTWARE (the
+                                               sprite-only A/B).  Pad Z cycles ONLY {M0, M4, M6}; M1/M2/M3/M5
+                                               are PARKED (kept for reference/A-B, off the cycle). */
+static const char *const sat_m_name[M_COUNT] = { "soft", "full", "flr", "ceil", "rbg0", "cvx", "nospr" };
+/* Pad-Z cycle: the live modes only (parked M1/M2/M3/M5 stay reachable only via code). */
+static const int sat_m_cycle[] = { M0_SOFT, M4_RBG0, M6_NOSPR };
+#define SAT_M_CYCLE_N ((int)(sizeof(sat_m_cycle) / sizeof(sat_m_cycle[0])))
 enum { SQ_FULL, SQ_LD, SQ_BAND, SQ_FLAT };
 static int sq_wall = SQ_FULL, sq_floor = SQ_LD, sq_ceil = SQ_LD;   /* floor+ceil ld by default (HW-tested "fll":
                                                                      ld is ~invisible on the ceiling and fine on the
@@ -711,21 +727,21 @@ static int wall_potato_mode = 0;            /* VDP1 wall style: 0=tex 1=banded 2
 static int sat_vdp1_floor_claim = 1;        /* leftover floors -> VDP1 tiles (M1,M2) */
 static int sat_vdp1_ceil_claim  = 1;        /* ceilings        -> VDP1 tiles (M1,M3) */
 
-/* Dual-CPU blit configs, cycled LIVE by the pad L+R chord (one press = next, wraps).
-   'mpct' = % of the 224 framebuffer rows the MASTER copies ([0,split)); the slave
-   copies the rest [split,224).  The slave reads work-RAM less-cached than the master
-   (which just generated it) so it is slower per row -> shifting rows toward the
-   master (higher mpct) trims the master's spin-wait.  Index 0 = single-CPU baseline
-   (for the A/B reference).  Sweep 50/50 -> 75/25 to bracket the balance point; if
-   even 75/25 still leaves the master waiting, add higher mpct entries (or vice-versa).
-   Row-2 'bl<idx> <mpct>/<spct>' shows the active config so a photo ties bl/MST/fps
-   to its ratio. */
-static const struct { int dual; int mpct; } blit_cfg[] = {
-    { 0, 100 },   /* 0: single-CPU (master copies all 224) */
-    { 1,  50 },   /* 1: 50/50 */
-    { 1,  60 },   /* 2: 60/40 */
-    { 1,  66 },   /* 3: 66/34 */
-    { 1,  75 },   /* 4: 75/25 */
+/* Framebuffer->VDP2 blit configs, cycled LIVE by the pad L+A chord (one press = next, wraps;
+   NOT L+R -- that's the debug-overlay cycle).  TWO orthogonal axes flattened into one cycle:
+   - dma : 0 = single-CPU memcpy, 1 = SCU-DMA blit (Inc 1, slDMACopy; docs/BLIT_DMA_PLAN.md).
+   - w5  : 0 = blit all 224 rows, 1 = W5 = skip the static HUD band [hud_top,224) when it did
+           not change (core sat_hud_dirty / the 2p signature); the 3D view always blits.
+   Row-1 'b<ms><c/d><-/5>' shows the ms + path (c/d) + W5 (- off / 5 on), so L+A steps through
+   the 4 combos and a photo ties b/MST/fps to the exact state.  W5 helps only when the HUD is
+   idle (mostly 1p/2p standing still); it is orthogonal to the path so both c5 and d5 exist.
+   The measured-DEAD dual-CPU configs are gone (bus-bound S~1.3 + slave-dispatch wedge risk);
+   the dual code stays behind DUAL_CPU_BLIT for git revival but no cfg selects it (dual=0). */
+static const struct { int dual; int mpct; int dma; int w5; } blit_cfg[] = {
+    { 0, 100, 0, 0 },   /* 0: CPU,     full HUD blit -- boot baseline */
+    { 0, 100, 0, 1 },   /* 1: CPU  + W5 (skip static HUD rows) */
+    { 0, 100, 1, 0 },   /* 2: SCU-DMA, full HUD blit */
+    { 0, 100, 1, 1 },   /* 3: SCU-DMA + W5 */
 };
 #define BLIT_CFG_N ((int)(sizeof(blit_cfg) / sizeof(blit_cfg[0])))
 static int blit_mode = 0;   /* boot: single-CPU blit.  2026-06-22 HW (pot0 tech room):
@@ -738,6 +754,15 @@ static inline int blit_split(void) { return (blit_cfg[blit_mode].mpct * 224) / 1
    decides dual-CPU blit GO/DROP -- fps/MST are too coarse (~12ms of a ~100ms frame).
    Read it on row 2 as 'b<ms.tenth>'; compare config 0 (single) vs 4 (75/25), same scene. */
 static unsigned int sat_blit_ms10 = 0;
+/* SATURN W5 (docs/BLIT_DMA_PLAN.md): blit the HUD rows [hud_top,224) only when the HUD
+   framebuffer actually changed; the 3D-view rows [0,hud_top) always blit.  hud_top = the
+   clear boundary (192 1p / 160 2p / 224 3-4p) so 3/4p (no bottom HUD band) blits all 224 = a
+   no-op.  1p dirty comes from core sat_hud_dirty (the STlib widgets, now diff'd); 2p from the
+   ST_SplitHudSig value signature below.  W5 is a RUNTIME axis of blit_cfg (the 'w5' field,
+   pad L+A) -- always compiled, off at boot; the core diff/dirty writes are unconditional and
+   harmless when w5=0.  Read blit_cfg[blit_mode].w5 at the blit. */
+extern "C" int sat_hud_dirty;            /* core st_stuff.c: HUD region (re)drawn this frame */
+extern "C" unsigned int ST_SplitHudSig(void);  /* core: 2p/4p compact-HUD value signature */
 /* core/r_plane.c L1 toggle (1 = visplane hash, 0 = vanilla linear scan); frozen at 1 (HW: NULL
    at E1M1, REC §C.2) -- kept extern for the row-1 stamp only, no longer pad-toggled. */
 extern "C" int sat_visplane_hash;
@@ -772,6 +797,8 @@ static void sat_apply_mode(void)
     sat_vdp2_floor          = rbg0_want ? 1 : 0;   /* per-frame block re-derives on split/1p (rbg0_on) */
     sat_vdp2_floor_dominant = RBG0_FLOOR_DOMINANT; /* every RBG0 mode uses the dominant-flat pick */
     sat_wall_skip           = vdp1_walls ? 1 : 0;  /* M0 -> core draws software one-sided walls */
+    sat_things_hw           = (M != M0_SOFT && M != M6_NOSPR); /* world sprites -> VDP1 prio-7 (M4); M6 = SOFTWARE
+                                                     sprites (same walls+floor as M4) = the sprite-only A/B */
     sat_vdp1_floor          = hook_consult ? 1 : 0;/* core: consult the emit hook (M1..M3) */
     /* sat_ftex_mode: 4 = M0 (legacy all-software path drops the VDP1 wall_acc); 6 = M5 CONVEX-EXACT
        (distant planes whose every run is ONE linear trapezoid -> 1 exact quad; non-convex or near ->
@@ -1283,11 +1310,67 @@ static volatile int vdp1_couple_nbg1     = 0;   /* brick B: defer the NBG1 blit 
 #define VDP1_COUPLE_MAX_VBL    4    /* couple: wait at most this many vblanks for CEF before blitting anyway */
 #endif
 
+/* SATURN world-things-on-VDP1: per-frame emitted / declined counters (overlay 'th').  Defined here
+   (before the SHOW_FPS overlay block that prints them, and unconditionally so the emit path that
+   increments them always links) -- the pool struct itself is defined later with the weapon cache. */
+static int sat_things_n = 0, sat_things_decl = 0;
+
 #if SHOW_FPS
 extern "C" int rp_timeout_count;
 extern "C" unsigned int rp_master_ms;   /* master frame ms -> prefixes r_parallel.c's row-18 SLV line */
 static unsigned int dg_frame_count = 0;
 static int vdp1_last_cmds = 0;
+
+/* ============================================================================
+   SATURN world-things-on-VDP1: SESSION percentile metrics -- so ONE end-of-level capture tells
+   the whole story instead of jittery instantaneous values.  Auto-RESET on a MODE change (sat_m /
+   SQ), NOT on a level change (user 2026-07-05: "par session, tant que je ne change pas le mode")
+   -> the numbers describe the whole run at the CURRENT mode.  A/B = capture M4, switch to M0
+   (pad Z), capture again.  Histograms give p50/p90/p99 with no sort: frame time (8ms buckets),
+   world-things emitted/frame and declined/frame (direct 0..63).  Plus the VDP1 plot done-rate (the
+   headroom / flicker-inverse: the OnVblank Dr sampler feeds mh_vbl_*) and occluded-skip avg.
+   ============================================================================ */
+#define MH_MS_BUCKETS  40          /* 8ms buckets -> 0..320ms frame time */
+#define MH_MS_SHIFT    3
+#define MH_N_BUCKETS   64          /* things count 0..63 (direct index) */
+static unsigned int mh_ms[MH_MS_BUCKETS];
+static unsigned int mh_things[MH_N_BUCKETS];
+static unsigned int mh_decl[MH_N_BUCKETS];
+static unsigned int mh_frames;
+static unsigned int mh_ms_mx, mh_things_mx, mh_decl_mx, mh_occ_sum;
+static unsigned int mh_vbl_done, mh_vbl_tot;   /* VDP1 plot done-rate over the session */
+
+static void mh_reset(void)
+{
+    memset(mh_ms, 0, sizeof mh_ms);
+    memset(mh_things, 0, sizeof mh_things);
+    memset(mh_decl, 0, sizeof mh_decl);
+    mh_frames = mh_ms_mx = mh_things_mx = mh_decl_mx = mh_occ_sum = 0;
+    mh_vbl_done = mh_vbl_tot = 0;
+}
+static void mh_add(int ms, int things, int decl, int occ)
+{
+    int b;
+    b = ms >> MH_MS_SHIFT; if (b < 0) b = 0; if (b >= MH_MS_BUCKETS) b = MH_MS_BUCKETS-1; mh_ms[b]++;
+    b = things;            if (b < 0) b = 0; if (b >= MH_N_BUCKETS)  b = MH_N_BUCKETS-1;  mh_things[b]++;
+    b = decl;              if (b < 0) b = 0; if (b >= MH_N_BUCKETS)  b = MH_N_BUCKETS-1;  mh_decl[b]++;
+    if ((unsigned)ms     > mh_ms_mx)     mh_ms_mx     = (unsigned)ms;
+    if ((unsigned)things > mh_things_mx) mh_things_mx = (unsigned)things;
+    if ((unsigned)decl   > mh_decl_mx)   mh_decl_mx   = (unsigned)decl;
+    mh_occ_sum += (unsigned)occ;
+    mh_frames++;
+}
+/* percentile p(0..100): first bucket whose cumulative count reaches p% of mh_frames.  For the ms
+   histogram the caller shifts the returned bucket back to ms (<<MH_MS_SHIFT = the lower edge). */
+static int mh_pct(const unsigned int *h, int nb, int p)
+{
+    unsigned int target, acc = 0; int b;
+    if (!mh_frames) return 0;
+    target = (mh_frames * (unsigned)p + 99u) / 100u;
+    for (b = 0; b < nb; b++) { acc += h[b]; if (acc >= target) return b; }
+    return nb - 1;
+}
+
 /* RELIABLE VDP1 load (replaces the CEF/vblank-aliased Dr%): command-budget FILL % for the wall
    and floor banks, computed where WALL_CMD_CAP/FTEX_F_CAP are in scope (they are #defined below
    fps_update) and read by the overlay.  The CPU-fallback counts (fb_pk_starve = walls dumped
@@ -1428,7 +1511,7 @@ static void fps_update(void)
            per-phase peaks, floor sizers, VDP1 done-rate) whenever the variable under test
            changes (new map / potato / visplane-hash / blit config),
            so each A/B run starts a clean min/avg/max window -- no manual button needed
-           (the pad is already saturated: Y=hash X=split Z=potato L+R=blit). */
+           (the pad is already saturated: Y=SQ X=split Z=mode-M L+A=blit). */
         {
             static int l_map=-1, l_m=-1, l_sq=-1, l_blit=-1;
 #if SAT_FLOOR_PERFSIM
@@ -1490,8 +1573,10 @@ static void fps_update(void)
         unsigned int _used = _tic + _snd + _blit + _dg;
         unsigned int _rec  = (mst > _used) ? (mst - _used) : 0u;         /* derived render */
         static char r1[45];
-        sprintf(r1, "R%u T%u S%u b%u dg%u pr%u.%u          ",
-                _rec, _tic, _snd, _blit, _dg, _pr10 / 10, _pr10 % 10);
+        char blit_c = blit_cfg[blit_mode].dma ? 'd' : 'c';   /* blit path: c=CPU, d=SCU-DMA (L+A) */
+        char blit_w = blit_cfg[blit_mode].w5  ? '5' : '-';   /* W5 HUD-skip: 5=on, -=off (L+A)  */
+        sprintf(r1, "R%u T%u S%u b%u%c%c dg%u pr%u.%u      ",
+                _rec, _tic, _snd, _blit, blit_c, blit_w, _dg, _pr10 / 10, _pr10 % 10);
         if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 1, r1);
         /* window reset -- read the row-1 composition ABOVE before this zeroes the sums.  The
            dead RAM/TXC/ZON sizer block (TEX/SPL/TXC/ZON, all display-off) was cut with the
@@ -1616,10 +1701,30 @@ static void fps_update(void)
                pointless.  Tenths-ms; FRT-quantised (~0.02ms/tick) so pj jitters +-0.1ms. */
             int sp_pj = 0, sp_fl = 0, sp_np = 0, sp_nd = 0;
             RP_SprStats(&sp_pj, &sp_fl, &sp_np, &sp_nd);
-            static char rSPR[45];
-            snprintf(rSPR, sizeof rSPR, "SPR pj%d.%d fl%d.%d n%d/%d      ",
-                     sp_pj/10, sp_pj%10, sp_fl/10, sp_fl%10, sp_np, sp_nd);
+            static char rSPR[48];
+            /* th e/d = world-things emitted on VDP1 / declined (too big or budget) this frame */
+            snprintf(rSPR, sizeof rSPR, "SPR pj%d.%d fl%d.%d n%d/%d th%d/%d   ",
+                     sp_pj/10, sp_pj%10, sp_fl/10, sp_fl%10, sp_np, sp_nd,
+                     sat_things_n, sat_things_decl);
             if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 15, rSPR);
+            /* rows 9-10: SESSION percentiles (reset ONLY on a MODE change) -- read ONE end-of-level
+               capture, no jitter.  THp = world-things emitted/frame p50/p99, declined/frame p99,
+               occluded-skip avg/frame, f = sample count.  FMp = frame time (ms) p50/p90/p99 + max,
+               D = VDP1 plot done-rate % (headroom; low D => things at the list tail get cut = flicker). */
+            int f_p50 = mh_pct(mh_ms, MH_MS_BUCKETS, 50) << MH_MS_SHIFT;
+            int f_p90 = mh_pct(mh_ms, MH_MS_BUCKETS, 90) << MH_MS_SHIFT;
+            int f_p99 = mh_pct(mh_ms, MH_MS_BUCKETS, 99) << MH_MS_SHIFT;
+            int t_p50 = mh_pct(mh_things, MH_N_BUCKETS, 50);
+            int t_p99 = mh_pct(mh_things, MH_N_BUCKETS, 99);
+            int d_p99 = mh_pct(mh_decl, MH_N_BUCKETS, 99);
+            unsigned int occ10 = mh_frames ? (mh_occ_sum * 10u / mh_frames) : 0;
+            unsigned int don    = mh_vbl_tot ? (mh_vbl_done * 100u / mh_vbl_tot) : 0;
+            static char rTHp[45], rFMp[45];
+            snprintf(rTHp, sizeof rTHp, "THp n%d/%d d%d o%u.%u f%u    ",
+                     t_p50, t_p99, d_p99, occ10 / 10, occ10 % 10, mh_frames);
+            snprintf(rFMp, sizeof rFMp, "FMp %d/%d/%d mx%u D%u%%    ",
+                     f_p50, f_p90, f_p99, mh_ms_mx, don);
+            if (sat_dbg_overlay_mode == 0) { SRL::Debug::Print(0, 9, rTHp); SRL::Debug::Print(0, 10, rFMp); }
             /* row 11 (ENDGAME limits high-water): how close this ~1s window got to the render
                HARD-HALT caps that I_Error-freeze a big WAD (docs/ENDGAME_ROADMAP.md Axis 2).
                vp = peak visplanes / MAXVISPLANES(256); ds = peak drawsegs / MAXDRAWSEGS(256);
@@ -2490,6 +2595,15 @@ extern "C" void DG_Init(void)
 #define SAT_WPN_VDP1 1   /* player weapon on the VDP1 prio-7 sprite layer (default ON).  Software-wall
                             split falls back to the software weapon (r_things.c R_DrawMasked gate). */
 #endif
+#ifndef SAT_WORLD_THINGS_VDP1
+#define SAT_WORLD_THINGS_VDP1 1  /* DE-RISK PROBE (default ON): world sprites on the VDP1 prio-7 layer to
+                                    offload the ~6-13ms masked FILL off the SH-2s.  Emitted at the post-BSP
+                                    kick (1p only), non-occlusion-clipped (viewport/system-clip only) -- so
+                                    a nearer wall does not yet hide a farther thing (FUNC_UserClip is the
+                                    follow-up).  M0 keeps software sprites (sat_wall_skip gate) = A/B ref.
+                                    Reads: overlay 'th e/d' (emitted/declined), Dr%/fps for the headroom
+                                    question, and whether the boxes track the monsters + walls survive. */
+#endif
 #if SAT_WPN_VDP1
     /* PER-COMMAND SPLIT: register 0 = 5 (below NBG1) is what walls/floors select -- their
        framebuffer values are CRAM addresses <=2047, so the priority-select bits are CLEAR ->
@@ -2587,6 +2701,11 @@ extern "C" void DG_Init(void)
     sat_psprite_hook  = sat_vdp1_wpn_draw;
     sat_psprite_begin = sat_vdp1_wpn_clip;   /* clip the weapon to its view (no HUD poke / no split spill) */
     sat_psprite_early = 1;
+#endif
+#if SAT_WORLD_THINGS_VDP1
+    /* Route the world sprites to VDP1 prio 7 (offload the masked FILL).  core R_EmitWorldThingsVDP1
+       (called from the post-BSP kick) computes each screen rect and calls this hook. */
+    sat_thing_hook = sat_vdp1_thing_draw;   /* sat_thing_cap set in vdp1_wpn_init (THINGS_TEX_SLOTS in scope there) */
 #endif
 #endif
 
@@ -2831,6 +2950,27 @@ static unsigned int vdp1_hud_csum = 0xFFFFFFFFu;  /* status-bar change detector 
 #define HUD_H        32
 #define HUD_Y        168
 #define VDP1_HUD_TEX 0x25C78000u   /* 320*32*2 = 20KB, just past the weapon cache */
+
+#if SAT_WORLD_THINGS_VDP1
+/* World-things-on-VDP1: 8bpp texture pool in the free 28KB gap between the weapon cache (ends
+   0x25C71000) and the HUD sprite (0x25C78000) -- touches neither the wall pool nor the weapon.
+   TEARING FIX: the pool is DOUBLE-BUFFERED by frame parity (= vdp1_wbank).  The VDP1 coherent-pair
+   present keeps replotting the OLD pair (parity ^1) every vblank until the new pair flips in; if a
+   thing texture is re-baked in place while the old pair still references it, the sprite tears
+   across its width.  So THIS frame bakes only into parity[vdp1_wbank]; the displayed pair's
+   textures (the other parity) are never touched -> tear-free.  NO cross-frame cache: each eligible
+   sprite is re-baked FRESH every frame (handles animation for free) into a per-frame slot (counter
+   reset each frame, always < THINGS_TEX_SLOTS -> never reused within a frame).  Full-patch bakes
+   are distance-independent, so 4 slots x 3584B fit any shareware monster (incl caco/pinky/baron-no:
+   9KB declined).  The core picks the NEAREST THINGS_TEX_SLOTS sprites (biggest fill) for VDP1; the
+   rest stay software.  4 x 3584 x 2 parity = 28KB (the whole gap).  Bigger clean offload => cede
+   wall-pool VRAM.  'th' counts emitted/declined. */
+#define THINGS_TEX_BASE   0x25C71000u
+#define THINGS_TEX_SLOTS  4                /* per parity == max things offloaded/frame (VRAM cap) */
+#define THINGS_TEX_SLOTSZ 0x0E00u          /* 3584 B -> fits any shareware monster frame @ 8bpp */
+static int          thing_slot_used;       /* slots baked in the CURRENT frame's parity (reset per frame) */
+/* (sat_things_n / sat_things_decl are defined earlier, before the overlay block) */
+#endif
 
 /* Write one 32-byte VDP1 command (16 halfwords) at command index `idx` of `base`. */
 static void vdp1_cmd_at(unsigned int base, int idx, const unsigned short *c)
@@ -4559,8 +4699,9 @@ static void vdp1_vblank_present(void)
 static void vdp1_vblank_dr(void)
 {
     if (!vd1_dr_live) return;
-    vd1_win_tot++;
-    if (VDP1_EDSR & 0x0002) vd1_win_done++;
+    int done = (VDP1_EDSR & 0x0002) ? 1 : 0;
+    vd1_win_tot++;   if (done) vd1_win_done++;   /* ~1s window (row 2 Dr%) */
+    mh_vbl_tot++;    if (done) mh_vbl_done++;     /* session (mode-scoped) done-rate -> metrics row */
 }
 #endif
 
@@ -4586,6 +4727,10 @@ static void vdp1_wpn_init(void)
     vdp1_bank = 0; vdp1_wactive = 0;
     for (int i = 0; i < WPN_TEX_SLOTS; ++i) wpn_cache[i].lump = -1;
     wpn_cache_rr = 0;
+#if SAT_WORLD_THINGS_VDP1
+    thing_slot_used = 0;
+    sat_thing_cap = THINGS_TEX_SLOTS;   /* nearest-N things/frame to VDP1 (VRAM slot cap) */
+#endif
 #if VDP1_WALL_TEST
     wtex_setup();                                    /* fixed per-slot VRAM addr + capacity */
     for (int i = 0; i < WTEX_SLOTS; ++i) { wtex_cache[i].texnum = -1; wtex_cache[i].lru = 0;
@@ -4623,6 +4768,10 @@ extern "C" void sat_vdp1_wpn_begin(void)
         for (int i = 0; i < WPN_TEX_SLOTS; ++i) wpn_cache[i].lump = -1;
         vdp1_hud_csum = 0xFFFFFFFFu;
     }
+#if SAT_WORLD_THINGS_VDP1
+    sat_things_n = sat_things_decl = 0;   /* per-frame 'th' overlay counters (reset at bank build) */
+    thing_slot_used = 0;                  /* per-frame parity slot counter (no re-bake into a displayed slot) */
+#endif
 #if VDP1_DBLBANK
     vdp1_wbank = vdp1_bank ^ 1;                      /* the bank VDP1 isn't showing */
 #else
@@ -4820,6 +4969,83 @@ extern "C" void sat_vdp1_wpn_draw(patch_t *patch, int lump, int sx, int sy, int 
     vdp1_cmd_at(VDP1_BANK[vdp1_wbank], vdp1_wnext++, cmd);
 }
 
+#if SAT_WORLD_THINGS_VDP1
+/* core sat_thing_hook: draw ONE world sprite as a VDP1 prio-7 distorted quad, offloading its
+   masked FILL off the SH-2s.  Returns 1 if taken, 0 if declined (command budget / per-frame slot
+   cap / oversize) -> the core then draws that one in software.  Same 8bpp palette recipe as the
+   weapon (texel = light-shaded index cmap[s], CRAM bank 1 full-bright, index 0 transparent, black
+   remap).  TEAR-FREE: bakes FRESH into parity[vdp1_wbank] slot [thing_slot_used++] -- the displayed
+   OLD pair (parity ^1) is never touched; the counter (reset each frame) keeps < THINGS_TEX_SLOTS so
+   a slot is never reused within a frame.  Occlusion clip rect + quad corners precomputed by core. */
+extern "C" int sat_vdp1_thing_draw(patch_t *patch, int lump, const unsigned char *cmap,
+                                   int x0, int y0, int x1, int y1,
+                                   int cx0, int cy0, int cx1, int cy1, int flip)
+{
+    (void)lump;
+    int padW, H, W;
+
+    if (vdp1_wnext >= WALL_CMD_CAP - 1) { sat_things_decl++; return 0; }  /* need 2 cmds (clip + quad) */
+    if (thing_slot_used >= THINGS_TEX_SLOTS) { sat_things_decl++; return 0; }  /* per-frame VRAM slot cap */
+
+    W    = (int)bswap16((unsigned short)patch->width);
+    H    = (int)bswap16((unsigned short)patch->height);
+    padW = (W + 7) & ~7;
+    if ((unsigned int)(padW * H) > THINGS_TEX_SLOTSZ) { sat_things_decl++; return 0; }  /* too big -> software */
+
+    int slot = (vdp1_wbank & 1) * THINGS_TEX_SLOTS + thing_slot_used;   /* parity-partitioned slot */
+    thing_slot_used++;
+    unsigned int texaddr = THINGS_TEX_BASE + (unsigned int)slot * THINGS_TEX_SLOTSZ;
+
+    {   /* bake the full patch fresh into this slot */
+        const unsigned int *colofs = (const unsigned int *)patch->columnofs;
+        volatile unsigned char *tex = (volatile unsigned char *)texaddr;
+        for (int i = 0; i < padW * H; ++i) tex[i] = 0;                 /* texel 0 = transparent gap */
+        int blk = 1, blkbest = 0x7fffffff;                            /* darkest non-zero index (keep black opaque) */
+        for (int p = 1; p < 256; ++p)
+        { int lum = colors[p].r + colors[p].g + colors[p].b; if (lum < blkbest) { blkbest = lum; blk = p; } }
+        for (int x = 0; x < W; ++x)
+        {
+            const post_t *post = (const post_t *)((const unsigned char *)patch + bswap32(colofs[x]));
+            while (post->topdelta != 0xFF)
+            {
+                const unsigned char *s = (const unsigned char *)post + 3;
+                int top = post->topdelta;
+                for (int i = 0; i < post->length; ++i)
+                { int c = cmap[s[i]]; tex[(top + i) * padW + x] = (unsigned char)(c ? c : blk); }
+                post = (const post_t *)((const unsigned char *)post + post->length + 4);
+            }
+        }
+    }
+
+    unsigned short cmd[16];
+
+    /* OCCLUSION: a FUNC_UserClip to the visible bounding box, then the quad clipped to it
+       (Window_In).  A fully-occluded sprite never reaches here (core skips it); a partial cut
+       (nearer wall/floor edge) is trimmed to the box -> the thing no longer floats over walls. */
+    memset(cmd, 0, sizeof cmd);
+    cmd[0]  = 0x0008;                              /* FUNC_UserClip */
+    cmd[6]  = (short)cx0; cmd[7]  = (short)cy0;    /* upper-left  */
+    cmd[10] = (short)cx1; cmd[11] = (short)cy1;    /* lower-right */
+    vdp1_cmd_at(VDP1_BANK[vdp1_wbank], vdp1_wnext++, cmd);
+
+    memset(cmd, 0, sizeof cmd);
+    int xl = flip ? x1 : x0;                       /* h-flip: texture A-corner -> screen right */
+    int xr = flip ? x0 : x1;
+    cmd[0] = 0x0002;                               /* distorted sprite */
+    cmd[2] = 0x04A0;                               /* 256-bank | ECD-off | SPD CLEAR (idx0 transparent) | Window_In */
+    cmd[3] = WPN_CMDCOLR;                          /* pr bit13 -> register 1 (prio 7, above NBG1) | CRAM bank 1 */
+    cmd[4] = (unsigned short)((texaddr - VDP1_VRAM_BASE) >> 3);
+    cmd[5] = (unsigned short)(((padW >> 3) << 8) | H);
+    cmd[6]  = (short)xl; cmd[7]  = (short)y0;              /* A top-left  */
+    cmd[8]  = (short)xr; cmd[9]  = (short)y0;              /* B top-right */
+    cmd[10] = (short)xr; cmd[11] = (short)y1;              /* C bottom-right */
+    cmd[12] = (short)xl; cmd[13] = (short)y1;              /* D bottom-left  */
+    vdp1_cmd_at(VDP1_BANK[vdp1_wbank], vdp1_wnext++, cmd);
+    sat_things_n++;
+    return 1;
+}
+#endif
+
 /* DG_DrawFrame, after the render + before the kick: append the status bar as a VDP1
    sprite ON TOP of the weapon, so the weapon no longer pokes over the HUD.  The
    texture (framebuffer rows 168-199 -> RGB555, opaque) is rebuilt only when the bar
@@ -4989,6 +5215,12 @@ extern "C" void sat_walls_kick(void)
 #endif
 #if VDP1_WALL_TEST
         vdp1_walls_flush();         /* walls BETWEEN the two weapon copies */
+#endif
+#if SAT_WORLD_THINGS_VDP1
+        /* World sprites to VDP1 prio 7, AFTER the walls (over them = clearly visible this probe;
+           occlusion vs nearer walls is the FUNC_UserClip follow-up) and BEFORE weapon (2) so the
+           gun stays on top (it is nearest).  Skips fuzz/translated + oversize -> those stay software. */
+        R_EmitWorldThingsVDP1();
 #endif
 #if SAT_WPN_VDP1
         sat_emit_weapon();          /* (2) LAST  -- on top of the walls when the plot completes */
@@ -5287,6 +5519,13 @@ extern "C" void DG_DrawFrame(void)
                             from sat_floors_done_hook at the end of R_DrawPlanes; this covers
                             split screen (hook defers there) and any path that skipped it. */
 #endif
+    /* M0 = PURE SOFTWARE reference: everything is drawn in the framebuffer (NBG1), so VDP1 must show
+       NOTHING.  Force the root to the EMPTY bank every M0 frame -> no stale VDP1 quads (walls /
+       weapon / world things) from the last VDP1-mode frame stay frozen on screen when the user A/Bs
+       to software (the coherent-pair flip was leaving the old pair rooted on the M4->M0 switch). */
+    if (sat_m == M0_SOFT)
+        *((volatile unsigned short *)VDP1_ROOT_ADDR + 1) =
+            (unsigned short)((VDP1_BANKE_ADDR - VDP1_VRAM_BASE) >> 3);
     vdp1_kicked_this_frame = 0;
 #endif
 
@@ -5340,11 +5579,22 @@ extern "C" void DG_DrawFrame(void)
             if (sat_local_players == 2)
             {
                 /* 2p: two 160x64 compact-HUD panels in the bottom 64 rows (P1 left, P2 right),
-                   each player's widgets on top, then a per-half damage/pickup flash. */
-                hud2p_blit_panels();
-                ST_DrawCompactWidgets(0, 0,   HUD2P_TOP);   /* P1 (left)  */
-                ST_DrawCompactWidgets(1, 160, HUD2P_TOP);   /* P2 (right) */
-                hud2p_apply_flash();
+                   each player's widgets on top, then a per-half damage/pickup flash.  W5 (runtime
+                   blit_cfg[].w5): only repaint (and mark the band dirty) when a player's HUD
+                   signature changed -- else skip the paint AND the blit skips [160,224).  w5=0:
+                   always repaint (the flag then also always blits, below). */
+                static unsigned int w5_2p_sig = ~0u;
+                int w5_2p = blit_cfg[blit_mode].w5;
+                unsigned int sig = ST_SplitHudSig();
+                if (!w5_2p || sig != w5_2p_sig)
+                {
+                    w5_2p_sig = sig;
+                    hud2p_blit_panels();
+                    ST_DrawCompactWidgets(0, 0,   HUD2P_TOP);   /* P1 (left)  */
+                    ST_DrawCompactWidgets(1, 160, HUD2P_TOP);   /* P2 (right) */
+                    hud2p_apply_flash();
+                    sat_hud_dirty = 1;   /* the HUD band changed -> blit it this frame */
+                }
             }
             else
             {
@@ -5412,6 +5662,36 @@ extern "C" void DG_DrawFrame(void)
     RP_AuxWait();
 #endif
     unsigned short blit_t0 = frt_read();   /* SATURN PERF: time the blit (-> sat_blit_ms10) */
+    /* W5: split the copy at hud_top (= the clear boundary).  [0,hud_top) is the re-rendered
+       3D view -> always blit.  [hud_top,224) is the HUD band -> blit only when it changed
+       (core sat_hud_dirty / 2p signature) or an overlay may have painted over it. */
+    int hud_top = (sat_local_players >= 3) ? 224 : (sat_local_players == 2 ? 160 : 192);
+    /* W5 is the runtime blit_cfg[].w5 axis (pad L+A).  Off -> blit all 224.  On -> blit the HUD
+       band only when it changed, or an overlay/layout change may have painted over it. */
+    static int w5_last_players = -1;
+    int hud_force = (sat_local_players != w5_last_players)
+                 || menuactive || (gamestate != GS_LEVEL);   /* overlays / layout change */
+    w5_last_players = sat_local_players;
+    int hud_blit = !blit_cfg[blit_mode].w5 || sat_hud_dirty || hud_force;
+    if (blit_cfg[blit_mode].dma)
+    {
+        /* Inc 1 (docs/BLIT_DMA_PLAN.md) -- synchronous SCU-DMA blit via SGL, the wolf4sdl
+           pattern: one slDMACopy per row (HWRAM framebuffer -> VDP2 VRAM, 320 B) then a single
+           slDMAWait.  The framebuffer is write-through so RAM is already current -> NO cache_purge
+           (unlike the CPU paths below).  slDMACopy lets SGL own the SCU channel -- the path the
+           raw-register post-mortem pointed to after it hung at F00001 (3x).  UNVALIDATED on HW ->
+           boot stays single-CPU (blit_mode 0); L+A opts in.  Watch for RBG0 snow (B-bus contention
+           with the VDP2 fetch) + Dr (VDP1 shares the bus) when validating. */
+        for (int y = 0; y < hud_top; ++y)                     /* 3D view: always */
+            slDMACopy(framebuffer + y * 320,
+                      DOOM_VRAM + (y + VIEW_Y_OFFSET) * DOOM_VRAM_STRIDE, 320);
+        if (hud_blit)
+            for (int y = hud_top; y < 224; ++y)               /* HUD band: only when changed (W5) */
+                slDMACopy(framebuffer + y * 320,
+                          DOOM_VRAM + (y + VIEW_Y_OFFSET) * DOOM_VRAM_STRIDE, 320);
+        slDMAWait();
+    }
+    else
 #if DUAL_CPU_BLIT
     if (blit_cfg[blit_mode].dual)
     {
@@ -5444,11 +5724,19 @@ extern "C" void DG_DrawFrame(void)
     else
 #endif
     {
-        /* Single-CPU blit: master copies the whole picture (also the compile-out path). */
+        /* Single-CPU blit: master copies the picture (also the compile-out path).  W5: 3D-view
+           rows always, HUD band only when changed. */
         cache_purge();
-        for (int y = 0; y < 224; ++y)   /* native 224: blit the full picture (VIEW_Y_OFFSET = 0) */
+        for (int y = 0; y < hud_top; ++y)
             memcpy(DOOM_VRAM + (y + VIEW_Y_OFFSET) * DOOM_VRAM_STRIDE, framebuffer + y * 320, 320);
+        if (hud_blit)
+            for (int y = hud_top; y < 224; ++y)
+                memcpy(DOOM_VRAM + (y + VIEW_Y_OFFSET) * DOOM_VRAM_STRIDE, framebuffer + y * 320, 320);
     }
+    /* W5: the HUD band in VRAM now matches the framebuffer -> clear the dirty flag; the core
+       (1p) / the 2p signature re-sets it next frame only if the HUD changes again. */
+    if (hud_blit)
+        sat_hud_dirty = 0;
     {
         /* SATURN PERF: blit wall-clock = master FRT delta across the copy (incl. slave join). */
         unsigned short blit_t1 = frt_read();
@@ -5480,6 +5768,20 @@ extern "C" void DG_DrawFrame(void)
         df_present_sum += ((unsigned int)sat_present_frt * ns_per_frt) / 100000u;  /* FRT -> tenths-ms */
         sat_present_frt = 0;
         df_frames++;
+
+        /* SESSION percentile metrics: one sample per frame.  RESET on a MODE change (sat_m / SQ) so
+           the histograms describe the whole run at the current mode (not the level).  Frame time =
+           wall delta between DG_DrawFrame calls (== MST). */
+        {
+            static int mh_l_m = -999, mh_l_sq = -1;
+            static uint32_t mh_last = 0;
+            int cur_sq = (sq_wall << 4) | (sq_floor << 2) | sq_ceil;
+            if (sat_m != mh_l_m || cur_sq != mh_l_sq) { mh_reset(); mh_l_m = sat_m; mh_l_sq = cur_sq; }
+            uint32_t nowms = df3;                       /* end-of-frame timestamp (DG_GetTicksMs) */
+            int fms = mh_last ? (int)(nowms - mh_last) : 0;
+            mh_last = nowms;
+            if (fms > 0) mh_add(fms, sat_things_n, sat_things_decl, sat_things_occ);
+        }
     }
     return;
 #endif
@@ -5696,11 +5998,21 @@ static void poll_pad(void)
         }
         else
 #endif
-        {   /* Z: cycle the render mode M (0..4).  (R+Z blit-overlap cut -- marginal, parked.) */
-            sat_m = (sat_m + 1) % M_COUNT;
+        {   /* Z: cycle only the LIVE modes {M0, M4, M6}; M1/M2/M3/M5 are parked (off the cycle). */
+            int ci = 0;
+            for (int i = 0; i < SAT_M_CYCLE_N; ++i) if (sat_m_cycle[i] == sat_m) { ci = i; break; }
+            sat_m = sat_m_cycle[(ci + 1) % SAT_M_CYCLE_N];
             sat_apply_mode();
         }
     }
+
+    /* Pad L+A: live A/B of the framebuffer BLIT (docs/BLIT_DMA_PLAN.md) -- steps blit_mode
+       through the 4 blit_cfg combos of {path CPU/DMA} x {W5 HUD-skip off/on}: 0 c- -> 1 c5 ->
+       2 d- -> 3 d5.  Row-1 'b<ms><c/d><-/5>' names the state.  L held + A (edge); NOT L+R (the
+       debug-overlay cycle).  The incidental ','/fire taps to Doom are harmless (mirrors the R+A
+       wall-clamp chord).  Placed here (unconditional) so the blit A/B is always available. */
+    if (!(cur & PER_DGT_TL) && (changed & PER_DGT_TA) && !(cur & PER_DGT_TA))
+        blit_mode = (blit_mode + 1) % BLIT_CFG_N;
 
     /* Pad R + Up/Down tunes the VERTICAL plane-decrochage fill scale (sat_plane_vscale, r_main.c): Up = MORE
        vertical fill (bob / stairs / lifts), Down = LESS.  Clamped [0,16].  Live value on overlay row 5.  R is

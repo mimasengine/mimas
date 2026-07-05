@@ -28,13 +28,33 @@
 
 ## 1. Increment plan (each = one `blit_cfg` entry, live A/B)
 
-### Inc 1 — synchronous DMA blit (the wolf4sdl clone) — LOW RISK
-`cfg 5`: kick `slDMACopy(fb+y*320, VRAM+y*512, 320)` for y=0..223, then `slDMAWait()`,
-then the existing clear. Byte-identical pixels.
+### Inc 1 — synchronous DMA blit — **HW RESULT 2026-07-02: NO WIN (blit is B-bus-bound)**
+> Pad L+A flips the letter `c`→`d` (DMA path confirmed running, image updates) but the `b` ms
+> and MST/fps DO NOT change. The SCU DMA writes VDP2 VRAM over the same B-bus port at the same
+> bandwidth as the CPU longword memcpy, and `slDMAWait` blocks the master for that same transfer
+> time. So **synchronous DMA cannot beat the CPU blit** — the blit is write-bandwidth-bound, not
+> CPU-bound (consistent with the "bus-bound S~1.3 / dual-CPU never wins" finding). The lever is
+> real only ASYNC (Inc 2): overlap the ~11 ms transfer with the game tic. Inc 1 stays in as the
+> L+A `c`/`d` toggle + the proven-working DMA primitive that Inc 2 builds on.
+
+### Inc 1 — synchronous DMA blit (the wolf4sdl clone) — LOW RISK — **BUILT 2026-07-02, HW-PENDING**
+`blit_cfg[1]` (`dma=1`): kick `slDMACopy(fb+y*320, VRAM+y*512, 320)` for y=0..223, then
+`slDMAWait()`, then the existing clear. Byte-identical pixels. No `cache_purge` (fb is
+write-through). **Live A/B = pad L+A** — a clean 2-state flip single-CPU(0) ↔ DMA(1); row-1
+shows `b<ms><c/d>` (c=CPU one press → d=DMA). NOT L+R (= debug overlay). **Boot stays
+single-CPU** (blit_mode 0) so an unvalidated DMA hang can never brick boot — opt in with L+A.
+Implementation: [dg_saturn.cxx](../src/dg_saturn.cxx) blit_cfg table + the
+`blit_cfg[blit_mode].dma` branch in DG_DrawFrame + the L+A handler in poll_pad.
+- **The dead dual-CPU configs are REMOVED from the cycle** (2026-07-02): they were
+  measured-dead AND the first version cycled through them (5 presses to reach DMA — read as
+  "L+A doesn't fire"), and dispatching the blit to the slave (`slSlaveFunc`) can collide with
+  the evolved slave pipeline (F-build/plane-split) → a wedge (a candidate for the reported
+  cycle-freeze). Dual code stays behind `DUAL_CPU_BLIT` for revival but no cfg selects it.
 - **Verify on HW**: image intact, `b` value, **no RBG0 snow** (DMA bursts share the B-bus
   with the VDP2 fetch — watch the floor at pot0 1p), **`Dr` unchanged** (VDP1 also lives
   on the B-bus), consecutive-kick semantics (224 back-to-back `slDMACopy` — wolf4sdl
-  proves it, but confirm no dropped rows).
+  proves it, but confirm no dropped rows). If L+A → `d` FREEZES, that is the datapoint that
+  `slDMACopy` also hangs the bus like the raw path did (reset; boot-safe default protects).
 - **Expected**: b 5.5–11 → **~2–4 ms** (DMA 32-B bursts beat byte-wise CPU on B-bus).
 
 ### Inc 2 — asynchronous blit (the real prize) — MEDIUM RISK
@@ -60,10 +80,26 @@ Once Inc 2 lands the clear sits in the fence (still master ms). Options, in orde
    SGL-shadow-respecting poke — the raw history commands caution.
 - **Expected**: **−2…−3 ms** more.
 
-### Inc 4 — W5, blit only live rows — TRIVIAL after Inc 1
-Parameterize the row loop: rows 0–191 always; rows 192–223 (1p status bar) only when the
-HUD changed (`sat_hud_dirty` set from `ST_Drawer` — one-line core hook). 2p: rows 160+.
-- **Expected**: −14 % of the remaining transfer.
+### Inc 4 — W5, blit only live rows — **BUILT 2026-07-02, HW-PENDING**
+The blit loop is split at `hud_top` (= the clear boundary: 192 1p / 160 2p / 224 3-4p): the
+3D-view rows `[0,hud_top)` always blit; the HUD band `[hud_top,224)` blits only when it
+changed. 3/4p (`hud_top=224`) is a no-op (interspersed bands + minimap change every frame).
+- **Change detection**: core `sat_hud_dirty` (st_stuff.c), set by the STlib widgets — this
+  needed the **missing diff added to `STlib_drawNum`** (the vanilla `oldnum` field was set but
+  never tested, so numbers redrew every frame; now they redraw only on change → the HUD
+  framebuffer goes static when idle). 2p uses `ST_SplitHudSig()` (a value signature over both
+  players' health/armor/ammo/weapons/keys + damagecount/bonuscount) to also skip the panel
+  **repaint** when idle. Core changes are shared with DoomJo (benign: fewer redraws, identical
+  pixels; refresh still forces a full draw).
+- **W5 is a RUNTIME axis of `blit_cfg`** (the `w5` field), not a compile flag — folded into the
+  **pad L+A** cycle so path × W5 = 4 combos: `0 c-` (CPU) → `1 c5` (CPU+W5) → `2 d-` (DMA) →
+  `3 d5` (DMA+W5). Row-1 `b<ms><c/d><-/5>` names the state. Boot = `c-` (baseline). Forced full
+  HUD blit when `menuactive`, `gamestate != GS_LEVEL`, or the player count changes.
+- **Expected**: −14 % of the transfer **on idle frames only** (~1.5 ms 1p, ~3 ms 2p when the
+  HUD is static); 0 during combat (HUD changes every frame). Orthogonal to the sprite-VDP1
+  deport (that offloads the render `M` phase; W5 is the blit).
+- **Verify on HW**: HUD not stale/frozen (watch the face blink ~every 2 s → a momentary HUD
+  blit), `b` drops when standing still with `c5`/`d5`, menus/intermission still refresh the HUD.
 
 ## 2. Order & exit criteria
 

@@ -2487,7 +2487,8 @@ extern "C" void DG_Init(void)
 #define SAT_SPR_PRIO7_TEST 0
 #endif
 #ifndef SAT_WPN_VDP1
-#define SAT_WPN_VDP1 0
+#define SAT_WPN_VDP1 1   /* player weapon on the VDP1 prio-7 sprite layer (default ON).  Software-wall
+                            split falls back to the software weapon (r_things.c R_DrawMasked gate). */
 #endif
 #if SAT_WPN_VDP1
     /* PER-COMMAND SPLIT: register 0 = 5 (below NBG1) is what walls/floors select -- their

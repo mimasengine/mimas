@@ -1732,7 +1732,7 @@ static void fps_update(void)
                sb = SESSION bake% (mh_bake_sum/mh_emit_sum) = the cache read -- low = high reuse.
                On row 15 (bottom, clear of centre-screen monsters that hide the THp row). */
             unsigned int sbpc = mh_emit_sum ? (mh_bake_sum * 100u / mh_emit_sum) : 0;
-            snprintf(rSPR, sizeof rSPR, "SPR pj%d.%d fl%d.%d n%d/%d th%d/%d fb%d sb%u%%",
+            snprintf(rSPR, sizeof rSPR, "SPR pj%d.%d fl%d.%d n%d/%d th%d/%d fb%d sb%u%%  ",
                      sp_pj/10, sp_pj%10, sp_fl/10, sp_fl%10, sp_np, sp_nd,
                      sat_things_n, sat_things_decl, thing_bake_n, sbpc);
             if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 15, rSPR);

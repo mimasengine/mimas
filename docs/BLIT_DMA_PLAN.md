@@ -57,18 +57,54 @@ Implementation: [dg_saturn.cxx](../src/dg_saturn.cxx) blit_cfg table + the
   `slDMACopy` also hangs the bus like the raw path did (reset; boot-safe default protects).
 - **Expected**: b 5.5–11 → **~2–4 ms** (DMA 32-B bursts beat byte-wise CPU on B-bus).
 
-### Inc 2 — asynchronous blit (the real prize) — MEDIUM RISK
-`cfg 6`: kick the 224 rows at the end of `DG_DrawFrame` and **return without waiting**;
-the DMA overlaps the game tic (`nr` = 27–50 ms — far longer than the transfer). Fence =
-`slDMAWait()` **before the first framebuffer write of the next frame** (ST_Drawer /
-EX both write fb inside core `D_Display` *before* the next `DG_DrawFrame`), so export a
-core hook: `void (*sat_frame_fence)(void)` called at the top of `D_Display`
-(core-owned pointer, NULL default → DoomJo unaffected; same pattern as
-`sat_build_local_ticcmd`). The fence does `slDMAWait()` + the clear.
-- **Hazards**: single-buffered fb (next frame must not write before the fence — that is
-  exactly what the fence guarantees); SGL/SRL internal users of DMA L0 (CD? sound?) —
-  check `slDMAStatus` collisions.
-- **Expected**: master blit cost → **~1 ms of kicks**; net **−4…−9 ms of MST**.
+### Inc 2 — asynchronous blit — **slDMACopy CANNOT do it (disasm-proven 2026-07-05)**
+> **`slDMACopy` = `_slCpuDMACopy` = the SH-2 *on-chip* DMAC ch.0**, NOT the SCU DMA
+> (`slDMAWait`/`slDMAStatus` poll CHCR0 @0xFFFFFF8C). Its entry **spins-for-channel-free**
+> (`wait_DMAC_01011`: loop while `CHCR0 & 3 == 1`). So 224 back-to-back `slDMACopy` calls
+> **serialize** — the master sits in that spin loop for ~all 224 rows; dropping the trailing
+> `slDMAWait` recovers only the *last* row. **No overlap with the tic is possible via
+> `slDMACopy`**, and the on-chip DMAC steals/holds the SH-2 bus during transfer regardless.
+> The "kick 224, return, overlap the tic" design is DEAD — wrong engine. (Disasm: `objdump -d`
+> on `LIBSGL.A` via `SaturnRingLib/Compiler/sh2eb-elf/bin/sh2eb-elf-objdump.exe`.)
+
+**HW RESULT 2026-07-05 — SCU-indirect async is DEAD (freezes).** Built the gated boot-safe
+prototype (blit_cfg `s` = SCU-indirect SYNC / `a` = ASYNC, off the default ring; boot stays `c5`;
+core `sat_frame_fence` hook + `DG_FrameFence` = poll `SCU_DSTA` + deferred clear; VBLANK-IN start;
+cache-through descriptors). **Switching to `s` FROZE the console** — the SCU→VDP2 VRAM write hangs
+the B-bus even with the cache-through fix. That is the **4th confirmation** of the F00001 hang, and
+the cause is a **documented hardware law**, not a timing fluke. The **SEGA SCU User's Manual**
+(§2, exodusemulator SSDDV25 `p02_10`) states: *"During DMA operation from A-Bus to B-Bus or from
+B-Bus to A-Bus, access to A-Bus and B-Bus from the CPU is prohibited... refresh may no longer occur
+to SDRAM during wait, resulting in a hang."* **libyaul**'s `scu/scu/dma.h` corroborates (HWRAM↔B-bus
+is a *valid* transfer, but "Read of the VDP2 is prohibited" and "LWRAM DMA locks up the machine").
+This makes **async categorically impossible**: async's entire purpose is to run the CPU (tic +
+render + present) *during* the transfer, but every Mimas frame hammers the B-bus from the CPU (VDP1
+walls, VDP2 registers, sky/floor, SCSP) → CPU-touches-B-bus-during-SCU-DMA-to-B-bus = guaranteed
+SDRAM-refresh hang. My `s` froze because the VBLANK-IN start fired the transfer decoupled while the
+CPU rendered the next frame. A *sync* SCU blit (CPU frozen, bus-silent) is legal but pointless
+(no win, bus-bound = Inc 1). Universal port practice confirms it: wolf4sdl and every framebuffer
+port blit VDP2 VRAM via the CPU or on-chip DMAC, **never** SCU DMA. Boot-safety held (reset → `c5`). **VERDICT: there is NO viable async
+blit path on this hardware** (SCU hangs; `slDMACopy` = on-chip DMAC can't async). **The blit is
+permanently synchronous — `c5` + W5 is the end of the lever.** Neutralized: L+A back to the safe
+`c5 ↔ c-` W5 A/B; `s`/`a` parked off-ring with a "never re-add — cycling freezes" comment. Redirect
+to the ENDGAME keystones (R4 diet + crash-proofing). The paragraph below is retained for the record.
+
+**The (dead) true-async path = SCU DMA indirect mode** — a separate bus master that drains
+HWRAM→VRAM on the B-bus while the SH-2 runs the tic. That is the raw-register
+`dma_table` / `SCU_D0*` path (the STEP-4a probe, [dg_saturn.cxx:5806+](../src/dg_saturn.cxx#L5806);
+`dma_table_build` at :2757 already writes the descriptors **cache-through** = the documented
+fix for the F00001 bus-hang). This is exactly the path shelved as *"raw SCU DMA DEAD, hung 3×"*;
+the earlier *"use slDMACopy, not raw"* guidance was for the **sync** blit (Inc 1) and does **not**
+apply here — `slDMACopy` simply can't async. **Decision (user's):**
+- **(A)** one **boot-safe gated** SCU-indirect prototype: boot stays `c5` (DMA-free), the async
+  cfg is L+A opt-in, a bus hang is reset-recoverable. The only ~9 ms blit lever left; the
+  cache-through fix may have resolved the historical hang — but it may hang again (unknown other
+  causes: SCU↔VDP2 B-bus contention). Fence = core `sat_frame_fence()` (NULL default, DoomJo-
+  benign) polling `SCU_DSTA` + doing the clear, called at the top of `D_Display`.
+- **(B)** stop — async blit is a **non-keystone fps win** (ENDGAME keystones = R4 diet +
+  crash-proofing); leave the blit synchronous (W5 already banked) and redirect the effort.
+- **Expected if (A) works**: master blit → **~0 ms** (one kick), net **−4…−9 ms MST** in open
+  scenes (décrochage spots are PRE-stall-bound, no benefit there).
 
 ### Inc 3 — get the clear off the master (M4)
 Once Inc 2 lands the clear sits in the fence (still master ms). Options, in order:

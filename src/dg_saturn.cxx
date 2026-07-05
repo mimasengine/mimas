@@ -53,36 +53,10 @@ extern "C" char *gamedescription;
    run on a 4MB emulator the same way a no-cart / 1M-cart system would). */
 #define FORCE_CD_STREAM 0
 
-/* Framebuffer->VDP2 blit method.  1 = SCU DMA, 0 = plain CPU copy (~10ms/frame,
-   the reliable fallback -- CURRENT).
-   STEP 4a RESULT (2026-06-16): triggering on VBLANK-IN (D0MD start factor 0) does
-   NOT fix the hang -- real Saturn still locks the bus at F00001.  And the
-   "synchronous" wait is bogus for a deferred trigger: dma_wait_idle (DSTA & 0x30)
-   returns BEFORE the vblank-deferred DMA fires, so it ran effectively async on a
-   single buffer -> the next frame overwrote the framebuffer mid-transfer ->
-   intermittent/torn frames on emulator (e.g. menu text present-or-not).
-   Conclusion: the raw-register SCU DMA blit is a dead end (3rd failure).  Back to
-   the CPU blit.  If the ~10ms is pursued again: dual-CPU blit (idle slave copies
-   half) or SGL slDMACopy -- NOT this raw-register path. */
-#define USE_SCU_DMA 0
-
-/* SATURN PERF: dual-CPU framebuffer blit.  The framebuffer->VDP2 copy is the
-   biggest FIXED frame cost (~12ms, constant across configs).  Since the walls
-   moved to VDP1 and floors went flat, the slave SH-2 is ~80% IDLE by the time
-   DG_DrawFrame runs (render+EX long finished) -- so split the 224-row copy: the
-   slave copies the bottom rows [split,224) in parallel while the master copies the
-   top [0,split).  Both purge their own cache before reading
-   (SH7604 is write-through: the writes are in RAM, each CPU must purge to re-read
-   the other's); DOOM_VRAM is uncached so its writes need no flush.  The master
-   waits for the slave BEFORE clearing the framebuffer (else next frame's render
-   overwrites it mid-copy = the SCU-DMA tearing bug).  This is a 2nd slSlaveFunc
-   per frame -> we rewind the SGL slave work pointer before it (rp_sgl_workptr_reset)
-   so the dispatch records can't creep (the ~2-min freeze).  1 = feature compiled in,
-   0 = single-CPU copy only (trivial revert if the 2nd dispatch ever destabilises --
-   freeze zone).  The actual split is chosen LIVE from blit_cfg[] via the pad L+R
-   chord (one press = next config) so several ratios can be A/B'd on the same scene
-   without a rebuild; row-2 'bl' shows the active config + ratio. */
-#define DUAL_CPU_BLIT  1
+/* Framebuffer->VDP2 blit: plain CPU copy (~10ms/frame).  SCU-DMA and dual-CPU-blit were both
+   pursued and are DEAD: SCU->VDP2 hangs the B-bus (SEGA SCU manual -- no CPU A/B-bus access during
+   an SCU-DMA B-bus transfer, SDRAM refresh stalls), and the dual-CPU split never beat single
+   (bus-bound).  See docs/BLIT_DMA_PLAN.md.  The blit is permanently a single-CPU copy. */
 
 /* Diagnostic slave-offload pad toggles (work-steal plane split = pad Y 'ws'; slave wall-prep =
    pad L+R 'wp').  Both are HW-CONFIRMED DEAD-ENDS (docs/RANK3_WALLPREP.md + REC_BENCHMARKS §C.2 H):
@@ -295,14 +269,6 @@ static int wtex_bakes = 0;
 #define CRAM_DOOM_PAL       ((volatile unsigned short *)(0x25F00000 + 256 * 2))
 
 #define TVSTAT              (*(volatile unsigned short *)0x25F80004)
-
-/* SCU DMA level 0 (indirect mode) */
-#define SCU_D0W             (*(volatile unsigned int *)0x25FE0004)
-#define SCU_D0AD            (*(volatile unsigned int *)0x25FE000C)
-#define SCU_D0EN            (*(volatile unsigned int *)0x25FE0010)
-#define SCU_D0MD            (*(volatile unsigned int *)0x25FE0014)
-#define SCU_DSTA            (*(volatile unsigned int *)0x25FE007C)
-#define DMA_END_FLAG        0x80000000u
 
 extern "C" unsigned char  *sat_wad_base    = nullptr;
 extern "C" unsigned int    sat_wad_size     = 0;
@@ -727,27 +693,17 @@ static int wall_potato_mode = 0;            /* VDP1 wall style: 0=tex 1=banded 2
 static int sat_vdp1_floor_claim = 1;        /* leftover floors -> VDP1 tiles (M1,M2) */
 static int sat_vdp1_ceil_claim  = 1;        /* ceilings        -> VDP1 tiles (M1,M3) */
 
-/* Framebuffer->VDP2 blit configs, cycled LIVE by the pad L+A chord (one press = next, wraps;
-   NOT L+R -- that's the debug-overlay cycle).  TWO orthogonal axes flattened into one cycle:
-   - dma : 0 = single-CPU memcpy, 1 = SCU-DMA blit (Inc 1, slDMACopy; docs/BLIT_DMA_PLAN.md).
-   - w5  : 0 = blit all 224 rows, 1 = W5 = skip the static HUD band [hud_top,224) when it did
-           not change (core sat_hud_dirty / the 2p signature); the 3D view always blits.
-   Row-1 'b<ms><c/d><-/5>' shows the ms + path (c/d) + W5 (- off / 5 on), so L+A steps through
-   the 4 combos and a photo ties b/MST/fps to the exact state.  W5 helps only when the HUD is
-   idle (mostly 1p/2p standing still); it is orthogonal to the path so both c5 and d5 exist.
-   The measured-DEAD dual-CPU configs are gone (bus-bound S~1.3 + slave-dispatch wedge risk);
-   the dual code stays behind DUAL_CPU_BLIT for git revival but no cfg selects it (dual=0). */
-/* Blit-path selector.  dma = SGL slDMACopy = the SH-2 ON-CHIP DMAC (disasm-proven; spins-per-row,
-   sync, bus-bound, HW-confirmed no win).  Async blit was pursued via SCU-DMA and is HW-DEAD +
-   IMPOSSIBLE: the SEGA SCU manual forbids CPU A/B-bus access during an SCU-DMA B-bus transfer
-   (SDRAM refresh stalls -> hang), and every Mimas frame hits the B-bus from the CPU -> async hangs
-   by construction (see docs/BLIT_DMA_PLAN.md Inc 2).  The blit is permanently synchronous;
-   c5 + W5 is the end of the lever. */
-static const struct { int dual; int mpct; int dma; int w5; } blit_cfg[] = {
-    { 0, 100, 0, 0 },   /* 0: c-  CPU memcpy, full HUD */
-    { 0, 100, 0, 1 },   /* 1: c5  CPU memcpy + W5 -- boot default */
-    { 0, 100, 1, 0 },   /* 2: d-  slDMACopy (on-chip DMAC) sync -- parked (no win) */
-    { 0, 100, 1, 1 },   /* 3: d5  slDMACopy sync + W5           -- parked */
+/* Framebuffer->VDP2 blit selector, cycled LIVE by the pad L+A chord (NOT L+R = the debug overlay).
+   dma = 0 CPU memcpy, 1 = slDMACopy (on-chip DMAC; HW-confirmed no win, parked off the live ring).
+   w5  = skip the static HUD band [hud_top,224) when it didn't change (core sat_hud_dirty / 2p sig);
+   the 3D view always blits.  Row-1 'b<ms><c/d><-/5>' = ms + path + W5.  Async blit via SCU-DMA is
+   DEAD + IMPOSSIBLE (SEGA SCU manual: no CPU A/B-bus access during an SCU-DMA B-bus transfer ->
+   hang; every frame hits the B-bus) -> the blit is permanently synchronous.  docs/BLIT_DMA_PLAN.md. */
+static const struct { int dma; int w5; } blit_cfg[] = {
+    { 0, 0 },   /* 0: c-  CPU memcpy, full HUD */
+    { 0, 1 },   /* 1: c5  CPU memcpy + W5 -- boot default */
+    { 1, 0 },   /* 2: d-  slDMACopy (on-chip DMAC) sync -- parked (no win) */
+    { 1, 1 },   /* 3: d5  slDMACopy sync + W5           -- parked */
 };
 #define BLIT_CFG_N ((int)(sizeof(blit_cfg) / sizeof(blit_cfg[0])))
 /* Live pad-L+A A/B ring: c5 (CPU + W5, default) <-> c- (CPU, W5 off) -- the safe W5 on/off A/B.
@@ -756,8 +712,6 @@ static const int blit_cycle[] = { 1, 0 };
 #define BLIT_CYCLE_N ((int)(sizeof(blit_cycle) / sizeof(blit_cycle[0])))
 static int blit_cycle_i = 0;   /* index into blit_cycle; 0 -> blit_mode 1 (c5) at boot */
 static int blit_mode = 1;      /* boot: c5 (CPU + W5) = blit_cycle[0] */
-/* Master row count for the current config: mpct% of 224. */
-static inline int blit_split(void) { return (blit_cfg[blit_mode].mpct * 224) / 100; }
 /* SATURN PERF: last frame's framebuffer->VDP2 blit wall-clock in ms*10 (master FRT delta
    around the copy, INCLUDING the dual-blit slave-join spin).  This is the number that
    decides dual-CPU blit GO/DROP -- fps/MST are too coarse (~12ms of a ~100ms frame).
@@ -847,10 +801,6 @@ extern "C" void dbg_print(int x, int y, char *str)
     SRL::Debug::Print((uint8_t)x, (uint8_t)y, str);
 }
 
-#if SHOW_FPS
-static unsigned short last_dma_ticks;
-#endif
-
 static unsigned short pending_cram[256];
 static volatile int   palette_dirty = 0;
 
@@ -865,7 +815,6 @@ static volatile int   wbank_dirty = 0;
 #define CRAM_BANK(b)  ((volatile unsigned short *)(0x25F00000 + (b) * 512))
 
 static unsigned char framebuffer[320 * 224] __attribute__((aligned(4)));  /* = core I_VideoBuffer */
-static unsigned int  dma_table[224][3] __attribute__((aligned(16)));
 
 /* 2-player compact HUD: blit the two 160x64 panels (P1 left, P2 right) into the
    bottom 64 rows of the framebuffer; the core then draws each player's widgets
@@ -2765,34 +2714,6 @@ extern "C" void DG_Init(void)
 #endif
 
     SRL::Debug::Print(0, 1, "INIT DOOM...");
-}
-
-static void dma_table_build(void)
-{
-    /* SATURN: build the SCU indirect descriptor list through the cache-through
-       mirror (| 0x20000000) so the descriptors are guaranteed to be in
-       physical RAM.  The SCU is a bus master with no cache: if the table were
-       written copy-back and not flushed, the SCU would read stale/garbage
-       descriptors and DMA to wild addresses -- a classic cause of the bus
-       hang seen on real hardware (works on emulators, which model the cache
-       leniently).  SCU_D0W still gets the normal 0x06 address; the SCU reads
-       the same physical RAM we just wrote uncached. */
-    unsigned int (*t)[3] =
-        (unsigned int (*)[3])((unsigned int)dma_table | 0x20000000u);
-    for (int y = 0; y < 224; ++y)
-    {
-        t[y][0] = 320;
-        t[y][1] = (unsigned int)DOOM_VRAM + y * DOOM_VRAM_STRIDE;
-        t[y][2] = (unsigned int)framebuffer + y * 320;
-    }
-    t[223][2] |= DMA_END_FLAG;
-}
-
-static void dma_wait_idle(void)
-{
-    int guard = 2000000;
-    while ((SCU_DSTA & 0x30) && guard--)
-        ;
 }
 
 /* SATURN sky: upload the current sky texture (256x128, full-bright) into the NBG0
@@ -5298,32 +5219,6 @@ extern "C" void sat_walls_kick(void)
 }
 #endif
 
-#if DUAL_CPU_BLIT
-/* Slave-done flag for the dual-CPU blit.  SH7604 is write-through so the slave's
-   store reaches RAM, but the master must READ it uncached to see it (its cache
-   would hold the stale 0) -- so go through the cache-through mirror (0x20000000),
-   same trick as r_parallel.c's SYNC.  Plain static storage, accessed only via the
-   mirror macro. */
-static volatile int blit_slave_done_storage;
-#define BLIT_SLAVE_DONE (*(volatile int *)((unsigned int)&blit_slave_done_storage | 0x20000000u))
-
-/* Runs on the SLAVE SH-2 (dispatched from DG_DrawFrame): copy the BOTTOM rows of
-   the framebuffer to VDP2 VRAM while the master copies the top.  'arg' carries the
-   split row (passed by value in the dispatch record -> no cache-coherency concern).
-   Purge first so the slave sees the master's (and its own earlier) write-through
-   framebuffer pixels; DOOM_VRAM is uncached VDP2 VRAM so the writes need no flush. */
-static void blit_slave_body(void *arg)
-{
-    int split = (int)(unsigned int)arg;
-    volatile unsigned char *ccr = (volatile unsigned char *)0xFFFFFE92;
-    *ccr = (unsigned char)(*ccr | 0x10);   /* cache purge on THIS (slave) CPU */
-    for (int y = split; y < 224; ++y)
-        memcpy(DOOM_VRAM + (y + VIEW_Y_OFFSET) * DOOM_VRAM_STRIDE,
-               framebuffer + y * 320, 320);
-    BLIT_SLAVE_DONE = 1;
-}
-#endif
-
 extern "C" void DG_DrawFrame(void)
 {
     static int first_frame = 1;
@@ -5333,7 +5228,6 @@ extern "C" void DG_DrawFrame(void)
         first_frame      = 0;
         console_enabled  = 0;
         sat_console_clear();
-        dma_table_build();
 #if VDP1_WEAPON
         vdp1_wpn_init();
 #endif
@@ -5624,11 +5518,8 @@ extern "C" void DG_DrawFrame(void)
        slSynch's vblank-cap (~7-12fps) and its SCSP-sound conflict (silent SFX),
        so we keep the full parallel speed and working sound. */
 
-#if !USE_SCU_DMA
-    /* CPU blit fallback (no SCU DMA).  The raw SCU DMA blit below hangs the
-       SH-2 bus on real hardware; until that is fixed properly this plain CPU
-       copy keeps the game runnable on hardware (slow).  Purge first so the
-       master sees the slave's write-through framebuffer pixels. */
+    /* CPU blit (the only viable path -- SCU-DMA to VDP2 hangs the bus).  Purge
+       first so the master sees the slave's write-through framebuffer pixels. */
     /* Menus/title/intermission are 320x200 assets; on the 224 framebuffer rows 200..223 are
        uncovered.  Outside a level (no ST_Drawer), blacken that strip so it's not stale garbage. */
     if (gamestate != GS_LEVEL)
@@ -5759,39 +5650,8 @@ extern "C" void DG_DrawFrame(void)
         slDMAWait();
     }
     else
-#if DUAL_CPU_BLIT
-    if (blit_cfg[blit_mode].dual)
     {
-        /* Dual-CPU blit: dispatch the bottom rows [split,224) to the idle slave, copy
-           the top [0,split) on the master, then WAIT for the slave before clearing/
-           returning (else next frame's render overwrites the framebuffer mid-copy =
-           tearing).  rp_sgl_workptr_reset rewinds the SGL slave work pointer so this
-           2nd dispatch per frame can't creep into the freeze -- and covers the
-           rp_disabled serial frame (where rp_restart did not reset it this frame). */
-        int split = blit_split();
-        rp_sgl_workptr_reset();
-        BLIT_SLAVE_DONE = 0;            /* uncached: visible to the slave before it sets 1 */
-        cache_purge();                 /* master purges before reading its half */
-        slSlaveFunc(blit_slave_body, (void *)(unsigned int)split);
-        for (int y = 0; y < split; ++y)
-            memcpy(DOOM_VRAM + (y + VIEW_Y_OFFSET) * DOOM_VRAM_STRIDE, framebuffer + y * 320, 320);
-        {
-            /* Bounded wait: hang-safe in the freeze zone.  If the slave never signals
-               (wedge), the master copies the bottom rows itself -> a slow frame, not a
-               hard freeze.  Guard is generous (slave half ~6-8ms; master is already
-               past its half here so it normally spins only briefly). */
-            int guard = 30000000;
-            while (!BLIT_SLAVE_DONE && --guard) ;
-            if (!guard)
-                for (int y = split; y < 224; ++y)
-                    memcpy(DOOM_VRAM + (y + VIEW_Y_OFFSET) * DOOM_VRAM_STRIDE,
-                           framebuffer + y * 320, 320);
-        }
-    }
-    else
-#endif
-    {
-        /* Single-CPU blit: master copies the picture (also the compile-out path).  W5: 3D-view
+        /* Single-CPU blit: master copies the picture.  W5: 3D-view
            rows always, HUD band only when changed. */
         cache_purge();
         for (int y = 0; y < hud_top; ++y)
@@ -5852,47 +5712,6 @@ extern "C" void DG_DrawFrame(void)
         }
     }
     return;
-#endif
-
-    /* SCU DMA blit -- STEP 4a reliability probe.  D0MD start factor = 0
-       (VBLANK-IN) instead of 7 (immediate): the transfer is deferred to vblank
-       so it no longer fights the VDP for the B-bus during active display (the old
-       hang).  Still SYNCHRONOUS (wait for previous, kick, wait for this one) -- so
-       this is NOT a speed win yet (we pay the vblank latency + transfer); it only
-       answers "does VBLANK-IN stop the hang and render correctly?".  If stable,
-       step 4b drops the wait-after and adds a pre-render wait to reclaim the time. */
-#if SHOW_FPS
-    {
-        unsigned short t0, t1;
-        unsigned char  h, l;
-
-        h  = *(volatile unsigned char *)0xFFFFFE12;
-        l  = *(volatile unsigned char *)0xFFFFFE13;
-        t0 = (unsigned short)((h << 8) | l);
-
-        dma_wait_idle();
-
-        cache_purge();
-        SCU_D0W  = (unsigned int)dma_table;
-        SCU_D0AD = 0x101;
-        SCU_D0MD = 0x01000000;   /* indirect + start factor 0 = VBLANK-IN */
-        SCU_D0EN = 0x101;
-        dma_wait_idle();
-
-        h  = *(volatile unsigned char *)0xFFFFFE12;
-        l  = *(volatile unsigned char *)0xFFFFFE13;
-        t1 = (unsigned short)((h << 8) | l);
-        last_dma_ticks = (unsigned short)(t1 - t0);
-    }
-#else
-    dma_wait_idle();
-    cache_purge();
-    SCU_D0W  = (unsigned int)dma_table;
-    SCU_D0AD = 0x101;
-    SCU_D0MD = 0x01000000;   /* indirect + start factor 0 = VBLANK-IN */
-    SCU_D0EN = 0x101;
-    dma_wait_idle();
-#endif
 }
 
 extern "C" uint32_t DG_GetTicksMs(void)
@@ -6274,7 +6093,7 @@ static void poll_pad(void)
     /* Pad Y free (the ws diagnostic is parked, SAT_DIAG_SLAVE_TOGGLES=0) -- only taps 'y' to Doom. */
 #endif
 
-#if DUAL_CPU_BLIT && SAT_DIAG_SLAVE_TOGGLES
+#if SAT_DIAG_SLAVE_TOGGLES
     /* Pad L+R (chord): diagnostic A/B of the deferred wall-prep flush onto the SLAVE (RANK3_WALLPREP).
        wp 0 master inline / 1 slave+purge / 2 slave+warm.  ON ties sat_wallprep_defer (walls queued).
        DEAD-END on HW (slave +5.8ms, cold cache it can't keep warm) -- kept revivable behind

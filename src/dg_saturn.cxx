@@ -34,6 +34,7 @@ extern "C" {
 #include "doomkeys.h"
 #include "i_video.h"   /* struct color colors[256], palette_changed */
 #include "doomtype.h"
+#include "m_fixed.h"   /* FixedDiv: SH-2 hardware DIV0U divide (~37cyc) -- see fxdiv below */
 #include "v_patch.h"   /* patch_t / post_t (for the VDP1 weapon sprite) */
 #include "r_parallel.h"
 }
@@ -196,6 +197,16 @@ extern "C" void RP_AuxArm(void (*fn)(void));   /* piggyback: armed at the flush,
                                                   masked slave body right after MASK_DONE */
 extern "C" int  RP_AuxKick(void);              /* DG-entry consumer (fallback dispatch)     */
 static int sat_ftex_slave = 1;
+/* BLIT<->F-BUILD DECOUPLE (pad R+Z, HW-A/B via composition-row 'b').  The captures showed 'b'
+   (= RP_AuxWait + copy) inflated to ~17-23ms on heavy textured floors: the master IDLES in
+   RP_AuxWait for the slave F-build (which does the present flip) before blitting.  OFF (default,
+   0): current flip-before-blit, fully coherent, master idles.  ON (1): the slave emits tiles +
+   the W->F chain but NOT the flip; the master single-CPU-blits CONCURRENTLY, joins, THEN flips
+   (flip still after the blit => coherent) -- the blit hides in the wait, reclaiming ~6ms.  Needs
+   sat_ftex_slave=1.  Present-coherence sensitive -> gated, default off, validate on HW. */
+static int          sat_ftex_blit_overlap = 0;
+static volatile int ftex_overlap_flip     = 0;   /* set when a slave build is ARMED to skip its flip
+                                                    (so the master must flip in DG); read+cleared in DG */
 static int ftexd_tiles, ftexd_skips, ftexd_trunc, ftexd_bakes, ftexd_px, ftexd_acc;   /* last flush */
 extern "C" short *sat_floor_punch_edge;   /* core r_plane.c: mode-3 per-column VDP1/CPU split */
 static short ftex_punch_edge_buf[320];    /* the platform buffer behind it (armed at init)    */
@@ -226,6 +237,7 @@ static int ftex_claim_px;                       /* projected tile fill CLAIMED s
 extern "C" byte *I_VideoBuffer;
 extern "C" int   gametic;
 extern "C" int   r_visplane_peak;
+extern "C" int   sightcounts[2];   /* core p_sight.c: [0]=REJECT trivial-rejects, [1]=full BSP LOS walks */
 extern "C" int   sat_floor_vq_cur, sat_floor_vq_peak;  /* VDP1-floor inc-0 estimate, shown on row 2 */
 extern "C" unsigned int sat_sky_px, sat_floor_px;  /* sky-vs-floor coverage classifier (row 13) */
 extern "C" int sat_plane_vscale;      /* deported-plane VERTICAL decrochage fill scale (pad R+Up/Down) */
@@ -516,8 +528,10 @@ static int rbg0_split_yawsc = 16;   /* SPLIT yaw-RATE scale, Q4 (16 = 1.0x = cor
    Modes 1 vs 2 (read REC/EX/P/FLAT in both) isolate the software-floor cost = the saving
    the VDP2 floor buys.  Boot = 0. */
 static int rbg0_mode = 0;
-static int nbg3_show = 0;   /* NBG3 debug overlay display, toggled live by the pad L+R chord (default OFF).
-                               Its B1 cycle is reserved at init (RBG0_NBG3), so this only flips BGON. */
+static int nbg3_show = 1;   /* NBG3 debug overlay display; L+R cycles sat_dbg_overlay_mode (0 full / 1
+                               fps-only / 2 off) and syncs this = (mode != 2).  Default ON = full perf
+                               overlay visible at boot.  Its B1 cycle is reserved at init (RBG0_NBG3),
+                               so this only flips BGON. */
 /* RBG0_TUNE_PAD gates the live floor-tuning pad toggles (orientation / texel offset / plane
    pitch+level) AND the d-pad-from-Doom gate.  0 = PARKED: the found values below are the baked
    defaults and player movement is normal.  Flip to 1 to re-tune on the pad. */
@@ -662,28 +676,33 @@ void sat_walls_kick(void);                /* platform: flush + kick the VDP1 wal
 }
 #endif
 
-/* Potato / quality levels cycled live with pad Z -- 6 modes for in-game A/B comparison.
-   pot0 = textured; pot1 = flat floors; pot2 = flat-shaded walls (bd = banded texture stripes
-   that scroll, fl = single flat colour).  +ld = low-detail (half horizontal res), meaningful
-   ONLY in the 2-player split (it gates the d_main.c split block).  pot2+ld is omitted (low-detail
-   of flat/banded walls is invisible).  Everything is platform-side EXCEPT sat_split_lowdetail
-   (core flag, default 0 -> DoomJo/1p unaffected). */
-#define POTATO_LEVEL 0
-static int potato_level = POTATO_LEVEL;    /* 0..5, index into potato_modes */
-static int wall_potato_mode = 0;           /* Mimas VDP1 wall mode: 0=textured 1=banded 2=flat */
-/* the modes: floors flat?, wall mode (0=tex 1=banded 2=flat), low-detail?, floor-low-detail?,
-   display name.  pot0.5 = textured floors drawn at HALF-rate fill (1 texel / 2 screen px) with
-   FULL VDP1 walls -- the floor-only low-detail the global +ld can't give (global +ld halves the
-   whole render geometry, walls included).  Inserted right after pot0 (a finer first step). */
-static const struct { int floors, wmode, ld, fld; const char *name; } potato_modes[7] = {
-    { 0, 0, 0, 0, "pot0"    },
-    { 0, 0, 0, 1, "pot0.5" },
-    { 0, 0, 1, 0, "pot0+ld" },
-    { 1, 0, 0, 0, "pot1"    },
-    { 1, 0, 1, 0, "pot1+ld" },
-    { 1, 1, 0, 0, "pot2-bd" },
-    { 1, 2, 0, 0, "pot2-fl" },
-};
+/* ============================================================================
+   Render MODE (M) + per-zone Software Quality (SQ) -- the two orthogonal axes that
+   replace the old potato_modes[] path-jumble + the sat_ftex_mode 0-5 pad cycle.
+     M  = OFFLOAD strategy: WHERE each surface renders (software / VDP1 / VDP2).
+     SQ = quality of whatever stays on the CPU, PER ZONE (wall / floor / ceiling).
+   sat_apply_mode() is the SINGLE writer of every backend flag -> only coherent
+   tuples exist, and each M activates ONLY the subsystems it needs (see the plan).
+   Pad: Z cycles M (0..4); R+A/B/C cycle SQ wall/floor/ceil.  The MODE overlay row
+   shows the resolved composition so a capture always pins the exact state.
+   M1 reproduces the historical default (RBG0 dominant + VDP1 leftover + VDP1 walls
+   + NBG0 sky) verbatim -- the regression anchor. */
+enum { M0_SOFT, M1_FULL, M2_FLOORS, M3_CEILS, M4_RBG0, M5_CONVEX, M_COUNT };
+static int sat_m = M4_RBG0;                 /* boot = RBG0 dominant floor + VDP1 walls + software leftover/
+                                               ceilings (HW A/B 2026-07-05: +44% vs M1; VDP1 floor/ceiling
+                                               tiles cost ~40ms P+Bp).  M1..M3 (VDP1 deport) parked on Z. */
+static const char *const sat_m_name[M_COUNT] = { "soft", "full", "flr", "ceil", "rbg0", "cvx" };
+enum { SQ_FULL, SQ_LD, SQ_BAND, SQ_FLAT };
+static int sq_wall = SQ_FULL, sq_floor = SQ_LD, sq_ceil = SQ_LD;   /* floor+ceil ld by default (HW-tested "fll":
+                                                                     ld is ~invisible on the ceiling and fine on the
+                                                                     floor; the convex-exact deport (M5) puts the
+                                                                     convex floors at FULL quality on VDP1 anyway) */
+static const char *const sq_name[4] = { "full", "ld", "band", "flat" };
+static int wall_potato_mode = 0;            /* VDP1 wall style: 0=tex 1=banded 2=flat (SQ_wall-derived) */
+/* Platform VDP1-claim gates, read ONLY by sat_floor_vdp1_emit -- split leftover-floors vs
+   ceilings independently so M2 (floors only) and M3 (ceilings only) isolate each offload. */
+static int sat_vdp1_floor_claim = 1;        /* leftover floors -> VDP1 tiles (M1,M2) */
+static int sat_vdp1_ceil_claim  = 1;        /* ceilings        -> VDP1 tiles (M1,M3) */
 
 /* Dual-CPU blit configs, cycled LIVE by the pad L+R chord (one press = next, wraps).
    'mpct' = % of the 224 framebuffer rows the MASTER copies ([0,split)); the slave
@@ -725,22 +744,48 @@ extern "C" int sat_plane_steal;
    ~21ms + fps UNCHANGED (the win is inc-2).  Row 1 shows wp<state>. */
 extern "C" int sat_wallprep_slave;
 extern "C" int sat_wallprep_defer;
-static void sat_apply_potato(void)
+/* The single writer of every render backend flag.  Maps (sat_m, sq_*) -> a coherent
+   per-surface tuple; each M leaves ON only the subsystems it needs.  Called at init, on any
+   M/SQ change, and per-view in the split (the per-frame block downgrades RBG0 off P1). */
+static void sat_apply_mode(void)
 {
-    extern int sat_split_lowdetail;            /* core flag (only acts in the split block) */
-    extern int sat_floor_ld;                   /* core/r_plane.c -- pot0.5 half-rate textured floors */
-    int L = potato_level; if (L < 0 || L >= 7) L = 0;
-    sat_potato_floors   = potato_modes[L].floors;
-    sat_potato_walls    = (potato_modes[L].wmode == 2);  /* DoomJo software-wall flat parity (flat only) */
-    sat_wall_nocpu      = (potato_modes[L].wmode >= 1);  /* banded OR flat -> skip the close-wall CPU fallback */
-    sat_wall_clamp      = SAT_WALL_CLAMP;                 /* Phase-1 A/B: SPAN one-sided walls -> VDP1 clamp vs CPU */
-#if SAT_VDP1_FLOOR
-    sat_vdp1_floor      = 1;                              /* Option-1 first cut: secondary floors -> VDP1 flat quads */
-    sat_floor_vdp1_hook = sat_floor_vdp1_emit;
-#endif
-    wall_potato_mode    = potato_modes[L].wmode;         /* Mimas VDP1 3-way (tex/banded/flat) */
-    sat_split_lowdetail = potato_modes[L].ld;
-    sat_floor_ld        = potato_modes[L].fld;           /* pot0.5: textured floors at half-rate fill */
+    extern int sat_split_lowdetail;            /* core: split detailshift (low-detail) */
+    extern int sat_floor_ld;                   /* core r_plane.c: half-rate floor texel fetch */
+    extern int sat_ceil_potato, sat_ceil_ld;   /* core r_plane.c: independent ceiling SQ (step 2) */
+    int M = sat_m; if (M < 0 || M >= M_COUNT) { M = M1_FULL; sat_m = M; }
+
+    /* ---- Axis A: offload targets ---- */
+    int rbg0_want  = (M != M0_SOFT);           /* RBG0 dominant floor (M1..M4) */
+    int vdp1_walls = (M != M0_SOFT);           /* VDP1 one-sided walls  (M1..M4) */
+    sat_vdp1_floor_claim = (M == M1_FULL || M == M2_FLOORS || M == M5_CONVEX);   /* leftover floors -> VDP1 */
+    sat_vdp1_ceil_claim  = (M == M1_FULL || M == M3_CEILS  || M == M5_CONVEX);   /* ceilings        -> VDP1 */
+    int hook_consult = (sat_vdp1_floor_claim || sat_vdp1_ceil_claim);   /* any leftover -> VDP1 */
+
+    sat_vdp2_sky            = rbg0_want ? 1 : 0;   /* M0 -> sat_vdp2_sky=0: core draws the software sky */
+    sat_vdp2_floor          = rbg0_want ? 1 : 0;   /* per-frame block re-derives on split/1p (rbg0_on) */
+    sat_vdp2_floor_dominant = RBG0_FLOOR_DOMINANT; /* every RBG0 mode uses the dominant-flat pick */
+    sat_wall_skip           = vdp1_walls ? 1 : 0;  /* M0 -> core draws software one-sided walls */
+    sat_vdp1_floor          = hook_consult ? 1 : 0;/* core: consult the emit hook (M1..M3) */
+    /* sat_ftex_mode: 4 = M0 (legacy all-software path drops the VDP1 wall_acc); 6 = M5 CONVEX-EXACT
+       (distant planes whose every run is ONE linear trapezoid -> 1 exact quad; non-convex or near ->
+       software -- the cheap deport); 3 = the full tile deport (M1-M3).  M4's hook is not consulted
+       (sat_vdp1_floor=0) so its value is inert there. */
+    sat_ftex_mode           = (M == M0_SOFT) ? 4 : (M == M5_CONVEX) ? 6 : 3;
+
+    /* ---- Axis B: per-zone software quality (bites only on software zones / fallback slivers;
+       HW-owned zones ignore it -- no detail level on hardware) ---- */
+    wall_potato_mode = (sq_wall == SQ_BAND) ? 1 : (sq_wall == SQ_FLAT) ? 2 : 0;  /* VDP1 wall style */
+    sat_potato_walls = (sq_wall == SQ_FLAT);                     /* flat-shaded software walls */
+    sat_wall_nocpu   = (sq_wall == SQ_BAND || sq_wall == SQ_FLAT);/* banded/flat -> skip close-wall CPU */
+    sat_potato_floors = (sq_floor == SQ_FLAT);                   /* solid-colour software floors */
+    sat_floor_ld      = (sq_floor == SQ_LD);                     /* half-rate floor texel fetch */
+    sat_ceil_potato   = (sq_ceil == SQ_FLAT);                    /* solid-colour software ceilings */
+    sat_ceil_ld       = (sq_ceil == SQ_LD);                      /* half-rate ceiling texel fetch */
+    sat_split_lowdetail = (sq_wall == SQ_LD || sq_floor == SQ_LD || sq_ceil == SQ_LD); /* split detailshift */
+
+    sat_wall_clamp = (M == M5_CONVEX) ? 0 : SAT_WALL_CLAMP;   /* off in M5: convex-exact planes are distant
+                                                                 full-claims -> no near-band to clamp, and it
+                                                                 drops the Bp wall-clamp cost (pad R+A re-arms) */
 }
 #define GS_LEVEL 0
 #define SAT_CMAP_BYTES (34 * 256)           /* COLORMAP: 34 maps of 256 (r_data.c) */
@@ -1236,6 +1281,11 @@ extern "C" int rp_timeout_count;
 extern "C" unsigned int rp_master_ms;   /* master frame ms -> prefixes r_parallel.c's row-18 SLV line */
 static unsigned int dg_frame_count = 0;
 static int vdp1_last_cmds = 0;
+/* RELIABLE VDP1 load (replaces the CEF/vblank-aliased Dr%): command-budget FILL % for the wall
+   and floor banks, computed where WALL_CMD_CAP/FTEX_F_CAP are in scope (they are #defined below
+   fps_update) and read by the overlay.  The CPU-fallback counts (fb_pk_starve = walls dumped
+   when the bank fills, ftexd_trunc = floor tiles dropped) are the definitive "over budget" signal. */
+static int vd1_wpct = 0, vd1_fpct = 0;
 /* RBG0 floor view (pad Y): 0 = HW floor (sector-dimmed baked flat), 1 = software floor.  The HW floor
    ships BAKE-ONLY (no distance gradient) for now. */
 static int rbg0_floor_view = 0;
@@ -1270,6 +1320,16 @@ static int rbg0_floor_contrast = 0;   /* base bake cancelled -> 0 (no texture-co
    the index-0 view clear.  Summed over the fps 1s window, printed by fps_update on row 11. */
 extern "C" uint32_t DG_GetTicksMs(void);
 static unsigned int df_pre_sum, df_blit_sum, df_post_sum, df_frames;
+/* SATURN PERF (2026-07-04): master-frame composition.  MST = REC(render) + T(game-tic) + S(sound)
+   + blit + present(VDP1 kick) + other.  T/S come from the core (d_main.c, per tick); blit is the
+   existing DG split; present is the VDP1 wall-kick FRT timed at its call sites.  Window sums,
+   averaged once/sec by fps_update alongside df_pre/blit/post -> the decomposition on overlay row 1. */
+static unsigned int df_tic_sum, df_snd_sum;      /* window sums of the core game-tic / sound ms  */
+static unsigned int df_present_sum;              /* window sum of the VDP1 present-kick (tenths-ms) */
+static unsigned int sat_present_frt = 0;         /* VDP1 kick FRT ticks THIS frame (reset in DG df block) */
+extern "C" int sat_tic_ms, sat_snd_ms;           /* core d_main.c: game-tic / sound ms this tick   */
+extern "C" int sat_dbg_overlay_mode;             /* 0 full / 1 fps-only / 2 off (core r_parallel.c) */
+extern "C" int sat_prof_planepix;                /* arm the RP_PlanePixels floor sizer (core; def 0) */
 /* SATURN PERF (2026-06-29): sub-split of the DF 'pre' phase to pin the facing-wall stall.
    sky = sky scroll + cmap + slScrAutoDisp; up = rbg0_upload_flat (131KB rebuild, normally guarded);
    xf = rbg0_set_transform (slScrMatConv/slScrMatSet matrix); rp = the RPT VRAM memcpy. 1s-window
@@ -1362,14 +1422,14 @@ static void fps_update(void)
            so each A/B run starts a clean min/avg/max window -- no manual button needed
            (the pad is already saturated: Y=hash X=split Z=potato L+R=blit). */
         {
-            static int l_map=-1, l_pot=-1, l_blit=-1;
+            static int l_map=-1, l_m=-1, l_sq=-1, l_blit=-1;
 #if SAT_FLOOR_PERFSIM
             static int l_perfsim=-1;   /* reset the REC window on a pad-Y perf-sim toggle => clean per-mode numbers */
 #endif
 #if SAT_DIAG_SLAVE_TOGGLES
             static int l_steal=-1, l_wp=-1;
 #endif
-            if (gamemap != l_map || (int)potato_level != l_pot || blit_mode != l_blit
+            if (gamemap != l_map || sat_m != l_m || (sq_wall<<4|sq_floor<<2|sq_ceil) != l_sq || blit_mode != l_blit
 #if SAT_FLOOR_PERFSIM
                 || floor_perfsim_mode != l_perfsim
 #endif
@@ -1380,7 +1440,7 @@ static void fps_update(void)
                 RP_ProfReset();
                 vd1_win_done = vd1_win_tot = 0;
                 fb_pk_clamp = fb_pk_mag = fb_pk_starve = fb_pk_px = 0;   /* Phase-0: clean fallback A/B window */
-                l_map=gamemap; l_pot=(int)potato_level; l_blit=blit_mode;
+                l_map=gamemap; l_m=sat_m; l_sq=(sq_wall<<4|sq_floor<<2|sq_ceil); l_blit=blit_mode;
 #if SAT_FLOOR_PERFSIM
                 l_perfsim=floor_perfsim_mode;
 #endif
@@ -1395,94 +1455,43 @@ static void fps_update(void)
            to = slave-timeout count (must stay 0 -- the RP_CMD_BUF-shrink safety);
            cd = CD read-retries (whackCD): 0 = clean disc, climbing = flaky reads. */
         extern int sat_cd_read_retries;   /* w_file_saturn.cxx */
+        /* row 0 HEADLINE: inst fps, EMA(~4s) avg (the build-comparison number), MST (=1000/fps, the
+           master frame ms), to = slave-timeout count (must stay 0), cd = CD read-retries.  Shown in
+           every overlay mode except OFF(2); the fps-only mode(1) shows ONLY this row, so the
+           mode0<->mode1 fps delta measures the overlay's own per-frame tax. */
+        unsigned int mst = inst10 ? (10000u / inst10) : 0u;
         static char r0[45];
-        sprintf(r0, "%u.%u fps avg%u.%u to%d cd%d",
+        sprintf(r0, "%u.%ufps a%u.%u MST%u to%d cd%d      ",
                 inst10 / 10, inst10 % 10, avg10 / 10, avg10 % 10,
-                rp_timeout_count, sat_cd_read_retries);
-        SRL::Debug::Print(0, 0, r0);
-        /* row 1: vp = visplane peak (MAXVISPLANES sizing) + the live pad toggles:
-           potato mode (pad Z), blit config bl + measured blit ms b (pad L+R, dual-CPU
-           GO/DROP), visplane-hash h (pad Y). */
+                mst, rp_timeout_count, sat_cd_read_retries);
+        if (sat_dbg_overlay_mode != 2) SRL::Debug::Print(0, 0, r0);
+        /* row 1: MASTER-FRAME COMPOSITION, window-AVERAGED over this 1s tick (ms) -- so a single
+           heavy frame is never read as the general case (percentiles are on row 3).  Decomposes MST:
+             R  = render (REC = B+P+M), DERIVED = MST - T - S - b - dg  (=> R+T+S+b+dg == MST)
+             T  = game-tic     (core TryRunTics: thinkers / P_Ticker / P_CheckSights)
+             S  = sound        (core S_UpdateSounds)
+             b  = framebuffer->VDP2 blit
+             dg = DG_DrawFrame pre+post (sky + present-kick + split-HUD + this overlay + index-0 clear)
+             pr = VDP1 present-kick (tenths-ms) -- informational; a SUBSET of R (early kick runs in render). */
+        unsigned int _f    = df_frames ? df_frames : 1u;
+        unsigned int _tic  = df_tic_sum / _f;
+        unsigned int _snd  = df_snd_sum / _f;
+        unsigned int _blit = df_blit_sum / _f;
+        unsigned int _dg   = (df_pre_sum + df_post_sum) / _f;
+        unsigned int _pr10 = df_present_sum / _f;                        /* tenths-ms */
+        unsigned int _used = _tic + _snd + _blit + _dg;
+        unsigned int _rec  = (mst > _used) ? (mst - _used) : 0u;         /* derived render */
         static char r1[45];
-        /* cc = SH-2 master CCR @0xFFFFFE92 low nibble (CP bit4 reads 0): bit0 CE=cache enable,
-           bit1 ID, bit2 OD, bit3 TW (0=4-way / 1=2-way+2KB-RAM).  Expect 01 = enabled 4-way; if
-           it's 00 (disabled) or 09 (2-way) the warm-cache work is moot / a separate free win. */
-        unsigned ccr = (unsigned)(*(volatile unsigned char *)0xFFFFFE92) & 0x0Fu;
-#if SAT_DIAG_SLAVE_TOGGLES
-        sprintf(r1, "vp%3d %-7s bl%d b%u.%u ws%d wp%d cc%02x", r_visplane_peak,
-                potato_modes[potato_level].name, blit_mode,
-                sat_blit_ms10 / 10, sat_blit_ms10 % 10, sat_plane_steal, sat_wallprep_slave, ccr);
-#else
-        /* st = M5 BSP staging, ACTIVE/wanted KB this level (st17/40 = nodes+ssec+verts
-           live from HWRAM, segs on LWRAM; st0/40 = staging toggled OFF (pad R+C) or the
-           arena is missing/too small).  Trailing spaces erase ghosts when the row shrinks. */
-        sprintf(r1, "vp%3d %-7s bl%d b%u.%u cc%02x pm%d st%d/%d  ", r_visplane_peak,
-                potato_modes[potato_level].name, blit_mode,
-                sat_blit_ms10 / 10, sat_blit_ms10 % 10, ccr,
-                sat_plane_rowsplit ? 2 : sat_plane_tas,   /* plane mode: 0 static / 1 TAS / 2 row-split */
-                sat_bsp_stage_on ? (sat_bsp_stage_used >> 10) : 0, sat_bsp_stage_want >> 10);
-#endif
-        SRL::Debug::Print(0, 1, r1);
-        /* (WIP: the 'FL' floor-tuning readout row was removed with the gradient toggles.) */
-        df_pre_sum = df_blit_sum = df_post_sum = df_frames = 0;
+        sprintf(r1, "R%u T%u S%u b%u dg%u pr%u.%u          ",
+                _rec, _tic, _snd, _blit, _dg, _pr10 / 10, _pr10 % 10);
+        if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 1, r1);
+        /* window reset -- read the row-1 composition ABOVE before this zeroes the sums.  The
+           dead RAM/TXC/ZON sizer block (TEX/SPL/TXC/ZON, all display-off) was cut with the
+           overlay clean-up; re-add from git if a memory-lever session needs it. */
+        df_pre_sum = df_blit_sum = df_post_sum = 0;
+        df_tic_sum = df_snd_sum = df_present_sum = df_frames = 0;
         rbg_sky_sum = rbg_upl_sum = rbg_xfm_sum = rbg_rpt_sum = 0;
-        {
-            /* SATURN VALIDATION row: RAM-lever sizing (all high-water, Ymir-honest).
-               hp = newlib heap peak/cap (#4: trim HEAP_SIZE to peak+margin).
-               cov = peak sum of live-plane spans (#1: a tight pooled top-arena needs
-                     ~cov bytes, +cov for bottom => arena ~= 2*cov; compare to today's
-                     332KB pool to see #1's ceiling).  pool = #1 span-pool peak bytes
-                     (0 unless SAT_VISPLANE_POOL=1).  vp (row 2) sizes #2 MAXVISPLANES. */
-            /* TEX = Phase-0 texturecolumnlump floor measurement (one-shot at load,
-               docs/TEXTURECOLUMNLUMP_PLAN.md): nt=numtextures, w=total columns (Sum
-               width), d=the columnlump+columnofs PU_STATIC floor in KB (=4*w), mp=#
-               multi-patch textures.  Confirms the ~400-600K floor on real hardware.
-               (Replaced the VAL visplane-sizing telemetry -- that lever shipped.) */
-            static char rV[45];
-            sprintf(rV, "TEX nt%d w%d d%dK mp%d",
-                    sat_tex_numtex, sat_tex_sumwidth, sat_tex_dirbytes >> 10, sat_tex_mptex);
-            /* [overlay lean] SRL::Debug::Print(0, 8, rV);  -- mem levers, off for wall/floor work */
-            /* split-block breakdown + LIVE mode: P = player count (sat_local_players), W = wall
-               mode V/S/- (V=VDP1 walls all views, S=all software, -=1p inert), v0..v3 = each
-               R_RenderPlayerView ms, k = the VDP1 kick, bk = wall-texture re-bakes (last frame;
-               0 in 1p).  Surfaces the pad-X VDP1<->software A/B + which path actually ran. */
-            static char rS[45];
-            char wmode = (sat_local_players <= 1) ? '-' : (sat_split_vdp1 ? 'V' : 'S');
-            snprintf(rS, sizeof rS, "SPL P%d %c v0%u v1%u v2%u v3%u k%u bk%u",
-                    sat_local_players, wmode, sat_spl_v0, sat_spl_v1,
-                    sat_spl_v2, sat_spl_v3, sat_spl_kick, wtex_bakes);
-            /* [overlay lean] SRL::Debug::Print(0, 16, rS);  -- split config, off for now */
-#if RBG0_SPLIT_P1HW && RBG0_SPLIT_TUNE
-            {                               /* DIAG: shows why the HW split floor (de)activates + the live R+dpad cal */
-                static char rVP[64];
-                snprintf(rVP, sizeof rVP, "hz%d cx%d pit%d sd%d yw%d sc%d", rbg0_split_hz, rbg0_split_cx, rbg0_split_pitch, rbg0_split_sd, rbg0_split_yaw, rbg0_split_scroll);
-                SRL::Debug::Print(0, 22, rVP);   /* row 22: free (0-21 + 23 used by other overlays) */
-            }
-#endif
-            /* streaming texture cache (core/r_cache.c): a=active (0 in split/non-stream),
-               <pool>K size, e=live composites, b=builds this level, x=evictions.  a1 + b>0
-               = the LRU is doing work; a0 = inactive (2p split / shareware / cart mode). */
-            /* TXC = streaming texture cache (core/r_cache.c): a=active, <pool>K size,
-               e=live composites, b=builds, x=evicts.  lf = largest free block (KB) the
-               carve saw -- a0 with lf below ~88K means the zone was too tight to slice
-               the slab (64K margin + 24K min), so the cache is BLOCKED ON THE FLOOR
-               (the TEX-row cut is what frees it), not a measurement bug. */
-            static char rTC[45];
-            sprintf(rTC, "TXC a%d %dK e%d b%d x%d lf%dK",
-                    sat_texcache_active, sat_texcache_poolkb, sat_texcache_entries,
-                    sat_texcache_builds, sat_texcache_evicts, sat_texcache_carve_lf);
-            /* [overlay lean] SRL::Debug::Print(0, 6, rTC);  -- TXC streaming, off (row 6 now = FBK) */
-            /* LWRAM zone pressure (the Z_Malloc OOM lever): fr = total reclaimable
-               (free+purgeable); mx = largest CONTIGUOUS run after a purge.  At an
-               'Z_Malloc: failed on N' crash: mx < N while fr >> N => FRAGMENTATION;
-               fr < N => true EXHAUSTION. */
-            static char rZ[45];
-            sprintf(rZ, "ZON fr%dK mx%dK", Z_FreeMemory() >> 10, Z_LargestAllocatable() >> 10);
-            /* [overlay lean] SRL::Debug::Print(0, 7, rZ);  -- ZON zone-free, off (re-enable for OOM debug) */
-        }
-        /* master frame ms (the synchronous bottleneck) -> prefixes r_parallel.c's row-18
-           SLV line; set the shared value here (the AVG row is gone, fps is on row 0). */
-        rp_master_ms = inst10 ? (10000u / inst10) : 0;   /* frame ms */
+        rp_master_ms = mst;   /* master frame ms, exposed for the shared core */
         {
             /* row 2: VDP1 load + done-rate + build stamp.  VD1 = cmds this frame + D/B
                (EDSR-CEF this frame) + Dr = % of plotted frames Done over the window.
@@ -1500,7 +1509,7 @@ static void fps_update(void)
             snprintf(r2v, sizeof r2v, "VD1 %d%c Dr%u%% b:" __TIME__,
                     vdp1_last_cmds, vdp1_prev_done ? 'D' : 'B', dr);
 #endif
-            SRL::Debug::Print(0, 2, r2v);
+            (void)r2v;   /* VD1 row cut (perf overlay clean-up); dr reused on row 3 */
 #if SAT_FLOOR_TEX
             /* row 12 (free): FTX = floor-texture state.  m = pad-Y mode (0 flat-FB / 1 flat-lit /
                2 textured), t = tiles drawn last frame, s = skipped (z-guard / blow-up / no cache
@@ -1511,7 +1520,7 @@ static void fps_update(void)
             snprintf(r12, sizeof r12, "FTX m%d a%d t%d s%d x%d bk%d p%dK sl%d  ",
                      sat_ftex_mode, ftexd_acc, ftexd_tiles, ftexd_skips, ftexd_trunc,
                      ftexd_bakes, ftexd_px >> 10, sat_ftex_slave);
-            SRL::Debug::Print(0, 12, r12);
+            (void)r12;   /* FTX row cut (floor-tex state, not perf/composition) */
 #endif
             /* row 4: WINDOWED REC distribution p50/p95/max (tenths-ms) -- robust to the
                single-outlier max (a lone CD hitch) AND to an arbitrary threshold.  p50 =
@@ -1519,17 +1528,20 @@ static void fps_update(void)
                Window auto-resets on a config change (above).  ~29 cols. */
             static char r4[45];
             int p50 = RP_ProfPercentile(50), p95 = RP_ProfPercentile(95);
-            snprintf(r4, sizeof r4, "REC p50 %d.%d p95 %d.%d mx%d.%d d%d   ",
+            snprintf(r4, sizeof r4, "REC 50:%d.%d 95:%d.%d mx%d.%d d%d      ",
                     p50/10, p50%10, p95/10, p95%10,
                     sat_prof_rec_max/10, sat_prof_rec_max%10, sat_prof_dropped);
-            SRL::Debug::Print(0, 4, r4);
+            (void)dr;   /* Dr% dropped from the overlay: CEF/vblank-sampling aliasing makes it
+                           unreliable (owner: "Dr% biaisé"); the Dr0-but-floor-complete captures
+                           confirm it does NOT signal VDP1 saturation. */
+            if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 3, r4);   /* row 3: REC percentiles + VDP1 Dr% */
             /* row 8 (free -- rows 3/4/5 belong to r_parallel's Bw/Bp critical-path overlay): deported-plane
                VERTICAL decrochage-fill knob (pad R+Up/Down).  vs = scale (sat_plane_vscale), bV = this frame's
                actual vertical fill-border px. */
             static char r8[32];
             snprintf(r8, sizeof r8, "PVfill vs %d  bV %d bM %d   ",
                      sat_plane_vscale, sat_plane_border_v, sat_plane_border_max);
-            SRL::Debug::Print(0, 8, r8);
+            (void)r8;   /* PVfill row cut */
             /* row 10: per-PHASE INDEPENDENT peaks (each phase's own worst across the
                window, possibly different frames) -- the basis to size each offload
                (Bp -> slave wall-prep, P -> VDP1/RBG0 floor).  ~31 cols worst case. */
@@ -1537,7 +1549,7 @@ static void fps_update(void)
             snprintf(r10, sizeof r10, "PK Bw%d.%d Bp%d.%d P%d.%d M%d.%d        ",
                     sat_prof_pk_bw/10, sat_prof_pk_bw%10, sat_prof_pk_bp/10, sat_prof_pk_bp%10,
                     sat_prof_pk_p/10,  sat_prof_pk_p%10,  sat_prof_pk_m/10,  sat_prof_pk_m%10);
-            SRL::Debug::Print(0, 10, r10);
+            if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 4, r10);   /* row 4: per-phase peaks */
             /* row 9: WHERE/WHEN the REC-max frame was (the locator), so the worst frame is
                reproducible.  m=map, x,y=player render pos (map units), a=angle 0-255,
                t=sec into the level.  ~31 cols worst case (6-digit coords). */
@@ -1545,7 +1557,47 @@ static void fps_update(void)
             snprintf(r9, sizeof r9, "MX m%d %d,%d a%d t%ds        ",
                     sat_prof_mx_map, sat_prof_mx_x, sat_prof_mx_y, sat_prof_mx_ang,
                     sat_prof_mx_t/35);
-            SRL::Debug::Print(0, 9, r9);
+            if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 6, r9);   /* row 6: REC-max locator */
+            /* row 7: ACTIVE render composition -- so an A/B is never read against the wrong state.
+               M<n>:name = offload mode (pad Z).  RESOLVED per-surface targets: fl:<dom><leftover>
+               cl:<ceil> sk:<sky> wl:<wall>, where R=RBG0 V=VDP1 N=NBG0 .=software(CPU).  SQ:<W><F><C>
+               software quality per zone (pad R+Y/Y/L+Y): f=full l=ld b=band x=flat.  pm=plane split
+               0stat/1TAS/2rowsplit (pad C). */
+            static const char sqch[4] = { 'f', 'l', 'b', 'x' };   /* full / ld / band / flat */
+            char m0 = (sat_m == M0_SOFT);
+            char dm = m0 ? '.' : 'R';                                        /* dominant floor */
+            char lf = m0 ? '.' : (sat_vdp1_floor_claim ? 'V' : '.');         /* leftover floors */
+            char cl = m0 ? '.' : (sat_vdp1_ceil_claim  ? 'V' : '.');         /* ceilings        */
+            char sk = m0 ? '.' : 'N';                                        /* sky             */
+            char wl = m0 ? '.' : 'V';                                        /* walls           */
+            static char r7[45];
+            snprintf(r7, sizeof r7, "M%d %s fl:%c%c cl:%c sk:%c wl:%c SQ:%c%c%c pm%d ",
+                     sat_m, sat_m_name[sat_m], dm, lf, cl, sk, wl,
+                     sqch[sq_wall & 3], sqch[sq_floor & 3], sqch[sq_ceil & 3],
+                     sat_plane_rowsplit ? 2 : sat_plane_tas);
+            if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 7, r7);
+            /* row 8: RELIABLE VDP1 load (replaces the CEF-aliased Dr%).  w%/f% = wall/floor
+               command-budget FILL % (100% = bank full, further surfaces spill to CPU); fbw = walls
+               dumped to CPU because the bank filled (windowed peak); fbf = floor tiles dropped
+               (trunc).  fbw|fbf > 0 = VDP1 genuinely over budget this window (the master pays). */
+            static char rVD[45];
+            snprintf(rVD, sizeof rVD, "VD1 w%d%% f%d%% fbw%d fbf%d   ",
+                     vd1_wpct, vd1_fpct, fb_pk_starve, ftexd_trunc);
+            if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 8, rVD);
+            /* row 5 (free): LINE-OF-SIGHT volume this ~1s window -- the game-tic (T, row 1) cost
+               driver.  rej = P_CheckSight calls the REJECT table trivially rejected in O(1); walk =
+               full BSP LOS traversals (P_CrossBSPNode, the expensive division-heavy path).  In the
+               streaming-mode DEFAULT rejectmatrix is NULL so rej stays 0 and EVERY check full-walks
+               -- a high walk with rej0 quantifies the REJECT lever (build -DSAT_KEEP_REJECT=1 to
+               convert walks -> rej and read the T delta).  First window shows cumulative-since-boot,
+               then per-window deltas. */
+            static int l_sc0 = 0, l_sc1 = 0;
+            int d_sc0 = sightcounts[0] - l_sc0;
+            int d_sc1 = sightcounts[1] - l_sc1;
+            l_sc0 = sightcounts[0]; l_sc1 = sightcounts[1];
+            static char rLOS[45];
+            snprintf(rLOS, sizeof rLOS, "LOS rej%d walk%d /win        ", d_sc0, d_sc1);
+            if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 5, rLOS);
             /* row 17: FLOOR offload sizers.  Vs/Vp = VDP1-floor candidate quad count this
                frame / window peak (go/no-go: GO if Vp fits the VDP1 cmd budget).  d% = the
                dominant single-flat share of plane pixels, n = visplane count (RBG0 sweet
@@ -1553,7 +1605,7 @@ static void fps_update(void)
             static char r17[45];
             snprintf(r17, sizeof r17, "FLR Vs%d Vp%d d%d%% n%d        ",
                     sat_floor_vq_cur, sat_floor_vq_peak, sat_prof_dom_pct, sat_prof_plane_n);
-            SRL::Debug::Print(0, 17, r17);
+            (void)r17;   /* FLR sizer row cut (arm sat_prof_planepix to size the floor) */
             /* row 20 (pari A sizing): "all floors+ceilings as VDP1 quads" (PowerSlave model).
                ss = visible subsectors, Q = geometry quad count this frame (fan pieces,
                UNtextured -> texture tiling would multiply), Qp = window peak, q4 = % of
@@ -1561,7 +1613,7 @@ static void fps_update(void)
             static char r20[45];
             snprintf(r20, sizeof r20, "PAR ss%d Q%d Qp%d q4%d%%      ",
                     sat_prof_ss_n, sat_prof_ss_q, sat_prof_ss_qpk, sat_prof_ss_q4pct);
-            SRL::Debug::Print(0, 20, r20);
+            (void)r20;   /* PAR row cut */
             /* row 6: Phase-0 wall CPU-fallback sizer.  c = clampable tiers cur/pk (SPAN + below-floor
                = the Phase-1 world-anchored VDP1 clamp target); m = face-on magnified residue cur/pk;
                s = starved (VDP1 bank full) pk; K = clampable fill proxy cur/pk in kilo-pixels (the
@@ -1572,7 +1624,7 @@ static void fps_update(void)
                      fb_cur_clamp, fb_pk_clamp, fb_cur_mag, fb_pk_mag, fb_pk_starve,
                      fb_cur_px >> 10, fb_pk_px >> 10,
                      fb_cur_wclamp, sat_wall_clamp ? '+' : '-');
-            SRL::Debug::Print(0, 6, rFB);   /* moved 24->6: joins the sizer block (TXC/ZON/mem now off) */
+            (void)rFB;   /* FBK wall-fallback sizer row cut */
             /* row 18: memory-latency calibration (one-shot cold 32 KB read per bank, FRT
                ticks).  rL = LWRAM/HWRAM ratio -- >1.0 means LWRAM (cmd buf + visplanes) is
                the slow bank, = the memory-bound penalty + the L2-relocate upside, measured
@@ -1589,7 +1641,7 @@ static void fps_update(void)
                 "0 NORMAL", "1 DOM-ABSENT(vdp2)", "2 ALL-BUT-DOM(vdp1)", "3 BOTH" };
             static char r19[45];
             snprintf(r19, sizeof r19, "PERFSIM %s        ", perfsim_name[floor_perfsim_mode & 3]);
-            SRL::Debug::Print(0, 19, r19);
+            (void)r19;   /* PERFSIM row cut */
 #endif
             /* row 13: sky-vs-floor coverage classifier (Romain).  sky/flr = pixels the sky / the
                dominant floor cover this frame.  flr is non-zero only in a perf-sim floor-on mode
@@ -1598,7 +1650,7 @@ static void fps_update(void)
             static char r13[45];
             snprintf(r13, sizeof r13, "CLS sky%u flr%u %c       ", sat_sky_px, sat_floor_px,
                     (sat_sky_px >= sat_floor_px) ? 'S' : 'F');
-            SRL::Debug::Print(0, 13, r13);
+            (void)r13;   /* CLS classifier row cut */
         }
 #if VDP2_RBG0_TEST
         {
@@ -1608,7 +1660,7 @@ static void fps_update(void)
                or snow persists, the rotation banks' CYC pattern also needs writing. */
             static char rR[45];
             sprintf(rR, "RAMCTL b=%04X a=%04X", ramctl_before, ramctl_after);
-            SRL::Debug::Print(0, 14, rR);
+            (void)rR;   /* RAMCTL row cut */
         }
 #endif
 #ifdef SAT_REPACK
@@ -1628,10 +1680,17 @@ static void fps_update(void)
                          sat_drp_cart ? "CART" : "cd", sat_drp_cart_kb);
             else
                 snprintf(r21, sizeof r21, "DRP off (%d)         ", sat_drp_state);
-            SRL::Debug::Print(0, 21, r21);
+            (void)r21;   /* DRP streaming-status row cut (not perf/composition) */
         }
 #endif
-        /* (cut: the "WAD:" identity line -- served its purpose, owner flagged it useless.) */
+        /* fps-only mode: SRL::Debug tiles persist, so a row we stop writing would GHOST.  Blank
+           rows 1-6 (incl. r_parallel's rows 2/5, which its per-frame path also skips in mode!=0)
+           so only row 0 (fps + MST) remains -> the mode0<->mode1 fps delta is clean.  Mode 2 hides
+           the whole NBG3 layer (nbg3_show=0), so no blanking is needed there. */
+        if (sat_dbg_overlay_mode == 1) {
+            static const char bl[] = "                                        ";
+            for (int rr = 1; rr <= 8; ++rr) SRL::Debug::Print(0, rr, (char *)bl);
+        }
         t0     = now;
         frames = 0;
     }
@@ -2439,7 +2498,7 @@ extern "C" void DG_Init(void)
     sat_vdp2_floor = 1;
     sat_vdp2_floor_dominant = RBG0_FLOOR_DOMINANT;   /* HW floor pick: dominant visible flat (sector-change) vs under-eye */
 #endif
-    sat_apply_potato();   /* boot Potato level; pad Z cycles it live */
+    sat_apply_mode();   /* boot the render mode M (owns sat_wall_skip/sat_vdp1_floor/sky/SQ); pad Z cycles it */
 
     /* LAYER INVERSION: the weapon + HUD now render in SOFTWARE (NBG1, on top) -- do NOT
        route them to VDP1.  VDP1 carries ONLY the walls, BELOW NBG1.  (The VDP1 weapon/
@@ -2449,7 +2508,7 @@ extern "C" void DG_Init(void)
     /* Route one-sided (solid) walls to the VDP1 world renderer AND skip their
        software column draw -> see the VDP1 coverage + the perf it buys back. */
     sat_wall_hook = sat_wall_vdp1;
-    sat_wall_skip = 1;
+    /* sat_wall_skip is owned by sat_apply_mode (M-gated: 1 in M1..M4, 0 in M0 software walls). */
     /* kick VDP1 right after the BSP walk (parallel with the CPU floors/sprites) so the
        walls present the SAME frame as the framebuffer (no 1-frame lag / sky-at-the-seam). */
     sat_walls_done_hook = sat_walls_kick;
@@ -2461,7 +2520,7 @@ extern "C" void DG_Init(void)
        live to A/B the index-0 coverage (owned surfaces go black until the strip emitter). */
 #if SAT_VDP1_FLOOR
     sat_floor_vdp1_hook = sat_floor_vdp1_emit;   /* Option-1 first cut: secondary floors -> VDP1 flat quads */
-    sat_vdp1_floor      = 1;
+    /* sat_vdp1_floor (consult the hook) is owned by sat_apply_mode (M-gated: 1 in M1..M3). */
 #if SAT_FLOOR_TEX
     sat_floors_done_hook = sat_vdp1_floors_done;  /* build+flip the F floor bank right after
                                                      R_DrawPlanes (same frame as walls+mask) */
@@ -3327,8 +3386,8 @@ static void wall_emit_banded(int wi)
     wall_emit_band(x1, x2, yl1, yh1, yl2, yh2, u1, u2, texw, ca, cs, colr, vx, vxr, vyt, vyb);
 }
 
-/* the VDP1 wall mode (0=textured 1=banded 2=flat).  Global per level (set in sat_apply_potato);
-   the flush forces flat for a wall with no texture slot, and forces textured for special walls. */
+/* the VDP1 wall mode (0=textured 1=banded 2=flat).  Global per level (set in sat_apply_mode from
+   SQ_wall); the flush forces flat for a wall with no texture slot, and forces textured for special walls. */
 static int wall_potato(int wi)
 {
     (void)wi;
@@ -3393,7 +3452,7 @@ static int floor_acc_n = 0;
    consumed ONLY by ftex_slave_build on the slave -- so the kick/wjump/bank statics can move on
    with the next frame while a build is still in flight.  floor_acc entries themselves stay
    untouched until the next frame's claims, which JOIN the job first (RP_AuxWait). */
-static struct { unsigned int base, wjump; unsigned short wroot; short n;
+static struct { unsigned int base, wjump; unsigned short wroot; short n; short overlap;
                 unsigned char idx[MAX_FLOOR_ACC]; short slot[MAX_FLOOR_ACC]; } ftex_job;
 static int ftex_job_ready = 0;   /* master part done -> DG_DrawFrame dispatches the slave build */
 static int ftex_build_mode = 0;  /* fmode snapshot for the emitters (the pad can move mid-frame) */
@@ -3444,7 +3503,14 @@ static int ftex_ctx, ftex_cty;                        /* centerx, centery       
 static const unsigned char *ftex_fcmap;               /* fixedcolormap                   */
 
 static inline int fxmul(int a, int b) { return (int)(((long long)a * b) >> 16); }
-static inline int fxdiv(int a, int b) { return (int)(((long long)a << 16) / b); }
+/* SATURN PERF: the ftex per-node perspective divide is the tile-fabrication bottleneck
+   (HW mode-bench: P(textured) ~= 2x P(software) -- the cost is emitting tiles, not drawing
+   them).  Route it through the core's SH-2 hardware DIV0U divide (m_fixed.h, ~37 cyc) instead
+   of GCC's __divdi3 software 64/64 (~200 cyc).  BIT-IDENTICAL output: both ftex call sites are
+   inside FixedDiv's non-saturating domain -- at scale=fxdiv(proj,tz) the tz<FTEX_ZGUARD(8<<16)
+   guard above ensures tz>=524288 while abs(proj)>>14~=640; at the bbox site num>>14 (<=~704)
+   << den(=proj).  So the saturation branch never trips and (a<<16)/b matches exactly. */
+static inline int fxdiv(int a, int b) { return (int)FixedDiv(a, b); }
 
 #define FTEX_CHUNK     40           /* max fb px per clip-rect chunk (see ftex_chunk_for) */
 #define FTEX_WEDGE_MAX 6            /* px the sloped-chord wedge may reach within one chunk */
@@ -3526,6 +3592,10 @@ extern "C" int sat_floor_vdp1_emit(int picnum, int height, int minx, int maxx,
 {
     if (height == sat_vdp2_floor_h && picnum == sat_vdp2_floor_pic) return 0;   /* dominant stays (RBG0/software) */
     if (maxx < minx) return 0;
+    /* SATURN M: per-surface VDP1 claim gate.  M2 = leftover floors only (ceilings -> software);
+       M3 = ceilings only (leftover floors -> software); M1 = both (gate is a no-op).  A rejected
+       surface returns 0 so the core draws it with the software span path at its SQ quality. */
+    if ((height > viewz) ? !sat_vdp1_ceil_claim : !sat_vdp1_floor_claim) return 0;
 #if SAT_FLOOR_TEX
     int claim_add = 0;                   /* claim-budget charge, applied ONLY on a successful claim */
     int fdnear = 0;                      /* |row - centery| of the plane's nearest edge (mode-3 nsplit) */
@@ -3534,7 +3604,7 @@ extern "C" int sat_floor_vdp1_emit(int picnum, int height, int minx, int maxx,
                                             the core paints the textured wall-lag catch-up band
                                             (rows the plane held sat_plane_lag frames ago, now
                                             wall-punched) -- no VDP1 floor list at all */
-    if (sat_ftex_mode == 2 || sat_ftex_mode == 3)
+    if (sat_ftex_mode == 2 || sat_ftex_mode == 3 || sat_ftex_mode == 6)
     {
         /* SAFE ZONE (owner 2026-07-03): a plane hugging the viewer -- door threshold, shallow
            step (small planeheight) -- has a big on-screen share NEARER than FTEX_NEARCLIP,
@@ -3583,6 +3653,7 @@ extern "C" int sat_floor_vdp1_emit(int picnum, int height, int minx, int maxx,
             if (dyn < 1) dyn = 1;
             if (dnear > dyn)                                 /* a sub-NEARCLIP sliver exists */
             {
+                if (sat_ftex_mode == 6) return 3;            /* CONVEX-EXACT (M5): distant-only -- ANY near sliver -> software */
                 int span   = dnear - (dfar == 0x7FFF ? 0 : dfar); if (span < 1) span = 1;
                 int sliver = dnear - dyn;
                 if (sliver * 10 > span * 3) return 3;        /* >30% too near -> whole plane CPU
@@ -3718,6 +3789,7 @@ extern "C" int sat_floor_vdp1_emit(int picnum, int height, int minx, int maxx,
             f->ceil = (unsigned char)is_ceil;
 #endif
             x0 = x1;
+            if (sat_ftex_mode == 6 && x0 < re) { floor_acc_n = save_n; return 3; }   /* CONVEX-EXACT: this run needs >1 trapezoid (non-convex) -> whole plane software */
         }
     }
     if (floor_acc_n == save_n) return 0;   /* nothing emitted -> software */
@@ -4118,6 +4190,7 @@ static void vdp1_ftex_flush(void)
     }
     ftexd_tiles = ftex_tiles; ftexd_skips = ftex_skips;      /* row-12 snapshot of last frame */
     ftexd_trunc = ftex_trunc; ftexd_bakes = ftex_bakes; ftexd_px = ftex_px;
+    vd1_fpct = FTEX_F_CAP ? (ftexd_tiles * 100 / FTEX_F_CAP) : 0;   /* floor tile-budget fill % */
     ftexd_acc = floor_acc_n;                                 /* trapezoids claimed this frame */
     ftex_tiles = ftex_skips = ftex_trunc = ftex_bakes = 0; ftex_px = 0;
     ftex_claim_px = 0;                                       /* re-arm the claim-time budget */
@@ -4196,6 +4269,8 @@ static void vdp1_ftex_flush(void)
             ftex_job.base  = ftex_tile_base;
             ftex_job.wjump = ftex_wjump_addr;
             ftex_job.wroot = (unsigned short)wroot;
+            ftex_job.overlap = (short)sat_ftex_blit_overlap;   /* frozen: the slave skips its flip iff set */
+            ftex_overlap_flip = sat_ftex_blit_overlap ? 1 : 0; /* master flips in DG after the blit */
             ftex_wjump_addr = 0;
             ftex_job_ready  = 1;   /* floor_acc_n re-arms at the DG kick (entries stay frozen) */
             RP_AuxArm(ftex_slave_build);   /* PIGGYBACK: the masked slave body takes the build
@@ -4249,7 +4324,8 @@ static void ftex_slave_build(void)
     vdp1_cmd_at(ftex_job.base, ftex_next, cmd);
     *((volatile unsigned short *)ftex_job.wjump + 1) =         /* chain fresh W -> fresh F */
         (unsigned short)((ftex_job.base - VDP1_VRAM_BASE) >> 3);
-    *((volatile unsigned short *)VDP1_ROOT_ADDR + 1) = ftex_job.wroot;   /* ONE atomic present */
+    if (!ftex_job.overlap)                                     /* overlap mode: the MASTER flips after its blit */
+        *((volatile unsigned short *)VDP1_ROOT_ADDR + 1) = ftex_job.wroot;   /* ONE atomic present */
 }
 
 /* sat_floors_done_hook target.  In SPLIT the hook fires once per view with a partial
@@ -4597,6 +4673,7 @@ static void vdp1_wpn_kick(void)
     vdp1_prev_done = (VDP1_EDSR & 0x0002) ? 1 : 0;   /* did the previous frame's plot finish? */
 #if SHOW_FPS
     vdp1_last_cmds = vdp1_wactive ? vdp1_wnext : 0;
+    vd1_wpct = WALL_CMD_CAP ? (vdp1_last_cmds * 100 / WALL_CMD_CAP) : 0;   /* wall command-budget fill % */
     /* Dr accumulation moved to the OnVblank sampler (vdp1_vblank_dr): per-KICK sampling ran
        once per GAME frame while 1-cycle-auto replots every VBLANK -> the rate aliased with
        the frame rate and under/over-read at random phases (owner: "Dr% est biaisé").  Here
@@ -4689,8 +4766,12 @@ extern "C" void sat_walls_kick(void)
         return;
     }
 #endif
-    sat_vdp1_wpn_begin();
-    vdp1_wpn_kick();
+    {   /* SATURN PERF: time the VDP1 present (close bank + flip root LINK) -> overlay 'pr'. */
+        unsigned short pk0 = frt_read();
+        sat_vdp1_wpn_begin();
+        vdp1_wpn_kick();
+        sat_present_frt += (unsigned short)(frt_read() - pk0);
+    }
     vdp1_kicked_this_frame = 1;
 }
 #endif
@@ -4861,8 +4942,8 @@ extern "C" void DG_DrawFrame(void)
         /* SATURN: the VDP2/RBG0 floor is ONE rotation plane -> use it ONLY at full detail
            (potato 0) and in 1-player; in any potato level OR split-screen it falls back to the
            SOFTWARE floor (sat_vdp2_floor=0 -> the sw floor draws; RBG0 display off). */
-        int rbg0_active   = (potato_level == 0) && (sat_local_players <= 1);
-        int rbg0_split_p1 = RBG0_SPLIT_P1HW && (potato_level == 0) && (sat_local_players == 2);   /* SATURN split: P1 floor in HW (left half), P2 software */
+        int rbg0_active   = (sat_m != M0_SOFT) && (sat_local_players <= 1);
+        int rbg0_split_p1 = RBG0_SPLIT_P1HW && (sat_m != M0_SOFT) && (sat_local_players == 2);   /* SATURN split: P1 floor in HW (left half), P2 software */
         int rbg0_on       = rbg0_active || rbg0_split_p1;
         { static int prev_split_p1 = -1;                        /* SATURN: force ONE flat re-upload on the 1p<->split */
           if (rbg0_split_p1 != prev_split_p1) {                 /* transition (the stale-pic root cause is fixed in core */
@@ -4870,7 +4951,7 @@ extern "C" void DG_DrawFrame(void)
         sat_split_p1hw    = rbg0_split_p1;                       /* core (d_main): punch the HW floor only for P1 in split */
         rbg0_floor_win_xend = rbg0_split_p1 ? 159 : 319;         /* window X: P1's left half in split, full screen in 1p */
         sat_vdp2_floor    = (rbg0_mode == 1 || !rbg0_on) ? 0 : 1;  /* 1p drives the punch; split is overridden per-view in d_main */
-        uint16_t sky_bit  = ((VDP2_HW_SKY || VDP2_CELL_SKY) && show_sky) ? NBG0ON : 0;   /* HW sky: show_sky carries GS_LEVEL/!automap/has_sky/1p. NOT potato-gated -- a backdrop is cheap and offloads the SW sky most at low detail; sat_vdp2_sky=1 leaves index-0, so NBG0 must stay on whenever the core skips the sky */
+        uint16_t sky_bit  = (sat_vdp2_sky && show_sky) ? NBG0ON : 0;   /* HW sky bit gated on sat_vdp2_sky (M-owned): M0 => 0 => NBG0 off + core draws the software sky; M1..M4 => 1 => core leaves index-0, NBG0 shows through */
         uint16_t rbg0_bit = (RBG0_DISPLAY && rbg0_mode == 0 && rbg0_on) ? RBG0ON : 0;   /* HW floor: pot0 + (1p or 2p-split-P1) */
         uint16_t nbg3_bit = (RBG0_NBG3 && nbg3_show) ? NBG3ON : 0;  /* NBG3 overlay: display = pad L+R (default off); B1 cycle reserved at init */
         slScrAutoDisp((uint16_t)(sky_bit | NBG1ON | nbg3_bit | rbg0_bit));
@@ -4972,7 +5053,11 @@ extern "C" void DG_DrawFrame(void)
        presents the same frame.  Only kick HERE when it did NOT fire (menu/intermission: no
        R_RenderPlayerView) -> the empty bank clears any stale walls.  Both before the
        palette_changed reset so the wall cache re-tints on a damage/pickup flash. */
-    if (!vdp1_kicked_this_frame) { sat_vdp1_wpn_begin(); vdp1_wpn_kick(); }
+    if (!vdp1_kicked_this_frame) {
+        unsigned short pk0 = frt_read();   /* SATURN PERF: present-kick ms (menu/intermission path) */
+        sat_vdp1_wpn_begin(); vdp1_wpn_kick();
+        sat_present_frt += (unsigned short)(frt_read() - pk0);
+    }
 #if VDP1_WALL_TEST && SAT_VDP1_FLOOR && SAT_FLOOR_TEX
     vdp1_ftex_flush();   /* FALLBACK only (ftex_flushed-guarded): the normal build+flip runs
                             from sat_floors_done_hook at the end of R_DrawPlanes; this covers
@@ -5078,11 +5163,28 @@ extern "C" void DG_DrawFrame(void)
 #endif
     uint32_t df1 = DG_GetTicksMs();        /* SATURN PERF: ms split -- end of pre, start of blit */
 #if VDP1_WALL_TEST && SAT_VDP1_FLOOR && SAT_FLOOR_TEX
-    /* JOIN the slave F-build BEFORE the NBG1 mask blit on EVERY blit path (review finding:
-       the boot default is the SINGLE-CPU blit, whose branch never calls rp_sgl_workptr_reset
-       -- without this the slave's root flip landed ~35ms into game logic, AFTER the mask
-       went live, re-introducing the v7 mask-vs-pair slip in motion).  Cost = the build's
-       residual after the DG pre-work, visible in the row-11 blit bucket (b stays copy-only). */
+    /* BLIT<->F-BUILD DECOUPLE (R+Z).  ftex_overlap_flip is set iff the slave build was ARMED to
+       skip its flip -> the master owns the present flip and must do it AFTER the blit (acting on
+       what was armed, not the live toggle, so a mid-frame toggle never strands the flip). */
+    if (ftex_overlap_flip)
+    {
+        /* OVERLAP: single-CPU blit CONCURRENT with the slave F-build (tiles + W->F chain, NO flip),
+           then join and flip -- the flip stays after the blit (coherent), the copy hides in the wait. */
+        unsigned short bt0 = frt_read();
+        cache_purge();
+        for (int y = 0; y < 224; ++y)
+            memcpy(DOOM_VRAM + (y + VIEW_Y_OFFSET) * DOOM_VRAM_STRIDE, framebuffer + y * 320, 320);
+        RP_AuxWait();                                                      /* slave done: tiles + chain */
+        *((volatile unsigned short *)VDP1_ROOT_ADDR + 1) = ftex_job.wroot; /* master present, AFTER the blit */
+        ftex_overlap_flip = 0;
+        sat_blit_ms10 = ((unsigned int)(unsigned short)(frt_read() - bt0) * ns_per_frt) / 100000u;
+    }
+    else
+#endif
+    {
+#if VDP1_WALL_TEST && SAT_VDP1_FLOOR && SAT_FLOOR_TEX
+    /* JOIN the slave F-build BEFORE the NBG1 mask blit (review finding: without this the slave's
+       root flip landed ~35ms into game logic, AFTER the mask went live = the v7 mask-vs-pair slip). */
     RP_AuxWait();
 #endif
     unsigned short blit_t0 = frt_read();   /* SATURN PERF: time the blit (-> sat_blit_ms10) */
@@ -5128,6 +5230,7 @@ extern "C" void DG_DrawFrame(void)
         unsigned short blit_t1 = frt_read();
         sat_blit_ms10 = ((unsigned int)(unsigned short)(blit_t1 - blit_t0) * ns_per_frt) / 100000u;
     }
+    }   /* end non-overlap blit path (the flip-before-blit default) */
     uint32_t df2 = DG_GetTicksMs();        /* SATURN PERF: ms split -- end of blit, start of clear */
     /* LAYER INVERSION: clear the 3D VIEW to index 0 so next frame the SKIPPED wall columns stay
        transparent -> the VDP1 walls (below NBG1) show through.  The HUD rows are left intact
@@ -5139,11 +5242,19 @@ extern "C" void DG_DrawFrame(void)
         int clear_rows = (sat_local_players >= 3) ? 224 : (sat_local_players == 2 ? 160 : 192);
         memset(framebuffer, 0, clear_rows * 320);
     }
-    {   /* SATURN PERF: bank the reliable ms split (printed once/sec by fps_update, row 11) */
+    {   /* SATURN PERF: bank the master-frame composition (window-averaged once/sec by fps_update).
+           df_pre/blit/post are DG_DrawFrame's own ms split; tic/snd come from the core this tick;
+           present is the VDP1 kick FRT accumulated during render + this DG call.  sat_present_frt is
+           reset AFTER banking so next frame's early kick (sat_walls_kick, during render) accumulates
+           cleanly into it before the next bank. */
         uint32_t df3 = DG_GetTicksMs();
         df_pre_sum  += df1 - df0;
         df_blit_sum += df2 - df1;
         df_post_sum += df3 - df2;
+        df_tic_sum  += (unsigned int)sat_tic_ms;
+        df_snd_sum  += (unsigned int)sat_snd_ms;
+        df_present_sum += ((unsigned int)sat_present_frt * ns_per_frt) / 100000u;  /* FRT -> tenths-ms */
+        sat_present_frt = 0;
         df_frames++;
     }
     return;
@@ -5361,9 +5472,9 @@ static void poll_pad(void)
         }
         else
 #endif
-        {
-            potato_level = (potato_level + 1) % 7;   /* Z alone: cycle the Potato level */
-            sat_apply_potato();
+        {   /* Z: cycle the render mode M (0..4).  (R+Z blit-overlap cut -- marginal, parked.) */
+            sat_m = (sat_m + 1) % M_COUNT;
+            sat_apply_mode();
         }
     }
 
@@ -5383,28 +5494,18 @@ static void poll_pad(void)
         if ((changed & PER_DGT_KL) && !(cur & PER_DGT_KL) && sat_plane_border_max > 0)  sat_plane_border_max -= 2;
     }
 
-    /* Pad R + C toggles the M5 BSP-staging live A/B (core/p_setup.c P_BspStageApply): swaps
-       nodes/subsectors/vertexes/segs between the HWRAM staged copies (on) and the LWRAM
-       originals (off) at the SAME spot in the SAME binary -- the only layout-noise-free way
-       to read M5's true Bw/Bp effect (inter-build .bss shifts alone moved Bp ~6ms at an
-       identical scene, 2026-07-02, so build-vs-build fps comparisons cannot judge M5).
-       Both copies are byte-identical and read-only, so a mid-frame swap is safe.  Row 1
-       'st' drops to 0/.. while OFF.  (R taps '.' and C taps run to Doom -- harmless, the
-       established diag-chord pattern.) */
-    if (!(cur & PER_DGT_TR) && (changed & PER_DGT_TC) && !(cur & PER_DGT_TC))
-        P_BspStageApply(!sat_bsp_stage_on);
+    /* (R+C M5 BSP-staging A/B cut -- settled-negative; the staging mechanism stays inert in core.
+       R+C is now the CEILING SQ knob below; C alone still cycles the plane-split pmode.) */
 
 #if VDP2_RBG0_TEST
-    /* Pad R + Y = the floor A/B comparator: 0 = VDP2 hardware floor (RBG0) <-> 1 = software floor.
-       (MOVED from Y-alone: Y-alone now cycles the SAT_FLOOR_TEX mode below -- the chain-head bug
-       that shipped the ftex cycle dormant.  R taps '.' to Doom -- the established diag-chord
-       pattern; no clash with R+C (uses C) or R+Up/Down (d-pad).) */
-    if (!(cur & PER_DGT_TR) && (changed & PER_DGT_TY) && !(cur & PER_DGT_TY)) {
-        rbg0_floor_view = (rbg0_floor_view + 1) % 2;          /* 0 HW (baked, no gradient) / 1 software */
-        rbg0_mode       = rbg0_floor_view;                    /* 0 = HW floor, 1 = software floor */
-        /* (gradient is WIP/parked -> rbg0_linecol_mode stays 0; not in the toggle for now) */
-    }
-#if !RBG0_LINECOL_TEST && !RBG0_TUNE_PAD
+    /* Pad R + Y cycles the WALL software quality SQ (full/ld/band/flat), applied to the CPU wall
+       fallback + the VDP1 wall style (band/flat).  (Was the RBG0 floor A/B -- folded into the M
+       axis.)  R taps '.' to Doom -- the established diag-chord pattern. */
+    if (!(cur & PER_DGT_TR) && (changed & PER_DGT_TY) && !(cur & PER_DGT_TY))
+    { sq_wall = (sq_wall + 1) & 3; sat_apply_mode(); }
+#if !RBG0_TUNE_PAD   /* was gated on !RBG0_LINECOL_TEST too -- a coherence bug: the parked line-color
+                        fog (mode 0, never on C) has nothing to do with the plane-split toggle, and
+                        RBG0_LINECOL_TEST=1 was silently killing pad C.  Only RBG0_TUNE_PAD really uses C. */
     /* Pad C cycles the plane-split mode (overlay row1 'pm'): 0 = static half-split, 1 = TAS plane
        work-steal, 2 = ROW-SPLIT (the universal balancer -- both SH-2 split the screen ROWS, so a
        dominant plane is balanced too, which pm0/pm1 cannot).  Watch w / SLVidle (row 3): pm2 should
@@ -5426,7 +5527,14 @@ static void poll_pad(void)
         const unsigned short lr = (unsigned short)(PER_DGT_TL | PER_DGT_TR);
         static int lr_was = 0;
         int lr_now = ((cur & lr) == 0);          /* both held (active-low) */
-        if (lr_now && !lr_was) nbg3_show = !nbg3_show;
+        if (lr_now && !lr_was) {
+            /* Cycle the debug overlay: 0 full perf overlay -> 1 fps-only (measures the overlay's
+               own per-frame tax via the mode0<->mode1 fps delta -- gates the r_parallel per-frame
+               rows AND the RP_PlanePixels rescan) -> 2 off (layer hidden).  nbg3_show hides the
+               whole NBG3 text layer only in mode 2. */
+            sat_dbg_overlay_mode = (sat_dbg_overlay_mode + 1) % 3;
+            nbg3_show = (sat_dbg_overlay_mode != 2);
+        }
         lr_was = lr_now;
     }
 #endif
@@ -5519,33 +5627,23 @@ static void poll_pad(void)
 #endif
 #endif
 #if SAT_FLOOR_TEX
-    /* Pad Y (alone, L/R released) cycles the floor-TEXTURE mode LIVE (in-session A/B/C, the
-       inter-build-noise law): 0 = flat full-bright (step-1 ship baseline, byte-identical),
-       1 = flat + CRAM distance light, 2 = + textured near-field world tiles.  Row 12 `FTX m..`
-       shows the state.  (This block was a dead #elif behind VDP2_RBG0_TEST until 2026-07-02 --
-       the ftex cycle shipped dormant; the RBG0 floor A/B moved to R+Y.  L/R released so R+Y
-       (floor A/B) and L+Y can never also advance the mode.  SAT_FLOOR_PERFSIM regains pad Y
-       when SAT_FLOOR_TEX=0.) */
+    /* Pad Y (alone, L/R released) cycles the FLOOR software quality SQ, applied to the software
+       floor spans + the VDP1-floor CPU-fallback slivers.  Flats cycle full/ld/flat -- band is
+       skipped (meaningless for a flat: the potato span is already distance-shaded per row). */
     if ((cur & PER_DGT_TL) && (cur & PER_DGT_TR)
         && (changed & PER_DGT_TY) && !(cur & PER_DGT_TY))
-    {
-        sat_ftex_mode = (sat_ftex_mode + 1) % 6;   /* 0 flat-FB / 1 flat-lit / 2 textured /
-                                                      3 tex + CPU far / 4 all-software ref /
-                                                      5 software planes + VDP1 walls + band */
-        sat_wall_skip = (sat_ftex_mode == 4) ? 0 : 1;   /* mode 4: walls render software too */
-    }
-    /* Pad L+Y (R released): live A/B of the SLAVE F-build (row 12 'sl').  sl1 = tile emission
-       on the slave SH-2 (P should drop, b may grow by the join); sl0 = master-inline (the
-       pre-offload path, byte-identical).  Active-low buttons: !(cur&TL) = L held. */
+    { sq_floor = (sq_floor == SQ_FULL) ? SQ_LD : (sq_floor == SQ_LD) ? SQ_FLAT : SQ_FULL; sat_apply_mode(); }
+    /* Pad L+Y (R released) cycles the CEILING software quality SQ (full/ld/band/flat), independent
+       of the floor (core sat_ceil_potato/sat_ceil_ld).  (Was the slave-F-build A/B -- sl1 kept as
+       the compile default.)  Active-low: !(cur&TL) = L held. */
     if (!(cur & PER_DGT_TL) && (cur & PER_DGT_TR)
         && (changed & PER_DGT_TY) && !(cur & PER_DGT_TY))
-        sat_ftex_slave ^= 1;
-    /* Pad L+R+Y: live A/B of the Phase-1 WALL CLAMP (partially-occluded tiers kept on VDP1 via
-       the world-anchored cut + software wedge, core sat_wall_cut_floor/_ceil).  Row 6
-       W<n><+/-> = tiers kept this frame + state; c/K melt where W rises.  Y family: alone =
-       floor mode, L = slave F-build, R = RBG0 A/B, L+R = wall clamp. */
-    if (!(cur & PER_DGT_TL) && !(cur & PER_DGT_TR)
-        && (changed & PER_DGT_TY) && !(cur & PER_DGT_TY))
+    { sq_ceil = (sq_ceil == SQ_FULL) ? SQ_LD : (sq_ceil == SQ_LD) ? SQ_FLAT : SQ_FULL; sat_apply_mode(); }
+    /* Pad R+A: live A/B of the Phase-1 WALL CLAMP (partially-occluded tiers kept on VDP1 via the
+       world-anchored cut + software wedge, core sat_wall_cut_floor/_ceil).  Row 6 W<n><+/-> = tiers
+       kept + state.  (MOVED off L+R+Y -- the L+R chord fires the overlay toggle, so L+R+Y was
+       unreachable.)  R held + A; the incidental fire tap to Doom is harmless. */
+    if (!(cur & PER_DGT_TR) && (changed & PER_DGT_TA) && !(cur & PER_DGT_TA))
         sat_wall_clamp ^= 1;
 #elif SAT_FLOOR_PERFSIM
     /* Pad Y cycles the 4 floor PERF-SIM modes (read REC/P rows 4/5 in each = the floor-offload

@@ -125,7 +125,10 @@ Hard caps for all: slave reads LWRAM at rL=2.1 and **shares the bus**; new slave
   template for future live A/Bs. Corollary for M2: only promote a struct to HWRAM
   with actual cache-miss evidence.
 - **M3/M4 — DMA the blit + the framebuffer clear** (`slDMACopy`; raw SCU DMA failed 3×).
-  ~5.5 ms + a few ms of pure master time, same pixels.
+  ~5.5–11 ms + a few ms of pure master time, same pixels. **PLANNED** — 4-increment
+  plan (sync DMA → async + fence → clear off-master → W5), evidence + risks in
+  [`BLIT_DMA_PLAN.md`](BLIT_DMA_PLAN.md); wolf4sdl ships the identical per-row
+  `slDMACopy` blit on HW.
 - **M2 — promote a hot LWRAM struct (visplane top/bottom, spanstart) to HWRAM** (2.1× per
   read; the framebuffer already lives in HWRAM bss).
 - **V1 — 4bpp/COLOR_BANK walls** for textures whose ramp fits ≤16 entries: halves VDP1

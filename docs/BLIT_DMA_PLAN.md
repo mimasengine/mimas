@@ -80,7 +80,15 @@ Once Inc 2 lands the clear sits in the fence (still master ms). Options, in orde
    SGL-shadow-respecting poke — the raw history commands caution.
 - **Expected**: **−2…−3 ms** more.
 
-### Inc 4 — W5, blit only live rows — **BUILT 2026-07-02, HW-PENDING**
+### Inc 4 — W5, blit only live rows — **HW-CONFIRMED 2026-07-05: −1.3…−1.5 ms 1p idle**
+> Row-1 `b` (windowed mean, 1p standstill E1M1): c-=10.0, c5=8.7 (**−1.3**), d-=10.3, d5=8.8
+> (**−1.5** vs d-). The W5 delta = **14 % = the 32 HUD rows [192,224)/224 exactly** — not noise.
+> `sat_hud_dirty` works (ammo 47/50/49/48 tracked live). **Caveat**: the test spot was facing-wall
+> (the décrochage spot), which is PRE-stall-bound (~25 ms, `mx72` vs `MST98`), so the −1.3 ms is
+> swamped and MST/fps do NOT move there (98/100/100/98 doesn't track `b`). `b` is the clean signal;
+> to see W5 convert to fps, measure at a standstill in an **open** scene (no PRE stall). **c5 is the
+> winner** (pure upside: −1.3 ms idle / 0 combat); DMA (`d`) confirmed no-win (+0.3 ms), park it.
+
 The blit loop is split at `hud_top` (= the clear boundary: 192 1p / 160 2p / 224 3-4p): the
 3D-view rows `[0,hud_top)` always blit; the HUD band `[hud_top,224)` blits only when it
 changed. 3/4p (`hud_top=224`) is a no-op (interspersed bands + minimap change every frame).
@@ -109,6 +117,17 @@ Inc 1 → Inc 2 → Inc 3 → Inc 4, one HW session each, 2-spot protocol + pad 
 - **Abort to previous cfg** on any HW hang (the F00001 history), snow, or torn menus
   (the STEP-4a tearing symptom = fence bug).
 - Cumulative target: **MST −6…−12 ms** ⇒ pot0 ~8 → **~9–9.5 fps**, pot2 13.4 → **~15**.
+
+## 2b. Measuring small blit deltas (row 5)
+
+The row-1 `b` is a 1-second window average in **integer ms** — it rounds away the ~1.5 ms W5
+delta. **Overlay row 5** `BLT <path><w5> <mean.hundredths> n<samples>` is the precise A/B: it
+accumulates the per-frame FRT blit time (`sat_blit_ms10`, tenths) since the last L+A toggle and
+shows the **mean in hundredths-ms** + the sample count (capped 4096). Protocol: stand still (HUD
+idle — not firing / no damage), let `n` climb a few hundred, read the mean; toggle L+A (resets
+`n`) and compare across `c-`/`c5`/`d-`/`d5`. The blit is scene-independent (fixed 224 rows,
+bus-bound), so the mean is ~constant across the map — the W5 saving (~1.5 ms 1p) is the same
+everywhere; measure anywhere at a standstill.
 
 ## 3. Notes
 

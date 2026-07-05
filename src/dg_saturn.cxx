@@ -738,15 +738,18 @@ static int sat_vdp1_ceil_claim  = 1;        /* ceilings        -> VDP1 tiles (M1
    The measured-DEAD dual-CPU configs are gone (bus-bound S~1.3 + slave-dispatch wedge risk);
    the dual code stays behind DUAL_CPU_BLIT for git revival but no cfg selects it (dual=0). */
 static const struct { int dual; int mpct; int dma; int w5; } blit_cfg[] = {
-    { 0, 100, 0, 0 },   /* 0: CPU,     full HUD blit -- boot baseline */
-    { 0, 100, 0, 1 },   /* 1: CPU  + W5 (skip static HUD rows) */
-    { 0, 100, 1, 0 },   /* 2: SCU-DMA, full HUD blit */
-    { 0, 100, 1, 1 },   /* 3: SCU-DMA + W5 */
+    { 0, 100, 0, 0 },   /* 0: CPU,     full HUD blit (c-) */
+    { 0, 100, 0, 1 },   /* 1: CPU  + W5 (skip static HUD rows) (c5) -- boot default */
+    /* --- PARKED (not in the L+A cycle): SCU-DMA is bus-bound, HW-confirmed no win (+0.3ms).
+       Kept compiled so the slDMACopy branch builds for Inc 2 (async DMA); index directly only. */
+    { 0, 100, 1, 0 },   /* 2: SCU-DMA, full HUD blit (d-)  -- parked */
+    { 0, 100, 1, 1 },   /* 3: SCU-DMA + W5           (d5)  -- parked */
 };
-#define BLIT_CFG_N ((int)(sizeof(blit_cfg) / sizeof(blit_cfg[0])))
-static int blit_mode = 0;   /* boot: single-CPU blit.  2026-06-22 HW (pot0 tech room):
-   dual NEVER beats single -- blit is only ~5.5ms (not the assumed ~12ms) and is bus-bound
-   (S~1.3); 50/50 was the WORST (6.0 vs 5.5).  Verdict DROP; L+R chord still A/Bs configs. */
+#define BLIT_CFG_N   ((int)(sizeof(blit_cfg) / sizeof(blit_cfg[0])))
+#define BLIT_CYCLE_N 2   /* live pad-L+A cycle spans only c- <-> c5; DMA (2,3) parked above */
+static int blit_mode = 1;   /* boot: CPU + W5 (c5).  W5 HW-CONFIRMED 2026-07-05 -1.3..-1.5ms 1p
+   at standstill (=14% = the 32 static HUD rows) with no stale HUD over a session.  DMA parked
+   (bus-bound, +0.3ms, no win).  L+A now A/Bs W5 on/off (c5 <-> c-). */
 /* Master row count for the current config: mpct% of 224. */
 static inline int blit_split(void) { return (blit_cfg[blit_mode].mpct * 224) / 100; }
 /* SATURN PERF: last frame's framebuffer->VDP2 blit wall-clock in ms*10 (master FRT delta
@@ -754,6 +757,14 @@ static inline int blit_split(void) { return (blit_cfg[blit_mode].mpct * 224) / 1
    decides dual-CPU blit GO/DROP -- fps/MST are too coarse (~12ms of a ~100ms frame).
    Read it on row 2 as 'b<ms.tenth>'; compare config 0 (single) vs 4 (75/25), same scene. */
 static unsigned int sat_blit_ms10 = 0;
+/* SATURN blit A/B precision: windowed accumulation of the per-frame sat_blit_ms10 (FRT tenths),
+   reset on the L+A toggle (any config change) so at a standstill it builds a long, stable sample
+   -> the MEAN (shown in the row-1 'b' field, tenths) resolves the ~1.5ms W5 / DMA deltas that the
+   old integer 'b' rounded away.  Capped at 4096 samples (rock-stable by then, no overflow).
+   NB: displayed by FOLDING into row 1 -- NO new overlay row (rows are saturated across
+   dg_saturn.cxx AND core/r_parallel.c; see the debug-overlay-placement memory). */
+static unsigned int blit10_sum = 0, blit10_cnt = 0;
+#define BLIT10_CAP 4096
 /* SATURN W5 (docs/BLIT_DMA_PLAN.md): blit the HUD rows [hud_top,224) only when the HUD
    framebuffer actually changed; the 3D-view rows [0,hud_top) always blit.  hud_top = the
    clear boundary (192 1p / 160 2p / 224 3-4p) so 3/4p (no bottom HUD band) blits all 224 = a
@@ -1531,6 +1542,7 @@ static void fps_update(void)
                 RP_ProfReset();
                 vd1_win_done = vd1_win_tot = 0;
                 fb_pk_clamp = fb_pk_mag = fb_pk_starve = fb_pk_px = 0;   /* Phase-0: clean fallback A/B window */
+                blit10_sum = blit10_cnt = 0;   /* row-1 'b' precise window: fresh sample on the L+A toggle */
                 l_map=gamemap; l_m=sat_m; l_sq=(sq_wall<<4|sq_floor<<2|sq_ceil); l_blit=blit_mode;
 #if SAT_FLOOR_PERFSIM
                 l_perfsim=floor_perfsim_mode;
@@ -1575,8 +1587,12 @@ static void fps_update(void)
         static char r1[45];
         char blit_c = blit_cfg[blit_mode].dma ? 'd' : 'c';   /* blit path: c=CPU, d=SCU-DMA (L+A) */
         char blit_w = blit_cfg[blit_mode].w5  ? '5' : '-';   /* W5 HUD-skip: 5=on, -=off (L+A)  */
-        sprintf(r1, "R%u T%u S%u b%u%c%c dg%u pr%u.%u      ",
-                _rec, _tic, _snd, _blit, blit_c, blit_w, _dg, _pr10 / 10, _pr10 % 10);
+        /* 'b' = PRECISE blit mean in tenths-ms (FRT sat_blit_ms10, windowed since the last L+A
+           toggle) -> resolves the ~1.5ms W5/DMA deltas the old integer rounded away.  Folded into
+           THIS field (no new overlay row -- rows are saturated across dg_saturn + r_parallel). */
+        unsigned int bmt = blit10_cnt ? (blit10_sum / blit10_cnt) : 0u;   /* tenths-ms */
+        sprintf(r1, "R%u T%u S%u b%u.%u%c%c dg%u pr%u.%u    ",
+                _rec, _tic, _snd, bmt / 10, bmt % 10, blit_c, blit_w, _dg, _pr10 / 10, _pr10 % 10);
         if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 1, r1);
         /* window reset -- read the row-1 composition ABOVE before this zeroes the sums.  The
            dead RAM/TXC/ZON sizer block (TEX/SPL/TXC/ZON, all display-off) was cut with the
@@ -5741,6 +5757,7 @@ extern "C" void DG_DrawFrame(void)
         /* SATURN PERF: blit wall-clock = master FRT delta across the copy (incl. slave join). */
         unsigned short blit_t1 = frt_read();
         sat_blit_ms10 = ((unsigned int)(unsigned short)(blit_t1 - blit_t0) * ns_per_frt) / 100000u;
+        if (blit10_cnt < BLIT10_CAP) { blit10_sum += sat_blit_ms10; blit10_cnt++; }  /* row-5 precise A/B */
     }
     }   /* end non-overlap blit path (the flip-before-blit default) */
     uint32_t df2 = DG_GetTicksMs();        /* SATURN PERF: ms split -- end of blit, start of clear */
@@ -6006,13 +6023,13 @@ static void poll_pad(void)
         }
     }
 
-    /* Pad L+A: live A/B of the framebuffer BLIT (docs/BLIT_DMA_PLAN.md) -- steps blit_mode
-       through the 4 blit_cfg combos of {path CPU/DMA} x {W5 HUD-skip off/on}: 0 c- -> 1 c5 ->
-       2 d- -> 3 d5.  Row-1 'b<ms><c/d><-/5>' names the state.  L held + A (edge); NOT L+R (the
-       debug-overlay cycle).  The incidental ','/fire taps to Doom are harmless (mirrors the R+A
-       wall-clamp chord).  Placed here (unconditional) so the blit A/B is always available. */
+    /* Pad L+A: live A/B of the framebuffer BLIT (docs/BLIT_DMA_PLAN.md) -- toggles W5 (the HUD-
+       skip) on/off by stepping blit_mode across the 2 live cfgs c5 <-> c- (DMA is parked: HW-
+       confirmed bus-bound, no win).  Row-1 'b<ms><c/d><-/5>' names the state.  L held + A (edge);
+       NOT L+R (the debug-overlay cycle).  The incidental fire taps to Doom are harmless (mirrors
+       the R+A wall-clamp chord).  Placed here (unconditional) so the blit A/B is always available. */
     if (!(cur & PER_DGT_TL) && (changed & PER_DGT_TA) && !(cur & PER_DGT_TA))
-        blit_mode = (blit_mode + 1) % BLIT_CFG_N;
+        blit_mode = (blit_mode + 1) % BLIT_CYCLE_N;
 
     /* Pad R + Up/Down tunes the VERTICAL plane-decrochage fill scale (sat_plane_vscale, r_main.c): Up = MORE
        vertical fill (bob / stairs / lifts), Down = LESS.  Clamped [0,16].  Live value on overlay row 5.  R is

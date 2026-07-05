@@ -237,6 +237,7 @@ static int ftex_claim_px;                       /* projected tile fill CLAIMED s
 extern "C" byte *I_VideoBuffer;
 extern "C" int   gametic;
 extern "C" int   r_visplane_peak;
+extern "C" int   r_drawseg_peak;   /* core r_bsp.c: running high-water of drawsegs used (vs MAXDRAWSEGS 256) */
 extern "C" int   sightcounts[2];   /* core p_sight.c: [0]=REJECT trivial-rejects, [1]=full BSP LOS walks */
 extern "C" int   sat_floor_vq_cur, sat_floor_vq_peak;  /* VDP1-floor inc-0 estimate, shown on row 2 */
 extern "C" unsigned int sat_sky_px, sat_floor_px;  /* sky-vs-floor coverage classifier (row 13) */
@@ -648,6 +649,12 @@ extern "C" {
 extern void (*sat_psprite_begin)(void);
 extern void (*sat_psprite_hook)(patch_t *patch, int lump, int sx, int sy, int flip,
                                 const unsigned char *cmap);
+extern int sat_psprite_early;          /* core r_things.c: platform draws psprites early (VDP1) */
+extern int viewangleoffset;            /* core r_main.c: nonzero on side views (no psprites)    */
+extern int viewwindowx, viewwindowy;   /* core r_draw.c: this view's framebuffer origin (0,0 in 1p) */
+extern int scaledviewwidth, viewheight;/* core r_draw.c: this view's screen-space size            */
+void R_DrawPlayerSprites(void);        /* core r_things.c: emit the weapon via sat_psprite_hook */
+void sat_vdp1_wpn_clip(void);          /* sat_psprite_begin hook: clip the weapon to its view    */
 void sat_vdp1_wpn_begin(void);
 void sat_vdp1_wpn_draw(patch_t *patch, int lump, int sx, int sy, int flip,
                        const unsigned char *cmap);
@@ -1348,6 +1355,7 @@ extern "C" int sat_prof_ss_n, sat_prof_ss_q, sat_prof_ss_qpk, sat_prof_ss_q4pct;
 extern "C" int sat_prof_dropped;                                 /* glitch frames excluded from the window */
 extern "C" int RP_ProfPercentile(int pct);                       /* windowed REC percentile, tenths-ms */
 extern "C" void RP_ProfReset(void);
+extern "C" void RP_SprStats(int *proj10, int *fill10, int *nproj, int *ndraw); /* SATURN sprite-cost profiler (DSP study) */
 extern "C" int gamemap;   /* core doomstat: drives the per-map window reset */
 
 /* Phase-0 wall CPU-fallback profiler (core r_segs.c): per-frame tally by cause, folded to
@@ -1597,7 +1605,36 @@ static void fps_update(void)
             l_sc0 = sightcounts[0]; l_sc1 = sightcounts[1];
             static char rLOS[45];
             snprintf(rLOS, sizeof rLOS, "LOS rej%d walk%d /win        ", d_sc0, d_sc1);
-            if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 5, rLOS);
+            /* row 13: was row 5, but r_parallel's SLVidle ('SLV') p3 row ALSO writes row 5 in
+               the shipping (rp_disabled) config -> they collided.  Moved to the free row 13. */
+            if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 13, rLOS);
+            /* row 15 (SCU-DSP feasibility, deliverable #1): per-frame sprite cost split.
+               pj = R_ProjectSprite time (the arithmetic a DSP could offload); fl = master
+               R_DrawVisSprite fill (memory-bound, ~2x for total incl. slave right-half);
+               n = things projected / vissprites filled.  Hold a monster-heavy scene still
+               and read: pj<<fl => projection is not the sprite cost, so offloading it is
+               pointless.  Tenths-ms; FRT-quantised (~0.02ms/tick) so pj jitters +-0.1ms. */
+            int sp_pj = 0, sp_fl = 0, sp_np = 0, sp_nd = 0;
+            RP_SprStats(&sp_pj, &sp_fl, &sp_np, &sp_nd);
+            static char rSPR[45];
+            snprintf(rSPR, sizeof rSPR, "SPR pj%d.%d fl%d.%d n%d/%d      ",
+                     sp_pj/10, sp_pj%10, sp_fl/10, sp_fl%10, sp_np, sp_nd);
+            if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 15, rSPR);
+            /* row 11 (ENDGAME limits high-water): how close this ~1s window got to the render
+               HARD-HALT caps that I_Error-freeze a big WAD (docs/ENDGAME_ROADMAP.md Axis 2).
+               vp = peak visplanes / MAXVISPLANES(256); ds = peak drawsegs / MAXDRAWSEGS(256);
+               zf = zone free (KB); lg = largest contiguous purgeable run (KB) = the fragmentation-
+               vs-exhaustion signal.  vp/ds are core running-maxes zeroed here each window; when
+               either climbs toward 256 on Doom II MAP13/15 that is the cap that crashes next.
+               (VP_POOL_PLANES=96 span-pool overflow -> r_visplane_pool_ovf is a GRACEFUL flat
+               glitch, not a freeze -- tracked separately, not shown here.) */
+            static char rLIM[48];
+            snprintf(rLIM, sizeof rLIM, "LIM vp%d/256 ds%d/256 zf%dk lg%dk ",
+                     r_visplane_peak, r_drawseg_peak,
+                     Z_FreeMemory() >> 10, Z_LargestAllocatable() >> 10);
+            if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 11, rLIM);
+            r_visplane_peak = 0;   /* zero the core running-maxes -> next window re-accumulates its own peak */
+            r_drawseg_peak  = 0;
             /* row 17: FLOOR offload sizers.  Vs/Vp = VDP1-floor candidate quad count this
                frame / window peak (go/no-go: GO if Vp fits the VDP1 cmd budget).  d% = the
                dominant single-flat share of plane pixels, n = visplane count (RBG0 sweet
@@ -1684,12 +1721,13 @@ static void fps_update(void)
         }
 #endif
         /* fps-only mode: SRL::Debug tiles persist, so a row we stop writing would GHOST.  Blank
-           rows 1-6 (incl. r_parallel's rows 2/5, which its per-frame path also skips in mode!=0)
-           so only row 0 (fps + MST) remains -> the mode0<->mode1 fps delta is clean.  Mode 2 hides
-           the whole NBG3 layer (nbg3_show=0), so no blanking is needed there. */
+           rows 1-16 (every per-frame row: 1-8 the core B/P/M/REC/PK/SLV block, 11 LIM, 13 LOS,
+           15 SPR -- all gated on mode==0 for both writers, so nothing re-fills them here) so only
+           row 0 (fps + MST) remains -> the mode0<->mode1 fps delta is clean.  Mode 2 hides the
+           whole NBG3 layer (nbg3_show=0), so no blanking is needed there. */
         if (sat_dbg_overlay_mode == 1) {
             static const char bl[] = "                                        ";
-            for (int rr = 1; rr <= 8; ++rr) SRL::Debug::Print(0, rr, (char *)bl);
+            for (int rr = 1; rr <= 16; ++rr) SRL::Debug::Print(0, rr, (char *)bl);
         }
         t0     = now;
         frames = 0;
@@ -2435,8 +2473,37 @@ extern "C" void DG_Init(void)
 #else
     slPriorityNbg0(4); slPriorityNbg1(6);
 #endif
+    /* SATURN sprites-on-VDP1 study (2026-07-05): FOUNDATION probe.  The whole "sprites can't
+       go on VDP1" claim rested on VDP1 sitting BELOW NBG1 (prio 5 < 6).  But VDP1 sprite
+       priority is PER-COMMAND (8 slPrioritySpr registers, selected by each sprite's priority
+       bits), so it is NOT fixed.  Build with SAT_SPR_PRIO7_TEST=1 to raise the WHOLE VDP1
+       sprite layer to 7 (ABOVE NBG1=6): the textured VDP1 walls/floors should then composite
+       ON TOP of the software framebuffer.  If they do -> VDP1-above-NBG1 is real -> the
+       weapon/things-at-prio-7 path is worth building (per-command split: things set their
+       priority bits -> a reg pinned to 7, walls keep bits clear -> reg 0 = 5).  Deliberately
+       "wrong-looking" (walls over everything) -- it is a yes/no mechanism proof, not the final
+       layering.  Default 0 = shipping behaviour byte-identical. */
+#ifndef SAT_SPR_PRIO7_TEST
+#define SAT_SPR_PRIO7_TEST 0
+#endif
+#ifndef SAT_WPN_VDP1
+#define SAT_WPN_VDP1 0
+#endif
+#if SAT_WPN_VDP1
+    /* PER-COMMAND SPLIT: register 0 = 5 (below NBG1) is what walls/floors select -- their
+       framebuffer values are CRAM addresses <=2047, so the priority-select bits are CLEAR ->
+       register 0.  registers 1..7 = 7 (above NBG1) -- anything that SETS a priority bit lands
+       here.  So a command that ORs a priority bit into its CMDCOLR jumps above NBG1 while the
+       walls/floors stay below.  This is the sprite-vs-world layer split. */
+    slPrioritySpr0(5); slPrioritySpr1(7); slPrioritySpr2(7); slPrioritySpr3(7);
+    slPrioritySpr4(7); slPrioritySpr5(7); slPrioritySpr6(7); slPrioritySpr7(7);
+#elif SAT_SPR_PRIO7_TEST
+    slPrioritySpr0(7); slPrioritySpr1(7); slPrioritySpr2(7); slPrioritySpr3(7);
+    slPrioritySpr4(7); slPrioritySpr5(7); slPrioritySpr6(7); slPrioritySpr7(7);
+#else
     slPrioritySpr0(5); slPrioritySpr1(5); slPrioritySpr2(5); slPrioritySpr3(5);
     slPrioritySpr4(5); slPrioritySpr5(5); slPrioritySpr6(5); slPrioritySpr7(5);
+#endif
 #endif
 #if VDP2_RBG0_TEST
     /* rbg0_proto_init() was called above, before the NBG bitmaps (cycle-pattern order). */
@@ -2512,6 +2579,14 @@ extern "C" void DG_Init(void)
     /* kick VDP1 right after the BSP walk (parallel with the CPU floors/sprites) so the
        walls present the SAME frame as the framebuffer (no 1-frame lag / sky-at-the-seam). */
     sat_walls_done_hook = sat_walls_kick;
+#if SAT_WPN_VDP1
+    /* Route the player weapon to VDP1 at prio 7: the core R_DrawPSprite calls sat_psprite_hook
+       (opaque case) instead of the software fill, and sat_psprite_early makes the platform draw
+       it EARLY (in sat_walls_kick, before the end-of-planes present) so it lands this frame. */
+    sat_psprite_hook  = sat_vdp1_wpn_draw;
+    sat_psprite_begin = sat_vdp1_wpn_clip;   /* clip the weapon to its view (no HUD poke / no split spill) */
+    sat_psprite_early = 1;
+#endif
 #endif
 
 #if VDP1_FLOOR_TEST
@@ -2712,9 +2787,29 @@ static const unsigned int VDP1_BANK[2] = { 0x25C00100u, 0x25C02100u };
    (shrunk from 8 to free VRAM for the wall cache); round-robin eviction (4 slots =
    enough margin that a slot referenced by the displayed bank survives the 1-frame
    flip -- the weapon draws only 1-2 sprites/frame). */
+#if SAT_WPN_VDP1
+/* SAT_WPN_VDP1: the weapon goes on VDP1 at prio 7 as an 8BPP palette sprite (half the RGB555
+   size + carries the priority bit via CMDCOLR).  Its cache is RELOCATED off the LIVE wall pool
+   (the old 0x25C45000 sat inside it -> would corrupt walls) to the last FOUR WTEX wide slots
+   (WTEX_WIDE_N is cut 6->2 below) at 0x25C51000.
+   TEARING FIX: 8 slots (not 2).  The textures are NOT double-buffered, so during the fast
+   shooting animation a MISS unpacks a new frame into a round-robin slot; with too few slots it
+   overwrites a slot the CURRENTLY-DISPLAYED bank still references -> VDP1 plots a half-written
+   texture = tear.  Need >= 2 x (textures/frame) so the displayed frame's slots survive the flip:
+   1p draws weapon+flash = 2/frame; 2p up to 4/frame (2 players) -> 8 slots.  8 x 16KB fits any
+   shareware weapon at 8bpp (a rare bigger frame that overflows just skips that frame).  Cost:
+   only 2 wide wall slots remain -- watch the 'bk' (wall re-bake) counter; a follow-up can
+   half-res the split weapon texture to reclaim margin. */
+#define WPN_TEX_BASE   0x25C51000u        /* reclaimed 4x32KB wide slots (see WTEX_WIDE_N) -> 8x16KB */
+#define WPN_TEX_SLOTSZ 0x4000u            /* 16 KB @ 8bpp -> up to ~128x128 padded */
+#define WPN_TEX_SLOTS  8
+#define WPN_CMDCOLR    (0x2000u | 0x0100u)/* pr bit13 -> register 1 (=7, above NBG1) | CRAM bank 1
+                                             (full-bright PLAYPAL; texel = the light-shaded index) */
+#else
 #define WPN_TEX_BASE   0x25C45000u
 #define WPN_TEX_SLOTSZ 0xB000u            /* 44 KB -> up to ~160x140 padded */
 #define WPN_TEX_SLOTS  4
+#endif
 static struct { int lump; const unsigned char *cmap; int padW; int H; }
                     wpn_cache[WPN_TEX_SLOTS];
 static int          wpn_cache_rr;
@@ -2782,7 +2877,13 @@ static inline unsigned short pal_rgb555(int idx)
                                tail (bigger F banks + mip storage).  Walls historically ran on 8 narrow
                                slots; watch the wtex_bakes (`bk`) counter if wall re-bakes climb. */
 #define WTEX_NARROW_SZ 0x4000u                                      /* 16KB -> 128x128 @ 8bpp */
+#if SAT_WPN_VDP1
+#define WTEX_WIDE_N    2   /* SAT_WPN_VDP1: cede the last 4 wide slots (128KB) to the 8-slot VDP1
+                              weapon cache (WPN_TEX_BASE=0x25C51000) -- see the tearing note above.
+                              Watch the wtex_bakes 'bk' counter: only 2 wide-wall slots remain. */
+#else
 #define WTEX_WIDE_N    6
+#endif
 #define WTEX_WIDE_SZ   0x8000u                                      /* 32KB -> 256x128 @ 8bpp */
 #define WTEX_WIDE_BASE (WTEX_BASE + WTEX_NARROW_N * WTEX_NARROW_SZ) /* 0x25C45000 */
 #define WTEX_SLOTS     (WTEX_NARROW_N + WTEX_WIDE_N)                /* 22; ends 0x25C75000 */
@@ -4567,8 +4668,28 @@ extern "C" void sat_vdp1_wpn_begin(void)
        R_DrawPlanes and chained BEFORE this wall bank -- see vdp1_ftex_flush.) */
     vdp1_walls_flush();   /* textured walls -- behind the weapon, in front of NBG1 */
 #endif
+    /* SAT_WPN_VDP1: the player weapon is emitted into THIS wall bank (before the closing JUMP)
+       by the early R_DrawPlayerSprites() call in sat_walls_kick -> sat_psprite_hook ->
+       sat_vdp1_wpn_draw, at priority 7 (above NBG1).  Nothing to emit here. */
     vdp1_wactive = 1;
 }
+
+#if SAT_WPN_VDP1
+/* sat_psprite_begin hook: emitted ONCE at the top of R_DrawPlayerSprites (per view), before the
+   weapon sprites.  A FUNC_UserClip that windows the following (Window_In) weapon quads to THIS
+   view's screen rect -- so the weapon cannot poke over the status bar (1p) or spill into another
+   quadrant (split).  Uses screen coords (bank local-coord origin VIEW_Y_OFFSET = 0). */
+extern "C" void sat_vdp1_wpn_clip(void)
+{
+    if (vdp1_wnext >= VDP1_CMD_GUARD) return;
+    unsigned short cmd[16];
+    memset(cmd, 0, sizeof cmd);
+    cmd[0]  = 0x0008;                                          /* FUNC_UserClip                 */
+    cmd[6]  = (short)viewwindowx;                             cmd[7]  = (short)viewwindowy;            /* upper-left  */
+    cmd[10] = (short)(viewwindowx + scaledviewwidth - 1);     cmd[11] = (short)(viewwindowy + viewheight - 1); /* lower-right */
+    vdp1_cmd_at(VDP1_BANK[vdp1_wbank], vdp1_wnext++, cmd);
+}
+#endif
 
 /* core hook (per psprite): draw the weapon frame as a VDP1 sprite at the screen
    position.  The texture is CACHED by (lump, colormap) in stable VRAM, so it is
@@ -4596,20 +4717,50 @@ extern "C" void sat_vdp1_wpn_draw(patch_t *patch, int lump, int sx, int sy, int 
         int W = (int)bswap16((unsigned short)patch->width);
         H     = (int)bswap16((unsigned short)patch->height);
         padW  = (W + 7) & ~7;
-        if ((unsigned int)(padW * H) * 2u > WPN_TEX_SLOTSZ) return;  /* too big to cache */
-
         slot = wpn_cache_rr;
         wpn_cache_rr = (wpn_cache_rr + 1) % WPN_TEX_SLOTS;
 
+        const unsigned int *colofs = (const unsigned int *)patch->columnofs;
+#if SAT_WPN_VDP1
+        /* 8BPP: 1 byte/texel = the LIGHT-SHADED Doom palette index (cmap[s[i]]); the CRAM bank 1
+           (full-bright PLAYPAL) in WPN_CMDCOLR turns it back into the shaded colour.  Index 0 =
+           transparent (SPD-off), so the padded gaps + true-black pixels show the scene through. */
+        if ((unsigned int)(padW * H) > WPN_TEX_SLOTSZ) return;       /* too big to cache */
+        volatile unsigned char *tex =
+            (volatile unsigned char *)(WPN_TEX_BASE + (unsigned int)slot * WPN_TEX_SLOTSZ);
+        for (int i = 0; i < padW * H; ++i) tex[i] = 0;               /* texel 0 = transparent gap */
+        /* texel 0 is the HW transparent code, so a real black weapon pixel (shaded index 0) would
+           punch a hole.  Remap 0 -> the darkest NON-zero palette index (looks black, stays opaque).
+           Computed once per texture build from the live full-bright palette (bank 1 = colors[]). */
+        int blk = 1, blkbest = 0x7fffffff;
+        for (int p = 1; p < 256; ++p)
+        {
+            int lum = colors[p].r + colors[p].g + colors[p].b;
+            if (lum < blkbest) { blkbest = lum; blk = p; }
+        }
+        for (int x = 0; x < W; ++x)
+        {
+            const post_t *post = (const post_t *)((const unsigned char *)patch + bswap32(colofs[x]));
+            while (post->topdelta != 0xFF)
+            {
+                const unsigned char *s = (const unsigned char *)post + 3;
+                int top = post->topdelta;
+                for (int i = 0; i < post->length; ++i)
+                {
+                    int c = cmap[s[i]];
+                    tex[(top + i) * padW + x] = (unsigned char)(c ? c : blk);   /* keep black opaque */
+                }
+                post = (const post_t *)((const unsigned char *)post + post->length + 4);
+            }
+        }
+#else
+        if ((unsigned int)(padW * H) * 2u > WPN_TEX_SLOTSZ) return;  /* RGB555: 2 bytes/texel */
         volatile unsigned short *tex =
             (volatile unsigned short *)(WPN_TEX_BASE + (unsigned int)slot * WPN_TEX_SLOTSZ);
         for (int i = 0; i < padW * H; ++i) tex[i] = 0;   /* clear to transparent */
-
-        const unsigned int *colofs = (const unsigned int *)patch->columnofs;
         for (int x = 0; x < W; ++x)
         {
-            const post_t *post =
-                (const post_t *)((const unsigned char *)patch + bswap32(colofs[x]));
+            const post_t *post = (const post_t *)((const unsigned char *)patch + bswap32(colofs[x]));
             while (post->topdelta != 0xFF)
             {
                 const unsigned char *s = (const unsigned char *)post + 3;
@@ -4619,6 +4770,7 @@ extern "C" void sat_vdp1_wpn_draw(patch_t *patch, int lump, int sx, int sy, int 
                 post = (const post_t *)((const unsigned char *)post + post->length + 4);
             }
         }
+#endif
         wpn_cache[slot].lump = lump; wpn_cache[slot].cmap = cmap;
         wpn_cache[slot].padW = padW; wpn_cache[slot].H = H;
     }
@@ -4626,11 +4778,41 @@ extern "C" void sat_vdp1_wpn_draw(patch_t *patch, int lump, int sx, int sy, int 
     unsigned int texaddr = WPN_TEX_BASE + (unsigned int)slot * WPN_TEX_SLOTSZ;
     unsigned short cmd[16];
     memset(cmd, 0, sizeof cmd);
+#if SAT_WPN_VDP1
+    /* Draw the weapon as a DISTORTED (scaled) VDP1 sprite so its on-screen size matches the
+       software pspritescale.  A native-size sprite is wrong in a SPLIT view (viewwidth 160 ->
+       pspritescale 0.5): it draws double-size and, placed at the half-scale x1, sits off-centre.
+       scale = vis->scale = pspritescale<<detailshift; the internal x1 (sx) -> screen via
+       <<detailshift + viewwindowx (0 in 1p, the quadrant origin in split); sy is already
+       screen-vertical + viewwindowy.  1p: scale=FRACUNIT, offset=0 -> a native-size quad ==
+       the old normal sprite. */
+    {
+        extern fixed_t pspritescale; extern int detailshift;
+        unsigned int scale = (unsigned int)(pspritescale << detailshift);
+        int x0 = (sx << detailshift) + viewwindowx;
+        int y0 = sy + viewwindowy;
+        int w  = (int)(((unsigned int)padW * scale) >> 16); if (w < 1) w = 1;
+        int h  = (int)(((unsigned int)H    * scale) >> 16); if (h < 1) h = 1;
+        int xl = flip ? (x0 + w - 1) : x0;             /* h-flip: texture A-corner -> screen right */
+        int xr = flip ? x0 : (x0 + w - 1);
+        cmd[0] = 0x0002;                               /* distorted sprite -> maps the texture into A,B,C,D */
+        cmd[2] = 0x04A0;                               /* 256-bank | ECD-disable | Window_In (clip to the view);
+                                                          SPD (bit6) CLEAR => index 0 transparent */
+        cmd[3] = WPN_CMDCOLR;                          /* pr bit13 -> register 1 (prio 7, above NBG1) | bank 1 */
+        cmd[4] = (unsigned short)((texaddr - VDP1_VRAM_BASE) >> 3);
+        cmd[5] = (unsigned short)(((padW >> 3) << 8) | H);
+        cmd[6]  = (short)xl; cmd[7]  = (short)y0;              /* A top-left  (of the texture)  */
+        cmd[8]  = (short)xr; cmd[9]  = (short)y0;              /* B top-right                   */
+        cmd[10] = (short)xr; cmd[11] = (short)(y0 + h - 1);    /* C bottom-right                */
+        cmd[12] = (short)xl; cmd[13] = (short)(y0 + h - 1);    /* D bottom-left                 */
+    }
+#else
     cmd[0] = (unsigned short)(flip ? 0x0010 : 0x0000);  /* normal sprite, LR flip */
     cmd[2] = 0x00A8;                                    /* RGB (COLOR_5) | ECD off => SPD on */
     cmd[4] = (unsigned short)((texaddr - VDP1_VRAM_BASE) >> 3);  /* charAddr */
     cmd[5] = (unsigned short)(((padW >> 3) << 8) | H);          /* charSize */
     cmd[6] = (short)sx; cmd[7] = (short)sy;             /* point A = top-left */
+#endif
     vdp1_cmd_at(VDP1_BANK[vdp1_wbank], vdp1_wnext++, cmd);
 }
 
@@ -4768,7 +4950,23 @@ extern "C" void sat_walls_kick(void)
 #endif
     {   /* SATURN PERF: time the VDP1 present (close bank + flip root LINK) -> overlay 'pr'. */
         unsigned short pk0 = frt_read();
-        sat_vdp1_wpn_begin();
+        sat_vdp1_wpn_begin();       /* reset the bank + drain walls */
+#if SAT_WPN_VDP1
+        /* Emit the player weapon into THIS wall bank (before the closing JUMP) so it presents in
+           this frame's coherent pair, at prio 7 (above NBG1).  We call the core R_DrawPlayerSprites
+           HERE -- right after the BSP walk, before the end-of-planes present -- because it is the
+           only window before the root flip; sat_psprite_early makes R_DrawMasked skip the (late)
+           software draw.  Reuses the engine's psprite positioning + light selection (no dup).
+           In SPLIT (sat_split_active) fan out to every view's weapon (R_DrawSplitPlayerSprites,
+           per-view viewport + clip); this hook fires once after the split render loop. */
+        if (sat_psprite_early && !viewangleoffset)
+        {
+            extern int sat_split_active;
+            extern void R_DrawSplitPlayerSprites(void);
+            if (sat_split_active) R_DrawSplitPlayerSprites();
+            else                  R_DrawPlayerSprites();
+        }
+#endif
         vdp1_wpn_kick();
         sat_present_frt += (unsigned short)(frt_read() - pk0);
     }

@@ -3006,9 +3006,9 @@ static unsigned int vdp1_hud_csum = 0xFFFFFFFFu;  /* status-bar change detector 
 #define THINGS_TEX_BASE   0x25C71000u
 #define THINGS_TEX_SLOTS  4                /* slots PER parity == max distinct things offloaded/frame (VRAM cap) */
 #define THINGS_TEX_SLOTSZ 0x0E00u          /* 3584 B -> fits any shareware monster frame @ 8bpp */
-static struct { int lump; const unsigned char *cmap; unsigned char used; }
-                    thing_cache[2][THINGS_TEX_SLOTS];   /* [parity][slot]: resident key + per-frame used bit */
-static int          thing_cache_rr[2];     /* per-parity round-robin eviction cursor */
+static struct { int lump; const unsigned char *cmap; unsigned char used; unsigned int lru; }
+                    thing_cache[2][THINGS_TEX_SLOTS];   /* [parity][slot]: key + per-frame used bit + LRU tick */
+static unsigned int thing_lru_tick;        /* monotonic use counter -> evict the smallest (oldest) lru */
 /* (sat_things_n / sat_things_decl / thing_bake_n are defined earlier, before the overlay block) */
 #endif
 
@@ -4768,9 +4768,11 @@ static void vdp1_wpn_init(void)
     for (int i = 0; i < WPN_TEX_SLOTS; ++i) wpn_cache[i].lump = -1;
     wpn_cache_rr = 0;
 #if SAT_WORLD_THINGS_VDP1
-    for (int p = 0; p < 2; ++p) { thing_cache_rr[p] = 0;
-        for (int i = 0; i < THINGS_TEX_SLOTS; ++i) { thing_cache[p][i].lump = -1; thing_cache[p][i].used = 0; } }
-    sat_thing_cap = THINGS_TEX_SLOTS;   /* largest-area things/frame to VDP1 (VRAM slot cap) */
+    thing_lru_tick = 0;
+    for (int p = 0; p < 2; ++p)
+        for (int i = 0; i < THINGS_TEX_SLOTS; ++i)
+        { thing_cache[p][i].lump = -1; thing_cache[p][i].used = 0; thing_cache[p][i].lru = 0; }
+    sat_thing_cap = THINGS_TEX_SLOTS;   /* granted distinct textures/frame (VRAM slot cap) */
 #endif
 #if VDP1_WALL_TEST
     wtex_setup();                                    /* fixed per-slot VRAM addr + capacity */
@@ -5044,16 +5046,18 @@ extern "C" int sat_vdp1_thing_draw(patch_t *patch, int lump, const unsigned char
 
     int bake = (slot < 0);
     if (bake)
-    {   /* MISS: claim a slot NOT already feeding this frame's list (round-robin eviction start) */
-        for (int k = 0; k < THINGS_TEX_SLOTS; ++k)
-        {
-            int i = (thing_cache_rr[p] + k) % THINGS_TEX_SLOTS;
-            if (!thing_cache[p][i].used) { slot = i; break; }
-        }
-        if (slot < 0) { sat_things_decl++; return 0; }   /* every slot feeds the current list -> out of textures this frame */
-        thing_cache_rr[p] = (slot + 1) % THINGS_TEX_SLOTS;
+    {   /* MISS: evict the OLDEST (min lru) slot NOT feeding this frame's list.  An empty slot has
+           lru 0 = always picked first (fill before evicting a resident texture). */
+        int oldest = -1;
+        for (int i = 0; i < THINGS_TEX_SLOTS; ++i)
+            if (!thing_cache[p][i].used &&
+                (oldest < 0 || thing_cache[p][i].lru < thing_cache[p][oldest].lru))
+                oldest = i;
+        if (oldest < 0) { sat_things_decl++; return 0; }   /* every slot feeds the current list -> out of textures this frame */
+        slot = oldest;
     }
     thing_cache[p][slot].used = 1;
+    thing_cache[p][slot].lru = ++thing_lru_tick;           /* most-recently-used (hit OR bake) */
     unsigned int texaddr = THINGS_TEX_BASE + (unsigned int)(p * THINGS_TEX_SLOTS + slot) * THINGS_TEX_SLOTSZ;
 
     if (bake)

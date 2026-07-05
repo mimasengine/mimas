@@ -737,19 +737,25 @@ static int sat_vdp1_ceil_claim  = 1;        /* ceilings        -> VDP1 tiles (M1
    idle (mostly 1p/2p standing still); it is orthogonal to the path so both c5 and d5 exist.
    The measured-DEAD dual-CPU configs are gone (bus-bound S~1.3 + slave-dispatch wedge risk);
    the dual code stays behind DUAL_CPU_BLIT for git revival but no cfg selects it (dual=0). */
+/* Blit-path selector.  dma = SGL slDMACopy = the SH-2 ON-CHIP DMAC (disasm-proven; spins-per-row,
+   sync, bus-bound, HW-confirmed no win).  Async blit was pursued via SCU-DMA and is HW-DEAD +
+   IMPOSSIBLE: the SEGA SCU manual forbids CPU A/B-bus access during an SCU-DMA B-bus transfer
+   (SDRAM refresh stalls -> hang), and every Mimas frame hits the B-bus from the CPU -> async hangs
+   by construction (see docs/BLIT_DMA_PLAN.md Inc 2).  The blit is permanently synchronous;
+   c5 + W5 is the end of the lever. */
 static const struct { int dual; int mpct; int dma; int w5; } blit_cfg[] = {
-    { 0, 100, 0, 0 },   /* 0: CPU,     full HUD blit (c-) */
-    { 0, 100, 0, 1 },   /* 1: CPU  + W5 (skip static HUD rows) (c5) -- boot default */
-    /* --- PARKED (not in the L+A cycle): SCU-DMA is bus-bound, HW-confirmed no win (+0.3ms).
-       Kept compiled so the slDMACopy branch builds for Inc 2 (async DMA); index directly only. */
-    { 0, 100, 1, 0 },   /* 2: SCU-DMA, full HUD blit (d-)  -- parked */
-    { 0, 100, 1, 1 },   /* 3: SCU-DMA + W5           (d5)  -- parked */
+    { 0, 100, 0, 0 },   /* 0: c-  CPU memcpy, full HUD */
+    { 0, 100, 0, 1 },   /* 1: c5  CPU memcpy + W5 -- boot default */
+    { 0, 100, 1, 0 },   /* 2: d-  slDMACopy (on-chip DMAC) sync -- parked (no win) */
+    { 0, 100, 1, 1 },   /* 3: d5  slDMACopy sync + W5           -- parked */
 };
-#define BLIT_CFG_N   ((int)(sizeof(blit_cfg) / sizeof(blit_cfg[0])))
-#define BLIT_CYCLE_N 2   /* live pad-L+A cycle spans only c- <-> c5; DMA (2,3) parked above */
-static int blit_mode = 1;   /* boot: CPU + W5 (c5).  W5 HW-CONFIRMED 2026-07-05 -1.3..-1.5ms 1p
-   at standstill (=14% = the 32 static HUD rows) with no stale HUD over a session.  DMA parked
-   (bus-bound, +0.3ms, no win).  L+A now A/Bs W5 on/off (c5 <-> c-). */
+#define BLIT_CFG_N ((int)(sizeof(blit_cfg) / sizeof(blit_cfg[0])))
+/* Live pad-L+A A/B ring: c5 (CPU + W5, default) <-> c- (CPU, W5 off) -- the safe W5 on/off A/B.
+   slDMACopy paths (2,3) parked off-ring (no win). */
+static const int blit_cycle[] = { 1, 0 };
+#define BLIT_CYCLE_N ((int)(sizeof(blit_cycle) / sizeof(blit_cycle[0])))
+static int blit_cycle_i = 0;   /* index into blit_cycle; 0 -> blit_mode 1 (c5) at boot */
+static int blit_mode = 1;      /* boot: c5 (CPU + W5) = blit_cycle[0] */
 /* Master row count for the current config: mpct% of 224. */
 static inline int blit_split(void) { return (blit_cfg[blit_mode].mpct * 224) / 100; }
 /* SATURN PERF: last frame's framebuffer->VDP2 blit wall-clock in ms*10 (master FRT delta
@@ -1324,7 +1330,7 @@ static volatile int vdp1_couple_nbg1     = 0;   /* brick B: defer the NBG1 blit 
 /* SATURN world-things-on-VDP1: per-frame emitted / declined counters (overlay 'th').  Defined here
    (before the SHOW_FPS overlay block that prints them, and unconditionally so the emit path that
    increments them always links) -- the pool struct itself is defined later with the weapon cache. */
-static int sat_things_n = 0, sat_things_decl = 0;
+static int sat_things_n = 0, sat_things_decl = 0, thing_bake_n = 0;   /* 'th' emitted/declined, 'fb' baked (cache misses) */
 
 #if SHOW_FPS
 extern "C" int rp_timeout_count;
@@ -1350,6 +1356,7 @@ static unsigned int mh_decl[MH_N_BUCKETS];
 static unsigned int mh_frames;
 static unsigned int mh_ms_mx, mh_things_mx, mh_decl_mx, mh_occ_sum;
 static unsigned int mh_vbl_done, mh_vbl_tot;   /* VDP1 plot done-rate over the session */
+static unsigned int mh_bake_sum, mh_emit_sum;  /* session totals: fresh bakes vs sprites emitted (cache reuse) */
 
 static void mh_reset(void)
 {
@@ -1358,8 +1365,9 @@ static void mh_reset(void)
     memset(mh_decl, 0, sizeof mh_decl);
     mh_frames = mh_ms_mx = mh_things_mx = mh_decl_mx = mh_occ_sum = 0;
     mh_vbl_done = mh_vbl_tot = 0;
+    mh_bake_sum = mh_emit_sum = 0;
 }
-static void mh_add(int ms, int things, int decl, int occ)
+static void mh_add(int ms, int things, int decl, int occ, int bake)
 {
     int b;
     b = ms >> MH_MS_SHIFT; if (b < 0) b = 0; if (b >= MH_MS_BUCKETS) b = MH_MS_BUCKETS-1; mh_ms[b]++;
@@ -1368,7 +1376,9 @@ static void mh_add(int ms, int things, int decl, int occ)
     if ((unsigned)ms     > mh_ms_mx)     mh_ms_mx     = (unsigned)ms;
     if ((unsigned)things > mh_things_mx) mh_things_mx = (unsigned)things;
     if ((unsigned)decl   > mh_decl_mx)   mh_decl_mx   = (unsigned)decl;
-    mh_occ_sum += (unsigned)occ;
+    mh_occ_sum  += (unsigned)occ;
+    mh_bake_sum += (unsigned)bake;
+    mh_emit_sum += (unsigned)things;
     mh_frames++;
 }
 /* percentile p(0..100): first bucket whose cumulative count reaches p% of mh_frames.  For the ms
@@ -1585,7 +1595,7 @@ static void fps_update(void)
         unsigned int _used = _tic + _snd + _blit + _dg;
         unsigned int _rec  = (mst > _used) ? (mst - _used) : 0u;         /* derived render */
         static char r1[45];
-        char blit_c = blit_cfg[blit_mode].dma ? 'd' : 'c';   /* blit path: c=CPU, d=SCU-DMA (L+A) */
+        char blit_c = blit_cfg[blit_mode].dma ? 'd' : 'c';   /* blit path: c=CPU, d=slDMACopy (parked) */
         char blit_w = blit_cfg[blit_mode].w5  ? '5' : '-';   /* W5 HUD-skip: 5=on, -=off (L+A)  */
         /* 'b' = PRECISE blit mean in tenths-ms (FRT sat_blit_ms10, windowed since the last L+A
            toggle) -> resolves the ~1.5ms W5/DMA deltas the old integer rounded away.  Folded into
@@ -1718,10 +1728,13 @@ static void fps_update(void)
             int sp_pj = 0, sp_fl = 0, sp_np = 0, sp_nd = 0;
             RP_SprStats(&sp_pj, &sp_fl, &sp_np, &sp_nd);
             static char rSPR[48];
-            /* th e/d = world-things emitted on VDP1 / declined (too big or budget) this frame */
-            snprintf(rSPR, sizeof rSPR, "SPR pj%d.%d fl%d.%d n%d/%d th%d/%d   ",
+            /* th e/d = world-things emitted on VDP1 / declined; fb = baked THIS frame (instant);
+               sb = SESSION bake% (mh_bake_sum/mh_emit_sum) = the cache read -- low = high reuse.
+               On row 15 (bottom, clear of centre-screen monsters that hide the THp row). */
+            unsigned int sbpc = mh_emit_sum ? (mh_bake_sum * 100u / mh_emit_sum) : 0;
+            snprintf(rSPR, sizeof rSPR, "SPR pj%d.%d fl%d.%d n%d/%d th%d/%d fb%d sb%u%%",
                      sp_pj/10, sp_pj%10, sp_fl/10, sp_fl%10, sp_np, sp_nd,
-                     sat_things_n, sat_things_decl);
+                     sat_things_n, sat_things_decl, thing_bake_n, sbpc);
             if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 15, rSPR);
             /* rows 9-10: SESSION percentiles (reset ONLY on a MODE change) -- read ONE end-of-level
                capture, no jitter.  THp = world-things emitted/frame p50/p99, declined/frame p99,
@@ -2974,18 +2987,29 @@ static unsigned int vdp1_hud_csum = 0xFFFFFFFFu;  /* status-bar change detector 
    present keeps replotting the OLD pair (parity ^1) every vblank until the new pair flips in; if a
    thing texture is re-baked in place while the old pair still references it, the sprite tears
    across its width.  So THIS frame bakes only into parity[vdp1_wbank]; the displayed pair's
-   textures (the other parity) are never touched -> tear-free.  NO cross-frame cache: each eligible
-   sprite is re-baked FRESH every frame (handles animation for free) into a per-frame slot (counter
-   reset each frame, always < THINGS_TEX_SLOTS -> never reused within a frame).  Full-patch bakes
-   are distance-independent, so 4 slots x 3584B fit any shareware monster (incl caco/pinky/baron-no:
-   9KB declined).  The core picks the NEAREST THINGS_TEX_SLOTS sprites (biggest fill) for VDP1; the
-   rest stay software.  4 x 3584 x 2 parity = 28KB (the whole gap).  Bigger clean offload => cede
-   wall-pool VRAM.  'th' counts emitted/declined. */
+   textures (the other parity) are never touched -> tear-free.
+   TEAR-SAFE CACHE (keyed by lump+cmap; flip is geometric = quad corners, not baked): a slot in the
+   write-bank parity keeps its baked texture ACROSS that parity's frames, so a sprite that stays on
+   screen is baked ONCE (then reused) instead of re-baked every frame.  A stable set costs 0 bakes
+   after the first 2 frames (one per parity); only NEW keys (a monster turns/animates, a fresh
+   monster) bake, and only into the non-displayed parity -> still tear-free.  Two identical sprites
+   (same lump+cmap) share one slot for free.  The pool is written ONLY here, so a key-match always
+   means the VRAM holds that key's texture (survives M0/M6 excursions -> no invalidation needed).
+   PER-FRAME GUARD: a slot claimed by an already-emitted command this frame must not be re-baked for
+   a different key this frame (would clobber a texture the current list points at) -> `used` bit,
+   reset per frame; if every slot is used, decline.  Full-patch bakes are distance-independent, so 4
+   slots x 3584B fit any shareware monster.  The core GRANTS the 4 slots to the 4 distinct TEXTURES
+   with the largest sprite (above a %-of-view floor) and offloads every sprite using a granted
+   texture, so a same-type horde shares slots and offloads wholesale; the rest stay software.  4 x
+   3584 x 2 parity = 28KB (the whole gap).  More distinct textures => cede wall-pool VRAM to raise
+   THINGS_TEX_SLOTS.  'th' counts emitted/declined; 'fb' baked (misses), 'sb' session bake%. */
 #define THINGS_TEX_BASE   0x25C71000u
-#define THINGS_TEX_SLOTS  4                /* per parity == max things offloaded/frame (VRAM cap) */
+#define THINGS_TEX_SLOTS  4                /* slots PER parity == max distinct things offloaded/frame (VRAM cap) */
 #define THINGS_TEX_SLOTSZ 0x0E00u          /* 3584 B -> fits any shareware monster frame @ 8bpp */
-static int          thing_slot_used;       /* slots baked in the CURRENT frame's parity (reset per frame) */
-/* (sat_things_n / sat_things_decl are defined earlier, before the overlay block) */
+static struct { int lump; const unsigned char *cmap; unsigned char used; }
+                    thing_cache[2][THINGS_TEX_SLOTS];   /* [parity][slot]: resident key + per-frame used bit */
+static int          thing_cache_rr[2];     /* per-parity round-robin eviction cursor */
+/* (sat_things_n / sat_things_decl / thing_bake_n are defined earlier, before the overlay block) */
 #endif
 
 /* Write one 32-byte VDP1 command (16 halfwords) at command index `idx` of `base`. */
@@ -4744,8 +4768,9 @@ static void vdp1_wpn_init(void)
     for (int i = 0; i < WPN_TEX_SLOTS; ++i) wpn_cache[i].lump = -1;
     wpn_cache_rr = 0;
 #if SAT_WORLD_THINGS_VDP1
-    thing_slot_used = 0;
-    sat_thing_cap = THINGS_TEX_SLOTS;   /* nearest-N things/frame to VDP1 (VRAM slot cap) */
+    for (int p = 0; p < 2; ++p) { thing_cache_rr[p] = 0;
+        for (int i = 0; i < THINGS_TEX_SLOTS; ++i) { thing_cache[p][i].lump = -1; thing_cache[p][i].used = 0; } }
+    sat_thing_cap = THINGS_TEX_SLOTS;   /* largest-area things/frame to VDP1 (VRAM slot cap) */
 #endif
 #if VDP1_WALL_TEST
     wtex_setup();                                    /* fixed per-slot VRAM addr + capacity */
@@ -4785,13 +4810,18 @@ extern "C" void sat_vdp1_wpn_begin(void)
         vdp1_hud_csum = 0xFFFFFFFFu;
     }
 #if SAT_WORLD_THINGS_VDP1
-    sat_things_n = sat_things_decl = 0;   /* per-frame 'th' overlay counters (reset at bank build) */
-    thing_slot_used = 0;                  /* per-frame parity slot counter (no re-bake into a displayed slot) */
+    sat_things_n = sat_things_decl = thing_bake_n = 0;   /* per-frame 'th'/'fb' overlay counters (reset at bank build) */
 #endif
 #if VDP1_DBLBANK
     vdp1_wbank = vdp1_bank ^ 1;                      /* the bank VDP1 isn't showing */
 #else
     vdp1_wbank = vdp1_bank;                          /* TEST: single bank (no extra frame?) */
+#endif
+#if SAT_WORLD_THINGS_VDP1
+    {   /* clear the write-bank parity's per-frame `used` bits (cache keys persist across frames) */
+        int p = vdp1_wbank & 1;
+        for (int i = 0; i < THINGS_TEX_SLOTS; ++i) thing_cache[p][i].used = 0;
+    }
 #endif
     memset(cmd, 0, sizeof cmd);
     cmd[0] = 0x000A;                                 /* bank cmd0 = local coord */
@@ -4987,38 +5017,54 @@ extern "C" void sat_vdp1_wpn_draw(patch_t *patch, int lump, int sx, int sy, int 
 
 #if SAT_WORLD_THINGS_VDP1
 /* core sat_thing_hook: draw ONE world sprite as a VDP1 prio-7 distorted quad, offloading its
-   masked FILL off the SH-2s.  Returns 1 if taken, 0 if declined (command budget / per-frame slot
-   cap / oversize) -> the core then draws that one in software.  Same 8bpp palette recipe as the
-   weapon (texel = light-shaded index cmap[s], CRAM bank 1 full-bright, index 0 transparent, black
-   remap).  TEAR-FREE: bakes FRESH into parity[vdp1_wbank] slot [thing_slot_used++] -- the displayed
-   OLD pair (parity ^1) is never touched; the counter (reset each frame) keeps < THINGS_TEX_SLOTS so
-   a slot is never reused within a frame.  Occlusion clip rect + quad corners precomputed by core. */
+   masked FILL off the SH-2s.  Returns 1 if taken, 0 if declined (command budget / no free slot /
+   oversize) -> the core then draws that one in software.  Same 8bpp palette recipe as the weapon
+   (texel = light-shaded index cmap[s], CRAM bank 1 full-bright, index 0 transparent, black remap).
+   TEAR-SAFE CACHE: reuses a slot in the write-bank parity whose (lump,cmap) still resides there (no
+   re-bake); a MISS bakes into a slot NOT yet referenced by this frame's list (the `used` guard), so
+   the displayed pair (other parity) is never touched.  Occlusion clip rect + quad corners by core. */
 extern "C" int sat_vdp1_thing_draw(patch_t *patch, int lump, const unsigned char *cmap,
                                    int x0, int y0, int x1, int y1,
                                    int cx0, int cy0, int cx1, int cy1, int flip)
 {
-    (void)lump;
     int padW, H, W;
 
     if (vdp1_wnext >= WALL_CMD_CAP - 1) { sat_things_decl++; return 0; }  /* need 2 cmds (clip + quad) */
-    if (thing_slot_used >= THINGS_TEX_SLOTS) { sat_things_decl++; return 0; }  /* per-frame VRAM slot cap */
 
     W    = (int)bswap16((unsigned short)patch->width);
     H    = (int)bswap16((unsigned short)patch->height);
     padW = (W + 7) & ~7;
     if ((unsigned int)(padW * H) > THINGS_TEX_SLOTSZ) { sat_things_decl++; return 0; }  /* too big -> software */
 
-    int slot = (vdp1_wbank & 1) * THINGS_TEX_SLOTS + thing_slot_used;   /* parity-partitioned slot */
-    thing_slot_used++;
-    unsigned int texaddr = THINGS_TEX_BASE + (unsigned int)slot * THINGS_TEX_SLOTSZ;
+    int p = vdp1_wbank & 1;
+    int slot = -1;
 
-    {   /* bake the full patch fresh into this slot */
+    for (int i = 0; i < THINGS_TEX_SLOTS; ++i)                          /* cache lookup: (lump, cmap) */
+        if (thing_cache[p][i].lump == lump && thing_cache[p][i].cmap == cmap) { slot = i; break; }
+
+    int bake = (slot < 0);
+    if (bake)
+    {   /* MISS: claim a slot NOT already feeding this frame's list (round-robin eviction start) */
+        for (int k = 0; k < THINGS_TEX_SLOTS; ++k)
+        {
+            int i = (thing_cache_rr[p] + k) % THINGS_TEX_SLOTS;
+            if (!thing_cache[p][i].used) { slot = i; break; }
+        }
+        if (slot < 0) { sat_things_decl++; return 0; }   /* every slot feeds the current list -> out of textures this frame */
+        thing_cache_rr[p] = (slot + 1) % THINGS_TEX_SLOTS;
+    }
+    thing_cache[p][slot].used = 1;
+    unsigned int texaddr = THINGS_TEX_BASE + (unsigned int)(p * THINGS_TEX_SLOTS + slot) * THINGS_TEX_SLOTSZ;
+
+    if (bake)
+    {   /* unpack the full patch into this slot (once per key per parity, then reused) */
+        thing_cache[p][slot].lump = lump; thing_cache[p][slot].cmap = cmap; thing_bake_n++;
         const unsigned int *colofs = (const unsigned int *)patch->columnofs;
         volatile unsigned char *tex = (volatile unsigned char *)texaddr;
         for (int i = 0; i < padW * H; ++i) tex[i] = 0;                 /* texel 0 = transparent gap */
         int blk = 1, blkbest = 0x7fffffff;                            /* darkest non-zero index (keep black opaque) */
-        for (int p = 1; p < 256; ++p)
-        { int lum = colors[p].r + colors[p].g + colors[p].b; if (lum < blkbest) { blkbest = lum; blk = p; } }
+        for (int pi = 1; pi < 256; ++pi)
+        { int lum = colors[pi].r + colors[pi].g + colors[pi].b; if (lum < blkbest) { blkbest = lum; blk = pi; } }
         for (int x = 0; x < W; ++x)
         {
             const post_t *post = (const post_t *)((const unsigned char *)patch + bswap32(colofs[x]));
@@ -5691,11 +5737,12 @@ extern "C" void DG_DrawFrame(void)
     int hud_blit = !blit_cfg[blit_mode].w5 || sat_hud_dirty || hud_force;
     if (blit_cfg[blit_mode].dma)
     {
-        /* Inc 1 (docs/BLIT_DMA_PLAN.md) -- synchronous SCU-DMA blit via SGL, the wolf4sdl
-           pattern: one slDMACopy per row (HWRAM framebuffer -> VDP2 VRAM, 320 B) then a single
-           slDMAWait.  The framebuffer is write-through so RAM is already current -> NO cache_purge
-           (unlike the CPU paths below).  slDMACopy lets SGL own the SCU channel -- the path the
-           raw-register post-mortem pointed to after it hung at F00001 (3x).  UNVALIDATED on HW ->
+        /* Inc 1 (docs/BLIT_DMA_PLAN.md) -- synchronous on-chip-DMAC blit via SGL slDMACopy, the
+           wolf4sdl pattern: one slDMACopy per row (HWRAM framebuffer -> VDP2 VRAM, 320 B) then a
+           single slDMAWait.  The framebuffer is write-through so RAM is already current -> NO
+           cache_purge (unlike the CPU paths below).  slDMACopy = the SH-2 ON-CHIP DMAC (disasm-
+           proven; spins-per-row -> bus-bound, HW-confirmed no win).  UNVALIDATED-async paths ->
+           boot stays single-CPU (blit_mode 0); L+A opts in.  Watch for RBG0 snow (B-bus contention
            boot stays single-CPU (blit_mode 0); L+A opts in.  Watch for RBG0 snow (B-bus contention
            with the VDP2 fetch) + Dr (VDP1 shares the bus) when validating. */
         for (int y = 0; y < hud_top; ++y)                     /* 3D view: always */
@@ -5757,7 +5804,7 @@ extern "C" void DG_DrawFrame(void)
         /* SATURN PERF: blit wall-clock = master FRT delta across the copy (incl. slave join). */
         unsigned short blit_t1 = frt_read();
         sat_blit_ms10 = ((unsigned int)(unsigned short)(blit_t1 - blit_t0) * ns_per_frt) / 100000u;
-        if (blit10_cnt < BLIT10_CAP) { blit10_sum += sat_blit_ms10; blit10_cnt++; }  /* row-5 precise A/B */
+        if (blit10_cnt < BLIT10_CAP) { blit10_sum += sat_blit_ms10; blit10_cnt++; }  /* row-1 `b` precise A/B */
     }
     }   /* end non-overlap blit path (the flip-before-blit default) */
     uint32_t df2 = DG_GetTicksMs();        /* SATURN PERF: ms split -- end of blit, start of clear */
@@ -5797,7 +5844,7 @@ extern "C" void DG_DrawFrame(void)
             uint32_t nowms = df3;                       /* end-of-frame timestamp (DG_GetTicksMs) */
             int fms = mh_last ? (int)(nowms - mh_last) : 0;
             mh_last = nowms;
-            if (fms > 0) mh_add(fms, sat_things_n, sat_things_decl, sat_things_occ);
+            if (fms > 0) mh_add(fms, sat_things_n, sat_things_decl, sat_things_occ, thing_bake_n);
         }
     }
     return;
@@ -6023,13 +6070,16 @@ static void poll_pad(void)
         }
     }
 
-    /* Pad L+A: live A/B of the framebuffer BLIT (docs/BLIT_DMA_PLAN.md) -- toggles W5 (the HUD-
-       skip) on/off by stepping blit_mode across the 2 live cfgs c5 <-> c- (DMA is parked: HW-
-       confirmed bus-bound, no win).  Row-1 'b<ms><c/d><-/5>' names the state.  L held + A (edge);
-       NOT L+R (the debug-overlay cycle).  The incidental fire taps to Doom are harmless (mirrors
-       the R+A wall-clamp chord).  Placed here (unconditional) so the blit A/B is always available. */
+    /* Pad L+A: live A/B of the framebuffer BLIT (docs/BLIT_DMA_PLAN.md) -- toggles W5 (HUD-skip)
+       on/off across the safe ring c5 <-> c- (CPU blit; the ~1.3ms W5 A/B).  Row-1 'b<ms>c<-/5>'.
+       The SCU-DMA paths (s/a) are OFF-RING: HW-DEAD, cycling to them FROZE the console (SCU->VDP2
+       B-bus hang, 2026-07-05).  L held + A (edge); NOT L+R (the debug-overlay cycle).  The
+       incidental fire taps to Doom are harmless (mirrors the R+A wall-clamp chord). */
     if (!(cur & PER_DGT_TL) && (changed & PER_DGT_TA) && !(cur & PER_DGT_TA))
-        blit_mode = (blit_mode + 1) % BLIT_CYCLE_N;
+    {
+        blit_cycle_i = (blit_cycle_i + 1) % BLIT_CYCLE_N;
+        blit_mode = blit_cycle[blit_cycle_i];
+    }
 
     /* Pad R + Up/Down tunes the VERTICAL plane-decrochage fill scale (sat_plane_vscale, r_main.c): Up = MORE
        vertical fill (bob / stairs / lifts), Down = LESS.  Clamped [0,16].  Live value on overlay row 5.  R is

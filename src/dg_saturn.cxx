@@ -631,7 +631,8 @@ extern int (*sat_thing_hook)(patch_t *patch, int lump, const unsigned char *cmap
                              int cx0, int cy0, int cx1, int cy1, int flip); /* core r_things.c */
 void R_EmitWorldThingsVDP1(void);      /* core: emit world sprites to VDP1 at the post-BSP kick */
 extern int sat_things_occ;             /* core: fully-occluded sprites skipped this frame (metric) */
-extern int sat_thing_cap;              /* core: how many (nearest) things go to VDP1/frame (we set = slots) */
+extern int sat_thing_cap;              /* core: granted distinct textures/frame (we set = VRAM slots) */
+extern int sat_thing_emit_cap;         /* core: max things emitted/frame -- we AIMD-adapt it (raster budget) */
 extern int sat_things_hw;              /* core: 1 = world sprites -> VDP1 (M4); 0 = software (M0/M6) */
 int  sat_vdp1_thing_draw(patch_t *patch, int lump, const unsigned char *cmap,
                          int x0, int y0, int x1, int y1,
@@ -1681,9 +1682,9 @@ static void fps_update(void)
                sb = SESSION bake% (mh_bake_sum/mh_emit_sum) = the cache read -- low = high reuse.
                On row 15 (bottom, clear of centre-screen monsters that hide the THp row). */
             unsigned int sbpc = mh_emit_sum ? (mh_bake_sum * 100u / mh_emit_sum) : 0;
-            snprintf(rSPR, sizeof rSPR, "SPR pj%d.%d fl%d.%d n%d/%d th%d/%d fb%d sb%u%%  ",
-                     sp_pj/10, sp_pj%10, sp_fl/10, sp_fl%10, sp_np, sp_nd,
-                     sat_things_n, sat_things_decl, thing_bake_n, sbpc);
+            snprintf(rSPR, sizeof rSPR, "SPR fl%d.%d n%d/%d th%d/%d ec%d fb%d sb%u%% ",
+                     sp_fl/10, sp_fl%10, sp_np, sp_nd,
+                     sat_things_n, sat_things_decl, sat_thing_emit_cap, thing_bake_n, sbpc);
             if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 15, rSPR);
             /* rows 9-10: SESSION percentiles (reset ONLY on a MODE change) -- read ONE end-of-level
                capture, no jitter.  THp = world-things emitted/frame p50/p99, declined/frame p99,
@@ -2930,6 +2931,11 @@ static unsigned int vdp1_hud_csum = 0xFFFFFFFFu;  /* status-bar change detector 
 static struct { int lump; const unsigned char *cmap; unsigned char used; unsigned int lru; }
                     thing_cache[2][THINGS_TEX_SLOTS];   /* [parity][slot]: key + per-frame used bit + LRU tick */
 static unsigned int thing_lru_tick;        /* monotonic use counter -> evict the smallest (oldest) lru */
+/* AIMD adaptive things-per-frame budget (sat_walls_kick): grow slowly on a finished plot, back off
+   fast on an overrun.  THING_ADAPT_MAX must match core THING_EMIT_MAX (the scratch-array bound). */
+#define THING_CAP_GROW  8                  /* clean frames before +1 (slow additive increase) */
+#define THING_ADAPT_MAX 16                 /* outdoor ceiling == core THING_EMIT_MAX */
+static int          thing_cap_clean;       /* consecutive finished-plot frames */
 /* (sat_things_n / sat_things_decl / thing_bake_n are defined earlier, before the overlay block) */
 #endif
 
@@ -5204,9 +5210,20 @@ extern "C" void sat_walls_kick(void)
         vdp1_walls_flush();         /* walls BETWEEN the two weapon copies */
 #endif
 #if SAT_WORLD_THINGS_VDP1
-        /* World sprites to VDP1 prio 7, AFTER the walls (over them = clearly visible this probe;
-           occlusion vs nearer walls is the FUNC_UserClip follow-up) and BEFORE weapon (2) so the
-           gun stays on top (it is nearest).  Skips fuzz/translated + oversize -> those stay software. */
+        /* ADAPTIVE things budget (AIMD).  The VDP1 raster is SHARED with the walls, whose share
+           swings wildly (open outdoor = few segs, spare VDP1 -> many enemies fit; tech room = dense
+           = VDP1 already near full -> flickered at only th4).  So grow the cap slowly while the plot
+           FINISHED (vdp1_prev_done, EDSR CEF), back off fast (-2) when it OVERRAN (would drop+vanish
+           things).  It settles just under the per-scene flicker threshold: high outdoors, low indoors. */
+        if (vdp1_prev_done) {
+            if (++thing_cap_clean >= THING_CAP_GROW)
+            { if (sat_thing_emit_cap < THING_ADAPT_MAX) sat_thing_emit_cap++; thing_cap_clean = 0; }
+        } else {
+            sat_thing_emit_cap -= 2; if (sat_thing_emit_cap < 0) sat_thing_emit_cap = 0;
+            thing_cap_clean = 0;
+        }
+        /* World sprites to VDP1 prio 7, AFTER the walls and BEFORE weapon (2) so the gun stays on
+           top.  Occlusion = FUNC_UserClip; fuzz/translated/oversize/over-budget stay software. */
         R_EmitWorldThingsVDP1();
 #endif
 #if SAT_WPN_VDP1

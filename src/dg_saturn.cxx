@@ -2792,18 +2792,19 @@ static const unsigned int VDP1_BANK[2] = { 0x25C00100u, 0x25C02100u };
 /* SAT_WPN_VDP1: the weapon goes on VDP1 at prio 7 as an 8BPP palette sprite (half the RGB555
    size + carries the priority bit via CMDCOLR).  Its cache is RELOCATED off the LIVE wall pool
    (the old 0x25C45000 sat inside it -> would corrupt walls) to the last FOUR WTEX wide slots
-   (WTEX_WIDE_N is cut 6->2 below) at 0x25C51000.
-   TEARING FIX: 8 slots (not 2).  The textures are NOT double-buffered, so during the fast
-   shooting animation a MISS unpacks a new frame into a round-robin slot; with too few slots it
-   overwrites a slot the CURRENTLY-DISPLAYED bank still references -> VDP1 plots a half-written
-   texture = tear.  Need >= 2 x (textures/frame) so the displayed frame's slots survive the flip:
-   1p draws weapon+flash = 2/frame; 2p up to 4/frame (2 players) -> 8 slots.  8 x 16KB fits any
-   shareware weapon at 8bpp (a rare bigger frame that overflows just skips that frame).  Cost:
-   only 2 wide wall slots remain -- watch the 'bk' (wall re-bake) counter; a follow-up can
-   half-res the split weapon texture to reclaim margin. */
-#define WPN_TEX_BASE   0x25C51000u        /* reclaimed 4x32KB wide slots (see WTEX_WIDE_N) -> 8x16KB */
-#define WPN_TEX_SLOTSZ 0x4000u            /* 16 KB @ 8bpp -> up to ~128x128 padded */
-#define WPN_TEX_SLOTS  8
+   (WTEX_WIDE_N is cut 6->4 below) at 0x25C61000.
+   Right-sized (measured): the LARGEST shareware weapon frame is SHTGD0 = 120x131 padded = 15720 B
+   = 15.4KB at 8bpp, so a 16KB slot fits EVERY frame (a 32KB slot was 2x waste).  Slot COUNT is for
+   tearing margin -- the textures are NOT double-buffered, so a MISS during the fast fire animation
+   unpacks into a round-robin slot; need >= 2 x (textures/frame) so the displayed frame's slots
+   survive the flip.  1p draws weapon+flash = 2/frame -> 4 slots.  So 4 x 16KB = 64KB (was 128KB):
+   reclaims only 2 wide wall slots (WTEX_WIDE_N 6->4, not 6->2).  (2p needs 8 slots + half-res split
+   weapon = follow-up.)  NOTE: the "weapon flickers/misses a frame" bug is NOT a size skip (every
+   frame fits 16KB) -- it is the weapon at the TAIL of the VDP1 list being dropped on a HW plot
+   overrun; fixed by emitting the weapon FIRST (see sat_walls_kick). */
+#define WPN_TEX_BASE   0x25C61000u        /* reclaimed 2x32KB wide slots (see WTEX_WIDE_N) -> 4x16KB */
+#define WPN_TEX_SLOTSZ 0x4000u            /* 16 KB @ 8bpp -> fits the 15.4KB max frame */
+#define WPN_TEX_SLOTS  4
 #define WPN_CMDCOLR    (0x2000u | 0x0100u)/* pr bit13 -> register 1 (=7, above NBG1) | CRAM bank 1
                                              (full-bright PLAYPAL; texel = the light-shaded index) */
 #else
@@ -2879,9 +2880,9 @@ static inline unsigned short pal_rgb555(int idx)
                                slots; watch the wtex_bakes (`bk`) counter if wall re-bakes climb. */
 #define WTEX_NARROW_SZ 0x4000u                                      /* 16KB -> 128x128 @ 8bpp */
 #if SAT_WPN_VDP1
-#define WTEX_WIDE_N    2   /* SAT_WPN_VDP1: cede the last 4 wide slots (128KB) to the 8-slot VDP1
-                              weapon cache (WPN_TEX_BASE=0x25C51000) -- see the tearing note above.
-                              Watch the wtex_bakes 'bk' counter: only 2 wide-wall slots remain. */
+#define WTEX_WIDE_N    4   /* SAT_WPN_VDP1: cede the last 2 wide slots (64KB) to the 4-slot 16KB VDP1
+                              weapon cache (WPN_TEX_BASE=0x25C61000).  Watch the wtex_bakes 'bk'
+                              counter: 4 wide-wall slots remain (was 6). */
 #else
 #define WTEX_WIDE_N    6
 #endif
@@ -4667,7 +4668,9 @@ extern "C" void sat_vdp1_wpn_begin(void)
 #endif
     /* (SAT_FLOOR_TEX: the whole floor layer lives in the F bank, built fresh at the end of
        R_DrawPlanes and chained BEFORE this wall bank -- see vdp1_ftex_flush.) */
-    vdp1_walls_flush();   /* textured walls -- behind the weapon, in front of NBG1 */
+    /* WALLS moved: they are flushed in sat_walls_kick AFTER the weapon (weapon-first plot-overrun
+       fix) so the weapon is the always-plotted prefix and the walls are the tail an overrun cuts.
+       The DG_DrawFrame fallback caller (menu/intermission) has no walls, so nothing to flush here. */
 #endif
     /* SAT_WPN_VDP1: the player weapon is emitted into THIS wall bank (before the closing JUMP)
        by the early R_DrawPlayerSprites() call in sat_walls_kick -> sat_psprite_hook ->
@@ -4951,22 +4954,44 @@ extern "C" void sat_walls_kick(void)
 #endif
     {   /* SATURN PERF: time the VDP1 present (close bank + flip root LINK) -> overlay 'pr'. */
         unsigned short pk0 = frt_read();
-        sat_vdp1_wpn_begin();       /* reset the bank + drain walls */
+        sat_vdp1_wpn_begin();       /* reset the bank + local-coord (walls flushed BETWEEN the copies) */
 #if SAT_WPN_VDP1
-        /* Emit the player weapon into THIS wall bank (before the closing JUMP) so it presents in
-           this frame's coherent pair, at prio 7 (above NBG1).  We call the core R_DrawPlayerSprites
-           HERE -- right after the BSP walk, before the end-of-planes present -- because it is the
-           only window before the root flip; sat_psprite_early makes R_DrawMasked skip the (late)
-           software draw.  Reuses the engine's psprite positioning + light selection (no dup).
-           In SPLIT (sat_split_active) fan out to every view's weapon (R_DrawSplitPlayerSprites,
-           per-view viewport + clip); this hook fires once after the split render loop. */
-        if (sat_psprite_early && !viewangleoffset)
+        /* DOUBLE-EMIT the player weapon -- VDP1 has NO z-buffer: it rasterises every command into
+           ONE framebuffer in painter order, so where the gun and a wall overlap the LAST-drawn
+           command wins that pixel (its priority then only decides that pixel vs NBG1, it can't undo
+           an overwrite).  So "on top of the walls" needs the weapon drawn AFTER them -- but "after"
+           is the tail a HW 1-cycle-auto plot OVERRUN cuts (= the flicker: weapon drops, walls fine).
+           On-top and no-flicker are in direct tension, so we draw the weapon TWICE:
+             (1) FIRST, before the walls -> always in the plotted PREFIX, never fully flickers out;
+                 the walls (drawn after) overwrite it only where they OVERLAP.
+             (2) LAST, after the walls   -> redraws the overlap ON TOP.  If a plot overrun cuts (2),
+                 copy (1) still shows the weapon -- gun-top just reverts to behind-the-walls that
+                 frame.  Net: whole weapon ALWAYS visible; on top when the plot completes; only the
+                 gun/wall overlap goes behind-walls in dense overrun frames.
+           TODO (revisit): the clean fix is a VDP1 plot that always COMPLETES, so weapon-LAST alone
+           is on top + flicker-free.  The manual / draw-gated present is a SETTLED DEAD END here
+           (tried 4-5x, too many tradeoffs -- do NOT go back).  Find another route: shorten the wall
+           list, a VDP1 command/time budget, or an L2-relocated cmd buffer.
+           Emitted HERE (after the BSP walk, before the end-of-planes present -- the only pre-flip
+           window); sat_psprite_early makes R_DrawMasked skip the late software draw.  SPLIT fans out
+           per view (R_DrawSplitPlayerSprites).  sat_wall_skip gate -> M0 keeps the SOFTWARE weapon. */
+        auto sat_emit_weapon = [](void)
         {
-            extern int sat_split_active;
-            extern void R_DrawSplitPlayerSprites(void);
-            if (sat_split_active) R_DrawSplitPlayerSprites();
-            else                  R_DrawPlayerSprites();
-        }
+            if (sat_psprite_early && !viewangleoffset && sat_wall_skip)
+            {
+                extern int sat_split_active;
+                extern void R_DrawSplitPlayerSprites(void);
+                if (sat_split_active) R_DrawSplitPlayerSprites();   /* per-view weapons */
+                else                  R_DrawPlayerSprites();
+            }
+        };
+        sat_emit_weapon();          /* (1) FIRST -- guaranteed in the plotted prefix (anti-flicker) */
+#endif
+#if VDP1_WALL_TEST
+        vdp1_walls_flush();         /* walls BETWEEN the two weapon copies */
+#endif
+#if SAT_WPN_VDP1
+        sat_emit_weapon();          /* (2) LAST  -- on top of the walls when the plot completes */
 #endif
         vdp1_wpn_kick();
         sat_present_frt += (unsigned short)(frt_read() - pk0);

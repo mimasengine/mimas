@@ -33,6 +33,7 @@ extern "C" {
 #include <stdio.h>
 #include "doomtype.h"
 #include "w_file.h"
+#include "z_zone.h"
 }
 
 extern "C" unsigned char *sat_wad_base;
@@ -85,7 +86,10 @@ extern "C" int W_SaturnCDInit(void)
     ** So sat_wad_size = infotableofs + numlumps * 16.
     */
     sat_debug_row0("CD:hdr...");
-    static unsigned char hdr[12];
+    /* 4-byte aligned so this offset-0 read takes Saturn_Read's fast path (sub==0 &&
+    ** aligned dest) and never bounces -- it runs BEFORE Z_Init, so it must not touch
+    ** the (not-yet-allocated) zone staging buffer used by the multi-sector bounce. */
+    static unsigned char hdr[12] __attribute__((aligned(4)));
     int hgot = wad_cd_file->LoadBytes(0, 12, hdr);
     {
         static char hdbg[45];
@@ -156,10 +160,21 @@ static void Saturn_CloseFile(wad_file_t *file) { (void)file; }
 ** giving up; sat_cd_read_retries is surfaced on the overlay (row 0 `cd`) so a high
 ** count flags a flaky disc rather than a one-off. */
 extern "C" int sat_cd_read_retries = 0;   /* cumulative retried reads this session */
+/* R1 telemetry: cumulative GFS_Load "chunk" commands issued (one per sat_cd_load /
+** drp_load invocation, retries excluded).  Ymir-measurable even though it can't time
+** the CD -- the whole point of R1 is to shrink this per lump (bytes/16K, not bytes/2K).
+** Watch the jump across a level warp: with the multi-sector bounce it is ~1/8 of the
+** old per-sector count. */
+extern "C" int sat_cd_loads = 0;
+/* Companion: cumulative GFS_Loads the OLD per-sector path WOULD have issued for the
+** same reads (fast-path reads +1; bounces += ceil((sub+n)/2048)).  Overlay shows
+** ld<sat_cd_loads>/<sat_cd_persector> -> the ratio IS the R1 win, no rebuild needed. */
+extern "C" int sat_cd_persector = 0;
 #define SAT_CD_READ_RETRIES 8
 
 static int sat_cd_load(size_t sector, int32_t bytes, void *dst)
 {
+    sat_cd_loads++;
     int got = wad_cd_file->LoadBytes(sector, bytes, dst);
     for (int attempt = 1; got <= 0 && attempt < SAT_CD_READ_RETRIES; ++attempt)
     {
@@ -167,6 +182,70 @@ static int sat_cd_load(size_t sector, int32_t bytes, void *dst)
         got = wad_cd_file->LoadBytes(sector, bytes, dst);
     }
     return got;
+}
+
+/* ------------------------------------------------------------------ */
+/* R1: multi-sector bounce (STREAMING_FLUIDITY_ROADMAP.md sec.4)       */
+/* ------------------------------------------------------------------ */
+/* GFS needs a sector offset + a 4-byte-aligned dest, so an unaligned lump (the
+** common case: raw-bundled big WADs have ~0 sector-aligned lumps) is bounced
+** through an aligned scratch.  The old bounce issued ONE full GFS_Load
+** (open/seek/play/wait-pause/close) PER 2048 B sector -- a 64K lump = 33 CD
+** commands.  Read up to SAT_CD_STAGE_SECTORS sectors per GFS_Load into a shared
+** staging buffer, then memcpy the wanted slice out -> the same lump collapses to
+** ceil(size/stage)+1 commands (~5 at 16K, ~3 at 32K).
+**
+** Placement: PU_STATIC in the Doom zone, allocated once on first bounce.  HWRAM is
+** out (the TLSF pool is a few KB), and LWRAM is fully partitioned into [zone |
+** RP_CMD_BUF] with the render buffer unborrowable (the slave consumes it while a
+** master page-in can bounce mid-render).  Post-R4 the zone has >100K of headroom on
+** every currently-loadable map, so this ~16-32K carve (CD-streaming mode only) is
+** safe; the maps it would push over (Plutonia/TNT worst) already need R4.2 to fit at
+** all.  Allocated lazily because the zone (Z_Init) comes up AFTER DG_Init -- the one
+** pre-Z_Init read (the WAD header) is aligned to take the fast path and never bounce. */
+#ifndef SAT_CD_STAGE_SECTORS
+#define SAT_CD_STAGE_SECTORS 8                         /* 16 KB; raise to 16 for 32 KB */
+#endif
+#define SAT_CD_STAGE_BYTES   (SAT_CD_STAGE_SECTORS * 2048)
+
+static unsigned char *sat_cd_stage = nullptr;
+
+extern "C" unsigned char *sat_cd_stage_get(void)
+{
+    if (!sat_cd_stage)
+        sat_cd_stage = (unsigned char *)Z_Malloc(SAT_CD_STAGE_BYTES, PU_STATIC, NULL);
+    return sat_cd_stage;                               /* Z_Malloc I_Errors on OOM, never NULL */
+}
+
+/* Deliver [sector*2048 + sub, +n) into `buffer` (any alignment) via `load`, chunked
+** through the staging buffer.  Returns bytes delivered.  Reads are serial on the
+** master (Saturn_Read and drp_read never nest), so one shared staging buffer is safe. */
+typedef int (*sat_cd_loader_fn)(size_t sector, int32_t bytes, void *dst);
+
+extern "C" size_t sat_cd_bounce(sat_cd_loader_fn load, size_t sector, size_t sub,
+                                void *buffer, size_t n)
+{
+    unsigned char *stage = sat_cd_stage_get();
+    sat_cd_persector += (int)((sub + n + 2047) >> 11);   /* sectors the old per-sector loop issued */
+    size_t done = 0;
+    while (done < n)
+    {
+        size_t remaining = n - done;
+        size_t span      = sub + remaining;            /* bytes still needed from `sector` on */
+        size_t nsect     = (span + 2047) >> 11;
+        if (nsect > SAT_CD_STAGE_SECTORS) nsect = SAT_CD_STAGE_SECTORS;
+        int got = load(sector, (int32_t)(nsect << 11), stage);
+        if (got <= (int)sub) break;                    /* read error or short of our start */
+        size_t avail = (size_t)got - sub;
+        size_t want  = remaining < avail ? remaining : avail;
+        memcpy((unsigned char *)buffer + done, stage + sub, want);
+        done += want;
+        if (want < avail) break;                        /* satisfied within this chunk */
+        size_t consumed = sub + want;                   /* whole sectors consumed from this chunk */
+        sector += consumed >> 11;
+        sub     = consumed & 2047;
+    }
+    return done;
 }
 
 static size_t Saturn_Read(wad_file_t *file, unsigned int offset,
@@ -211,26 +290,13 @@ static size_t Saturn_Read(wad_file_t *file, unsigned int offset,
     if (sub == 0 && ((size_t)buffer & 3u) == 0)
     {
         /* Sector-aligned offset into a 4-byte-aligned dest: one GFS_Load (retried). */
+        sat_cd_persector++;                    /* aligned: old path also did 1 GFS_Load */
         int got = sat_cd_load(sector, (int32_t)n, buffer);
         return (got > 0) ? (size_t)got : 0;
     }
 
-    /* Bounce path: read whole sectors into an aligned buffer, copy what we
-    ** need.  GFS therefore only ever writes to sect_buf (always aligned). */
-    static unsigned char sect_buf[2048] __attribute__((aligned(4)));
-    size_t done = 0;
-    while (done < n)
-    {
-        int got = sat_cd_load(sector, 2048, sect_buf);
-        if (got <= (int)sub) break;              /* read error or short of our start */
-        size_t avail = (size_t)got - sub;        /* usable bytes after the in-sector skip */
-        size_t want  = n - done;
-        if (want > avail) want = avail;
-        memcpy((unsigned char *)buffer + done, sect_buf + sub, want);
-        done += want;
-        if (want < avail) break;                 /* satisfied n within this sector */
-        sector++;
-        sub = 0;
-    }
-    return done;
+    /* Bounce path (R1): read up to SAT_CD_STAGE_SECTORS sectors per GFS_Load into
+    ** the aligned staging buffer and copy the wanted slice out -- one CD command per
+    ** chunk instead of one per sector.  GFS only ever writes to the aligned staging. */
+    return sat_cd_bounce(sat_cd_load, sector, sub, buffer, n);
 }

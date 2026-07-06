@@ -51,6 +51,14 @@ extern "C" unsigned int    sat_cart_usable;
 extern "C" unsigned char  *sat_cart_cached_base;
 extern int sat_cart_load_region(SRL::Cd::File &f, size_t sector, int len, unsigned int cart_ofs);
 
+/* R1 multi-sector bounce helper, shared with the WAD reader (defined in
+   w_file_saturn.cxx).  Reads are serial on the master so the single staging buffer
+   is reentrancy-safe across the two sites. */
+extern "C" {
+typedef int (*sat_cd_loader_fn)(size_t sector, int32_t bytes, void *dst);
+size_t sat_cd_bounce(sat_cd_loader_fn load, size_t sector, size_t sub, void *buffer, size_t n);
+}
+
 /* Compile-time A/B (hardware): 1 = stage the map blob into cart (Step 4b); 0 =
    always read the blob from CD (Step 3 behaviour).  Lets the cart path be toggled
    off without code surgery if hardware shows it regresses. */
@@ -169,8 +177,12 @@ extern "C" int sat_drp_read_retries;
 int sat_drp_read_retries = 0;
 #define DRP_READ_RETRIES 8
 
+extern "C" int sat_cd_loads;       /* R1 telemetry (defined in w_file_saturn.cxx) */
+extern "C" int sat_cd_persector;   /* R1 per-sector-equivalent baseline */
+
 static int drp_load(size_t sector, int32_t bytes, void *dst)
 {
+    sat_cd_loads++;
     int got = drp_file->LoadBytes(sector, bytes, dst);
     for (int a = 1; got <= 0 && a < DRP_READ_RETRIES; ++a)
     {
@@ -192,26 +204,13 @@ static int drp_read(uint32_t offset, void *buffer, int len)
 
     if (sub == 0 && ((uintptr_t)buffer & 3u) == 0)
     {
+        sat_cd_persector++;                    /* aligned: old path also did 1 GFS_Load */
         int got = drp_load(sector, (int32_t)len, buffer);
         return got > 0 ? got : 0;
     }
 
-    static unsigned char sect_buf[2048] __attribute__((aligned(4)));
-    int done = 0;
-    while (done < len)
-    {
-        int got = drp_load(sector, 2048, sect_buf);
-        if (got <= (int)sub) break;
-        int avail = got - (int)sub;
-        int want  = len - done;
-        if (want > avail) want = avail;
-        memcpy((unsigned char *)buffer + done, sect_buf + sub, want);
-        done += want;
-        if (want < avail) break;
-        sector++;
-        sub = 0;
-    }
-    return done;
+    /* R1: multi-sector bounce (was one GFS_Load per 2048 B sector). */
+    return (int)sat_cd_bounce(drp_load, sector, sub, buffer, (size_t)len);
 }
 
 /* One-time probe: open DOOMRP.DRP and validate it against the loaded WAD.  Only

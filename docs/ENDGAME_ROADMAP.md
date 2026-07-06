@@ -30,13 +30,16 @@ So the endgame is **not** "make it run". It is: **survive the big maps + fit in 
 |---|---|---|---|
 | **Shareware** | ✅ cart (zero-copy map) | ✅ (dev vehicle) | none — temporary |
 | **Ultimate Doom** | ✅ streams | ✅ **fits everywhere** (+117 K worst) | ~none — **best big-WAD case** |
-| **Doom II** | ✅ streams | ⚠️ **~1 lever** | fits zone except MAP15 (−4.4 K); real killers = **crash-caps** (Axis 2) |
+| **Doom II** | ✅ streams | ✅ **MAP13 loads (R4 done)** | first wall was **memory FRAGMENTATION** (segs array), fixed by **R4** (Axis 1); crash-caps monitored, NOT hit (`vp30/ds56`) |
 | **TNT: Evilution** | ✅ streams | ❌ **23/32 maps don't fit** (MAP20 −318 K) | **memory diet R4** (~−433 K) |
 | **Plutonia** | ✅ streams | ❌ 5 maps 1p / 10 in 4p (MAP28 −272 K) | **R4** for the heavy maps |
 | **generic PWAD** | ✅ ≤4 MB cart / else streams | depends | no PWAD-merge, no DEHACKED |
 
-**Key split:** *Doom II is gated by the CRASH-caps (Axis 2), not by memory* (it almost fits the
-zone). *Final Doom is gated by MEMORY* (Axis 1 / R4). They need different keystones.
+**Key split (HW-CORRECTED 2026-07-06):** *Doom II's actual first wall was MEMORY-FRAGMENTATION*, not
+the crash-caps first predicted here — MAP13 `Z_Malloc`-failed on the segs array (`P_LoadSegs`: 245 K
+free but no 57 K contiguous run), while the crash-caps sat idle (`vp30/ds56` « 256, row 11). **R4
+(Axis 1) fixed it** — MAP13 now loads, largest-contiguous 48 K→130 K. *Final Doom is gated by MEMORY
+too* (a bigger diet). Crash-proofing (P0) stays a latent risk on open vistas, not yet hit.
 
 ---
 

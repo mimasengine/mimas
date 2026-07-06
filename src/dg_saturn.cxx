@@ -634,6 +634,7 @@ extern int sat_things_occ;             /* core: fully-occluded sprites skipped t
 extern int sat_thing_cap;              /* core: granted distinct textures/frame (we set = VRAM slots) */
 extern int sat_thing_emit_cap;         /* core: max things emitted/frame -- we AIMD-adapt it (raster budget) */
 extern int sat_things_hw;              /* core: 1 = world sprites -> VDP1 (M4); 0 = software (M0/M6) */
+extern int sat_split_active;           /* core r_main.c: split emits per view PRE-kick -> queue path */
 int  sat_vdp1_thing_draw(patch_t *patch, int lump, const unsigned char *cmap,
                          int x0, int y0, int x1, int y1,
                          int cx0, int cy0, int cx1, int cy1, int flip);     /* our sat_thing_hook impl */
@@ -2957,6 +2958,23 @@ static unsigned int thing_lru_tick;        /* monotonic use counter -> evict the
 #define THING_ADAPT_MAX 16                 /* outdoor ceiling == core THING_EMIT_MAX */
 static int          thing_cap_clean;       /* consecutive finished-plot frames */
 /* (sat_things_n / sat_things_decl / thing_bake_n are defined earlier, before the overlay block) */
+/* SPLIT-SCREEN QUEUE: split renders its views BEFORE the kick and the walls only flush AT the
+   kick, so a per-view thing emitted straight into the command bank would land BEFORE the walls
+   and be painted over (VDP1 = painter order).  Instead the per-view emissions (core calls the
+   hook from R_RenderViewPass, per view, with that view's live vissprites/drawsegs/window):
+     - BAKE immediately, into the parity the NEXT begin will write (vdp1_bank ^ 1 -- the pair
+       the displayed list never references, so pre-kick VRAM writes stay tear-safe), and
+     - QUEUE the two commands' fields here; vdp1_things_flush() emits them at the kick AFTER
+       vdp1_walls_flush -> painter order walls -> things -> weapon(2), same as 1p.
+   1p keeps the direct path (its emission already happens at the kick, after the walls). */
+#define THING_ACC_MAX      (4 * THING_ADAPT_MAX)  /* 4 views x per-view AIMD ceiling */
+#define THING_FLUSH_MARGIN 16                     /* bank tail kept free: 4 views' weapon(2) + HUD + end */
+static struct { unsigned short texoff, csize;     /* precomputed CMDSRCA / CMDSIZE halfwords */
+                short x0, y0, x1, y1;             /* quad rect (screen, view offset baked in) */
+                short cx0, cy0, cx1, cy1;         /* FUNC_UserClip visible box */
+                unsigned char flip; } thing_acc[THING_ACC_MAX];
+static int thing_acc_n;                    /* queued entries this split frame */
+static int thing_acc_open;                 /* 1 = a split frame's per-view emissions are underway */
 #endif
 
 /* Write one 32-byte VDP1 command (16 halfwords) at command index `idx` of `base`. */
@@ -4759,7 +4777,9 @@ extern "C" void sat_vdp1_wpn_begin(void)
         vdp1_hud_csum = 0xFFFFFFFFu;
     }
 #if SAT_WORLD_THINGS_VDP1
-    sat_things_n = sat_things_decl = thing_bake_n = 0;   /* per-frame 'th'/'fb' overlay counters (reset at bank build) */
+    if (!thing_acc_open)   /* split queued this frame's things PRE-kick: its open reset the
+                              counters already -- resetting here would zero the overlay/mh stats */
+        sat_things_n = sat_things_decl = thing_bake_n = 0;   /* per-frame 'th'/'fb' overlay counters (reset at bank build) */
 #endif
 #if VDP1_DBLBANK
     vdp1_wbank = vdp1_bank ^ 1;                      /* the bank VDP1 isn't showing */
@@ -4979,15 +4999,32 @@ extern "C" int sat_vdp1_thing_draw(patch_t *patch, int lump, const unsigned char
                                    int cx0, int cy0, int cx1, int cy1, int flip)
 {
     int padW, H, W;
+    int split = sat_split_active;      /* split = per-view PRE-kick call -> queue (see thing_acc) */
 
-    if (vdp1_wnext >= WALL_CMD_CAP - 1) { sat_things_decl++; return 0; }  /* need 2 cmds (clip + quad) */
+    if (split && !thing_acc_open)
+    {   /* first thing of this split frame: open the queue.  The per-frame housekeeping that 1p
+           gets from sat_vdp1_wpn_begin (which in split only runs at the KICK, i.e. after these
+           emissions) happens here instead: reset the overlay counters and the target parity's
+           `used` bits (begin's own clear is post-emission in split, and is skipped entirely on
+           a gated-present HOLD frame -- stale bits would fake "out of textures"). */
+        int np = (vdp1_bank ^ 1) & 1;
+        thing_acc_open = 1; thing_acc_n = 0;
+        sat_things_n = sat_things_decl = thing_bake_n = 0;
+        for (int i = 0; i < THINGS_TEX_SLOTS; ++i) thing_cache[np][i].used = 0;
+    }
+    if (split ? (thing_acc_n >= THING_ACC_MAX)
+              : (vdp1_wnext >= WALL_CMD_CAP - 1))   /* direct path needs 2 cmds (clip + quad) */
+    { sat_things_decl++; return 0; }
 
     W    = (int)bswap16((unsigned short)patch->width);
     H    = (int)bswap16((unsigned short)patch->height);
     padW = (W + 7) & ~7;
     if ((unsigned int)(padW * H) > THINGS_TEX_SLOTSZ) { sat_things_decl++; return 0; }  /* too big -> software */
 
-    int p = vdp1_wbank & 1;
+    /* Write parity: 1p emits at the kick, after begin flipped vdp1_wbank; split emits BEFORE the
+       kick, so target the parity begin WILL pick (vdp1_bank ^ 1, VDP1_DBLBANK).  Either way it is
+       the pair the displayed list does not reference -> baking now never tears the shown frame. */
+    int p = (split ? vdp1_bank ^ 1 : vdp1_wbank) & 1;
     int slot = -1;
 
     for (int i = 0; i < THINGS_TEX_SLOTS; ++i)                          /* cache lookup: (lump, cmap) */
@@ -5032,6 +5069,21 @@ extern "C" int sat_vdp1_thing_draw(patch_t *patch, int lump, const unsigned char
         }
     }
 
+    if (split)
+    {   /* QUEUE: the walls have not flushed yet -- park the two commands' fields; the kick's
+           vdp1_things_flush() emits them right after vdp1_walls_flush (painter order kept). */
+        thing_acc[thing_acc_n].texoff = (unsigned short)((texaddr - VDP1_VRAM_BASE) >> 3);
+        thing_acc[thing_acc_n].csize  = (unsigned short)(((padW >> 3) << 8) | H);
+        thing_acc[thing_acc_n].x0  = (short)x0;  thing_acc[thing_acc_n].y0  = (short)y0;
+        thing_acc[thing_acc_n].x1  = (short)x1;  thing_acc[thing_acc_n].y1  = (short)y1;
+        thing_acc[thing_acc_n].cx0 = (short)cx0; thing_acc[thing_acc_n].cy0 = (short)cy0;
+        thing_acc[thing_acc_n].cx1 = (short)cx1; thing_acc[thing_acc_n].cy1 = (short)cy1;
+        thing_acc[thing_acc_n].flip = (unsigned char)(flip != 0);
+        thing_acc_n++;
+        sat_things_n++;
+        return 1;
+    }
+
     unsigned short cmd[16];
 
     /* OCCLUSION: a FUNC_UserClip to the visible bounding box, then the quad clipped to it
@@ -5058,6 +5110,50 @@ extern "C" int sat_vdp1_thing_draw(patch_t *patch, int lump, const unsigned char
     vdp1_cmd_at(VDP1_BANK[vdp1_wbank], vdp1_wnext++, cmd);
     sat_things_n++;
     return 1;
+}
+
+/* Kick-time drain of the split thing queue into the command bank, AFTER vdp1_walls_flush.
+   Same two commands per entry as the 1p direct path (FUNC_UserClip box + prio-7 distorted
+   quad).  Entries beyond the command budget are DROPPED (their software fill was already
+   skipped -> the sprite vanishes this frame, exactly the overrun failure mode), so a drop
+   also feeds the AIMD back-off below -- the per-view cap shrinks until walls+things fit. */
+static void vdp1_things_flush(void)
+{
+    unsigned short cmd[16];
+    int i;
+    for (i = 0; i < thing_acc_n; ++i)
+    {
+        if (vdp1_wnext >= WALL_CMD_CAP - THING_FLUSH_MARGIN) break;
+        memset(cmd, 0, sizeof cmd);
+        cmd[0]  = 0x0008;                          /* FUNC_UserClip */
+        cmd[6]  = thing_acc[i].cx0; cmd[7]  = thing_acc[i].cy0;
+        cmd[10] = thing_acc[i].cx1; cmd[11] = thing_acc[i].cy1;
+        vdp1_cmd_at(VDP1_BANK[vdp1_wbank], vdp1_wnext++, cmd);
+
+        memset(cmd, 0, sizeof cmd);
+        short xl = thing_acc[i].flip ? thing_acc[i].x1 : thing_acc[i].x0;
+        short xr = thing_acc[i].flip ? thing_acc[i].x0 : thing_acc[i].x1;
+        cmd[0] = 0x0002;                           /* distorted sprite */
+        cmd[2] = 0x04A0;                           /* 256-bank | ECD-off | SPD CLEAR | Window_In */
+        cmd[3] = WPN_CMDCOLR;                      /* prio 7 (above NBG1) | CRAM bank 1 */
+        cmd[4] = thing_acc[i].texoff;
+        cmd[5] = thing_acc[i].csize;
+        cmd[6]  = xl; cmd[7]  = thing_acc[i].y0;
+        cmd[8]  = xr; cmd[9]  = thing_acc[i].y0;
+        cmd[10] = xr; cmd[11] = thing_acc[i].y1;
+        cmd[12] = xl; cmd[13] = thing_acc[i].y1;
+        vdp1_cmd_at(VDP1_BANK[vdp1_wbank], vdp1_wnext++, cmd);
+    }
+    if (i < thing_acc_n)
+    {   /* budget cut the tail: count the vanished sprites + back the AIMD cap off NOW (the
+           EDSR overrun signal cannot see a queue drop -- without this the same tail would
+           re-drop every frame = steady flicker instead of a one-off adaptation). */
+        sat_things_decl += thing_acc_n - i;
+        sat_things_n    -= thing_acc_n - i;
+        sat_thing_emit_cap -= 2; if (sat_thing_emit_cap < 0) sat_thing_emit_cap = 0;
+        thing_cap_clean = 0;
+    }
+    thing_acc_n = 0; thing_acc_open = 0;
 }
 #endif
 
@@ -5189,6 +5285,11 @@ extern "C" void sat_walls_kick(void)
 #if VDP1_WALL_TEST
         wall_acc_n = 0;             /* discard this frame's BSP-accumulated walls */
 #endif
+#if SAT_WORLD_THINGS_VDP1
+        thing_acc_n = 0; thing_acc_open = 0;   /* and the split frame's queued things (their bakes
+                                                  hit the non-displayed parity -> harmless; the
+                                                  cache keys persist = free hits next frame) */
+#endif
         vdp1_kicked_this_frame = 1; /* suppress the DG_DrawFrame fallback kick */
         return;
     }
@@ -5245,8 +5346,11 @@ extern "C" void sat_walls_kick(void)
             thing_cap_clean = 0;
         }
         /* World sprites to VDP1 prio 7, AFTER the walls and BEFORE weapon (2) so the gun stays on
-           top.  Occlusion = FUNC_UserClip; fuzz/translated/oversize/over-budget stay software. */
-        R_EmitWorldThingsVDP1();
+           top.  Occlusion = FUNC_UserClip; fuzz/translated/oversize/over-budget stay software.
+           1p: emit directly (vissprites still live).  Split: the views already emitted per view
+           into the queue (R_RenderViewPass) -- drain it here, after the walls. */
+        if (sat_split_active) vdp1_things_flush();
+        else                  R_EmitWorldThingsVDP1();
 #endif
 #if SAT_WPN_VDP1
         sat_emit_weapon();          /* (2) LAST  -- on top of the walls when the plot completes */

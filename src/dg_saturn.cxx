@@ -687,6 +687,12 @@ static int sq_wall = SQ_FULL, sq_floor = SQ_LD, sq_ceil = SQ_LD;   /* floor+ceil
                                                                      ld is ~invisible on the ceiling and fine on the
                                                                      floor; the convex-exact deport (M5) puts the
                                                                      convex floors at FULL quality on VDP1 anyway) */
+/* SATURN sprite-SQ (the 4th SQ zone, pad R+B): full/ld only.  Software world sprites are drawn at
+   half horizontal resolution when SQ_LD -- an INDEPENDENT axis from the wall/floor/ceil detailshift
+   (sat_sprite_ld, core r_things.c), so the sprite quality no longer rides the global detailshift the
+   floor/ceil LD used to force.  Default FULL -> inert (byte-identical to today); the LD path only
+   bites the software sprite fill (split/M0/M6), never the VDP1 world-things (1p M4). */
+static int sq_sprite = SQ_FULL;
 static const char *const sq_name[4] = { "full", "ld", "band", "flat" };
 static int wall_potato_mode = 0;            /* VDP1 wall style: 0=tex 1=banded 2=flat (SQ_wall-derived) */
 /* Platform VDP1-claim gates, read ONLY by sat_floor_vdp1_emit -- split leftover-floors vs
@@ -756,6 +762,7 @@ static void sat_apply_mode(void)
     extern int sat_split_lowdetail;            /* core: split detailshift (low-detail) */
     extern int sat_floor_ld;                   /* core r_plane.c: half-rate floor texel fetch */
     extern int sat_ceil_potato, sat_ceil_ld;   /* core r_plane.c: independent ceiling SQ (step 2) */
+    extern int sat_sprite_ld;                  /* core r_things.c: half-res software sprite fill (indep. of detailshift) */
     int M = sat_m; if (M < 0 || M >= M_COUNT) { M = M1_FULL; sat_m = M; }
 
     /* ---- Axis A: offload targets ---- */
@@ -787,7 +794,16 @@ static void sat_apply_mode(void)
     sat_floor_ld      = (sq_floor == SQ_LD);                     /* half-rate floor texel fetch */
     sat_ceil_potato   = (sq_ceil == SQ_FLAT);                    /* solid-colour software ceilings */
     sat_ceil_ld       = (sq_ceil == SQ_LD);                      /* half-rate ceiling texel fetch */
-    sat_split_lowdetail = (sq_wall == SQ_LD || sq_floor == SQ_LD || sq_ceil == SQ_LD); /* split detailshift */
+    /* SATURN M/SQ: detailshift is a GLOBAL half-viewwidth lever -- it hits walls' software
+       fallback AND sprites AND spans alike, so it must NOT be driven by the floor/ceil SQ.
+       Floor/ceil LD already have their OWN per-plane mechanism (sat_floor_ld / sat_ceil_ld =
+       half-rate texel fetch on the worklist), independent of detailshift.  Deriving the global
+       detailshift from floor/ceil LD dragged sprites + the wall CPU-fallback to half-res in split
+       even at sq_wall=FULL.  Gate it on the WALL SQ only -> "fll" (wall full, floor+ceil LD) now
+       keeps sprites + walls full-res.  (A dedicated split-detailshift control, decoupled from SQ
+       entirely, is the follow-up for the solo/multi hd/ld combos.) */
+    sat_split_lowdetail = (sq_wall == SQ_LD); /* split detailshift: wall SQ only */
+    sat_sprite_ld       = (sq_sprite == SQ_LD); /* independent sprite axis (pad R+B); only bites when detailshift==0 */
 
     sat_wall_clamp = (M == M5_CONVEX) ? 0 : SAT_WALL_CLAMP;   /* off in M5: convex-exact planes are distant
                                                                  full-claims -> no near-band to clamp, and it
@@ -1491,7 +1507,7 @@ static void fps_update(void)
 #if SAT_DIAG_SLAVE_TOGGLES
             static int l_steal=-1, l_wp=-1;
 #endif
-            if (gamemap != l_map || sat_m != l_m || (sq_wall<<4|sq_floor<<2|sq_ceil) != l_sq || blit_mode != l_blit
+            if (gamemap != l_map || sat_m != l_m || (sq_wall<<6|sq_sprite<<4|sq_floor<<2|sq_ceil) != l_sq || blit_mode != l_blit
 #if SAT_FLOOR_PERFSIM
                 || floor_perfsim_mode != l_perfsim
 #endif
@@ -1503,7 +1519,7 @@ static void fps_update(void)
                 vd1_win_done = vd1_win_tot = 0;
                 fb_pk_clamp = fb_pk_mag = fb_pk_starve = fb_pk_px = 0;   /* Phase-0: clean fallback A/B window */
                 blit10_sum = blit10_cnt = 0;   /* row-1 'b' precise window: fresh sample on the L+A toggle */
-                l_map=gamemap; l_m=sat_m; l_sq=(sq_wall<<4|sq_floor<<2|sq_ceil); l_blit=blit_mode;
+                l_map=gamemap; l_m=sat_m; l_sq=(sq_wall<<6|sq_sprite<<4|sq_floor<<2|sq_ceil); l_blit=blit_mode;
 #if SAT_FLOOR_PERFSIM
                 l_perfsim=floor_perfsim_mode;
 #endif
@@ -1629,9 +1645,9 @@ static void fps_update(void)
             if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 6, r9);   /* row 6: REC-max locator */
             /* row 7: ACTIVE render composition -- so an A/B is never read against the wrong state.
                M<n>:name = offload mode (pad Z).  RESOLVED per-surface targets: fl:<dom><leftover>
-               cl:<ceil> sk:<sky> wl:<wall>, where R=RBG0 V=VDP1 N=NBG0 .=software(CPU).  SQ:<W><F><C>
-               software quality per zone (pad R+Y/Y/L+Y): f=full l=ld b=band x=flat.  pm=plane split
-               0stat/1TAS/2rowsplit (pad C). */
+               cl:<ceil> sk:<sky> wl:<wall>, where R=RBG0 V=VDP1 N=NBG0 .=software(CPU).  SQ:<W><F><C><S>
+               software quality per zone (pad R+Y/Y/L+Y/R+B = wall/floor/ceil/sprite): f=full l=ld
+               b=band x=flat.  pm=plane split 0stat/1TAS/2rowsplit (pad C). */
             static const char sqch[4] = { 'f', 'l', 'b', 'x' };   /* full / ld / band / flat */
             char m0 = (sat_m == M0_SOFT);
             char dm = m0 ? '.' : 'R';                                        /* dominant floor */
@@ -1640,9 +1656,9 @@ static void fps_update(void)
             char sk = m0 ? '.' : 'N';                                        /* sky             */
             char wl = m0 ? '.' : 'V';                                        /* walls           */
             static char r7[45];
-            snprintf(r7, sizeof r7, "M%d %s fl:%c%c cl:%c sk:%c wl:%c SQ:%c%c%c pm%d ",
+            snprintf(r7, sizeof r7, "M%d %s fl:%c%c cl:%c sk:%c wl:%c SQ:%c%c%c%c pm%d ",
                      sat_m, sat_m_name[sat_m], dm, lf, cl, sk, wl,
-                     sqch[sq_wall & 3], sqch[sq_floor & 3], sqch[sq_ceil & 3],
+                     sqch[sq_wall & 3], sqch[sq_floor & 3], sqch[sq_ceil & 3], sqch[sq_sprite & 3],
                      sat_plane_rowsplit ? 2 : sat_plane_tas);
             if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 7, r7);
             /* row 8: RELIABLE VDP1 load (replaces the CEF-aliased Dr%).  w%/f% = wall/floor
@@ -2884,7 +2900,11 @@ static const unsigned int VDP1_BANK[2] = { 0x25C00100u, 0x25C02100u };
 #endif
 static struct { int lump; const unsigned char *cmap; int padW; int H; }
                     wpn_cache[WPN_TEX_SLOTS];
-static int          wpn_cache_rr;
+/* TEAR-SAFE: partition the weapon slots by frame parity (like thing_cache) -- bake ONLY into the
+   write-parity half so the DISPLAYED half is never re-baked mid-plot.  1p fires gun+flash = 2 lumps
+   <= WPN_SLOTS_PER, so it fits; split (2-4 weapons) still wants the parked 8-slot follow-up. */
+#define WPN_SLOTS_PER (WPN_TEX_SLOTS / 2)
+static int          wpn_cache_rr[2];   /* per-parity round-robin cursor */
 
 static volatile int vd1_dr_live;   /* 1 = a world list is linked -> the vblank Dr sampler counts */
 static int          vdp1_bank;     /* weapon bank VDP1 is currently displaying */
@@ -4693,7 +4713,7 @@ static void vdp1_wpn_init(void)
 
     vdp1_bank = 0; vdp1_wactive = 0;
     for (int i = 0; i < WPN_TEX_SLOTS; ++i) wpn_cache[i].lump = -1;
-    wpn_cache_rr = 0;
+    wpn_cache_rr[0] = wpn_cache_rr[1] = 0;
 #if SAT_WORLD_THINGS_VDP1
     thing_lru_tick = 0;
     for (int p = 0; p < 2; ++p)
@@ -4831,8 +4851,9 @@ extern "C" void sat_vdp1_wpn_draw(patch_t *patch, int lump, int sx, int sy, int 
 
     if (vdp1_wnext >= VDP1_CMD_GUARD) return;         /* command-bank slot guard */
 
-    for (int i = 0; i < WPN_TEX_SLOTS; ++i)          /* cache lookup: (lump, cmap) */
-        if (wpn_cache[i].lump == lump && wpn_cache[i].cmap == cmap) { slot = i; break; }
+    int wp = (vdp1_wbank & 1) * WPN_SLOTS_PER;        /* write-parity slot base (tear-safe) */
+    for (int i = 0; i < WPN_SLOTS_PER; ++i)           /* cache lookup within the write parity: (lump, cmap) */
+        if (wpn_cache[wp+i].lump == lump && wpn_cache[wp+i].cmap == cmap) { slot = wp+i; break; }
 
     if (slot >= 0)
     {
@@ -4845,8 +4866,9 @@ extern "C" void sat_vdp1_wpn_draw(patch_t *patch, int lump, int sx, int sy, int 
         int W = (int)bswap16((unsigned short)patch->width);
         H     = (int)bswap16((unsigned short)patch->height);
         padW  = (W + 7) & ~7;
-        slot = wpn_cache_rr;
-        wpn_cache_rr = (wpn_cache_rr + 1) % WPN_TEX_SLOTS;
+        { int pp = vdp1_wbank & 1;                    /* round-robin WITHIN the write parity */
+          slot = pp * WPN_SLOTS_PER + wpn_cache_rr[pp];
+          wpn_cache_rr[pp] = (wpn_cache_rr[pp] + 1) % WPN_SLOTS_PER; }
 
         const unsigned int *colofs = (const unsigned int *)patch->columnofs;
 #if SAT_WPN_VDP1
@@ -5720,7 +5742,7 @@ extern "C" void DG_DrawFrame(void)
         {
             static int mh_l_m = -999, mh_l_sq = -1;
             static uint32_t mh_last = 0;
-            int cur_sq = (sq_wall << 4) | (sq_floor << 2) | sq_ceil;
+            int cur_sq = (sq_wall << 6) | (sq_sprite << 4) | (sq_floor << 2) | sq_ceil;
             if (sat_m != mh_l_m || cur_sq != mh_l_sq) { mh_reset(); mh_l_m = sat_m; mh_l_sq = cur_sq; }
             uint32_t nowms = df3;                       /* end-of-frame timestamp (DG_GetTicksMs) */
             int fms = mh_last ? (int)(nowms - mh_last) : 0;
@@ -6088,6 +6110,12 @@ static void poll_pad(void)
        unreachable.)  R held + A; the incidental fire tap to Doom is harmless. */
     if (!(cur & PER_DGT_TR) && (changed & PER_DGT_TA) && !(cur & PER_DGT_TA))
         sat_wall_clamp ^= 1;
+    /* Pad R+B: the 4th SQ zone -- SPRITE software quality (full<->ld), INDEPENDENT of the wall/floor/
+       ceil detailshift (core sat_sprite_ld).  ld halves the software sprite fill (split/M0/M6); the
+       VDP1 world-things (1p M4) ignore it.  R held + B; the incidental USE tap to Doom is harmless
+       (mirrors the R+A wall-clamp chord).  Row 7 SQ 4th char. */
+    if (!(cur & PER_DGT_TR) && (changed & PER_DGT_TB) && !(cur & PER_DGT_TB))
+    { sq_sprite = (sq_sprite == SQ_FULL) ? SQ_LD : SQ_FULL; sat_apply_mode(); }
 #elif SAT_FLOOR_PERFSIM
     /* Pad Y cycles the 4 floor PERF-SIM modes (read REC/P rows 4/5 in each = the floor-offload
        ceiling, valid for RBG0 / VDP1-strips / gradient alike).  No RBG0/RAMCTL -> overlay stays

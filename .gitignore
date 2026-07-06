@@ -43,3 +43,6 @@ tools/hud2p_preview.png
 # Python bytecode cache (tools/)
 __pycache__/
 *.pyc
+
+# Reference material kept locally, not committed (e.g. SEGA DTS CD ISO, ~525 MB)
+refs/

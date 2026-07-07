@@ -47,6 +47,31 @@ extern "C" void sat_debug_row0(const char *s);
 /* SRL::Cd::File held open for the game's lifetime in CD mode */
 static SRL::Cd::File *wad_cd_file = nullptr;
 
+/* R2.2 (STREAMING_FLUIDITY_ROADMAP.md sec.5) -- persistent GFS handle on the WAD.
+** SRL::Cd::File::LoadBytes is a full GFS_Load (open / seek / play / wait-pause / close +
+** read-ahead DISCARD) on EVERY read.  A handle held OPEN lets each read be just
+** GFS_Seek (pointer-only, no CD command) + GFS_Fread, which RIDES the CD-block's
+** autonomous read-ahead -- so on a REAL CD a level's many reads stop paying the per-read
+** physical seek/wait-pause.
+**
+** DEFAULT-OFF 2026-07-07 -- HW-MEASURED REGRESSION on a fast-seek SD ODE (Phoebe): with an
+** instant-seek medium there is no physical seek to save, and Doom reads lumps at RANDOM
+** offsets (each read GFS_Seeks absolute), so the GFS read-ahead-to-EOF (GFS_RPARA_DFL) after
+** every read is pure churn -- the CD-block keeps streaming data the next seek discards and
+** keeps the ODE's virtual drive active.  Worse, just HOLDING the handle open is a constant
+** timing drag (game-time dilation, NOT fps) -- so it hurt on BOTH the persistent (p1) and
+** LoadBytes (p0) read paths, because p0/p1 only toggles whether reads USE the handle, not
+** whether it is OPEN.  Net: slower level loads (2->4 s) + a constant slow feel on the Phoebe.
+** So default 0 => the handle is NEVER opened (W_SaturnCDInit below) => zero R2.2 footprint,
+** byte-behaviour-identical to the pre-R2 LoadBytes path.  The code stays as a compile/A-B
+** opt-in for a REAL-CD Saturn (flip to 1 + Makefile SRL_MAX_CD_BACKGROUND_JOBS=2 + rebuild),
+** where physical seek dominates and read-ahead pays -- ideally with R3.2 access-ordered blobs
+** so the reads are sequential (then read-ahead is used, not discarded).  Additive + fail-safe:
+** null handle => LoadBytes; a persistent read error => LoadBytes for that read. */
+extern "C" int sat_cd_persistent       = 0;   /* 0 = LoadBytes only (default; ODE-safe); 1 = persistent GFS_Seek+Fread (real-CD opt-in) */
+extern "C" int sat_cd_persist_fallbacks = 0;   /* persistent reads that fell back to LoadBytes (flaky handle) */
+static GfsHn   wad_hn = nullptr;                /* the persistent handle (null => not open; stays null while default-off) */
+
 /*
 ** W_SaturnCDInit -- open DOOM1.WAD via SRL::Cd::File and record its size.
 ** Called by dg_saturn.cxx when no RAM cartridge is found.
@@ -119,6 +144,19 @@ extern "C" int W_SaturnCDInit(void)
         sprintf(msg, "CD:WAD=%u nl=%d", sat_wad_size, (int)numlumps);
         sat_debug_row0(msg);
     }
+
+    /* R2.2: open the persistent GFS handle now that the fid + directory record are known
+    ** (the SRL File ctor above already resolved the name and loaded the dir).  Best-effort:
+    ** a null handle just leaves sat_cd_persistent effectively off (reads use LoadBytes).
+    ** Held open for the game's lifetime -- one WAD, reads are serial on the master.  Needs
+    ** SRL_MAX_CD_BACKGROUND_JOBS >= 2 (Makefile) so the LoadBytes fallback's transient
+    ** GFS_Load handle can coexist with this one. */
+    if (sat_cd_persistent)
+    {
+        wad_hn = GFS_Open(wad_cd_file->GetIdentifier());
+        if (!wad_hn) sat_cd_persistent = 0;   /* open failed -> stay on the proven LoadBytes path */
+    }
+
     return sat_wad_size > 12 ? 1 : 0;
 }
 
@@ -172,10 +210,38 @@ extern "C" int sat_cd_loads = 0;
 extern "C" int sat_cd_persector = 0;
 #define SAT_CD_READ_RETRIES 8
 
+/* R2.2 persistent read: absolute sector seek (pointer-only) + blocking Fread on the open
+** handle.  Same (sector, bytes, dst) contract as the LoadBytes path, so it drops straight
+** into both the fast path and sat_cd_bounce.  GFS_Fread reads whole sectors but caps the
+** transfer at `bytes` (bsize), matching GFS_Load's truncation -- so an arbitrary byte count
+** into an exactly-sized buffer is safe (same as LoadBytes today). */
+static int sat_cd_load_hn(size_t sector, int32_t bytes, void *dst)
+{
+    if (!wad_hn) return -1;
+    if (GFS_Seek(wad_hn, (int32_t)sector, GFS_SEEK_SET) < 0) return -1;
+    int32_t nsct = (bytes + 2047) >> 11;
+    return GFS_Fread(wad_hn, nsct, dst, bytes);
+}
+
 static int sat_cd_load(size_t sector, int32_t bytes, void *dst)
 {
     sat_cd_loads++;
-    int got = wad_cd_file->LoadBytes(sector, bytes, dst);
+    int got;
+
+    /* Persistent path first (rides read-ahead); retry hard, then fall back to LoadBytes. */
+    if (sat_cd_persistent && wad_hn)
+    {
+        got = sat_cd_load_hn(sector, bytes, dst);
+        for (int attempt = 1; got <= 0 && attempt < SAT_CD_READ_RETRIES; ++attempt)
+        {
+            sat_cd_read_retries++;
+            got = sat_cd_load_hn(sector, bytes, dst);
+        }
+        if (got > 0) return got;
+        sat_cd_persist_fallbacks++;   /* handle proved flaky this read -> LoadBytes below */
+    }
+
+    got = wad_cd_file->LoadBytes(sector, bytes, dst);
     for (int attempt = 1; got <= 0 && attempt < SAT_CD_READ_RETRIES; ++attempt)
     {
         sat_cd_read_retries++;

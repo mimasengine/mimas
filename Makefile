@@ -13,7 +13,13 @@ SRL_MAX_TEXTURES          = 16      # We don't use VDP1 textures
 SRL_MODE                  = NTSC
 SRL_HIGH_RES              = 0
 SRL_FRAMERATE             = 0
-SRL_MAX_CD_BACKGROUND_JOBS = 1
+SRL_MAX_CD_BACKGROUND_JOBS = 1   # R2.1 reverted 2026-07-07: the R2.2 persistent WAD handle
+                                 # REGRESSED on a fast-seek SD ODE (Phoebe) -- an open GFS handle
+                                 # keeps the CD-block read-ahead / virtual drive active = a constant
+                                 # timing drag (game-time dilation, not fps) present even with the
+                                 # read path toggled off.  R2.2 is now default-off + never opens the
+                                 # handle, so open_max=1 is enough again.  Restore =2 only to A/B R2.2
+                                 # on a REAL-CD Saturn (where physical seek dominates + read-ahead pays).
 SRL_MAX_CD_FILES          = 24   # GFS reads at most this many dir entries (incl. '.'/'..');
                                  # cd/data now holds DOOM1.WAD + DOOMRP.DRP + CDDAMAP.TXT +
                                  # SGL drivers/text (~12 entries). At 8, DOOM1.WAD sorted past

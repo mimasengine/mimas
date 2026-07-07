@@ -215,10 +215,10 @@ extern "C" int   r_drawseg_peak;   /* core r_bsp.c: running high-water of drawse
 extern "C" int   sightcounts[2];   /* core p_sight.c: [0]=REJECT trivial-rejects, [1]=full BSP LOS walks */
 extern "C" int   sat_floor_vq_cur, sat_floor_vq_peak;  /* VDP1-floor inc-0 estimate, shown on row 2 */
 extern "C" unsigned int sat_sky_px, sat_floor_px;  /* sky-vs-floor coverage classifier (row 13) */
-extern "C" int sat_plane_vscale;      /* deported-plane VERTICAL decrochage fill scale (pad R+Up/Down) */
+extern "C" int sat_plane_vscale;      /* deported-plane VERTICAL decrochage fill scale (baked at 4; live pad knob cut 2026-07-07) */
 extern "C" int sat_plane_border_max;  /* px cap on BOTH decrochage borders (core r_main.c, default 40 =
                                          legacy).  Set low (10) for SAT_FLOOR_TEX so a fast turn cannot
-                                         blanket a textured plane in potato colour; pad R+Left/Right. */
+                                         blanket a textured plane in potato colour (baked; live pad knob cut 2026-07-07). */
 extern "C" int sat_plane_fill_mode;   /* core r_plane.c: 0 = uniform-B perimeter (legacy), 1 = SWEPT
                                          per-column band from the claimed-region history (owner's
                                          red-band design) -- fills exactly the mask-vs-VDP1 gap. */
@@ -350,7 +350,7 @@ extern "C" int W_SaturnCDInit(void);
 #if VDP2_CELL_SKY
 static void sky_cell_init(void);        /* forward decl: defined below, called from DG_Init */
 static void sky_cell_build_map(void);   /* forward decl: rebuilds the sky map (live horizon tune) */
-static int  sky_horizon_row = SKY_HORIZON_ROW;  /* live HW-sky horizon row (pad L + Up/Down); bake into SKY_HORIZON_ROW when tuned */
+static int  sky_horizon_row = SKY_HORIZON_ROW;  /* HW-sky horizon row (baked at SKY_HORIZON_ROW=96; live pad knob cut 2026-07-07). Still re-derived live by the horizon auto-track (~5669). */
 #endif
 /* VDP2_SPLIT_HW_SKY (Part 5 -- docs/RBG0_SKY_SPLIT_ANALYSIS.md §5): 1 = in a co-op split give ONE
    ELECTED view the hardware NBG0 sky (the others keep the software sky), CONFINED to that view's band
@@ -714,12 +714,10 @@ static const struct { int dma; int w5; } blit_cfg[] = {
     { 1, 1 },   /* 3: d5  slDMACopy sync + W5           -- parked */
 };
 #define BLIT_CFG_N ((int)(sizeof(blit_cfg) / sizeof(blit_cfg[0])))
-/* Live pad-L+A A/B ring: c5 (CPU + W5, default) <-> c- (CPU, W5 off) -- the safe W5 on/off A/B.
-   slDMACopy paths (2,3) parked off-ring (no win). */
-static const int blit_cycle[] = { 1, 0 };
-#define BLIT_CYCLE_N ((int)(sizeof(blit_cycle) / sizeof(blit_cycle[0])))
-static int blit_cycle_i = 0;   /* index into blit_cycle; 0 -> blit_mode 1 (c5) at boot */
-static int blit_mode = 1;      /* boot: c5 (CPU + W5) = blit_cycle[0] */
+/* Blit config: c5 = CPU memcpy + W5 (skip the unchanged static-HUD band).  The old pad-L+A A/B
+   ring (c5<->c-, plus the HW-dead slDMACopy paths) was cut 2026-07-07 -- W5 is a real idle-time
+   win so it stays ON permanently; blit_mode is fixed at 1.  See [[blit-dma-lever]] / BLIT_DMA_PLAN. */
+static int blit_mode = 1;      /* c5 (CPU + W5); was the L+A ring index, now fixed */
 /* SATURN PERF: last frame's framebuffer->VDP2 blit wall-clock in ms*10 (master FRT delta
    around the copy, INCLUDING the dual-blit slave-join spin).  This is the number that
    decides dual-CPU blit GO/DROP -- fps/MST are too coarse (~12ms of a ~100ms frame).
@@ -1535,15 +1533,17 @@ static void fps_update(void)
            to = slave-timeout count (must stay 0 -- the RP_CMD_BUF-shrink safety);
            cd = CD read-retries (whackCD): 0 = clean disc, climbing = flaky reads. */
         extern int sat_cd_read_retries;   /* w_file_saturn.cxx */
+        extern int sat_cd_loads;          /* R1: cumulative GFS_Load chunk commands (watch the warp jump) */
+        extern int sat_cd_persector;      /* R1: what the old per-sector path would have issued (baseline) */
         /* row 0 HEADLINE: inst fps, EMA(~4s) avg (the build-comparison number), MST (=1000/fps, the
            master frame ms), to = slave-timeout count (must stay 0), cd = CD read-retries.  Shown in
            every overlay mode except OFF(2); the fps-only mode(1) shows ONLY this row, so the
            mode0<->mode1 fps delta measures the overlay's own per-frame tax. */
         unsigned int mst = inst10 ? (10000u / inst10) : 0u;
         static char r0[45];
-        sprintf(r0, "%u.%ufps a%u.%u MST%u to%d cd%d      ",
+        sprintf(r0, "%u.%ufps a%u.%u MST%u to%d cd%d ld%d/%d ",
                 inst10 / 10, inst10 % 10, avg10 / 10, avg10 % 10,
-                mst, rp_timeout_count, sat_cd_read_retries);
+                mst, rp_timeout_count, sat_cd_read_retries, sat_cd_loads, sat_cd_persector);
         if (sat_dbg_overlay_mode != 2) SRL::Debug::Print(0, 0, r0);
         /* row 1: MASTER-FRAME COMPOSITION, window-AVERAGED over this 1s tick (ms) -- so a single
            heavy frame is never read as the general case (percentiles are on row 3).  Decomposes MST:
@@ -1636,6 +1636,23 @@ static void fps_update(void)
                     sat_prof_pk_bw/10, sat_prof_pk_bw%10, sat_prof_pk_bp/10, sat_prof_pk_bp%10,
                     sat_prof_pk_p/10,  sat_prof_pk_p%10,  sat_prof_pk_m/10,  sat_prof_pk_m%10);
             if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 4, r10);   /* row 4: per-phase peaks */
+            /* row 5: SGL slave work-pointer creep watch (the idle menu/intermission freeze).
+               W72 = *(GBR+72) low 16 bits + delta vs the previous ~1s window.  slSetScreenDist
+               (per-frame RBG0 transform) bump-allocates +8B here; render frames rewind it at the
+               dispatch sites, no-render frames via the DG_DrawFrame fallback reset.  HEALTHY =
+               d stays ~0 everywhere (menu, intermission, automap, in-game).  Pre-fix the menu
+               crept d~+0x118/s up to the GBR+20 vblank callback = the freeze.  Remove this row
+               once HW-validated. */
+            {
+                unsigned int _gbr; __asm__ volatile ("stc gbr,%0" : "=r"(_gbr));
+                unsigned int _w72 = *(volatile unsigned int *)(_gbr + 72);
+                static unsigned int _w72_prev = 0;
+                static char rW72[40];
+                snprintf(rW72, sizeof rW72, "W72 %04x d%+d      ",
+                         _w72 & 0xffff, (int)(_w72 - _w72_prev));
+                _w72_prev = _w72;
+                if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 5, rW72);
+            }
             /* row 9: WHERE/WHEN the REC-max frame was (the locator), so the worst frame is
                reproducible.  m=map, x,y=player render pos (map units), a=angle 0-255,
                t=sec into the level.  ~31 cols worst case (6-digit coords). */
@@ -1763,6 +1780,19 @@ static void fps_update(void)
                      fb_cur_px >> 10, fb_pk_px >> 10,
                      fb_cur_wclamp, sat_wall_clamp ? '+' : '-');
             (void)rFB;   /* FBK wall-fallback sizer row cut */
+            /* row 12: R2 CD-streaming persistent-handle A/B (CD mode only -- cart mode reads
+               from RAM).  p = sat_cd_persistent (1 = GFS_Seek+Fread on the open handle, rides
+               read-ahead; 0 = LoadBytes per read).  fb = persistent reads that fell back to
+               LoadBytes (should stay 0; climbing = flaky handle).  Toggle live with pad L+A and
+               compare level-load feel on HW (Ymir can't time the CD).  See STREAMING_FLUIDITY R2. */
+            if (sat_wad_base == nullptr)   /* CD-streaming mode */
+            {
+                extern int sat_cd_persistent, sat_cd_persist_fallbacks;
+                static char rR2[45];
+                snprintf(rR2, sizeof rR2, "CD persist p%d fb%d  L+A      ",
+                         sat_cd_persistent, sat_cd_persist_fallbacks);
+                if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 12, rR2);
+            }
             /* row 18: memory-latency calibration (one-shot cold 32 KB read per bank, FRT
                ticks).  rL = LWRAM/HWRAM ratio -- >1.0 means LWRAM (cmd buf + visplanes) is
                the slow bank, = the memory-bound penalty + the L2-relocate upside, measured
@@ -2894,18 +2924,41 @@ static const unsigned int VDP1_BANK[2] = { 0x25C00100u, 0x25C02100u };
 #define WPN_TEX_SLOTS  4
 #define WPN_CMDCOLR    (0x2000u | 0x0100u)/* pr bit13 -> register 1 (=7, above NBG1) | CRAM bank 1
                                              (full-bright PLAYPAL; texel = the light-shaded index) */
+/* SPLIT (the multi firing tear, was the parked "8-slot follow-up"): 2-4 views x (gun+flash) =
+   up to 8 lumps/frame thrashed the shared 2-slot parity half -- a later view's bake OVERWROTE a
+   texture the SAME frame's earlier quads reference = torn/wrong weapon on every fire.  Fix: the
+   SAME 64KB re-addressed as 16 x 4KB HALF-RES slots = [parity(8)][view(2 each)].  The split
+   weapon draws at 0.5 scale (pspritescale, viewwidth 160), so a half-res bake is 1:1 on screen =
+   zero visual loss, ~1/4 the bake cost, and 4KB/frame fits (max frame SHTGD0 120x131 -> 64x66;
+   the >4KB tail rows of such raise/lower frames are cropped -- bottom-anchored + view-clipped =
+   invisible).  Doom has NUMPSPRITES==2, so 2 dedicated slots per view suffice: no cross-view
+   eviction.  Within-frame overwrite (gun HIT + flash MISS landing on the gun's slot -- the
+   one-frame fire tear) is prevented by the per-frame `used` guard below, same recipe as
+   thing_cache. */
+#define WPN_SPL_SLOTSZ 0x1000u            /* 4 KB half-res split slot */
+#define WPN_SPL_SLOTS  16                 /* 2 parities x 4 views x 2 psprites, same 64KB region */
 #else
 #define WPN_TEX_BASE   0x25C45000u
 #define WPN_TEX_SLOTSZ 0xB000u            /* 44 KB -> up to ~160x140 padded */
 #define WPN_TEX_SLOTS  4
+#define WPN_SPL_SLOTSZ WPN_TEX_SLOTSZ     /* legacy RGB path: no split re-addressing */
+#define WPN_SPL_SLOTS  WPN_TEX_SLOTS
 #endif
-static struct { int lump; const unsigned char *cmap; int padW; int H; }
-                    wpn_cache[WPN_TEX_SLOTS];
+#define WPN_CACHE_N   (WPN_SPL_SLOTS > WPN_TEX_SLOTS ? WPN_SPL_SLOTS : WPN_TEX_SLOTS)
+/* `used` = a quad of THIS frame's list references the slot (set on HIT and on bake, cleared each
+   frame in sat_vdp1_wpn_begin): a same-frame MISS must never bake over a used slot, or the
+   already-emitted quad plots the wrong texture (the "torn gun for one frame on fire" bug --
+   gun HIT slot s, flash lump changes -> MISS with the rr cursor parked on s). */
+static struct { int lump; const unsigned char *cmap; int padW; int H; unsigned char used; }
+                    wpn_cache[WPN_CACHE_N];
 /* TEAR-SAFE: partition the weapon slots by frame parity (like thing_cache) -- bake ONLY into the
    write-parity half so the DISPLAYED half is never re-baked mid-plot.  1p fires gun+flash = 2 lumps
-   <= WPN_SLOTS_PER, so it fits; split (2-4 weapons) still wants the parked 8-slot follow-up. */
+   <= WPN_SLOTS_PER, so it fits; split uses the per-(parity,view) half-res slots above. */
 #define WPN_SLOTS_PER (WPN_TEX_SLOTS / 2)
-static int          wpn_cache_rr[2];   /* per-parity round-robin cursor */
+static int           wpn_cache_rr[2];      /* 1p: per-parity round-robin cursor */
+static unsigned char wpn_rr_spl[2][4];     /* split: per-(parity,view) cursor within its 2 slots */
+static int           wpn_cache_split = -1; /* addressing mode the cache holds (1p/split); a flip
+                                              relocates+rescales every slot -> invalidate all */
 
 static volatile int vd1_dr_live;   /* 1 = a world list is linked -> the vblank Dr sampler counts */
 static int          vdp1_bank;     /* weapon bank VDP1 is currently displaying */
@@ -3189,13 +3242,12 @@ extern "C" void DG_FadeIn(void)     /* rise the freshly-drawn frame from black *
    hook REJECTS the wall and the core renders it in SOFTWARE (no sky) -- so the cap is also the
    VDP1->CPU starvation handoff. */
 #define WALL_ACC_MAX 128   /* restored to 128: lumpinfo moved to the LWRAM Doom zone + HEAP_SIZE trimmed 88->32KB (syscalls.c) freed ~56KB to the TLSF pool, so the 3p-minimap pool pressure is gone and full wall capacity is back. 1p peaks ~57 << 128. */
-#define WALL_PX_BUDGET 200000 /* accumulated wall fill (screen px) beyond which further walls are
-                                 REJECTED to the software fallback -- BSP visits near-first, so
-                                 the sacrificed walls are the FARTHEST (owner: "les plus eloignes
-                                 drop au CPU").  SAFETY NET ONLY: at 90k it starved corridor
-                                 scenes to ~5 VDP1 walls and Bp exploded to 25-58ms (owner
-                                 overlays 2026-07-03); 200k (~3x screen) only bites pathological
-                                 overdraw.  FBK `s` counts the rejects. */
+/* Fill px past which the remaining (FARTHEST -- BSP is near-first) walls fall back to CPU software
+   instead of overloading the VDP1 plot before vblank.  Was a live pad L+Left/Right sweep; the HW
+   sweep proved wall-offload a NET LOSS (MST 76->129 as the budget drops -- it rejects the cheapest
+   walls; see memory wall-offload-vdp1-slave-dead 2026-07-07), so it is baked back to ~off (200k).
+   FBK `s` counts the rejects. */
+#define WALL_PX_BUDGET 200000
 static int wall_px_acc;    /* fill claimed so far this frame (reset with wall_acc_n) */
 /* vx/vxr = the view's framebuffer x-range [vx, vxr] this wall belongs to (split-screen: 0..159 for
    the left view, 160..319 for the right).  x1/x2 are stored ALREADY offset by viewwindowx, so the
@@ -3234,7 +3286,7 @@ extern "C" int sat_wall_vdp1(int x1, int yl1, int yh1, int x2, int yl2, int yh2,
         int h1 = yh1 - yl1 + 1; if (h1 < 0) h1 = 0;
         int h2 = yh2 - yl2 + 1; if (h2 < 0) h2 = 0;
         int a  = aw * ((h1 + h2) >> 1);
-        if (wall_px_acc + a > WALL_PX_BUDGET) return 1;   /* -> CPU */
+        if (wall_px_acc + a > WALL_PX_BUDGET) return 1;   /* -> CPU software fallback */
         wall_px_acc += a;
     }
     int vx = viewwindowx, vy = viewwindowy;
@@ -3331,12 +3383,20 @@ static int wall_tex_resolve(int texnum, const unsigned char *cmap)
    (bounds VDP1 fill + coordinate range). */
 #define MAXWALLTILES 12   /* horizontal tiles per wall (more = fewer long-wall sky gaps) */
 #define MAXVBANDS    4    /* vertical texture-height bands per wall (wrap / tall-wall tiling) */
-static int wall_ext = 96;  /* extend past a screen edge before the squish fallback.  MAGNIFIED
-                              (close/face-on) walls -- which squish badly at the edge and CAN'T be
-                              fixed on VDP1 (DISTORSP can't address a texture column-subrange) -- are
-                              rendered in SOFTWARE upstream (core r_segs.c magnification fallback), so
-                              they never reach here; this only handles normal/grazing walls (low mag,
-                              small extrapolation -> squish is rare/mild). */
+static int wall_ext = 768; /* how far a tile's extrapolated extent may run past the view window
+                              before the squish fallback.  The extrapolated tile + user-clip window
+                              is the CORRECT path (exact texels); off-window pixels only cost idle
+                              VDP1 iteration (writes suppressed), so the allowance is generous:
+                              768 covers the worst overhang of a routed wall (<= SAT_WALL_CPU_MAG
+                              = 3 px/texel x texw-1 = 765 for texw=256).  The fallback is now only
+                              a VDP1 coordinate-range guard (with the +/-1000 absolute clamps in
+                              the test below), NOT the edge-tile default -- the old 96 was what
+                              squished ("ecrasement") wall textures against the screen edges.
+                              NOTE: magnified walls DO reach here since SAT_WALL_SUBDIV (as
+                              re-sampled sub-segs); hyper-magnified sub-segs that could only land
+                              in the fallback are routed to software upstream (r_segs.c subdiv
+                              guards).  HW tuning knob if edge-heavy scenes overrun the vblank:
+                              768 -> 512 -> 384 (judge via row-11 DF split, live A/B only). */
 
 /* Flat quad screen-y clamp: a flat fill has NO texture, so clamping its geometry is FREE (no v ->
    no swim) and bounds the VDP1 fill.  The clamp band is now THIS VIEW's [vyt, vyb] (read per-wall
@@ -3445,7 +3505,15 @@ static void wall_emit_band(int x1, int x2, int yl1, int yh1, int yl2, int yh2,
         int yle = yl1 + WDIV((long long)(yl2 - yl1) * (xe - x1), xspan, inv_xspan);
         int yhe = yh1 + WDIV((long long)(yh2 - yh1) * (xe - x1), xspan, inv_xspan);
 
-        if (lo >= -wall_ext && hi <= 320 + wall_ext)     /* extend + window-clip (correct) */
+        /* correct path = extrapolated tile + window-clip: allowance is view-window-relative
+           (split-safe), plus ABSOLUTE +/-1000 clamps on every corner coordinate so the larger
+           extrapolation can never wrap the signed 13-bit VDP1 coordinate field (the y's are
+           extrapolated AT xs/xe and can explode on sloped walls; sole known residual: a
+           texw=256 right-edge tile with xe in (1000,1087] still falls back). */
+        if (lo >= vx - wall_ext && hi <= vxr + wall_ext
+            && lo > -1000 && hi < 1000
+            && yls > -1000 && yls < 1000 && yhs > -1000 && yhs < 1000
+            && yle > -1000 && yle < 1000 && yhe > -1000 && yhe < 1000)
         {
             if (!winset)
             {
@@ -4730,8 +4798,9 @@ static void vdp1_wpn_init(void)
     vdp1_cmd_at(VDP1_BANKE_ADDR, 1, cmd);
 
     vdp1_bank = 0; vdp1_wactive = 0;
-    for (int i = 0; i < WPN_TEX_SLOTS; ++i) wpn_cache[i].lump = -1;
+    for (int i = 0; i < WPN_CACHE_N; ++i) wpn_cache[i].lump = -1;
     wpn_cache_rr[0] = wpn_cache_rr[1] = 0;
+    memset(wpn_rr_spl, 0, sizeof wpn_rr_spl);
 #if SAT_WORLD_THINGS_VDP1
     thing_lru_tick = 0;
     for (int p = 0; p < 2; ++p)
@@ -4773,7 +4842,7 @@ extern "C" void sat_vdp1_wpn_begin(void)
        DG_DrawFrame).  The weapon/HUD caches below are dead (software now) -- left harmless. */
     if (palette_changed)
     {
-        for (int i = 0; i < WPN_TEX_SLOTS; ++i) wpn_cache[i].lump = -1;
+        for (int i = 0; i < WPN_CACHE_N; ++i) { wpn_cache[i].lump = -1; wpn_cache[i].used = 0; }
         vdp1_hud_csum = 0xFFFFFFFFu;
     }
 #if SAT_WORLD_THINGS_VDP1
@@ -4792,6 +4861,10 @@ extern "C" void sat_vdp1_wpn_begin(void)
         for (int i = 0; i < THINGS_TEX_SLOTS; ++i) thing_cache[p][i].used = 0;
     }
 #endif
+    /* weapon cache: same per-frame `used` clear (all slots -- the displayed parity's flags are
+       never read).  Every weapon emission runs AFTER this begin inside sat_walls_kick (1p and
+       split), and the menu/intermission fallback caller emits no weapon -> never stale. */
+    for (int i = 0; i < WPN_CACHE_N; ++i) wpn_cache[i].used = 0;
     memset(cmd, 0, sizeof cmd);
     cmd[0] = 0x000A;                                 /* bank cmd0 = local coord */
     cmd[7] = VIEW_Y_OFFSET;                          /* local Y origin -> walls centred like NBG1 */
@@ -4871,34 +4944,69 @@ extern "C" void sat_vdp1_wpn_draw(patch_t *patch, int lump, int sx, int sy, int 
 
     if (vdp1_wnext >= VDP1_CMD_GUARD) return;         /* command-bank slot guard */
 
-    int wp = (vdp1_wbank & 1) * WPN_SLOTS_PER;        /* write-parity slot base (tear-safe) */
-    for (int i = 0; i < WPN_SLOTS_PER; ++i)           /* cache lookup within the write parity: (lump, cmap) */
+#if SAT_WPN_VDP1
+    int split = sat_split_active;
+    if (split != wpn_cache_split)
+    {   /* 1p<->split flips the slot ADDRESSING (4x16KB full-res <-> 16x4KB half-res over the same
+           64KB): every cached texture is at the wrong address/resolution for the new mode. */
+        for (int i = 0; i < WPN_CACHE_N; ++i) { wpn_cache[i].lump = -1; wpn_cache[i].used = 0; }
+        wpn_cache_rr[0] = wpn_cache_rr[1] = 0;
+        memset(wpn_rr_spl, 0, sizeof wpn_rr_spl);
+        wpn_cache_split = split;
+    }
+    unsigned int slotsz = split ? WPN_SPL_SLOTSZ : WPN_TEX_SLOTSZ;
+    int wp, pp = vdp1_wbank & 1;
+    int splview = 0;
+    if (split)
+    {   /* per-(parity,view) dedicated pair -- NUMPSPRITES==2 (gun+flash), so THIS view's lumps
+           always fit its own 2 slots: no cross-view eviction, no within-frame overwrite (the
+           multi firing tear).  sat_split_view is set per view by R_DrawSplitPlayerSprites. */
+        extern int sat_split_view;
+        splview = sat_split_view & 3;
+        wp = pp * (WPN_SPL_SLOTS / 2) + splview * 2;
+    }
+    else
+        wp = pp * WPN_SLOTS_PER;                      /* write-parity slot base (tear-safe) */
+#else
+    unsigned int slotsz = WPN_TEX_SLOTSZ;
+    int pp = vdp1_wbank & 1;
+    int wp = pp * WPN_SLOTS_PER;                      /* write-parity slot base (tear-safe) */
+#endif
+    for (int i = 0; i < 2; ++i)                       /* cache lookup within the pair: (lump, cmap) */
         if (wpn_cache[wp+i].lump == lump && wpn_cache[wp+i].cmap == cmap) { slot = wp+i; break; }
 
     if (slot >= 0)
     {
+        wpn_cache[slot].used = 1;    /* this frame's quad references it: a later same-frame
+                                        MISS (e.g. the flash) must not bake over it */
         padW = wpn_cache[slot].padW;
         H    = wpn_cache[slot].H;
     }
     else
     {
-        /* miss: unpack the patch into the next round-robin slot */
+        /* miss: unpack the patch into the next round-robin slot of the pair -- but never into a
+           slot a quad already emitted THIS frame references (the one-frame fire tear) */
         int W = (int)bswap16((unsigned short)patch->width);
         H     = (int)bswap16((unsigned short)patch->height);
         padW  = (W + 7) & ~7;
-        { int pp = vdp1_wbank & 1;                    /* round-robin WITHIN the write parity */
-          slot = pp * WPN_SLOTS_PER + wpn_cache_rr[pp];
-          wpn_cache_rr[pp] = (wpn_cache_rr[pp] + 1) % WPN_SLOTS_PER; }
+#if SAT_WPN_VDP1
+        if (split)
+        { int r = wpn_rr_spl[pp][splview];
+          if (wpn_cache[wp + r].used && !wpn_cache[wp + (r ^ 1)].used) r ^= 1;
+          slot = wp + r; wpn_rr_spl[pp][splview] = (unsigned char)(r ^ 1); }
+        else
+#endif
+        { int r = wpn_cache_rr[pp];
+          if (wpn_cache[wp + r].used && !wpn_cache[wp + ((r + 1) % WPN_SLOTS_PER)].used)
+              r = (r + 1) % WPN_SLOTS_PER;
+          slot = wp + r;
+          wpn_cache_rr[pp] = (r + 1) % WPN_SLOTS_PER; }
 
         const unsigned int *colofs = (const unsigned int *)patch->columnofs;
 #if SAT_WPN_VDP1
         /* 8BPP: 1 byte/texel = the LIGHT-SHADED Doom palette index (cmap[s[i]]); the CRAM bank 1
            (full-bright PLAYPAL) in WPN_CMDCOLR turns it back into the shaded colour.  Index 0 =
            transparent (SPD-off), so the padded gaps + true-black pixels show the scene through. */
-        if ((unsigned int)(padW * H) > WPN_TEX_SLOTSZ) return;       /* too big to cache */
-        volatile unsigned char *tex =
-            (volatile unsigned char *)(WPN_TEX_BASE + (unsigned int)slot * WPN_TEX_SLOTSZ);
-        for (int i = 0; i < padW * H; ++i) tex[i] = 0;               /* texel 0 = transparent gap */
         /* texel 0 is the HW transparent code, so a real black weapon pixel (shaded index 0) would
            punch a hole.  Remap 0 -> the darkest NON-zero palette index (looks black, stays opaque).
            Computed once per texture build from the live full-bright palette (bank 1 = colors[]). */
@@ -4908,6 +5016,43 @@ extern "C" void sat_vdp1_wpn_draw(patch_t *patch, int lump, int sx, int sy, int 
             int lum = colors[p].r + colors[p].g + colors[p].b;
             if (lum < blkbest) { blkbest = lum; blk = p; }
         }
+        if (split)
+        {   /* HALF-RES bake (2x point decimation, like the things mips): the split weapon draws
+               at 0.5 scale so this is 1:1 on screen.  Crop the rows that exceed the 4KB slot
+               (only the tallest raise/lower frames; bottom-anchored + view-clipped = invisible). */
+            padW = (((W + 1) >> 1) + 7) & ~7;
+            H    = (H + 1) >> 1;
+            while (H > 0 && (unsigned int)(padW * H) > WPN_SPL_SLOTSZ) H--;
+            if (H < 1) return;
+            volatile unsigned char *tex =
+                (volatile unsigned char *)(WPN_TEX_BASE + (unsigned int)slot * WPN_SPL_SLOTSZ);
+            for (int i = 0; i < padW * H; ++i) tex[i] = 0;           /* texel 0 = transparent gap */
+            for (int x = 0; x < W; x += 2)
+            {
+                const post_t *post = (const post_t *)((const unsigned char *)patch + bswap32(colofs[x]));
+                while (post->topdelta != 0xFF)
+                {
+                    const unsigned char *s = (const unsigned char *)post + 3;
+                    int top = post->topdelta;
+                    for (int i = 0; i < post->length; ++i)
+                    {
+                        int r = top + i;
+                        if (r & 1) continue;                          /* keep even source rows */
+                        r >>= 1;
+                        if (r >= H) break;                            /* cropped tail */
+                        int c = cmap[s[i]];
+                        tex[r * padW + (x >> 1)] = (unsigned char)(c ? c : blk);
+                    }
+                    post = (const post_t *)((const unsigned char *)post + post->length + 4);
+                }
+            }
+        }
+        else
+        {
+        if ((unsigned int)(padW * H) > WPN_TEX_SLOTSZ) return;       /* too big to cache */
+        volatile unsigned char *tex =
+            (volatile unsigned char *)(WPN_TEX_BASE + (unsigned int)slot * WPN_TEX_SLOTSZ);
+        for (int i = 0; i < padW * H; ++i) tex[i] = 0;               /* texel 0 = transparent gap */
         for (int x = 0; x < W; ++x)
         {
             const post_t *post = (const post_t *)((const unsigned char *)patch + bswap32(colofs[x]));
@@ -4922,6 +5067,7 @@ extern "C" void sat_vdp1_wpn_draw(patch_t *patch, int lump, int sx, int sy, int 
                 }
                 post = (const post_t *)((const unsigned char *)post + post->length + 4);
             }
+        }
         }
 #else
         if ((unsigned int)(padW * H) * 2u > WPN_TEX_SLOTSZ) return;  /* RGB555: 2 bytes/texel */
@@ -4943,9 +5089,10 @@ extern "C" void sat_vdp1_wpn_draw(patch_t *patch, int lump, int sx, int sy, int 
 #endif
         wpn_cache[slot].lump = lump; wpn_cache[slot].cmap = cmap;
         wpn_cache[slot].padW = padW; wpn_cache[slot].H = H;
+        wpn_cache[slot].used = 1;
     }
 
-    unsigned int texaddr = WPN_TEX_BASE + (unsigned int)slot * WPN_TEX_SLOTSZ;
+    unsigned int texaddr = WPN_TEX_BASE + (unsigned int)slot * slotsz;
     unsigned short cmd[16];
     memset(cmd, 0, sizeof cmd);
 #if SAT_WPN_VDP1
@@ -4959,6 +5106,8 @@ extern "C" void sat_vdp1_wpn_draw(patch_t *patch, int lump, int sx, int sy, int 
     {
         extern fixed_t pspritescale; extern int detailshift;
         unsigned int scale = (unsigned int)(pspritescale << detailshift);
+        if (split) scale <<= 1;    /* half-res texture x the 0.5 split view scale = 1:1 on screen
+                                      (padW/H below are the BAKED dims, halved by the split bake) */
         int x0 = (sx << detailshift) + viewwindowx;
         int y0 = sy + viewwindowy;
         int w  = (int)(((unsigned int)padW * scale) >> 16); if (w < 1) w = 1;
@@ -5613,6 +5762,14 @@ extern "C" void DG_DrawFrame(void)
        R_RenderPlayerView) -> the empty bank clears any stale walls.  Both before the
        palette_changed reset so the wall cache re-tints on a damage/pickup flash. */
     if (!vdp1_kicked_this_frame) {
+        /* NO-RENDER frame (menu/intermission/automap): rewind the SGL slave work-area pointers.
+           Every render frame gets this from the dispatch sites (rp_restart & co), but here NOBODY
+           resets them while the un-gated RBG0 block above still calls slSetScreenDist each frame,
+           which bump-allocates +8B from the GBR+72 transient buffer (LIBSGL sglC23.o, same pattern
+           as slSlaveFunc's +12) -> ~280 B/s creep -> overruns the vblank user-callback pointer at
+           GBR+20 after ~1-2 min -> _BlankIn jsr to garbage = the idle menu/intermission FREEZE.
+           No aux job is in flight on these frames, so the embedded RP_AuxWait join is free. */
+        rp_sgl_workptr_reset();
         unsigned short pk0 = frt_read();   /* SATURN PERF: present-kick ms (menu/intermission path) */
         sat_vdp1_wpn_begin(); vdp1_wpn_kick();
         sat_present_frt += (unsigned short)(frt_read() - pk0);
@@ -6036,32 +6193,26 @@ static void poll_pad(void)
         }
     }
 
-    /* Pad L+A: live A/B of the framebuffer BLIT (docs/BLIT_DMA_PLAN.md) -- toggles W5 (HUD-skip)
-       on/off across the safe ring c5 <-> c- (CPU blit; the ~1.3ms W5 A/B).  Row-1 'b<ms>c<-/5>'.
-       The SCU-DMA paths (s/a) are OFF-RING: HW-DEAD, cycling to them FROZE the console (SCU->VDP2
-       B-bus hang, 2026-07-05).  L held + A (edge); NOT L+R (the debug-overlay cycle).  The
-       incidental fire taps to Doom are harmless (mirrors the R+A wall-clamp chord). */
+    /* (Pad L+A blit A/B ring CUT 2026-07-07: W5 HUD-skip is a real idle win -> now permanently ON
+       (blit_mode fixed = c5); the slDMACopy paths were HW-dead.  docs/BLIT_DMA_PLAN.md.) */
+
+    /* Pad L+A now toggles the R2 CD persistent-handle read path (sat_cd_persistent, w_file_saturn.cxx)
+       for a live HW A/B of streaming fluidity: ON = GFS_Seek+Fread on the open handle (rides the CD
+       read-ahead), OFF = LoadBytes per read (a full GFS_Load).  Edge-triggered on A while L held (L
+       taps ',' and A taps fire -- harmless; toggle at a level boundary, not mid-combat).  Only
+       meaningful in CD mode; inert (but harmless) in cart mode.  Row 12 shows p<0/1> fb<n>. */
     if (!(cur & PER_DGT_TL) && (changed & PER_DGT_TA) && !(cur & PER_DGT_TA))
     {
-        blit_cycle_i = (blit_cycle_i + 1) % BLIT_CYCLE_N;
-        blit_mode = blit_cycle[blit_cycle_i];
+        extern int sat_cd_persistent;
+        sat_cd_persistent = !sat_cd_persistent;
     }
 
-    /* Pad R + Up/Down tunes the VERTICAL plane-decrochage fill scale (sat_plane_vscale, r_main.c): Up = MORE
-       vertical fill (bob / stairs / lifts), Down = LESS.  Clamped [0,16].  Live value on overlay row 5.  R is
-       the held modifier (R+C = M5 A/B, uses C -- no clash); the incidental Up/Down player-nudge during tuning
-       is minor, same as the L+Up/Down sky-horizon knob. */
-    if (!(cur & PER_DGT_TR))   /* R held */
-    {
-        if ((changed & PER_DGT_KU) && !(cur & PER_DGT_KU) && sat_plane_vscale < 16) sat_plane_vscale++;
-        if ((changed & PER_DGT_KD) && !(cur & PER_DGT_KD) && sat_plane_vscale > 0)  sat_plane_vscale--;
-        /* R + Left/Right tunes the decrochage border CAP (sat_plane_border_max, r_main.c): the px
-           ceiling both borders saturate at during a fast turn.  With textured VDP1 planes the old
-           40px ceiling blanketed any plane narrower than 80px in potato colour; the low default
-           (10) keeps the texture visible at the price of a thin stale strip.  Row 8 `bM`. */
-        if ((changed & PER_DGT_KR) && !(cur & PER_DGT_KR) && sat_plane_border_max < 40) sat_plane_border_max += 2;
-        if ((changed & PER_DGT_KL) && !(cur & PER_DGT_KL) && sat_plane_border_max > 0)  sat_plane_border_max -= 2;
-    }
+    /* (Pad R+Up/Down vertical decrochage-fill + R+Left/Right border-cap knobs CUT 2026-07-07 --
+       tuning finished, values baked: sat_plane_vscale=4 (r_main.c), sat_plane_border_max=10
+       (dg_saturn.cxx:~2738).  R+Up/Down/Left/Right are free.) */
+
+    /* (Pad L+Left/Right WALL_PX_BUDGET wall-offload A/B CUT 2026-07-07 -- settled-negative on HW
+       (net loss); WALL_PX_BUDGET baked to 200k.  L+Left/Right are free.) */
 
     /* (R+C M5 BSP-staging A/B cut -- settled-negative; the staging mechanism stays inert in core.
        R+C is now the CEILING SQ knob below; C alone still cycles the plane-split pmode.) */
@@ -6117,25 +6268,9 @@ static void poll_pad(void)
     if (!(cur & PER_DGT_TL) && (changed & PER_DGT_TC) && !(cur & PER_DGT_TC))
         hwsky_split_on = !hwsky_split_on;
 #endif
-#if VDP2_CELL_SKY && !RBG0_LINECOL_TEST
-    /* Pad L + Up/Down nudges the HW-sky horizon (the row where the sky turns transparent so the
-       floor shows below it), 8px (one cell row) per press.  Up raises the horizon up the screen,
-       Down lowers it.  (L taps ',' and Up/Down also move the player -- minor during tuning.)
-       Bake the found value into SKY_HORIZON_ROW and remove this block once tuned. */
-    if (!(cur & PER_DGT_TL))   /* L held */
-    {
-        int adj = 0;
-        if ((changed & PER_DGT_KU) && !(cur & PER_DGT_KU)) adj = -8;  /* Up: raise the horizon  */
-        if ((changed & PER_DGT_KD) && !(cur & PER_DGT_KD)) adj = +8;  /* Down: lower the horizon */
-        if (adj)
-        {
-            sky_horizon_row += adj;
-            if (sky_horizon_row < 8)   sky_horizon_row = 8;
-            if (sky_horizon_row > 128) sky_horizon_row = 128;
-            sky_cell_build_map();
-        }
-    }
-#endif
+    /* (Pad L+Up/Down HW-sky horizon nudge CUT 2026-07-07 -- tuning finished, baked into
+       SKY_HORIZON_ROW=96 (dg_saturn.cxx:~361).  L+Up/Down are free.  sky_cell_build_map() is
+       still driven live by the horizon auto-track at ~5669.) */
     /* (WIP: the L/R/C live floor-tuning toggles for the parked distance-gradient were removed for the
        bake-only ship.  rbg0_floor_dim/contrast + the veil params keep their baked defaults.  Re-add
        these handlers + the pad_map movement gate below to resume tuning the gradient.) */

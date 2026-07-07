@@ -135,6 +135,7 @@ SRL_CUSTOM_CCFLAGS = -w -fsigned-char \
     -DTEXCACHE_MARGIN=0x20000 \
     -DSAT_REPACK \
     -DSAT_DEFER_SOUND_INIT \
+    -DSAT_SND_PRECACHE \
     -Isaturn_libc \
     -Isrc \
     -Icore \

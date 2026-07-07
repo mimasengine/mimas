@@ -645,6 +645,21 @@ extern "C" void I_PrecacheSounds(sfxinfo_t *sounds, int num_sounds)
     (void)sounds; (void)num_sounds;
 }
 
+/* SATURN (SAT_SND_PRECACHE): warm ONE sfx into SCSP RAM ahead of its first play.  Reuses
+ * the exact play-path caching (link redirect + lumpnum resolve + cache_sfx = the CD read
+ * + PCM upload) so the FIRST play of a never-before-heard sfx no longer stalls the gameplay
+ * frame.  Called from the level-sound precache (core p_setup.c) at load time.  Idempotent
+ * (cache_sfx dedupes via driver_data) and fail-safe: on any failure the sfx simply stays
+ * un-warmed and lazy-loads on first play as before.  Doom-zone cost = 0 (PCM -> SCSP). */
+extern "C" void I_CacheSound(sfxinfo_t *sfxinfo)
+{
+    if (!sound_ready || sfxinfo == NULL) return;
+    if (sfxinfo->link != NULL) sfxinfo = sfxinfo->link;
+    if (sfxinfo->lumpnum < 0)
+        sfxinfo->lumpnum = I_GetSfxLumpNum(sfxinfo);
+    (void)cache_sfx(sfxinfo);
+}
+
 /* ================================================================== */
 /* Doom I_ interface -- Music                                          */
 /* ================================================================== */

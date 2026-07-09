@@ -788,6 +788,10 @@ extern "C" int sat_visplane_hash;
    work-steal); pad Y toggles it live -> read row-3 'w' (master wait at the barrier) + 'P' + fps.
    Row 1 shows ws<state>; the profiler window auto-resets on the flip. */
 extern "C" int sat_plane_steal;
+/* core/r_plane.c: RBG0 mark-suppress -- keep the never-drawn dominant floor as ONE visplane
+   (no R_CheckPlane split memsets).  Live A/B via pad L+B; window auto-resets on the flip.
+   Read Bp (row 2/4) + vp (row 11 LIM) with it on vs off, same scene. */
+extern "C" int sat_mark_suppress;
 /* RANK 3 inc-1 (docs/RANK3_WALLPREP.md): run the deferred wall-prep flush on the SLAVE (1) vs the
    master (0).  Pad L+R toggles it live; ON also enables sat_wallprep_defer (walls queued, not
    inline).  inc-1 is NON-overlapped -> expect byte-identical render + Bp off the master + w up
@@ -1470,6 +1474,8 @@ static unsigned int rbg_sky_sum, rbg_upl_sum, rbg_xfm_sum, rbg_rpt_sum;
 extern "C" int sat_prof_rec_max;                                 /* window max (= p100), tenths-ms */
 extern "C" int sat_prof_pk_bw, sat_prof_pk_bp, sat_prof_pk_p, sat_prof_pk_m;  /* per-phase peaks */
 extern "C" int sat_prof_mx_map, sat_prof_mx_x, sat_prof_mx_y, sat_prof_mx_ang, sat_prof_mx_t;
+/* worst-REC frame FULL detail, snapshotted at each new peak (row 14) -- phase split + slave b/Pb */
+extern "C" int sat_prof_mx_bw, sat_prof_mx_bp, sat_prof_mx_p, sat_prof_mx_m, sat_prof_mx_b, sat_prof_mx_pb;
 extern "C" int sat_prof_dom_pct, sat_prof_plane_n;               /* RBG0-floor sizer */
 extern "C" int sat_prof_ss_n, sat_prof_ss_q, sat_prof_ss_qpk, sat_prof_ss_q4pct;  /* pari A sizing */
 extern "C" int sat_prof_dropped;                                 /* glitch frames excluded from the window */
@@ -1550,7 +1556,7 @@ static void fps_update(void)
            so each A/B run starts a clean min/avg/max window -- no manual button needed
            (the pad is already saturated: Y=SQ X=split Z=mode-M L+A=blit). */
         {
-            static int l_map=-1, l_m=-1, l_sq=-1, l_blit=-1;
+            static int l_map=-1, l_m=-1, l_sq=-1, l_blit=-1, l_ms=-1;
 #if SAT_FLOOR_PERFSIM
             static int l_perfsim=-1;   /* reset the REC window on a pad-Y perf-sim toggle => clean per-mode numbers */
 #endif
@@ -1558,6 +1564,7 @@ static void fps_update(void)
             static int l_steal=-1, l_wp=-1;
 #endif
             if (gamemap != l_map || sat_m != l_m || (sq_wall<<6|sq_sprite<<4|sq_floor<<2|sq_ceil) != l_sq || blit_mode != l_blit
+                || sat_mark_suppress != l_ms
 #if SAT_FLOOR_PERFSIM
                 || floor_perfsim_mode != l_perfsim
 #endif
@@ -1569,7 +1576,7 @@ static void fps_update(void)
                 vd1_win_done = vd1_win_tot = 0;
                 fb_pk_clamp = fb_pk_mag = fb_pk_starve = fb_pk_px = 0;   /* Phase-0: clean fallback A/B window */
                 blit10_sum = blit10_cnt = 0;   /* row-1 'b' precise window: fresh sample on the L+A toggle */
-                l_map=gamemap; l_m=sat_m; l_sq=(sq_wall<<6|sq_sprite<<4|sq_floor<<2|sq_ceil); l_blit=blit_mode;
+                l_map=gamemap; l_m=sat_m; l_sq=(sq_wall<<6|sq_sprite<<4|sq_floor<<2|sq_ceil); l_blit=blit_mode; l_ms=sat_mark_suppress;
 #if SAT_FLOOR_PERFSIM
                 l_perfsim=floor_perfsim_mode;
 #endif
@@ -1714,25 +1721,29 @@ static void fps_update(void)
                     sat_prof_mx_map, sat_prof_mx_x, sat_prof_mx_y, sat_prof_mx_ang,
                     sat_prof_mx_t/35);
             if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 6, r9);   /* row 6: REC-max locator */
-            /* row 7: ACTIVE render composition -- so an A/B is never read against the wrong state.
-               M<n>:name = offload mode (pad Z).  RESOLVED per-surface targets: fl:<dom><leftover>
-               cl:<ceil> sk:<sky> wl:<wall>, where R=RBG0 V=VDP1 N=NBG0 .=software(CPU).  SQ:<W><F><C><S>
-               software quality per zone (pad R+Y/Y/L+Y/R+B = wall/floor/ceil/sprite): f=full l=ld
-               b=band x=flat.  pm=plane split 0stat/1TAS/2rowsplit (pad C). */
+            /* row 14: WORST-frame DETAIL, snapshotted at the same peak as the MX locator (row 6) and
+               the REC mx (row 3).  Updates ONLY when a new all-time-worst REC frame occurs (persists
+               until beaten or a config change) -> a fresh peak is a capture opportunity.  Bw/Bp/P/M =
+               that frame's phase split (which phase spiked); b/Pb = the slave's busy%/plane-share AT
+               that frame (was the idle slave able to help, or was it a master-serial Bp spike?). */
+            static char r14[48];
+            snprintf(r14, sizeof r14, "MXd Bw%d.%d Bp%d.%d P%d.%d M%d.%d b%d Pb%d ",
+                     sat_prof_mx_bw/10, sat_prof_mx_bw%10, sat_prof_mx_bp/10, sat_prof_mx_bp%10,
+                     sat_prof_mx_p/10,  sat_prof_mx_p%10,  sat_prof_mx_m/10,  sat_prof_mx_m%10,
+                     sat_prof_mx_b, sat_prof_mx_pb);
+            if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 14, r14);
+            /* row 7: ACTIVE A/B state -- so a photo is never read against the wrong config.  Kept
+               SHORT (<=~40 visible cols; see the debug-overlay-line-width memory): the changing
+               knobs FIRST so nothing clips.  M<n>:name = offload mode (pad Z).  ms = mark-suppress
+               (pad L+B).  pm = plane split 0stat/1TAS/2rowsplit (pad C).  SQ:<W><F><C><S> software
+               quality per zone (f=full l=ld b=band x=flat).  The old fl/cl/sk/wl routing chars were
+               dropped -- they are all-on in M4/M6 and all-off in M0, i.e. redundant with M. */
             static const char sqch[4] = { 'f', 'l', 'b', 'x' };   /* full / ld / band / flat */
-            char m0 = (sat_m == M0_SOFT);
-            char dm = m0 ? '.' : (rbg0_kind == RBG0_KIND_CELL              /* dominant floor: R=RBG0 bitmap, */
-                                  ? (rbg0_autodisp_ret == 0 ? 'x' : 'C')  /* C=cell scheduled OK, x=cell but slScrAutoDisp NG (unschedulable) */
-                                  : 'R');
-            char lf = m0 ? '.' : (sat_vdp1_floor_claim ? 'V' : '.');         /* leftover floors */
-            char cl = m0 ? '.' : (sat_vdp1_ceil_claim  ? 'V' : '.');         /* ceilings        */
-            char sk = m0 ? '.' : 'N';                                        /* sky             */
-            char wl = m0 ? '.' : 'V';                                        /* walls           */
-            static char r7[45];
-            snprintf(r7, sizeof r7, "M%d %s fl:%c%c cl:%c sk:%c wl:%c SQ:%c%c%c%c pm%d ",
-                     sat_m, sat_m_name[sat_m], dm, lf, cl, sk, wl,
-                     sqch[sq_wall & 3], sqch[sq_floor & 3], sqch[sq_ceil & 3], sqch[sq_sprite & 3],
-                     sat_plane_rowsplit ? 2 : sat_plane_tas);
+            static char r7[40];
+            snprintf(r7, sizeof r7, "M%d %s ms%d pm%d SQ:%c%c%c%c ",
+                     sat_m, sat_m_name[sat_m], sat_mark_suppress,
+                     sat_plane_rowsplit ? 2 : sat_plane_tas,
+                     sqch[sq_wall & 3], sqch[sq_floor & 3], sqch[sq_ceil & 3], sqch[sq_sprite & 3]);
             if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 7, r7);
             /* row 8: RELIABLE VDP1 load (replaces the CEF-aliased Dr%).  w%/f% = wall/floor
                command-budget FILL % (100% = bank full, further surfaces spill to CPU); fbw = walls
@@ -6564,6 +6575,12 @@ static void poll_pad(void)
        (mirrors the R+A wall-clamp chord).  Row 7 SQ 4th char. */
     if (!(cur & PER_DGT_TR) && (changed & PER_DGT_TB) && !(cur & PER_DGT_TB))
     { sq_sprite = (sq_sprite == SQ_FULL) ? SQ_LD : SQ_FULL; sat_apply_mode(); }
+    /* Pad L+B (R released): live A/B of RBG0 mark-suppress (core R_CheckPlane no-split of the
+       dominant floor).  L held, R released, B pressed -> no clash with the R+B sprite chord; the
+       incidental USE tap to Doom is harmless.  Watch Bp (rows 2/4) and vp (row 11) fall when on. */
+    if (!(cur & PER_DGT_TL) && (cur & PER_DGT_TR)
+        && (changed & PER_DGT_TB) && !(cur & PER_DGT_TB))
+        sat_mark_suppress ^= 1;
 #elif SAT_FLOOR_PERFSIM
     /* Pad Y cycles the 4 floor PERF-SIM modes (read REC/P rows 4/5 in each = the floor-offload
        ceiling, valid for RBG0 / VDP1-strips / gradient alike).  No RBG0/RAMCTL -> overlay stays

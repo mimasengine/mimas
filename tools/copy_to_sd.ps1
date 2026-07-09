@@ -2,7 +2,7 @@
 $ErrorActionPreference = 'Stop'
 
 $src = 'C:\Users\pcico\Projects\Mimas\build'
-$dst = 'D:\02'
+$dst = 'E:\02'
 
 if (-not (Test-Path -LiteralPath $dst)) {
     New-Item -ItemType Directory -Path $dst -Force | Out-Null

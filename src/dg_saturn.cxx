@@ -212,6 +212,7 @@ extern "C" byte *I_VideoBuffer;
 extern "C" int   gametic;
 extern "C" int   r_visplane_peak;
 extern "C" int   r_drawseg_peak;   /* core r_bsp.c: running high-water of drawsegs used (vs MAXDRAWSEGS 256) */
+extern "C" int   r_opening_ovf;    /* core r_plane.c: openings-pool overflow redirects THIS frame (0 = fine; >0 = garde-OPENINGS sinking) */
 extern "C" int   sightcounts[2];   /* core p_sight.c: [0]=REJECT trivial-rejects, [1]=full BSP LOS walks */
 extern "C" int   sat_floor_vq_cur, sat_floor_vq_peak;  /* VDP1-floor inc-0 estimate, shown on row 2 */
 extern "C" unsigned int sat_sky_px, sat_floor_px;  /* sky-vs-floor coverage classifier (row 13) */
@@ -1838,9 +1839,9 @@ static void fps_update(void)
                (VP_POOL_PLANES=96 span-pool overflow -> r_visplane_pool_ovf is a GRACEFUL flat
                glitch, not a freeze -- tracked separately, not shown here.) */
             static char rLIM[48];
-            snprintf(rLIM, sizeof rLIM, "LIM vp%d/256 ds%d/256 zf%dk lg%dk ",
+            snprintf(rLIM, sizeof rLIM, "LIM vp%d/256 ds%d/256 zf%dk lg%dk op%d",
                      r_visplane_peak, r_drawseg_peak,
-                     Z_FreeMemory() >> 10, Z_LargestAllocatable() >> 10);
+                     Z_FreeMemory() >> 10, Z_LargestAllocatable() >> 10, r_opening_ovf);
             if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 11, rLIM);
             r_visplane_peak = 0;   /* zero the core running-maxes -> next window re-accumulates its own peak */
             r_drawseg_peak  = 0;

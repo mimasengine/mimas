@@ -3435,11 +3435,11 @@ extern "C" void DG_FadeIn(void)     /* rise the freshly-drawn frame from black *
    so a dense LEFT view -- accumulated first -- can't hog every VDP1 slot.  When the cap is hit the
    hook REJECTS the wall and the core renders it in SOFTWARE (no sky) -- so the cap is also the
    VDP1->CPU starvation handoff. */
-#define WALL_ACC_MAX 96    /* 128->96 (2026-07-09): reclaim ~1.5KB HWRAM for the clear-slave/nearSprites/AIMD-damp
-                              levers' .text so the TLSF pool clears the 4KB boot floor ([[boot-loop-can-be-tlsf-pool-starvation]]).
-                              SAFE: walls past the budget fall back to CPU SOFTWARE (no drop).  1p peaks ~57 << 96; split
-                              per-view = 96/nv (24 in 4p, 32 in 3p, 48 in 2p) -- ample for a quadrant.  Was 128 after
-                              lumpinfo->LWRAM + HEAP_SIZE 88->32KB freed the pool; the levers ate that headroom back. */
+#define WALL_ACC_MAX 128   /* RESTORED to 128 (2026-07-09): the 128->96 pool-reclaim tried earlier this date DROPPED
+                              WALLS in split co-op (per-view budget 96/nv = 24/view in 4p too tight; the software
+                              fallback did not fully cover dense split views on HW).  Pool pressure from the clear-slave/
+                              nearSprites/AIMD-damp levers' .text is reclaimed via HEAP_SIZE 32->24KB (syscalls.c) instead
+                              -- never rob the wall budget for the pool.  1p peaks ~57 << 128; split = 128/nv (32 in 4p). */
 /* Fill px past which the remaining (FARTHEST -- BSP is near-first) walls fall back to CPU software
    instead of overloading the VDP1 plot before vblank.  Was a live pad L+Left/Right sweep; the HW
    sweep proved wall-offload a NET LOSS (MST 76->129 as the budget drops -- it rejects the cheapest
@@ -6115,7 +6115,10 @@ extern "C" void DG_DrawFrame(void)
            loop, or an open automap, would get a split HUD painted over a view d_main did NOT
            split-render.  usergame is externed as int elsewhere in this file (matches core). */
         extern int sat_local_players, usergame;
-        if (sat_local_players > 1 && usergame && gamestate == GS_LEVEL && !automapactive)
+        /* !menuactive: the platform paints the split HUD band AFTER the core drew the pause
+           menu into the framebuffer, so painting it here would cover the menu.  Skip the
+           repaint while the menu is up -> the menu (NBG1) stays on top of the band. */
+        if (sat_local_players > 1 && usergame && gamestate == GS_LEVEL && !automapactive && !menuactive)
         {
             if (sat_local_players == 2)
             {

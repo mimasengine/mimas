@@ -52,7 +52,10 @@ char **environ = __env;
    ~6 KB peak), so the heap is trimmed 88 -> 32 KB, returning ~56 KB to the TLSF pool.
    Watch row-22 `hp` (dg_heap_peak) stays < HEAP_SIZE on a full E1 run; trim further toward
    the measured peak if you want even more pool, or raise back if a hidden libc alloc appears. */
-#define HEAP_SIZE (32 * 1024)
+#define HEAP_SIZE (24 * 1024)   /* 32->24KB 2026-07-09: reclaim 8KB HWRAM .bss to the TLSF pool for the
+                                    clear-slave/nearSprites/AIMD-damp levers' .text (WALL_ACC_MAX stays 128 --
+                                    never rob the wall budget for the pool).  Peak is ~6KB (lumpinfo is in LWRAM),
+                                    so 24KB keeps ~18KB headroom; watch row-22 hp < 24KB on a full-E1 / big-WAD run. */
 static char heap[HEAP_SIZE] __attribute__((aligned(8)));
 static char *heap_end = heap;
 

@@ -39,7 +39,7 @@ extern "C" {
 #include "r_parallel.h"
 }
 #include "hud2p_panel.h"   /* generated 2-player compact HUD panel + field anchors */
-#include "hud4p_panel.h"   /* generated 3/4-player compact HUD band bevel column + anchors */
+#include "hud4p_panel.h"   /* generated 3/4-player compact HUD band (brushed-metal bg) + anchors */
 
 /* Set by D_SetGameDescription() from the loaded IWAD's lumps; we surface it on
    the debug overlay (row 21) to confirm which WAD the binary actually detected.
@@ -471,6 +471,21 @@ static int rbg0_split_yawsc = 16;   /* SPLIT yaw-RATE scale, Q4 (16 = 1.0x = cor
    KTBL0_RAM, where SGL expects it.  0 = legacy cell+map floor (map in B1, 3 banks, evicts
    NBG3 -- the dead-end). */
 #define RBG0_BITMAP      1
+/* K_OFF PROBE (temporary, 2026-07-07) -- the cell floor's 3rd rotation read (pattern-name) makes
+   slScrAutoDisp return NG (unschedulable) alongside the 8bpp framebuffer; HW+diag confirmed (ad=0,
+   rotation banks got zero cycle slots).  Set 1 to DROP the coefficient read (K_OFF -> flat/affine
+   floor, NO perspective, ugly -- IGNORE the look) purely to test whether 2 rotation reads (char+map)
+   DO schedule.  Read `ad` in the NBG1 diag box (works in Ymir -- slScrAutoDisp is deterministic SGL):
+     ad = 00000001 -> 2 reads schedule -> CRKTE (coeff->CRAM, keeps perspective) is the validated fix.
+     ad = 00000000 -> even 2 reads don't fit the framebuffer -> cell floor is dead, drop it.
+   Set back to 0 to restore the real K_ON perspective coefficient. */
+#define RBG0_CELL_KOFF_PROBE 0
+/* SNOW FIX option 1: 16-colour (4bpp) floor cells.  256c char read = 2 VRAM accesses/dot, 16c = 1 ->
+   cell rotation drops from 3 reads/dot (PN+char2) to 2 (PN+char1) = the bitmap floor's budget that
+   coexists with the 8bpp framebuffer.  Cost: floor quantized to <=16 colours/flat.  The 16 (shaded)
+   colours live in a free CRAM window (bank 0 idx 16..31; palette_number 1 = the map's 0x1000 bit). */
+#define RBG0_CELL_4BPP   1
+#define CRAM_CEL16       ((volatile unsigned short *)(0x25F00000 + 16 * 2))  /* 16-entry cell palette */
 #define RBG0_CEL_VRAM    ((void *)0x25E20000)  /* VDP2 VRAM A1: cell (char) data (cell path)   */
 #define RBG0_MAP_VRAM    ((void *)0x25E70000)  /* VDP2 VRAM B1: pattern name table (cell path) */
 #if RBG0_BITMAP
@@ -495,6 +510,32 @@ static int rbg0_split_yawsc = 16;   /* SPLIT yaw-RATE scale, Q4 (16 = 1.0x = cor
    Modes 1 vs 2 (read REC/EX/P/FLAT in both) isolate the software-floor cost = the saving
    the VDP2 floor buys.  Boot = 0. */
 static int rbg0_mode = 0;
+/* RBG0 floor KIND -- runtime-selectable (per-map), NOT a compile flag, so the shipping BITMAP floor
+   and the new CELL / dual-param (RPA+RPB) floor coexist in ONE binary and switch at level load (or
+   via the test chord).  Default = the shipping bitmap floor -> its path stays byte-identical.  The
+   cell path revives the old #else branch but with the MATURE bitmap-era commit (RDBS=0x8D + A0/A1/B1
+   parked + block-flush + slCashPurge) that fixed the snow class; docs/VDP2_RBG0_CURRENT_STATE.md. */
+enum { RBG0_KIND_BITMAP = 0, RBG0_KIND_CELL = 1 };
+static int rbg0_kind      = RBG0_KIND_BITMAP;   /* live kind (what is currently committed to the chip) */
+static int rbg0_kind_want = RBG0_KIND_BITMAP;   /* requested kind; a mismatch triggers rbg0_reinit()   */
+/* Rotation-parameter-table (RPT) location.  BITMAP keeps it at SRL's default B1+0x1ff00 (shipping,
+   byte-identical -- B1 is otherwise free there).  CELL needs B1 for the pattern-name MAP, and having
+   the RPT + the per-dot map READ in the SAME bank B1 starves the rotation (whole-plane snow, HW 2026-
+   07-07).  So CELL moves the RPT into A0 (high), joining the K-table -- exactly SEGA's S_8_9_2 layout
+   (RPT+K together, cells alone, map alone).  A0=K+RPT is SEGA-proven (there it's A1).  We only move it
+   on a real switch (rbg0_rpt_moved) so the boot bitmap path never calls slRparaInitSet = unchanged. */
+#define RBG0_RPT_B1  ((void *)0x25E7FF00)   /* B1+0x1ff00: bitmap RPT (SRL default)                    */
+#define RBG0_RPT_A0  ((void *)0x25E1FF00)   /* A0+0x1ff00: cell RPT (joins K-table -> B1 = map alone)  */
+static void *rbg0_rpt_vram  = RBG0_RPT_B1;  /* live RPT base; RA at +0, RB (dual-param) at +0x80       */
+static int   rbg0_rpt_moved = 0;            /* 1 once we've re-pointed off the SRL B1 default           */
+static int   rbg0_autodisp_ret = -1;        /* diag: slScrAutoDisp() return -- NG (0) for BOTH kinds (it is
+                                               NOT the schedulability oracle; the hand-park is what works) */
+static int   rbg0_cell_koff    = RBG0_CELL_KOFF_PROBE; /* runtime: cell coeff K_OFF (2 rotation reads char+map)
+                                               vs K_ON (3 reads +coeff) -- R+Down A/Bs it to test a 2-bank wall */
+static int   rbg0_reinit_force = 0;          /* R+Down sets this to re-run rbg0_reinit() with no kind change */
+static int   rbg0_cell_nofb    = 0;          /* R+Left test: drop NBG1 (framebuffer) in cell mode -> if the
+                                               floor renders CLEAN without it, the 8bpp framebuffer is the
+                                               NG cause (proves the 'free a bank' path).  Loses HUD/weapon. */
 static int nbg3_show = 1;   /* NBG3 debug overlay display; L+R cycles sat_dbg_overlay_mode (0 full / 1
                                fps-only / 2 off) and syncs this = (mode != 2).  Default ON = full perf
                                overlay visible at boot.  Its B1 cycle is reserved at init (RBG0_NBG3),
@@ -784,6 +825,15 @@ static void sat_apply_mode(void)
        (sat_vdp1_floor=0) so its value is inert there. */
     sat_ftex_mode           = (M == M0_SOFT) ? 4 : (M == M5_CONVEX) ? 6 : 3;
 
+    /* VRAM INTERLOCK (see THINGS_TEX_BASE / FTEX_SLOT_BASE): both texture pools live at
+       0x25C71000 and cannot coexist (28KB things + 42KB ftex > 44KB tail).  They are safe in the
+       reachable pad-Z modes M0/M4/M6 (things and floor-deport never both on), but M1/M2/M3/M5
+       (parked) DO request both -> they would silently corrupt VDP1 VRAM.  Enforce the invariant:
+       when world-things are on VDP1, the ftex floor deport yields (things is the shipped default).
+       No-op in every reachable mode (M4: floor already 0; M0/M6: things already 0); only bites a
+       future un-park of M1/M2/M3/M5, where it prevents the corruption until the VRAM is separated. */
+    if (sat_things_hw && sat_vdp1_floor) { sat_vdp1_floor = 0; sat_ftex_mode = 4; }
+
     /* ---- Axis B: per-zone software quality (bites only on software zones / fallback slivers;
        HW-owned zones ignore it -- no detail level on hardware) ---- */
     wall_potato_mode = (sq_wall == SQ_BAND) ? 1 : (sq_wall == SQ_FLAT) ? 2 : 0;  /* VDP1 wall style */
@@ -847,16 +897,17 @@ static void hud2p_blit_panels(void)
     }
 }
 
-/* 3/4-player compact HUD: paint one quadrant's 160x16 band (each row a solid bevel
-   colour -> one memset per row) at (ox, oy); the core then draws that player's
-   widgets on top via ST_DrawQuadHud.  The band is OPAQUE (non-zero indices) so it
-   occludes the VDP1 wall layer below NBG1 -- see hud4p_col in hud4p_panel.h. */
+/* 3/4-player compact HUD: blit one quadrant's 160x16 brushed-metal band (real STBAR
+   pixels, hud4p_panel) at (ox, oy); the core then draws that player's widgets on top
+   via ST_DrawQuadHud.  The band is OPAQUE (every index non-zero) so it occludes the
+   VDP1 wall layer below NBG1 -- see hud4p_panel.h. */
 extern "C" void ST_DrawQuadHud(int pnum, int ox, int oy);   /* core: per-player compact widgets */
 static void hud4p_blit_band(int ox, int oy)
 {
     for (int y = 0; y < HUD4P_H; ++y)
-        memset(framebuffer + (oy + y) * 320 + ox, hud4p_col[y], HUD4P_W);
+        memcpy(framebuffer + (oy + y) * 320 + ox, hud4p_panel + y * HUD4P_W, HUD4P_W);
 }
+
 
 /* 2-player flash (per-half software wash): the hardware palette is shared by both
    viewports, so each player's damage/pickup flash is applied by remapping that
@@ -1636,7 +1687,9 @@ static void fps_update(void)
                     sat_prof_pk_bw/10, sat_prof_pk_bw%10, sat_prof_pk_bp/10, sat_prof_pk_bp%10,
                     sat_prof_pk_p/10,  sat_prof_pk_p%10,  sat_prof_pk_m/10,  sat_prof_pk_m%10);
             if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 4, r10);   /* row 4: per-phase peaks */
-            /* row 5: SGL slave work-pointer creep watch (the idle menu/intermission freeze).
+            /* row 16 (moved off row 5 -- row 5 belongs to r_parallel's per-frame SLVi%/w slave-
+               occupancy readout, the WORK-DISTRIBUTION meter; the 1/s W72 stamp was stomping it
+               once a second): SGL slave work-pointer creep watch (the idle menu/intermission freeze).
                W72 = *(GBR+72) low 16 bits + delta vs the previous ~1s window.  slSetScreenDist
                (per-frame RBG0 transform) bump-allocates +8B here; render frames rewind it at the
                dispatch sites, no-render frames via the DG_DrawFrame fallback reset.  HEALTHY =
@@ -1651,7 +1704,7 @@ static void fps_update(void)
                 snprintf(rW72, sizeof rW72, "W72 %04x d%+d      ",
                          _w72 & 0xffff, (int)(_w72 - _w72_prev));
                 _w72_prev = _w72;
-                if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 5, rW72);
+                if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 16, rW72);
             }
             /* row 9: WHERE/WHEN the REC-max frame was (the locator), so the worst frame is
                reproducible.  m=map, x,y=player render pos (map units), a=angle 0-255,
@@ -1668,7 +1721,9 @@ static void fps_update(void)
                b=band x=flat.  pm=plane split 0stat/1TAS/2rowsplit (pad C). */
             static const char sqch[4] = { 'f', 'l', 'b', 'x' };   /* full / ld / band / flat */
             char m0 = (sat_m == M0_SOFT);
-            char dm = m0 ? '.' : 'R';                                        /* dominant floor */
+            char dm = m0 ? '.' : (rbg0_kind == RBG0_KIND_CELL              /* dominant floor: R=RBG0 bitmap, */
+                                  ? (rbg0_autodisp_ret == 0 ? 'x' : 'C')  /* C=cell scheduled OK, x=cell but slScrAutoDisp NG (unschedulable) */
+                                  : 'R');
             char lf = m0 ? '.' : (sat_vdp1_floor_claim ? 'V' : '.');         /* leftover floors */
             char cl = m0 ? '.' : (sat_vdp1_ceil_claim  ? 'V' : '.');         /* ceilings        */
             char sk = m0 ? '.' : 'N';                                        /* sky             */
@@ -1972,7 +2027,7 @@ static void rbg0_upload_flat(int picnum)
         if (lvl < 0) lvl = 0; else if (lvl > 31) lvl = 31;
         cm_q[i] = colormaps[lvl * 256 + i];
     }
-#if RBG0_BITMAP
+    if (rbg0_kind == RBG0_KIND_BITMAP) {
     /* Build each 512-wide bitmap row in a STACK buffer (cached), then bulk-memcpy to the
        uncached VRAM (A1).  Avoids 131072 slow per-byte uncached writes (= the slowdown) and
        uses no static .bss (a 4KB static here starved the TLSF pool = the old boot-loop).
@@ -2006,8 +2061,71 @@ static void rbg0_upload_flat(int picnum)
         for (int t = 1; t < 8; ++t) memcpy(row + t * 64, row, 64); /* tile 64 -> 512          */
         memcpy(bmp + y * 512, row, 512);                           /* bulk write to VRAM      */
     }
-#else
+    } else {
+    /* CELL path (RPA slot): 8x8 grid of 8x8 cells = one 64x64 flat at RBG0_CEL_VRAM (A1).  The
+       RPB slot (2nd flat) is uploaded by rbg0_upload_flat_rb() into the same bank at a fixed
+       offset -- see Stage 2.  The SAME D4 orientation + texel offset the bitmap path uses
+       (rbg0_tex_orient / _xoff / _yoff, pad Y + L+d-pad) is applied per-texel here too, so the
+       cell floor matches the bitmap floor's tuned world-alignment (without it the cell floor sat
+       at identity orientation = "of-travers" vs the walls). */
     unsigned char *cel = (unsigned char *)RBG0_CEL_VRAM;
+#if RBG0_CELL_4BPP
+    /* 16-COLOUR (4bpp) cells -- the snow fix.  Quantize the flat to <=16 BASE indices, remap every
+       texel to a 4-bit slot, and put the 16 SHADED colours in a CRAM window (shade lives in the
+       palette so a light change rewrites 16 CRAM entries, not the cells).  Stack arrays only (a static
+       .bss here starves the TLSF pool = boot loop -- see the bitmap path's row[] note). */
+    int hist[256];
+    for (int i = 0; i < 256; ++i) hist[i] = 0;
+    for (int i = 0; i < 64 * 64; ++i) hist[flat[i]]++;
+    unsigned char pal16[16]; int npal = 0;                     /* up to 16 most-frequent distinct bases */
+    for (int j = 0; j < 16; ++j) {
+        int best = -1, bc = 0;
+        for (int i = 0; i < 256; ++i) if (hist[i] > bc) { bc = hist[i]; best = i; }
+        if (best < 0) break;
+        pal16[npal++] = (unsigned char)best; hist[best] = 0;
+    }
+    if (!npal) { pal16[0] = 0; npal = 1; }
+    unsigned char remap[256];                                  /* base index -> nearest slot (RGB dist) */
+    for (int i = 0; i < 256; ++i) {
+        int bj = 0, bd = 1 << 30;
+        for (int j = 0; j < npal; ++j) {
+            int dr = (int)colors[i].r - colors[pal16[j]].r;
+            int dg = (int)colors[i].g - colors[pal16[j]].g;
+            int db = (int)colors[i].b - colors[pal16[j]].b;
+            int d = dr*dr + dg*dg + db*db;
+            if (d < bd) { bd = d; bj = j; }
+        }
+        remap[i] = (unsigned char)bj;
+    }
+    for (int j = 0; j < 16; ++j) {                             /* 16 SHADED colours -> CRAM window */
+        int s = cm_q[(j < npal) ? pal16[j] : pal16[0]];        /* cm_q folds qlevel+contrast */
+        CRAM_CEL16[j] = (unsigned short)(0x8000 | ((colors[s].b >> 3) << 10)
+                                                | ((colors[s].g >> 3) << 5)
+                                                |  (colors[s].r >> 3));
+    }
+    for (int cy = 0; cy < 8; ++cy)                             /* pack 4bpp cells (32B each), ROW-MAJOR */
+        for (int cx = 0; cx < 8; ++cx) {
+            unsigned char *c = cel + (cy * 8 + cx) * 32;
+            for (int ry = 0; ry < 8; ++ry)
+                for (int rx = 0; rx < 8; ++rx) {
+                    int px = cx * 8 + rx, py = cy * 8 + ry;
+                    int u = (px + rbg0_tex_xoff) & 63, v = (py + rbg0_tex_yoff) & 63, fx, fy;
+                    switch (rbg0_tex_orient & 7) {            /* D4 orientation (parity with bitmap) */
+                        default:
+                        case 0: fx = u;      fy = v;      break;  case 1: fx = v;      fy = 63 - u; break;
+                        case 2: fx = 63 - u; fy = 63 - v; break;  case 3: fx = 63 - v; fy = u;      break;
+                        case 4: fx = 63 - u; fy = v;      break;  case 5: fx = u;      fy = 63 - v; break;
+                        case 6: fx = v;      fy = u;      break;  case 7: fx = 63 - v; fy = 63 - u; break;
+                    }
+                    int idx4 = remap[flat[fy * 64 + fx]];     /* 0..npal-1 (<16) */
+                    int b = ry * 4 + (rx >> 1);               /* row-major; high nibble = even (left) col */
+                    if ((rx & 1) == 0) c[b] = (unsigned char)((c[b] & 0x0F) | (idx4 << 4));
+                    else               c[b] = (unsigned char)((c[b] & 0xF0) |  idx4);
+                }
+        }
+#else
+    /* 256-COLOUR cells (RBG0_CELL_4BPP 0): kept as a compile-time fallback -- correct but SNOWS with the
+       8bpp framebuffer (3 reads/dot); the shipped path is 4bpp above. */
     for (int cy = 0; cy < 8; ++cy)
         for (int cx = 0; cx < 8; ++cx)
         {
@@ -2015,10 +2133,31 @@ static void rbg0_upload_flat(int picnum)
             for (int ry = 0; ry < 8; ++ry)
                 for (int rx = 0; rx < 8; ++rx)
                 {
-                    c[ry * 8 + rx] = cm_q[flat[(cy * 8 + ry) * 64 + (cx * 8 + rx)]];   /* baked quantized shade */
+                    /* Destination byte = ROW-MAJOR (ry*8+rx): VDP2 256-color cells use the SAME raster
+                       dot order as the (working) 256-color bitmap floor bmp[y*512+x] -> byte b paints
+                       screen dot (row=b/8, col=b%8), so byte (ry*8+rx) carries the pixel at (col=rx,
+                       row=ry).  CN_12BIT has no per-cell flip (sl_def.h), so any wrong order transposes
+                       EVERY cell uniformly = seams at every boundary (looks like "some cells rotated"). */
+                    int px = cx * 8 + rx, py = cy * 8 + ry;          /* flat texel this cell dot maps to */
+                    int u  = (px + rbg0_tex_xoff) & 63;             /* texel offset (parity with bitmap) */
+                    int v  = (py + rbg0_tex_yoff) & 63;
+                    int fx, fy;                                     /* D4 orientation (parity with bitmap) */
+                    switch (rbg0_tex_orient & 7) {
+                        default:
+                        case 0: fx = u;      fy = v;      break;  /* identity       */
+                        case 1: fx = v;      fy = 63 - u; break;  /* rot 90         */
+                        case 2: fx = 63 - u; fy = 63 - v; break;  /* rot 180        */
+                        case 3: fx = 63 - v; fy = u;      break;  /* rot 270        */
+                        case 4: fx = 63 - u; fy = v;      break;  /* mirror H       */
+                        case 5: fx = u;      fy = 63 - v; break;  /* mirror V       */
+                        case 6: fx = v;      fy = u;      break;  /* transpose      */
+                        case 7: fx = 63 - v; fy = 63 - u; break;  /* anti-transpose */
+                    }
+                    c[ry * 8 + rx] = cm_q[flat[fy * 64 + fx]];   /* baked quantized shade */
                 }
         }
 #endif
+    }
 }
 
 #if RBG0_LINECOL_TEST
@@ -2153,11 +2292,13 @@ static void rbg0_linecol_apply(void)
 
 static void rbg0_proto_init(void)
 {
-#if RBG0_BITMAP
+    if (rbg0_kind == RBG0_KIND_BITMAP) {
     /* SlaveDriver-inspired BITMAP RBG0 (PLAX.C initPlax): bitmap (char) 512x256 in A1, the
        coefficient/rotation table in A0, OVER_0 (repeat), perspective via the coefficient
        table.  NO pattern-name map.  Same banks as the BOOTING cell path (A1 char / A0 K).
        NBG3 debug is fully off (B1 holds only the RPT now). */
+    if (rbg0_rpt_moved) { slRparaInitSet(RBG0_RPT_B1); rbg0_rpt_moved = 0; }  /* restore RPT to B1 after a cell->bitmap switch (boot path never enters here) */
+    rbg0_rpt_vram = RBG0_RPT_B1;
     memset((void *)RBG0_BMP_VRAM, 0, 512 * 256);          /* zero the whole bitmap (A1)         */
     slRparaMode(K_CHANGE);                                 /* rpara mode FIRST (SRL/SlaveDriver order) */
     slOverRA(0);                                            /* OVER_0: repeat (wrap the bitmap)   */
@@ -2174,30 +2315,45 @@ static void rbg0_proto_init(void)
        HAND below (rbg0_commit_ramctl + rbg0_commit_cyc), and do NOT use slSynch -- it would
        recompute the cycle pattern from the inconsistent shadow (= the boot-loop).  Mirrors
        SlaveDriver's explicit vramA0=K/vramA1=CHAR + parked-0xEEEE cycle table. */
-#else
-    /* 1) cells filled per-flat by rbg0_upload_flat(); zero them for the pre-first-flat frame. */
-    memset((void *)RBG0_CEL_VRAM, 0, 64 * 64);
-    /* 2) pattern-name table (1-WORD) tiling the flat's 8x8 cell grid, palette 1, map in B1. */
+    } else {
+    /* CELL RBG0 (revived) -- the SEGA S_8_9_2 recipe: char (cells) in A1, pattern-name map in
+       B1, coefficient/K-table in A0.  3 rotation banks vs the bitmap's 2, so B1 is spent on the
+       map (no NBG3/cell-sky in B1 here).  The old cell path SNOWED because its commit never
+       parked B1 as a rotation bank; the mature commit below (RDBS=0x8D + A0/A1/B1 parked +
+       block-flush + slCashPurge) fixes that class.  Stage 1 = single-param (RA); slPlaneRB /
+       sl1MapRB / slKtableRB (RPB) are added by rbg0_cell_init_rb() when dual-param is armed. */
+    /* 0) MOVE the RPT out of B1 into A0 (joins the K-table) so B1 carries ONLY the pattern-name map.
+       RPT + per-dot map read sharing B1 starved the rotation = whole-plane snow (HW 2026-07-07).  SEGA
+       S_8_9_2 keeps RPT+K together and the map in its own bank; this reproduces that separation. */
+    slRparaInitSet(RBG0_RPT_A0); rbg0_rpt_moved = 1;
+    rbg0_rpt_vram = RBG0_RPT_A0;
+    /* 1) cells filled per-flat by rbg0_upload_flat(); zero them for the pre-first-flat frame.
+       16c cell = 32B, 256c cell = 64B -> 64 cells * cell size. */
+    memset((void *)RBG0_CEL_VRAM, 0, 64 * (RBG0_CELL_4BPP ? 32 : 64));
+    /* 2) pattern-name table (1-WORD) tiling the flat's 8x8 cell grid, palette_number 1 (0x1000), map
+       in B1.  char# unit is 0x20 bytes: 256c cell (0x40) = 2 units -> idx*2; 16c cell (0x20) = 1 -> idx. */
     {
         unsigned short *map = (unsigned short *)RBG0_MAP_VRAM;
         for (int my = 0; my < 64; ++my)
             for (int mx = 0; mx < 64; ++mx)
             {
                 int cellidx = (my & 7) * 8 + (mx & 7);
-                map[my * 64 + mx] = (unsigned short)((cellidx * 2) | 0x1000);
+                int charno  = RBG0_CELL_4BPP ? cellidx : (cellidx * 2);
+                map[my * 64 + mx] = (unsigned short)(charno | 0x1000);
             }
     }
     /* 3) RBG0 cell config + per-line coefficient table (Mode-7 perspective). */
     slOverRA(0);
-    slCharRbg0(COL_TYPE_256, CHAR_SIZE_1x1);
+    slCharRbg0(RBG0_CELL_4BPP ? COL_TYPE_16 : COL_TYPE_256, CHAR_SIZE_1x1);
     slPageRbg0(RBG0_CEL_VRAM, 0, PNB_1WORD | CN_12BIT);
     slPlaneRA(PL_SIZE_1x1);
     sl1MapRA(RBG0_MAP_VRAM);
     slMakeKtable(RBG0_KTAB_VRAM);
-    slKtableRA(RBG0_KTAB_VRAM, K_FIX | K_LINE | K_2WORD | K_ON);
+    /* R+Down A/B: rbg0_cell_koff drops the coefficient (VRAM) read -> 2 rotation reads (char+map) vs 3. */
+    slKtableRA(RBG0_KTAB_VRAM, K_FIX | K_LINE | K_2WORD | (rbg0_cell_koff ? K_OFF : K_ON));
     slRparaMode(K_CHANGE);
     slBMPaletteRbg0(1);
-#endif
+    }
 
     /* 4) DRIVE THE ROTATION FROM THE MATRIX, NOT BY HAND.  We do NOT call slRparaInitSet:
        SRL::Core::Initialize already pointed the rotation-param table at VRAM (B1+0x1ff00).
@@ -2227,12 +2383,14 @@ static void rbg0_commit_ramctl(void)
 {
     volatile uint16_t *const RAMCTL = (volatile uint16_t *)0x25F8000E;
     ramctl_before = *RAMCTL;
-    /* RDBS low byte = (B1)<<6 | (B0)<<4 | (A1)<<2 | (A0).  1=coeff, 2=pattern-name, 3=char/bitmap. */
-#if RBG0_BITMAP
-    uint16_t v = (uint16_t)((ramctl_before & 0xFC00u) | 0x0300u | 0x000Du);  /* A1=char/bitmap(3), A0=coeff(1), B1=0 */
-#else
-    uint16_t v = (uint16_t)((ramctl_before & 0xFC00u) | 0x0300u | 0x008Du);  /* cell: + B1=pattern-name(2) = 0x8D */
-#endif
+    /* RDBS low byte = (B1)<<6 | (B0)<<4 | (A1)<<2 | (A0).  1=coeff, 2=pattern-name, 3=char/bitmap.
+       BITMAP: A1=char(3), A0=coeff(1), B1=0 -> 0x0D.  CELL K_ON: + B1=pattern-name(2), A0=coeff -> 0x8D.
+       CELL K_OFF (the CRKTE-bandwidth test): A0=NONE(0), A1=char(3), B1=pattern-name(2) -> 0x8C.  This is
+       exactly what CRKTE gives (coeff out of VRAM -> 2 rotation banks char+map, A0 free).  If THIS still
+       snows, CRKTE cannot help and the cell floor is definitively dead with the framebuffer. */
+    uint16_t rdbs = (rbg0_kind == RBG0_KIND_BITMAP) ? 0x000Du
+                  : (rbg0_cell_koff ? 0x008Cu : 0x008Du);
+    uint16_t v = (uint16_t)((ramctl_before & 0xFC00u) | 0x0300u | rdbs);
     *RAMCTL = v;
     VDP2_RAMCTL = v;   /* shadow-coherent: survive a possible per-vblank ISR re-push (RBG0 snow fix) */
     ramctl_after = *RAMCTL;
@@ -2251,24 +2409,28 @@ static void rbg0_commit_ramctl(void)
    We flush 0x0E..0xFE (skip the display/status regs 0x00-0x0C). */
 static void rbg0_commit_cyc(void)
 {
-#if RBG0_BITMAP
-    /* THE FIX (disasm + SlaveDriver): slBitMapRbg0 never reserved the A1 bitmap bank, so SGL's
-       auto-cycle leaves A0/A1 inconsistent -> the rotation engine/ISR walks a bad bank map ->
-       address error -> boot-loop.  Park BOTH rotation banks (A0=coeff, A1=bitmap) at 0xEEEE,
-       exactly like SlaveDriver's cycle[] table; B1 = normal (RPT). */
+    /* HAND-PARK the rotation banks at 0xEEEE (rotation reads them via RDBS, NOT the cycle table) -- the
+       mechanism the shipping bitmap floor is proven to work with (slScrAutoDisp returns NG for BOTH kinds,
+       so it is not the oracle; this park is).  A0=coeff, A1=char are rotation banks in BOTH kinds. */
     VDP2_CYCA0L = 0xEEEE; VDP2_CYCA0U = 0xEEEE;
     VDP2_CYCA1L = 0xEEEE; VDP2_CYCA1U = 0xEEEE;
+    if (rbg0_kind == RBG0_KIND_CELL) {
+        /* CELL: B1 = pattern-name MAP = the 3rd rotation bank -> park it (sky/NBG3 forced off -> map alone).
+           B0 = NBG1 framebuffer: PIN its two 8bpp reads by hand.  Cell uses slScrAutoDisp(RBG0ON) ALONE
+           (NBG1 kept OUT of the mask so SGL doesn't reset the RBG0 map to its default B0 bank) -> SGL never
+           schedules NBG1, so we author B0 ourselves (else HUD/weapon/other floors go black). */
+        VDP2_CYCB0L = 0x55EE; VDP2_CYCB0U = 0xEEEE;   /* NBG1 framebuffer (two 8bpp char reads) */
+        VDP2_CYCB1L = 0xEEEE; VDP2_CYCB1U = 0xEEEE;   /* B1 = rotation pattern-name map (park)  */
+    } else {
+        /* BITMAP: B1 is free (RPT only) -> host NBG3 / cell-sky if present, else scrub the stale read. */
 #if RBG0_NBG3 || VDP2_CELL_SKY
-    /* NBG3 and/or the cell sky live in B1: leave CYCB1 EXACTLY as slScrAutoDisp's allocator authored it
-       (NBG0 sky = 1 PN + 2 char, NBG3 = 1 PN + 1 char).  Do NOT scrub it -- a hand-pinned/scrubbed value
-       would starve the sky's 2nd 8bpp char read = snow on HW (memory rbg0-hw-sky-feasible). */
+        /* NBG3 and/or the cell sky live in B1: leave CYCB1 EXACTLY as slScrAutoDisp's allocator authored
+           it (NBG0 sky = 1 PN + 2 char, NBG3 = 1 PN + 1 char).  Do NOT scrub it -- a hand-pinned/scrubbed
+           value would starve the sky's 2nd 8bpp char read = snow on HW (memory rbg0-hw-sky-feasible). */
 #else
-    VDP2_CYCB1L = 0xFEEE; VDP2_CYCB1U = 0xEEEE;   /* NBG3 off + no cell sky: scrub the stale NBG3 read SGL left */
+        VDP2_CYCB1L = 0xFEEE; VDP2_CYCB1U = 0xEEEE;   /* NBG3 off + no cell sky: scrub the stale NBG3 read */
 #endif
-#else
-    /* first correct the stale NBG3 reads SGL left in CYCB1's shadow (B1 is now the RBG0 map) */
-    VDP2_CYCB1L = 0xFEEE; VDP2_CYCB1U = 0xEEEE;
-#endif
+    }
     volatile uint8_t *const shadow = (volatile uint8_t *)((uintptr_t)&VDP2_RAMCTL - 0x0E);
     volatile uint8_t *const chip   = (volatile uint8_t *)0x25F80000;
     for (int off = 0x0E; off <= 0xFE; off += 2)
@@ -2277,6 +2439,51 @@ static void rbg0_commit_cyc(void)
         volatile uint16_t *s = (volatile uint16_t *)(shadow + 0x10 + b * 4);
         cyc_before[b] = ((uint32_t)s[0] << 16) | (uint32_t)s[1];
     }
+}
+
+/* Runtime SWITCH of the RBG0 floor KIND (bitmap <-> cell/dual) -- the "separate mode, don't replace"
+   requirement: both paths live in the binary, selected per-map (or by the R+Up test chord).  Re-runs
+   the SGL RBG0 config + the commit.  BITMAP: hand-commit (RDBS + park A0/A1 + block-flush, no slSynch --
+   slBitMapRbg0 is deficient).  CELL: let slScrAutoDisp ASSIGN the 3-read cell cycle into the shadow
+   (SGL knows how; returns NG if unschedulable), then block-flush that computed cycle to the chip (the
+   vblank ISR never pushes CYC/RAMCTL) -- the no-slSynch equivalent of Jo/SEGA's slScrAutoDisp+slSynch.
+   Forces a flat re-upload because the A1 layout differs (bitmap 512-wide rows vs 8x8 cell grid).  Called
+   from DG_DrawFrame at a safe point (top of the floor block) when rbg0_kind_want != rbg0_kind. */
+static void rbg0_reinit(void)
+{
+    rbg0_kind = rbg0_kind_want;
+    rbg0_proto_init();        /* re-config SGL RBG0 for the new kind (bitmap vs cell) + VRAM + transform */
+    /* SAME MECHANISM for BOTH kinds -- the HAND-PARK that the shipping bitmap floor is proven to work
+       with: RDBS dedicates the rotation banks, the cycle table parks them at 0xEEEE, block-flush, NO
+       slSynch.  (slScrAutoDisp returns NG for BOTH kinds -- HW-confirmed ad=0 for the working bitmap
+       floor too -- so it is NOT the oracle; the hand-park is what actually works.)  The only cell/bitmap
+       differences: RDBS (0x8D vs 0x0D, in commit_ramctl) and parking B1 too (cell's map, in commit_cyc).
+       Cell's B1 sky/NBG3 confound is now removed (both forced off in cell mode) -> B1 = map alone. */
+    /* HW-localized (R+Left): cell renders CLEAN without NBG1 -> the COMBINED slScrAutoDisp(NBG1ON|RBG0ON)
+       NG's and corrupts the rotation, but slScrAutoDisp(RBG0ON) alone is clean.  So for CELL, configure
+       RBG0 ALONE first (clean rotation cycle), then add NBG1 in a SEPARATE call (SRL note: "allocate RBG0
+       before NBG0-3").  Bitmap keeps the combined call (it works). */
+    if (rbg0_kind == RBG0_KIND_CELL) {
+        /* CELL: slScrAutoDisp(RBG0ON) ALONE gives a clean, textured floor (HW-proven via R+Left).  Do
+           NOT call slScrAutoDisp(NBG1ON) even separately -- it re-runs SGL's allocator which RESETS the
+           RBG0 map to SGL's DEFAULT bank (B0, our framebuffer!) -> RBG0 reads the framebuffer as its map
+           -> BLACK floor.  Instead ADD NBG1's display bit by poking the SGL BGON shadow directly (bit 1);
+           NBG1's B0 framebuffer cycle is pinned in commit_cyc.  The block-flush + vblank ISR push BGON. */
+        rbg0_autodisp_ret = slScrAutoDisp((uint32_t)RBG0ON);
+        if (!rbg0_cell_nofb) {
+            /* Display NBG1 by editing the BGON display bits directly (bits 0-5), NOT via slScrAutoDisp:
+               keep NBG1(1)+RBG0(4), clear sky NBG0(0)+NBG3(3); the transparent-enable bits (8-15, incl.
+               NBG1 colour-0 transparent so the floor shows through) are preserved. */
+            volatile uint16_t *bgon = (volatile uint16_t *)((uintptr_t)&VDP2_RAMCTL - 0x0E + 0x20);
+            *bgon = (uint16_t)((*bgon & ~(uint16_t)(NBG0ON | NBG3ON)) | (uint16_t)(NBG1ON | RBG0ON));
+        }
+    } else {
+        rbg0_autodisp_ret = slScrAutoDisp((uint32_t)(NBG1ON | RBG0ON));
+    }
+    rbg0_commit_ramctl();   /* RDBS 0x0D (bitmap) / 0x8D (cell) */
+    rbg0_commit_cyc();      /* hand-park rotation banks (A0/A1[/B1 cell]) + block-flush shadow -> chip */
+    slCashPurge();            /* SGL wrote cells/map/K via CACHED addrs -> flush so HW reads fresh VRAM  */
+    rbg0_tex_dirty = 1;       /* force rbg0_upload_flat to rebuild the A1 texture in the new layout      */
 }
 
 #if RBG0_FLOOR_WINDOW
@@ -2369,55 +2576,6 @@ static void sky_cell_force_cyc(int sky_on, int nbg3_on)
 }
 #endif
 
-/* 8x8 hex font (0-F), 1 byte/row, MSB = leftmost pixel. */
-static const unsigned char rbg0_hexfont[16][8] = {
-    {0x3C,0x66,0x6E,0x76,0x66,0x66,0x3C,0x00}, {0x18,0x38,0x18,0x18,0x18,0x18,0x7E,0x00},
-    {0x3C,0x66,0x06,0x0C,0x18,0x30,0x7E,0x00}, {0x3C,0x66,0x06,0x1C,0x06,0x66,0x3C,0x00},
-    {0x0C,0x1C,0x3C,0x6C,0x7E,0x0C,0x0C,0x00}, {0x7E,0x60,0x7C,0x06,0x06,0x66,0x3C,0x00},
-    {0x1C,0x30,0x60,0x7C,0x66,0x66,0x3C,0x00}, {0x7E,0x06,0x0C,0x18,0x30,0x30,0x30,0x00},
-    {0x3C,0x66,0x66,0x3C,0x66,0x66,0x3C,0x00}, {0x3C,0x66,0x66,0x3E,0x06,0x0C,0x38,0x00},
-    {0x18,0x3C,0x66,0x66,0x7E,0x66,0x66,0x00}, {0x7C,0x66,0x66,0x7C,0x66,0x66,0x7C,0x00},
-    {0x3C,0x66,0x60,0x60,0x60,0x66,0x3C,0x00}, {0x78,0x6C,0x66,0x66,0x66,0x6C,0x78,0x00},
-    {0x7E,0x60,0x60,0x7C,0x60,0x60,0x7E,0x00}, {0x7E,0x60,0x60,0x7C,0x60,0x60,0x60,0x00},
-};
-static void rbg0_puthex(int px, int py, uint32_t val, int ndig)
-{
-    for (int i = 0; i < ndig; ++i) {
-        const unsigned char *g = rbg0_hexfont[(val >> ((ndig - 1 - i) * 4)) & 0xF];
-        int gx = px + i * 8;
-        for (int r = 0; r < 8; ++r)
-            for (int c = 0; c < 8; ++c)
-                if ((g[r] >> (7 - c)) & 1)
-                    DOOM_VRAM[(py + r) * DOOM_VRAM_STRIDE + gx + c] = 254;
-    }
-}
-/* Hex dump of the chip RAMCTL/CYC registers straight into the framebuffer (NBG1, bank B0 -- the one
-   bank RBG0 never touches, so it survives when the NBG3 overlay dies on B1).  5 lines, before|after.
-   Readable even WITH the RBG0 snow behind it (NBG1 prio 6 > RBG0 prio 4).  Holds ~3s for the photo.
-   Line order top->bottom: RAMCTL / CYCA0 / CYCA1 / CYCB0 / CYCB1.  CYCB0 (4th) must read 55EEEEEE. */
-static void rbg0_draw_debug_readout(void)
-{
-    volatile uint16_t *const cram1 = (volatile uint16_t *)0x25F00200;  /* CRAM bank-1 (NBG1 palette) */
-    cram1[1]   = 0x8000;                                          /* opaque black (box bg)   */
-    cram1[254] = (uint16_t)(0x8000 | (31 << 10) | (31 << 5) | 31);/* opaque white (glyphs)   */
-    for (int y = 0; y < 72; ++y)                                  /* black box rows 0..71    */
-        for (int x = 0; x < 320; ++x)
-            DOOM_VRAM[y * DOOM_VRAM_STRIDE + x] = 1;
-    volatile uint16_t *const C = (volatile uint16_t *)0x25F80010;
-    volatile uint8_t  *const shadow = (volatile uint8_t *)((uintptr_t)&VDP2_RAMCTL - 0x0E);
-    uint32_t cyc_sh[4], cyc_chip[4];                /* read fresh -> independent of the commit method */
-    for (int b = 0; b < 4; ++b) {
-        volatile uint16_t *s = (volatile uint16_t *)(shadow + 0x10 + b * 4);
-        cyc_sh[b]   = ((uint32_t)s[0] << 16) | (uint32_t)s[1];          /* SGL shadow (the real values) */
-        cyc_chip[b] = ((uint32_t)C[b*2] << 16) | (uint32_t)C[b*2 + 1];  /* chip (write-only -> 0)       */
-    }
-    rbg0_puthex(4, 4, ramctl_before, 4);  rbg0_puthex(84, 4, ramctl_after, 4);   /* line 0 RAMCTL b|a    */
-    for (int b = 0; b < 4; ++b) {                                                 /* lines 1..4 CYC sh|chip */
-        int py = 16 + b * 12;
-        rbg0_puthex(4, py, cyc_sh[b], 8);  rbg0_puthex(84, py, cyc_chip[b], 8);
-    }
-    { unsigned int t = vbl_count; while (vbl_count - t < 180) ; }                 /* hold ~3s      */
-}
 #endif
 
 #if VDP1_FLOOR_TEST
@@ -2678,21 +2836,12 @@ extern "C" void DG_Init(void)
        live, pad-tunable sky horizon. */
     rbg0_floor_window_apply(SKY_HORIZON_ROW);
 #endif
-#if RBG0_BITMAP
-    /* BITMAP fix (disasm + SlaveDriver): reserve the RDBS (A1=char/A0=coeff) + park the A0/A1
-       rotation cycle slots BY HAND -- slBitMapRbg0 never did (no rbank_set).  Then flush the
-       shadow.  Do NOT slSynch: it would recompute the cycle pattern from the inconsistent
-       shadow = the boot-loop. */
-    rbg0_commit_ramctl();         /* RDBS = 0x0D */
-    rbg0_commit_cyc();            /* park A0/A1 cycles + block-flush shadow -> chip */
-#else
-    rbg0_commit_ramctl();         /* cell path: poke RDBS (B1=pattern-name) */
-#if RBG0_COMMIT_VIA_SLSYNCH
-    slSynch();                    /* one-shot full-register commit via SGL's own flush */
-#else
-    rbg0_commit_cyc();            /* manual block-flush of the shadow register image */
-#endif
-#endif
+    /* MATURE commit for BOTH kinds (disasm + SlaveDriver): reserve the RDBS (0x0D bitmap / 0x8D cell)
+       + park the rotation cycle slots BY HAND -- SGL never did (no rbank_set) -- then block-flush the
+       shadow.  Do NOT slSynch: it would recompute the cycle pattern from the inconsistent shadow =
+       the boot-loop.  The old cell path's slSynch/wrong-B1 commit was the snow; this is the fix. */
+    rbg0_commit_ramctl();         /* RDBS = 0x0D (bitmap) / 0x8D (cell: B1=pattern-name) */
+    rbg0_commit_cyc();            /* park rotation banks (A0/A1[/B1 cell]) + block-flush shadow -> chip */
     slCashPurge();               /* TEST (cache hypothesis): flush the SH-2 cache so the RBG0 cells/map/
                                     K-table SGL wrote via CACHED addresses actually reach VRAM.  Ymir has
                                     no cache model (renders); HW reads stale VRAM -> snow.  Known trap. */
@@ -2999,6 +3148,14 @@ static unsigned int vdp1_hud_csum = 0xFFFFFFFFu;  /* status-bar change detector 
    texture, so a same-type horde shares slots and offloads wholesale; the rest stay software.  4 x
    3584 x 2 parity = 28KB (the whole gap).  More distinct textures => cede wall-pool VRAM to raise
    THINGS_TEX_SLOTS.  'th' counts emitted/declined; 'fb' baked (misses), 'sb' session bake%. */
+/* VRAM UNION (see FTEX_SLOT_BASE, ~line 4306): this pool 0x25C71000..0x25C78000 (28KB) ALIASES the
+   ftex flat-cache tail 0x25C71000..0x25C7B800 (42KB).  The 44KB tail cannot hold BOTH -- they share
+   it, and it is safe ONLY because they are mutually exclusive by render mode: world-things on VDP1
+   (sat_things_hw) is live in M1..M4; the ftex floor deport (sat_vdp1_floor) is live in M1/M2/M3/M5.
+   In the three REACHABLE modes (pad-Z cycle M0/M4/M6) they NEVER coactivate (M4: things on, floor
+   off; M0/M6: things off), so there is no runtime collision.  Only reviving a parked M1/M2/M3/M5
+   would run both at once -> sat_apply_mode() enforces the interlock (floor deport yields to things).
+   If a real coexistence is ever needed, separate the VRAM first (cede wall-pool space). */
 #define THINGS_TEX_BASE   0x25C71000u
 #define THINGS_TEX_SLOTS  4                /* slots PER parity == max distinct things offloaded/frame (VRAM cap) */
 #define THINGS_TEX_SLOTSZ 0x0E00u          /* 3584 B -> fits any shareware monster frame @ 8bpp */
@@ -4166,7 +4323,9 @@ extern "C" int sat_floor_vdp1_emit(int picnum, int height, int minx, int maxx,
 #define FTEX_MAXV      16           /* tile-grid rows per clip rect */
 #define FTEX_SLOTS     7            /* 7 x 6KB flat cache slots (64x64 + its two mips) */
 #define FTEX_SLOT_SZ   0x1800u      /* +0x0000 = 64x64 (4KB), +0x1000 = 32x32 mip, +0x1400 = 16x16 mip */
-#define FTEX_SLOT_BASE 0x25C71000u  /* the tail freed by the wtex 16->15 narrow shrink            */
+#define FTEX_SLOT_BASE 0x25C71000u  /* the tail freed by the wtex 16->15 narrow shrink; ALIASES
+                                       THINGS_TEX_BASE -- see the VRAM UNION note there. Mode-interlocked
+                                       (sat_apply_mode): never both live in reachable modes M0/M4/M6. */
 #define FTEX_FBANK0    0x25C7C000u  /* F bank pair (256 cmds each): the WHOLE floor layer --      */
 #define FTEX_FBANK1    0x25C7E000u  /* localcoord + fresh underlays + tiles + tail JUMP->walls -- */
 #define FTEX_F_CAP     252          /* built AFTER R_DrawPlanes (same frame as walls+mask, kills
@@ -4181,7 +4340,12 @@ extern "C" int sat_floor_vdp1_emit(int picnum, int height, int minx, int maxx,
 /* VRAM tail ledger (wtex now ends 0x25C71000 after the 16->15 narrow shrink; VRAM ends
    0x25C80000): 7 flat slots x 0x1800 = 0x25C71000..0x25C7B800, 2KB slack, F banks 2 x 8KB at
    0x25C7C000..0x25C80000.  The old VDP1_HUD_TEX region (0x25C78000, dead code -- vdp1_hud_emit
-   is never called) is inside the slot run; if the VDP1 HUD is ever revived it must move. */
+   is never called) is inside the slot run; if the VDP1 HUD is ever revived it must move.
+   NB: the world-things pool THINGS_TEX_BASE (0x25C71000..0x25C78000, 28KB) ALIASES flat slots
+   0-4 of this run.  Not a bug in shipping: things (sat_things_hw) and this ftex fill
+   (sat_vdp1_floor) are mode-exclusive and never both live in the reachable M0/M4/M6 cycle;
+   sat_apply_mode() enforces that interlock.  Any new tail allocation must treat 0x25C71000..
+   0x25C7B800 as DOUBLE-CLAIMED (things + ftex), i.e. not free. */
 static inline unsigned int ftex_slot_addr(int slot)
 { return FTEX_SLOT_BASE + (unsigned int)slot * FTEX_SLOT_SZ; }
 static struct { int lump; unsigned int lru; unsigned char locked; } ftex_cache[FTEX_SLOTS];
@@ -5659,10 +5823,29 @@ extern "C" void DG_DrawFrame(void)
         sat_split_p1hw    = rbg0_split_p1;                       /* core (d_main): punch the HW floor only for P1 in split */
         rbg0_floor_win_xend = rbg0_split_p1 ? 159 : 319;         /* window X: P1's left half in split, full screen in 1p */
         sat_vdp2_floor    = (rbg0_mode == 1 || !rbg0_on) ? 0 : 1;  /* 1p drives the punch; split is overridden per-view in d_main */
-        uint16_t sky_bit  = (sat_vdp2_sky && show_sky) ? NBG0ON : 0;   /* HW sky bit gated on sat_vdp2_sky (M-owned): M0 => 0 => NBG0 off + core draws the software sky; M1..M4 => 1 => core leaves index-0, NBG0 shows through */
+        /* CELL FLOOR uses B1 as a whole rotation bank (pattern-name MAP, RDBS=0x8D) -> it CANNOT share
+           B1 with the HW cell sky (NBG0) NOR the NBG3 debug overlay.  Force BOTH off whenever the cell
+           floor is live so B1 = map alone (else B1 contention = the snow the first two HW tests hit).
+           The sky region falls back to backdrop for now; a real SOFTWARE sky is Stage 3. */
+        int cell_floor_live = (rbg0_kind == RBG0_KIND_CELL) && (rbg0_mode == 0) && rbg0_on;
+        uint16_t sky_bit  = (!cell_floor_live && sat_vdp2_sky && show_sky) ? NBG0ON : 0;   /* HW sky bit (M-owned); OFF in cell floor -> B1 free */
         uint16_t rbg0_bit = (RBG0_DISPLAY && rbg0_mode == 0 && rbg0_on) ? RBG0ON : 0;   /* HW floor: pot0 + (1p or 2p-split-P1) */
-        uint16_t nbg3_bit = (RBG0_NBG3 && nbg3_show) ? NBG3ON : 0;  /* NBG3 overlay: display = pad L+R (default off); B1 cycle reserved at init */
-        slScrAutoDisp((uint16_t)(sky_bit | NBG1ON | nbg3_bit | rbg0_bit));
+        uint16_t nbg3_bit = (RBG0_NBG3 && nbg3_show && !cell_floor_live) ? NBG3ON : 0;  /* NBG3 overlay (B1); OFF in cell floor -> B1 free */
+        uint16_t nbg1_bit = (cell_floor_live && rbg0_cell_nofb) ? 0 : NBG1ON;           /* R+Left test: drop the framebuffer to prove it's the NG cause */
+        if (cell_floor_live) {
+            /* CELL: refresh the RBG0 rotation cycle every frame with slScrAutoDisp(RBG0ON) ALONE -> clean
+               textured floor (HW-proven; skipping it made the texture buggy, and RBG0ON alone keeps the
+               map on B1, unlike a combined/NBG1 call which resets it to B0 -> black).  Re-assert NBG1's
+               display by editing the BGON bits directly (never slScrAutoDisp(NBG1ON)).  One call/frame =
+               acceptable speed (two were slow).  B0's framebuffer cycle stays pinned from commit_cyc. */
+            slScrAutoDisp((uint16_t)RBG0ON);
+            if (nbg1_bit) {
+                volatile uint16_t *bgon = (volatile uint16_t *)((uintptr_t)&VDP2_RAMCTL - 0x0E + 0x20);
+                *bgon = (uint16_t)((*bgon & ~(uint16_t)(NBG0ON | NBG3ON)) | (uint16_t)(NBG1ON | RBG0ON));
+            }
+        } else {
+            slScrAutoDisp((uint16_t)(sky_bit | nbg1_bit | nbg3_bit | rbg0_bit));
+        }
 #if VDP2_CELL_SKY && VDP2_SKY_FORCE_CYC
         sky_cell_force_cyc(sky_bit, nbg3_bit);   /* RBG0-on makes the allocator put NBG0's char in A1; force it back to B1 */
 #endif
@@ -5670,7 +5853,12 @@ extern "C" void DG_DrawFrame(void)
         slScrAutoDisp((uint16_t)(show_sky ? (NBG0ON | NBG1ON | NBG3ON)
                                           : (NBG1ON | NBG3ON)));
 #endif
-        if (show_sky)
+        /* Scrub the 1p STATUS-BAR rows' index-0 -> near-black so the HW sky doesn't show
+           through the direct-palette bar.  1-PLAYER ONLY: in 3/4p rows 192..207 are the
+           BOTTOM of players 3&4's 3D view (their band is at 208..223), and scrubbing the
+           VDP1 walls' index-0 gaps there to near-black leaves a black block below those
+           views (the "doesn't reach the HUD" bug -- a 1p-max-draw-zone leftover). */
+        if (show_sky && sat_local_players <= 1)
             for (int i = 192 * 320; i < 224 * 320; ++i)   /* status-bar rows (224: 192..223) */
                 if (framebuffer[i] == 0) framebuffer[i] = nb;
     }
@@ -5685,6 +5873,7 @@ extern "C" void DG_DrawFrame(void)
        So the transform never reaches VRAM without RBG0_RPT_TRANSFER below. */
     if (rbg0_mode == 0 && sat_vdp2_floor)   /* sat_vdp2_floor folds in the pot0 + 1p gate (set above) */
     {
+        if (rbg0_kind != rbg0_kind_want || rbg0_reinit_force) { rbg0_reinit_force = 0; rbg0_reinit(); }  /* R+Up kind / R+Down coeff A/B */
         uint32_t rb_t0 = DG_GetTicksMs();
         rbg0_upload_flat(sat_vdp2_floor_pic);   /* per-sector light is now BAKED (quantized) into the texels */
         /* (The RBG0 bitmap palette-bank switch was removed: slBMPaletteRbg0/BMPNB never reach the chip
@@ -5745,8 +5934,10 @@ extern "C" void DG_DrawFrame(void)
            for centre 80 but Cx still 160) -> the half-texel per-frame jitter.  Stop BEFORE KAST (@0x54): the
            coefficient-table address is written once at init (slKtableRA), NOT by slScrMatSet -- copying it
            would clobber the K-table.  RB (unused) stays 0x30. */
-        memcpy((void *)0x25E7FF00,          (const void *)0x260FFE1C, 0x54);
-        memcpy((void *)(0x25E7FF00 + 0x68), (const void *)0x260FFE84, 0x30);
+        /* dest = the LIVE RPT base (B1+0x1ff00 bitmap / A0+0x1ff00 cell); RB (unused until dual-param)
+           rides +0x68 relative so it never strays into B1's map when the RPT is in A0. */
+        memcpy(rbg0_rpt_vram,                        (const void *)0x260FFE1C, 0x54);
+        memcpy((void *)((char *)rbg0_rpt_vram + 0x68), (const void *)0x260FFE84, 0x30);
 #endif
         uint32_t rb_t3 = DG_GetTicksMs();   /* SATURN PERF: split upl/xfm/rpt to pin the stall */
         rbg_upl_sum += rb_t1 - rb_t0;
@@ -5867,7 +6058,7 @@ extern "C" void DG_DrawFrame(void)
                 {
                     int oy = qy[q] + (HUD4P_QUAD_H - HUD4P_H);   /* = qy + 96: band at the view bottom */
                     hud4p_blit_band(qx[q], oy);
-                    ST_DrawQuadHud(q, qx[q], oy);
+                    ST_DrawQuadHud(q, qx[q], oy);                /* widgets: red hu_font numbers, keys */
                 }
                 hud4p_apply_flash(n);
             }
@@ -6192,6 +6383,24 @@ static void poll_pad(void)
             sat_apply_mode();
         }
     }
+
+#if VDP2_RBG0_TEST
+    /* Pad R + Up (1p, edge): toggle the RBG0 FLOOR KIND live -- shipping BITMAP <-> 16-colour CELL
+       (snow-free with the framebuffer; dual-param capable).  Dev toggle to compare the two floors on the
+       SAME scene; the real per-map selection lands in Stage 3.  Sets the WANT; DG_DrawFrame calls
+       rbg0_reinit() at a safe point (top of the floor block) when it differs.  1p only (split uses its
+       own P1HW path).  R taps '.' + Up nudges forward once -- harmless.  Overlay row 5 shows fl:B/fl:C. */
+    if (!sat_split_p1hw && !(cur & PER_DGT_TR) && (changed & PER_DGT_KU) && !(cur & PER_DGT_KU))
+        rbg0_kind_want = (rbg0_kind_want == RBG0_KIND_BITMAP) ? RBG0_KIND_CELL : RBG0_KIND_BITMAP;
+    /* Pad R + Down (1p, cell mode): A/B the cell coefficient K_ON (perspective) <-> K_OFF (flat). */
+    if (!sat_split_p1hw && !(cur & PER_DGT_TR) && (changed & PER_DGT_KD) && !(cur & PER_DGT_KD)
+        && rbg0_kind == RBG0_KIND_CELL)
+        { rbg0_cell_koff = !rbg0_cell_koff; rbg0_reinit_force = 1; }
+    /* Pad R + Left (1p, cell mode): DROP the NBG1 framebuffer to judge the cell floor in isolation. */
+    if (!sat_split_p1hw && !(cur & PER_DGT_TR) && (changed & PER_DGT_KL) && !(cur & PER_DGT_KL)
+        && rbg0_kind == RBG0_KIND_CELL)
+        { rbg0_cell_nofb = !rbg0_cell_nofb; rbg0_reinit_force = 1; }
+#endif
 
     /* (Pad L+A blit A/B ring CUT 2026-07-07: W5 HUD-skip is a real idle win -> now permanently ON
        (blit_mode fixed = c5); the slDMACopy paths were HW-dead.  docs/BLIT_DMA_PLAN.md.) */

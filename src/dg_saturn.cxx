@@ -879,6 +879,7 @@ static void sat_apply_mode(void)
                                                                  drops the Bp wall-clamp cost (pad R+A re-arms) */
 }
 #define GS_LEVEL 0
+#define GS_INTERMISSION 1                   /* gamestate_t: WI owns the 200..223 band (meta line + grain-extended art) */
 #define SAT_CMAP_BYTES (34 * 256)           /* COLORMAP: 34 maps of 256 (r_data.c) */
 
 /* Debug-overlay shim: core (d_main.c, r_*.c) calls dbg_print(x, y, str). */
@@ -6104,9 +6105,11 @@ extern "C" void DG_DrawFrame(void)
 
     /* CPU blit (the only viable path -- SCU-DMA to VDP2 hangs the bus).  Purge
        first so the master sees the slave's write-through framebuffer pixels. */
-    /* Menus/title/intermission are 320x200 assets; on the 224 framebuffer rows 200..223 are
-       uncovered.  Outside a level (no ST_Drawer), blacken that strip so it's not stale garbage. */
-    if (gamestate != GS_LEVEL)
+    /* Menus/title/finale are 320x200 assets; on the 224 framebuffer rows 200..223 are
+       uncovered.  Outside a level (no ST_Drawer), blacken that strip so it's not stale garbage.
+       EXCEPT the intermission: WI_drawMetaBand (core wi_stuff.c) fills those rows itself with the
+       grain-extended art + the meta line, so leave them alone there. */
+    if (gamestate != GS_LEVEL && gamestate != GS_INTERMISSION)
         memset(framebuffer + 200 * 320, 0, 24 * 320);
     {
         /* SATURN split-screen HUD, painted into the framebuffer before the blit.  Gate on

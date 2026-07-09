@@ -674,6 +674,22 @@ void R_EmitWorldThingsVDP1(void);      /* core: emit world sprites to VDP1 at th
 extern int sat_things_occ;             /* core: fully-occluded sprites skipped this frame (metric) */
 extern int sat_thing_cap;              /* core: granted distinct textures/frame (we set = VRAM slots) */
 extern int sat_thing_emit_cap;         /* core: max things emitted/frame -- we AIMD-adapt it (raster budget) */
+
+/* SATURN live A/B toggles (2026-07-09) -- three perf levers, each a one-HW-session flip (see poll_pad):
+   sat_clear_slave (R+C): dispatch the end-of-frame fb clear to the idle slave SH-2 (docs/BLIT_DMA_PLAN
+     Inc3).  It writes HWRAM, not the B-bus, so the SCU-DMA hang law does not apply; the core joins it
+     (RP_AuxWait) at the top of R_RenderPlayerView.  Watch dg/MST (rows 1/0).
+   sat_near_sprites (R+X): FastDoom nearSprites cull of far decorations (defined in core/r_things.c).
+     Watch SPR n<projected> (row 15) fall + MST.
+   sat_aimd_damp (L+X): damped things-AIMD (learned floor + overrun hysteresis) so ec does not collapse
+     to 0 and stick on the noisy HW EDSR-CEF.  Watch SPR ec/ef (row 15) hold up. */
+extern "C" int sat_clear_slave = 1;    /* default ON: HW-validated -2..-3ms dg (R+C to A/B off) */
+extern "C" int sat_aimd_damp   = 1;    /* default ON: inert until VDP1 things emit ec>0 (L+X to A/B off) */
+extern int     sat_near_sprites;       /* defined in core/r_things.c; default ON there (R+X to A/B off) */
+/* AIMD-damp state (read by fps_update row 15 + the two back-off sites): learned floor never lets ec
+   collapse to 0, overrun-run gives 2-frame hysteresis against the noisy HW EDSR-CEF. */
+static int     thing_emit_floor  = 0;
+static int     thing_overrun_run = 0;
 extern int sat_things_hw;              /* core: 1 = world sprites -> VDP1 (M4); 0 = software (M0/M6) */
 extern int sat_split_active;           /* core r_main.c: split emits per view PRE-kick -> queue path */
 int  sat_vdp1_thing_draw(patch_t *patch, int lump, const unsigned char *cmap,
@@ -1556,7 +1572,7 @@ static void fps_update(void)
            so each A/B run starts a clean min/avg/max window -- no manual button needed
            (the pad is already saturated: Y=SQ X=split Z=mode-M L+A=blit). */
         {
-            static int l_map=-1, l_m=-1, l_sq=-1, l_blit=-1, l_ms=-1;
+            static int l_map=-1, l_m=-1, l_sq=-1, l_blit=-1, l_ms=-1, l_cls=-1, l_ns=-1, l_ad=-1;
 #if SAT_FLOOR_PERFSIM
             static int l_perfsim=-1;   /* reset the REC window on a pad-Y perf-sim toggle => clean per-mode numbers */
 #endif
@@ -1565,6 +1581,7 @@ static void fps_update(void)
 #endif
             if (gamemap != l_map || sat_m != l_m || (sq_wall<<6|sq_sprite<<4|sq_floor<<2|sq_ceil) != l_sq || blit_mode != l_blit
                 || sat_mark_suppress != l_ms
+                || sat_clear_slave != l_cls || sat_near_sprites != l_ns || sat_aimd_damp != l_ad
 #if SAT_FLOOR_PERFSIM
                 || floor_perfsim_mode != l_perfsim
 #endif
@@ -1577,6 +1594,7 @@ static void fps_update(void)
                 fb_pk_clamp = fb_pk_mag = fb_pk_starve = fb_pk_px = 0;   /* Phase-0: clean fallback A/B window */
                 blit10_sum = blit10_cnt = 0;   /* row-1 'b' precise window: fresh sample on the L+A toggle */
                 l_map=gamemap; l_m=sat_m; l_sq=(sq_wall<<6|sq_sprite<<4|sq_floor<<2|sq_ceil); l_blit=blit_mode; l_ms=sat_mark_suppress;
+                l_cls=sat_clear_slave; l_ns=sat_near_sprites; l_ad=sat_aimd_damp;
 #if SAT_FLOOR_PERFSIM
                 l_perfsim=floor_perfsim_mode;
 #endif
@@ -1740,10 +1758,11 @@ static void fps_update(void)
                dropped -- they are all-on in M4/M6 and all-off in M0, i.e. redundant with M. */
             static const char sqch[4] = { 'f', 'l', 'b', 'x' };   /* full / ld / band / flat */
             static char r7[40];
-            snprintf(r7, sizeof r7, "M%d %s ms%d pm%d SQ:%c%c%c%c ",
+            snprintf(r7, sizeof r7, "M%d %s ms%d pm%d SQ:%c%c%c%c cs%dns%dad%d ",
                      sat_m, sat_m_name[sat_m], sat_mark_suppress,
                      sat_plane_rowsplit ? 2 : sat_plane_tas,
-                     sqch[sq_wall & 3], sqch[sq_floor & 3], sqch[sq_ceil & 3], sqch[sq_sprite & 3]);
+                     sqch[sq_wall & 3], sqch[sq_floor & 3], sqch[sq_ceil & 3], sqch[sq_sprite & 3],
+                     sat_clear_slave, sat_near_sprites, sat_aimd_damp);
             if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 7, r7);
             /* row 8: RELIABLE VDP1 load (replaces the CEF-aliased Dr%).  w%/f% = wall/floor
                command-budget FILL % (100% = bank full, further surfaces spill to CPU); fbw = walls
@@ -1782,9 +1801,14 @@ static void fps_update(void)
                sb = SESSION bake% (mh_bake_sum/mh_emit_sum) = the cache read -- low = high reuse.
                On row 15 (bottom, clear of centre-screen monsters that hide the THp row). */
             unsigned int sbpc = mh_emit_sum ? (mh_bake_sum * 100u / mh_emit_sum) : 0;
-            snprintf(rSPR, sizeof rSPR, "SPR fl%d.%d n%d/%d th%d/%d ec%d fb%d sb%u%% ",
-                     sp_fl/10, sp_fl%10, sp_np, sp_nd,
-                     sat_things_n, sat_things_decl, sat_thing_emit_cap, thing_bake_n, sbpc);
+            if (sat_aimd_damp)   /* damp on: show the learned floor ef (drop sb% to keep the row <=40 cols) */
+                snprintf(rSPR, sizeof rSPR, "SPR fl%d.%d n%d/%d th%d/%d ec%d ef%d fb%d ",
+                         sp_fl/10, sp_fl%10, sp_np, sp_nd,
+                         sat_things_n, sat_things_decl, sat_thing_emit_cap, thing_emit_floor, thing_bake_n);
+            else
+                snprintf(rSPR, sizeof rSPR, "SPR fl%d.%d n%d/%d th%d/%d ec%d fb%d sb%u%% ",
+                         sp_fl/10, sp_fl%10, sp_np, sp_nd,
+                         sat_things_n, sat_things_decl, sat_thing_emit_cap, thing_bake_n, sbpc);
             if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 15, rSPR);
             /* rows 9-10: SESSION percentiles (reset ONLY on a MODE change) -- read ONE end-of-level
                capture, no jitter.  THp = world-things emitted/frame p50/p99, declined/frame p99,
@@ -3178,6 +3202,8 @@ static unsigned int thing_lru_tick;        /* monotonic use counter -> evict the
 #define THING_CAP_GROW  8                  /* clean frames before +1 (slow additive increase) */
 #define THING_ADAPT_MAX 16                 /* outdoor ceiling == core THING_EMIT_MAX */
 static int          thing_cap_clean;       /* consecutive finished-plot frames */
+/* thing_emit_floor / thing_overrun_run (AIMD damp state) are defined near the top toggles (before
+   fps_update, which reads thing_emit_floor for the row-15 ef field). */
 /* (sat_things_n / sat_things_decl / thing_bake_n are defined earlier, before the overlay block) */
 /* SPLIT-SCREEN QUEUE: split renders its views BEFORE the kick and the walls only flush AT the
    kick, so a per-view thing emitted straight into the command bank would land BEFORE the walls
@@ -3409,7 +3435,11 @@ extern "C" void DG_FadeIn(void)     /* rise the freshly-drawn frame from black *
    so a dense LEFT view -- accumulated first -- can't hog every VDP1 slot.  When the cap is hit the
    hook REJECTS the wall and the core renders it in SOFTWARE (no sky) -- so the cap is also the
    VDP1->CPU starvation handoff. */
-#define WALL_ACC_MAX 128   /* restored to 128: lumpinfo moved to the LWRAM Doom zone + HEAP_SIZE trimmed 88->32KB (syscalls.c) freed ~56KB to the TLSF pool, so the 3p-minimap pool pressure is gone and full wall capacity is back. 1p peaks ~57 << 128. */
+#define WALL_ACC_MAX 96    /* 128->96 (2026-07-09): reclaim ~1.5KB HWRAM for the clear-slave/nearSprites/AIMD-damp
+                              levers' .text so the TLSF pool clears the 4KB boot floor ([[boot-loop-can-be-tlsf-pool-starvation]]).
+                              SAFE: walls past the budget fall back to CPU SOFTWARE (no drop).  1p peaks ~57 << 96; split
+                              per-view = 96/nv (24 in 4p, 32 in 3p, 48 in 2p) -- ample for a quadrant.  Was 128 after
+                              lumpinfo->LWRAM + HEAP_SIZE 88->32KB freed the pool; the levers ate that headroom back. */
 /* Fill px past which the remaining (FARTHEST -- BSP is near-first) walls fall back to CPU software
    instead of overloading the VDP1 plot before vblank.  Was a live pad L+Left/Right sweep; the HW
    sweep proved wall-offload a NET LOSS (MST 76->129 as the budget drops -- it rejects the cheapest
@@ -5474,7 +5504,13 @@ static void vdp1_things_flush(void)
            re-drop every frame = steady flicker instead of a one-off adaptation). */
         sat_things_decl += thing_acc_n - i;
         sat_things_n    -= thing_acc_n - i;
-        sat_thing_emit_cap -= 2; if (sat_thing_emit_cap < 0) sat_thing_emit_cap = 0;
+        if (sat_aimd_damp) {                              /* damped: multiplicative, floored (mirror sat_walls_kick) */
+            int dec = sat_thing_emit_cap >> 2; if (dec < 1) dec = 1;
+            sat_thing_emit_cap -= dec;
+            if (sat_thing_emit_cap < thing_emit_floor) sat_thing_emit_cap = thing_emit_floor;
+        } else {
+            sat_thing_emit_cap -= 2; if (sat_thing_emit_cap < 0) sat_thing_emit_cap = 0;
+        }
         thing_cap_clean = 0;
     }
     thing_acc_n = 0; thing_acc_open = 0;
@@ -5663,8 +5699,29 @@ extern "C" void sat_walls_kick(void)
            FINISHED (vdp1_prev_done, EDSR CEF), back off fast (-2) when it OVERRAN (would drop+vanish
            things).  It settles just under the per-scene flicker threshold: high outdoors, low indoors. */
         if (vdp1_prev_done) {
+            thing_overrun_run = 0;                        /* clean plot resets the hysteresis run */
             if (++thing_cap_clean >= THING_CAP_GROW)
-            { if (sat_thing_emit_cap < THING_ADAPT_MAX) sat_thing_emit_cap++; thing_cap_clean = 0; }
+            { if (sat_thing_emit_cap < THING_ADAPT_MAX) sat_thing_emit_cap++; thing_cap_clean = 0;
+              if (sat_aimd_damp) {                        /* a cap that survives GROW clean frames is safe -> */
+                  int f = sat_thing_emit_cap - 2;         /* ratchet the learned floor toward it (never above cap-2) */
+                  if (f > thing_emit_floor) thing_emit_floor = f;
+              } }
+        } else if (sat_aimd_damp) {
+            /* DAMPED back-off: the HW EDSR-CEF latches noisily (30-60% false "not done") and the plain
+               -2-to-0 rule then collapses ec to 0 and sticks (the captured ec0/th0).  Require 2
+               consecutive overruns (hysteresis), decrease MULTIPLICATIVELY toward the learned floor,
+               and only shed the floor itself (slowly) once pinned there and STILL overrunning. */
+            if (++thing_overrun_run >= 2) {
+                thing_overrun_run = 0;
+                if (sat_thing_emit_cap > thing_emit_floor) {
+                    int dec = sat_thing_emit_cap >> 2; if (dec < 1) dec = 1;
+                    sat_thing_emit_cap -= dec;
+                    if (sat_thing_emit_cap < thing_emit_floor) sat_thing_emit_cap = thing_emit_floor;
+                } else if (thing_emit_floor > 0) {
+                    thing_emit_floor--; sat_thing_emit_cap = thing_emit_floor;
+                }
+            }
+            thing_cap_clean = 0;
         } else {
             sat_thing_emit_cap -= 2; if (sat_thing_emit_cap < 0) sat_thing_emit_cap = 0;
             thing_cap_clean = 0;
@@ -5686,6 +5743,20 @@ extern "C" void sat_walls_kick(void)
 }
 #endif
 
+/* SATURN clear-on-slave (docs/BLIT_DMA_PLAN.md Inc3, pad R+C).  The end-of-frame framebuffer clear
+   (index-0 wipe of the 3D view, df_post) is a ~60-70 KB HWRAM memset -- pure master ms.  When
+   sat_clear_slave is on it is dispatched to the 2nd SH-2 (measured 80-99% idle) via RP_AuxDispatch; it
+   writes HWRAM (not the B-bus), so the SCU-DMA hang law that killed the async BLIT does NOT apply.  The
+   clear overlaps the game tic + next-frame REC and is joined before any fb write: the core joins at
+   R_RenderPlayerView entry (level frames), DG_DrawFrame joins at the top (transition frames) before the
+   blit reads fb.  The blit already cache_purges, so the master reads current RAM whoever cleared. */
+static volatile unsigned int g_clear_bytes = 0;
+static int clear_slave_pending = 0;
+static void dg_fb_clear_slave(void)
+{
+    memset(framebuffer, 0, g_clear_bytes);
+}
+
 extern "C" void DG_DrawFrame(void)
 {
     static int first_frame = 1;
@@ -5700,6 +5771,12 @@ extern "C" void DG_DrawFrame(void)
 #endif
         SRL::Debug::Print(0, 1, "FRAME1 OK               ");
     }
+
+    /* clear-on-slave backstop: join a slave fb clear left pending by the previous frame's df_post
+       before this frame's blit reads fb (level frames already joined it at R_RenderPlayerView; this
+       catches menu/intermission/transition frames).  BEFORE the ftex kick so it never waits on THIS
+       frame's F-build. */
+    if (clear_slave_pending) { RP_AuxWait(); clear_slave_pending = 0; }
 
 #if VDP1_WALL_TEST && SAT_VDP1_FLOOR && SAT_FLOOR_TEX
     if (ftex_job_ready)
@@ -5827,7 +5904,12 @@ extern "C" void DG_DrawFrame(void)
            SOFTWARE floor (sat_vdp2_floor=0 -> the sw floor draws; RBG0 display off). */
         int rbg0_active   = (sat_m != M0_SOFT) && (sat_local_players <= 1);
         int rbg0_split_p1 = RBG0_SPLIT_P1HW && (sat_m != M0_SOFT) && (sat_local_players == 2);   /* SATURN split: P1 floor in HW (left half), P2 software */
-        int rbg0_on       = rbg0_active || rbg0_split_p1;
+        /* SATURN: gate RBG0 DISPLAY on being in a level (like show_sky).  Outside a level the
+           intermission/finale/title are 320x200 opaque assets; the framebuffer's bottom rows
+           (200..223, ex-HUD) get memset to index 0 = VDP2 TRANSPARENT below -- if RBG0 stayed
+           on it would show the LAST level's floor through that strip ("intermission floor band").
+           Keep it on during the pause menu (still GS_LEVEL) so the frozen frame's floor persists. */
+        int rbg0_on       = (rbg0_active || rbg0_split_p1) && (gamestate == GS_LEVEL);
         { static int prev_split_p1 = -1;                        /* SATURN: force ONE flat re-upload on the 1p<->split */
           if (rbg0_split_p1 != prev_split_p1) {                 /* transition (the stale-pic root cause is fixed in core */
               rbg0_tex_dirty = 1; prev_split_p1 = rbg0_split_p1; } }  /* r_plane.c: sat_dom_last_sec dangled across level loads) */
@@ -6182,7 +6264,16 @@ extern "C" void DG_DrawFrame(void)
     {
         extern int sat_local_players;
         int clear_rows = (sat_local_players >= 3) ? 224 : (sat_local_players == 2 ? 160 : 192);
-        memset(framebuffer, 0, clear_rows * 320);
+        if (sat_clear_slave && gamestate == GS_LEVEL) {
+            /* offload to the idle slave; a render (R_RenderPlayerView) is guaranteed next frame to
+               join it.  Non-GS_LEVEL frames clear on the master (no render would join a slave clear
+               before a menu/intermission redraws fb -> gate keeps those on the master). */
+            g_clear_bytes = (unsigned int)clear_rows * 320u;
+            RP_AuxDispatch(dg_fb_clear_slave);
+            clear_slave_pending = 1;
+        } else {
+            memset(framebuffer, 0, clear_rows * 320);
+        }
     }
     {   /* SATURN PERF: bank the master-frame composition (window-averaged once/sec by fps_update).
            df_pre/blit/post are DG_DrawFrame's own ms split; tic/snd come from the core this tick;
@@ -6427,6 +6518,22 @@ static void poll_pad(void)
         sat_cd_persistent = !sat_cd_persistent;
     }
 
+    /* SATURN 2026-07-09 -- three perf-lever live A/B toggles, one HW session.  Letter+modifier chords
+       (the established pattern; the incidental Doom tap is harmless).  The d-pad is deliberately NOT
+       used (L/R + d-pad would eat movement in normal play).  R+C = clear-on-slave (R+C was the freed M5
+       staging slot); R+X = nearSprites cull; L+X = AIMD damp.  X's TAB (automap) is suppressed below
+       whenever L or R is held, and the mp split-VDP1 X toggle is gated to X-alone, so these never
+       collide.  Row 7 shows cs/ns/ad; row 15 SPR shows the AIMD ec/ef effect. */
+    if (!(cur & PER_DGT_TR) && (cur & PER_DGT_TL)                 /* R held, L released */
+        && (changed & PER_DGT_TC) && !(cur & PER_DGT_TC))
+        sat_clear_slave ^= 1;
+    if (!(cur & PER_DGT_TR) && (cur & PER_DGT_TL)                 /* R held, L released */
+        && (changed & PER_DGT_TX) && !(cur & PER_DGT_TX))
+        sat_near_sprites ^= 1;
+    if (!(cur & PER_DGT_TL) && (cur & PER_DGT_TR)                 /* L held, R released */
+        && (changed & PER_DGT_TX) && !(cur & PER_DGT_TX))
+        sat_aimd_damp ^= 1;
+
     /* (Pad R+Up/Down vertical decrochage-fill + R+Left/Right border-cap knobs CUT 2026-07-07 --
        tuning finished, values baked: sat_plane_vscale=4 (r_main.c), sat_plane_border_max=10
        (dg_saturn.cxx:~2738).  R+Up/Down/Left/Right are free.) */
@@ -6626,7 +6733,8 @@ static void poll_pad(void)
        (sat_split_vdp1=0, the baseline) so both can be compared on the same scene on hardware.
        Gated to sat_local_players>1 so X is inert in single-player.  In split the X->KEY_TAB
        (automap) forward is suppressed below so X is ONLY this toggle; 1p keeps X = automap. */
-    if (sat_local_players > 1 && (changed & PER_DGT_TX) && !(cur & PER_DGT_TX))
+    if (sat_local_players > 1 && (cur & PER_DGT_TL) && (cur & PER_DGT_TR)   /* X ALONE (no L/R -> those are the perf toggles) */
+        && (changed & PER_DGT_TX) && !(cur & PER_DGT_TX))
         sat_split_vdp1 = !sat_split_vdp1;
 
     /* Local co-op opt-in: outside a level (title/menu/demo), the 2nd pad's A toggles local
@@ -6688,7 +6796,8 @@ static void poll_pad(void)
             /* SATURN: in split, pad-X is the live sat_split_vdp1 A/B toggle (above),
                so DON'T also forward its KEY_TAB (= automap) -- the minimap would open
                over the 3D view and ruin the comparison.  1p keeps X = automap. */
-            if (pad_map[i].mask == PER_DGT_TX && sat_local_players > 1)
+            if (pad_map[i].mask == PER_DGT_TX
+                && (sat_local_players > 1 || !(cur & PER_DGT_TL) || !(cur & PER_DGT_TR)))   /* also eat TAB when L/R held (perf toggles) */
                 continue;
             keyq_push(pressed, keyq_encode(pad_map[i].key));
             if (pad_map[i].mask == PER_DGT_TA)

@@ -5500,18 +5500,23 @@ static void vdp1_things_flush(void)
         vdp1_cmd_at(VDP1_BANK[vdp1_wbank], vdp1_wnext++, cmd);
     }
     if (i < thing_acc_n)
-    {   /* budget cut the tail: count the vanished sprites + back the AIMD cap off NOW (the
-           EDSR overrun signal cannot see a queue drop -- without this the same tail would
-           re-drop every frame = steady flicker instead of a one-off adaptation). */
+    {   /* Bank-overflow drop: the tail's software fill was ALREADY skipped (sat_thing_vdp1 marked at
+           queue time, R_DrawMasked/R_SlaveDrawMasked continue past it) -> those enemies VANISH this
+           frame.  This is a HARD, RELIABLE signal (unlike the noisy 1p EDSR-CEF), so back off
+           AGGRESSIVELY and RESET the learned floor -> the cap converges to a fit fast (ideally next
+           frame), keeping the vanish to a rare 1-frame transient on scene entry.  The AIMD-damp
+           hysteresis/floor is deliberately NOT applied here: a damped (slow) back-off or a high learned
+           floor keeps the queue overflowing EVERY frame = PERSISTENT vanishing enemies in split (the
+           2026-07-09 regression).  Damping stays only on the 1p CEF back-off (sat_walls_kick). */
         sat_things_decl += thing_acc_n - i;
         sat_things_n    -= thing_acc_n - i;
-        if (sat_aimd_damp) {                              /* damped: multiplicative, floored (mirror sat_walls_kick) */
-            int dec = sat_thing_emit_cap >> 2; if (dec < 1) dec = 1;
-            sat_thing_emit_cap -= dec;
-            if (sat_thing_emit_cap < thing_emit_floor) sat_thing_emit_cap = thing_emit_floor;
-        } else {
-            sat_thing_emit_cap -= 2; if (sat_thing_emit_cap < 0) sat_thing_emit_cap = 0;
-        }
+        /* Converge in ONE frame (not -2/frame = several frames of vanishing): clamp the per-view cap to
+           what actually fit this frame (fit / nv views), so next frame the total re-queued (~fit) fits
+           the bank -> no re-drop.  Undershoot is safe (extra sprites just go software, never vanish). */
+        { extern int sat_local_players; int nv = sat_local_players; if (nv < 1) nv = 1;
+          int fit = i / nv; if (fit < sat_thing_emit_cap) sat_thing_emit_cap = fit;
+          if (sat_thing_emit_cap < 0) sat_thing_emit_cap = 0; }
+        thing_emit_floor = 0;
         thing_cap_clean = 0;
     }
     thing_acc_n = 0; thing_acc_open = 0;

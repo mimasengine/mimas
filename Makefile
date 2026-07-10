@@ -127,11 +127,16 @@ endif
 # Put the compiler's real newlib headers first so Doom's uses of FILE* work.
 # -Isrc: Doom sources include each other with relative paths.
 # -DNDEBUG: silence assert() (no abort() on Saturn anyway).
+# -DRP_CMD_BUF_SIZE=0x2000: L2-RECLAIM (2026-07-10).  The legacy parity column-renderer cmd ring
+#   (top of LWRAM) is INERT in shipping (rp_disabled forced =1 via sat_plane_parallel, r_main.c:1291;
+#   the draw funcs r_parallel.c:1715+ render direct + return, never recording).  Shrunk 0x14000->0x2000
+#   (keep an 8KB floor so the parity A/B stays revivable) returns ~72KB LWRAM to the Doom zone
+#   (DG_ZoneBase = LOW_WORK_RAM_SIZE - RP_CMD_BUF_SIZE) -- endgame RAM for big PWADs.  DoomJo: benign.
 SRL_CUSTOM_CCFLAGS = -w -fsigned-char \
     -DCMAP256 -DDOOMGENERIC_RESX=320 -DDOOMGENERIC_RESY=200 -DNDEBUG \
     -DMAXVISPLANES=256 \
     -DSAT_VISPLANE_POOL=1 -DVP_POOL_PLANES=96 \
-    -DRP_CMD_BUF_SIZE=0x14000 \
+    -DRP_CMD_BUF_SIZE=0x2000 \
     -DTEXCACHE_MARGIN=0x20000 \
     -DSAT_REPACK \
     -DSAT_DEFER_SOUND_INIT \

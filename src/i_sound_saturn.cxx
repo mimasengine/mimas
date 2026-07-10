@@ -45,6 +45,7 @@ extern "C" {
    sat_streaming_mode (1 = WAD streamed from CD) is the main input.
    sat_music_use_cdda is DEFINED in core/s_sound.c so the shared core links it. */
 extern "C" int sat_streaming_mode;
+extern "C" int Z_LargestAllocatable(void);   /* core z_zone.c: largest alloc after purge (garde-COMPOSITE/sfx OOM pre-check) */
 extern "C" int sat_music_use_cdda;
 /* Step 4d: "will the CD be idle during play?" -- !streaming, or big-WAD per-map cart
    staging available (provided by w_drp_saturn.cxx).  Picks CDDA vs the MUS synth. */
@@ -234,6 +235,11 @@ static cached_sfx_t *cache_sfx(sfxinfo_t *sfxinfo)
     sfxinfo->driver_data = c;
 
     if (sfxinfo->lumpnum < 0) return NULL;
+    /* SATURN crash-proof: W_CacheLumpNum below COPIES the lump into the Doom zone (streaming mode)
+       and would I_Error-freeze if even a PURGEABLE copy will not fit (TNT: a ~29 KB sfx vs a full/
+       fragmented zone -> the observed Zmalloc-fail 29164 t8 crash).  The sfx cache is OPTIONAL (the
+       sound simply stays silent / lazy-loads later), so SKIP gracefully instead of crashing. */
+    if (Z_LargestAllocatable() < (int)W_LumpLength(sfxinfo->lumpnum)) return NULL;
     /* SATURN LEAK FIX (PU_CACHE=8, was PU_STATIC=1): in CD-streaming mode (no cart)
        W_CacheLumpNum COPIES the lump into the Doom zone.  We immediately upload the
        PCM to the separate SCSP sound RAM below and NEVER read this work-RAM copy

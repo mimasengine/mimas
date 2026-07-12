@@ -219,6 +219,13 @@ a CD state machine, SDMA0), Azel (per-frame ring drain ≤20 sectors), Jo Engine
   `R_InitTextures` consume it in one sequential read, classic fallback if absent (same
   CRC-validated pattern as the `.DRP` itself). Kills boot passes P3+P4 = **−88–95 % of boot
   reads**; with R1, big-WAD CD boot ≈ **2–8 s** `[est]` vs ~1–20+ min today.
+  **STATUS: sprite half (P4) SHIPPED 2026-07-12** — `sprite_headers()` emitter + header
+  `sprh_ofs/sprh_n` + `sat_drp_sprite_headers()` one-read loader + fail-closed
+  `R_InitSpriteLumps` hook (`SAT_REPACK`); 1381 boot reads → one 8.1 K read, every entry
+  verified byte-identical vs the WAD patch headers. **Texture half (P3,
+  `R_GenerateLookup`) remains.** Caveat `[HW]`: on a fast-seek ODE (Phoebe SD) the per-read
+  overhead is far smaller than on a real drive — the R2 persistent-handle regression proved
+  the seek-avoidance cost model inverts there; quantify the actual win with the R0 k-meter.
 - **R3.2 Access-ordered blobs**: `emit()` currently writes `sorted(sub)` by lump index →
   reorder geometry-first, then flats/textures/sprites-by-mobj (or a runtime-traced order).
   Offline-only, helps the cartless path; marginal once cart staging works.

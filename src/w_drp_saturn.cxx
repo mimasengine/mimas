@@ -73,6 +73,13 @@ static inline uint32_t rd32(const unsigned char *p)
            ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
 }
 
+/* signed little-endian 16 -- the sprite-header index stores patch width/offsets
+   (offsets are signed) as int16, same LE discipline as the rest of the container. */
+static inline int16_t rd16(const unsigned char *p)
+{
+    return (int16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
+}
+
 /* ------------------------------------------------------------------ */
 /* CRC32 (zlib polynomial), continuable -- matches tools/repack_wad.py  */
 /* dir_crc32(): crc32_run(crc, data) == zlib.crc32(data, crc).          */
@@ -164,6 +171,11 @@ extern "C" int sat_drp_cart_kb;  int sat_drp_cart_kb = 0;   /* staged blob size 
 static uint32_t       drp_n_maps      = 0;
 static unsigned char *drp_map_tab     = nullptr;  /* n_maps * 24, PU_STATIC */
 
+/* R3.1 boot index: precomputed sprite-header section (byte offset + count of
+   sprite lumps).  0 count = the .DRP predates R3.1 -> classic per-lump boot path. */
+static uint32_t       drp_sprh_ofs    = 0;
+static uint32_t       drp_sprh_n      = 0;
+
 /* current selected map */
 static unsigned char *drp_entries     = nullptr;  /* n_entries * 16, PU_STATIC */
 static int            drp_n_entries   = 0;
@@ -233,6 +245,8 @@ static void drp_probe(void)
     uint32_t n_maps   = rd32(hdr + 12);
     uint32_t maptabof = rd32(hdr + 16);
     uint32_t codec    = rd32(hdr + 20);
+    uint32_t sprh_ofs = rd32(hdr + 24);       /* R3.1 sprite-header index (0 = absent) */
+    uint32_t sprh_n   = rd32(hdr + 28);
 
     if (magic != DRP_MAGIC || codec != DRP_CODEC_LZSS ||
         n_lumps != numlumps || n_maps == 0 || n_maps > DRP_MAX_MAPS)
@@ -256,8 +270,44 @@ static void drp_probe(void)
     }
     drp_n_maps    = n_maps;
     sat_drp_n_maps = (int)n_maps;
+    /* R3.1: sanity the sprite-header section before trusting it (a corrupt count
+       could else over-read).  n_lumps is a safe upper bound on sprite lumps. */
+    if (sprh_n > 0 && sprh_n <= n_lumps && sprh_ofs >= DRP_HDR_SZ)
+    {
+        drp_sprh_ofs = sprh_ofs;
+        drp_sprh_n   = sprh_n;
+    }
     sat_drp_state = 1;
     printf("DRP: active, %u maps (repacked streaming)\n", (unsigned)n_maps);
+}
+
+/* R3.1 boot index (STREAMING_ROADMAP §6 R3.1): fill R_InitSpriteLumps' three arrays
+** (spritewidth / spriteoffset / spritetopoffset, each already <<FRACBITS) from the
+** .DRP's precomputed sprite-header section in ONE sequential read.  In CD-streaming
+** mode the classic path caches all ~1381 sprite lumps just for 6 header bytes each
+** (~1381 CD reads at boot); this collapses that to a single ~8 KB read.  `n` MUST be
+** the engine's numspritelumps (the .DRP is CRC-locked to this exact WAD directory, so
+** the sprite lump set is identical by construction -- a count mismatch means a stale
+** .DRP and we fall back).  Returns 1 = arrays filled; 0 = caller runs the classic loop.
+** Only the R3.1-era tool emits the section, so an older .DRP simply returns 0. */
+extern "C" int sat_drp_sprite_headers(int *width, int *loff, int *toff, int n)
+{
+    if (sat_drp_state == 0) drp_probe();
+    if (sat_drp_state != 1 || drp_sprh_n == 0) return 0;
+    if (n <= 0 || (int)drp_sprh_n != n) return 0;
+
+    int bytes = n * 6;                                   /* 3 int16 per sprite lump */
+    unsigned char *tmp = (unsigned char *)Z_Malloc(bytes, PU_STATIC, NULL);
+    if (drp_read(drp_sprh_ofs, tmp, bytes) < bytes) { Z_Free(tmp); return 0; }
+    for (int i = 0; i < n; i++)
+    {
+        const unsigned char *r = tmp + i * 6;
+        width[i] = (int)rd16(r + 0) << 16;               /* <<FRACBITS (fixed_t) */
+        loff[i]  = (int)rd16(r + 2) << 16;
+        toff[i]  = (int)rd16(r + 4) << 16;
+    }
+    Z_Free(tmp);
+    return 1;
 }
 
 /* uppercase 8-byte compare of a (lowercase) Doom map lumpname vs a stored name */

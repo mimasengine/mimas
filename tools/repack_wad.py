@@ -583,6 +583,29 @@ ENT_FMT = '<IIII'         # lump_idx, data_ofs, csize, usize  (all unsigned/non-
 ENT_SZ  = 16
 CODEC_LZSS = 1
 
+def sprite_headers(d, lumps):
+    """R3.1 boot index: for each sprite lump between the S_START/S_END markers, the
+    (width, leftoffset, topoffset) shorts from its patch header, packed little-endian
+    (offsets are signed).  Mirrors core/r_data.c R_InitSpriteLumps EXACTLY: the same
+    marker range (last S_START .. last S_END, W_GetNumForName's last-occurrence rule,
+    which marker_range() already reproduces) and the same three header fields.  The
+    loader (w_drp_saturn.cxx) reads this in one pass and skips caching every sprite
+    lump at boot.  Returns (packed_bytes, count)."""
+    s, e = marker_range(lumps, 'S_START', 'S_END')
+    if s is None or e is None or e <= s + 1:
+        return b'', 0
+    out = bytearray()
+    n = 0
+    for i in range(s + 1, e):                 # firstspritelump .. lastspritelump
+        _nm, fp, sz = lumps[i]
+        if sz >= 8:
+            w, _h, lo, to = struct.unpack_from('<hhhh', d, fp)
+        else:
+            w = lo = to = 0                   # not a patch -> zeros (engine would read garbage too)
+        out += struct.pack('<hhh', w, lo, to)
+        n += 1
+    return bytes(out), n
+
 def emit(wad, info, out_path):
     d, lumps, byname, maps = compute_subsets(wad, info)
     n_lumps = len(lumps)
@@ -613,10 +636,18 @@ def emit(wad, info, out_path):
         map_recs.append((name, entries, entries_ofs, blob_ofs, bytes(blob), blob_size))
         cursor = blob_ofs + blob_size
 
+    # SATURN R3.1 boot index: precomputed sprite-header section, appended after the
+    # map blobs.  Consumed in one sequential read by R_InitSpriteLumps instead of
+    # caching every sprite lump at boot.  Located via the header's two spare u32
+    # (sprh_ofs, sprh_n); an older loader ignores them, a pre-R3.1 .DRP reports 0.
+    sprh, sprh_n = sprite_headers(d, lumps)
+    sprh_ofs = cursor if sprh_n else 0
+    total = cursor + len(sprh)
+
     # serialize
-    buf = bytearray(cursor)
+    buf = bytearray(total)
     struct.pack_into(HDR_FMT, buf, 0, b'DRP1', n_lumps, dir_crc32(d, lumps),
-                     len(maps), map_tab_ofs, CODEC_LZSS, 0, 0)
+                     len(maps), map_tab_ofs, CODEC_LZSS, sprh_ofs, sprh_n)
     for k, (name, entries, entries_ofs, blob_ofs, blob, blob_size) in enumerate(map_recs):
         nm8 = name.encode('latin1')[:8].ljust(8, b'\x00')
         struct.pack_into(MAP_FMT, buf, map_tab_ofs + k*MAP_SZ,
@@ -624,6 +655,8 @@ def emit(wad, info, out_path):
         for e, (lix, dofs, csz, usz) in enumerate(entries):
             struct.pack_into(ENT_FMT, buf, entries_ofs + e*ENT_SZ, lix, dofs, csz, usz)
         buf[blob_ofs:blob_ofs+blob_size] = blob
+    if sprh_n:
+        buf[sprh_ofs:sprh_ofs+len(sprh)] = sprh
 
     open(out_path, 'wb').write(buf)
     return bytes(buf), d, lumps
@@ -631,7 +664,7 @@ def emit(wad, info, out_path):
 # ---------------------------------------------------------------- round-trip
 def verify(container, d, lumps):
     """Parse `container` from scratch and decode every lump; compare to source."""
-    magic, n_lumps, crc, n_maps, map_tab_ofs, codec, _, _ = struct.unpack_from(HDR_FMT, container, 0)
+    magic, n_lumps, crc, n_maps, map_tab_ofs, codec, sprh_ofs, sprh_n = struct.unpack_from(HDR_FMT, container, 0)
     assert magic == b'DRP1', "bad magic"
     assert codec == CODEC_LZSS, f"unknown codec {codec}"
     assert n_lumps == len(lumps), f"n_lumps {n_lumps} != WAD {len(lumps)}"
@@ -660,6 +693,14 @@ def verify(container, d, lumps):
                 raise AssertionError(f"{mapname}: lump #{lix} ({lumps[lix][0]}) "
                                      f"round-trip MISMATCH (usz={usz}, got {len(dec)})")
             n_lumps_checked += 1
+
+    # SATURN R3.1: the sprite-header index must reproduce R_InitSpriteLumps' reads
+    # byte-for-byte -- recompute from source and compare.
+    exp, exp_n = sprite_headers(d, lumps)
+    assert exp_n == sprh_n, f"sprh count {sprh_n} != recomputed {exp_n}"
+    if sprh_n:
+        got = container[sprh_ofs:sprh_ofs + len(exp)]
+        assert got == exp, "sprite-header index round-trip MISMATCH"
     return n_lumps_checked, n_maps, worst_blob
 
 # ---------------------------------------------------------------- self-test codec
@@ -718,6 +759,9 @@ def main():
         nlc, nmaps, worst = verify(container, d, lumps)
         print(f"  wrote {len(container)/1024.0:.0f}K  ({nmaps} maps, {nlc} lump instances)")
         print(f"  worst per-map blob = {worst/1024.0:.0f}K (4MB cart = 4096K)")
+        _sprh, _sprh_n = sprite_headers(d, lumps)
+        print(f"  R3.1 sprite-header index = {_sprh_n} sprites, {len(_sprh)/1024.0:.1f}K "
+              f"(boot: {_sprh_n} sprite-lump reads -> 1)")
         print("  ROUND-TRIP: OK (every lump decodes byte-identical to the source WAD).")
 
 if __name__ == '__main__':

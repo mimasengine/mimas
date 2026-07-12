@@ -31,6 +31,16 @@ Tags: `[HW]` real-hardware measured · `[Ymir]` emulator · `[src]` read at sour
 | **R4** | Memory levers (reopen texturecolumnlump; geometry diet; small cuts) | large, shared core | Makes TNT/Plutonia-class maps *fit at all*; restores the split slab |
 | **R5** | Split-screen specifics: intermission preload, per-frame LRU aging, per-view page-in budget | small–medium | Multi stops multiplying solo hitches by N views |
 
+> **Status 2026-07-12.** **R1 SHIPPED both paths** (`25450df`: 16 K chunked bounce in
+> `Saturn_Read` + `drp_read`; overlay row-0 `ld<chunks>/<per-sector-equivalent>` — the ratio
+> is the live win, Ymir-visible). **R1.3 (2048-align `.DRP` entries) DROPPED** — superseded
+> by the chunked bounce (≤ceil(size/16K)+1 reads regardless of alignment) and it would bloat
+> the per-map blobs against the 4 MB cart. **R2.2 persistent handle SHIPPED DEFAULT-OFF**
+> (`0bb3fc8` — HW regression on the fast-seek Phoebe SD ODE: no physical seek to save +
+> read-ahead churn + open-handle timing drag; stays a real-CD compile opt-in). **R3.1 sprite
+> half SHIPPED** (core `7d708bd` / port `de8f2de`, + boot trust-but-verify cross-check);
+> **R3.1 texture half CLOSED as MOOT** (§6).
+
 Dependency: R0 → R1 → (R2 ∥ R3) → R5; R4 is orthogonal and gates TNT/Plutonia support.
 The shipped `.DRP`+cart staging path ([`STREAMING_ANALYSIS.md` §7.9–7.12](STREAMING_ANALYSIS.md))
 remains the **best case** (CD idle + CDDA); this roadmap is what makes the **cartless** and
@@ -222,8 +232,17 @@ a CD state machine, SDMA0), Azel (per-frame ring drain ≤20 sectors), Jo Engine
   **STATUS: sprite half (P4) SHIPPED 2026-07-12** — `sprite_headers()` emitter + header
   `sprh_ofs/sprh_n` + `sat_drp_sprite_headers()` one-read loader + fail-closed
   `R_InitSpriteLumps` hook (`SAT_REPACK`); 1381 boot reads → one 8.1 K read, every entry
-  verified byte-identical vs the WAD patch headers. **Texture half (P3,
-  `R_GenerateLookup`) remains.** Caveat `[HW]`: on a fast-seek ODE (Phoebe SD) the per-read
+  verified byte-identical vs the WAD patch headers; boot now also cross-checks entries 0
+  and N−1 against the real patch headers (2 reads) and falls back loudly on mismatch.
+  **Texture half (P3): CLOSED as MOOT 2026-07-12** `[src]` — since R4 lazy directories,
+  `R_GenerateLookup` has **no boot caller** ([r_data.c:460-500](../core/r_data.c): only
+  `R_EnsureLookup`, on the draw path via `R_GetColumn`/`R_GenerateComposite`), and the
+  patches it reads are the same PU_CACHE lumps the draw/composite consumes immediately
+  after — a precomputed lookup index would save ~zero CD reads. §2.3's "P3 ≈ half the boot
+  reads" premise described the pre-R4 tree (the gap-filler agent's numbers were not
+  re-verified against R4). **The boot index is therefore COMPLETE with the sprite half**;
+  the residual ~300 small boot reads (directory, PNAMES/TEXTURE, ST/HU fonts, title) are
+  already chunked ÷8–16 by R1. Caveat `[HW]`: on a fast-seek ODE (Phoebe SD) the per-read
   overhead is far smaller than on a real drive — the R2 persistent-handle regression proved
   the seek-avoidance cost model inverts there; quantify the actual win with the R0 k-meter.
 - **R3.2 Access-ordered blobs**: `emit()` currently writes `sorted(sub)` by lump index →
@@ -287,6 +306,17 @@ count, texcache hit rate, and fps on: (a) big-WAD boot, (b) level load, (c) firs
 combat burst (cold sprites), (d) room-transition texture rafale, (e) 2p/4p same scenes.
 Success criteria: no in-game read > 1 frame `[R2]`; boot < 10 s `[R3.1]`; level load < 5 s
 cartless; zero CDDA glitches on cart maps after R0.3.
+
+**R3.1 sprite-index protocol.** (a) *Correctness (Ymir, ~1 min):* boot a repacked disc and
+check the console for `DRP: sprite index N ok (1 read)` with **no**
+`R3.1 sprite index MISMATCH` line — the boot cross-checks entries 0 and N−1 against the
+real patch headers and rebuilds classically (loudly) on any decode/container bug. Sprites
+sitting correctly in-game (offsets drive placement) is the visual confirmation.
+(b) *Fallback:* boot with a stale or absent `.DRP` (other WAD's, or pre-R3.1 tool) — expect
+the classic dotted loop and a normal boot. (c) *Gain:* row-0 `ld` at the title screen —
+with the index the boot issues ~10× fewer chunk loads (~200 vs ~1600+ on a big IWAD, the
+sprite pass alone was ~1400+); wall-clock delta is HW-only (small on the Phoebe ODE, large
+on a real drive — the k-meter quantifies).
 
 ---
 

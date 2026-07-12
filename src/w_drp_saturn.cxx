@@ -307,6 +307,7 @@ extern "C" int sat_drp_sprite_headers(int *width, int *loff, int *toff, int n)
         toff[i]  = (int)rd16(r + 4) << 16;
     }
     Z_Free(tmp);
+    printf("DRP: sprite index %d ok (1 read)\n", n);   /* validation proof the fast path ran */
     return 1;
 }
 

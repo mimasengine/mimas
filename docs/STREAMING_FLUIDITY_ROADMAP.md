@@ -229,7 +229,10 @@ a CD state machine, SDMA0), Azel (per-frame ring drain ≤20 sectors), Jo Engine
   `R_InitTextures` consume it in one sequential read, classic fallback if absent (same
   CRC-validated pattern as the `.DRP` itself). Kills boot passes P3+P4 = **−88–95 % of boot
   reads**; with R1, big-WAD CD boot ≈ **2–8 s** `[est]` vs ~1–20+ min today.
-  **STATUS: sprite half (P4) SHIPPED 2026-07-12** — `sprite_headers()` emitter + header
+  **STATUS: sprite half (P4) SHIPPED + Ymir-VALIDATED 2026-07-12** — title-screen overlay
+  read `ld162/278` (classic sprite pass would add ~1381 → index path proven taken), `cd0`
+  retries, no MISMATCH, and in-game sprite placement visually correct; HW wall-clock gain
+  pending (k-meter). `sprite_headers()` emitter + header
   `sprh_ofs/sprh_n` + `sat_drp_sprite_headers()` one-read loader + fail-closed
   `R_InitSpriteLumps` hook (`SAT_REPACK`); 1381 boot reads → one 8.1 K read, every entry
   verified byte-identical vs the WAD patch headers; boot now also cross-checks entries 0

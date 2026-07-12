@@ -15,8 +15,12 @@
 
 Tags: `[HW]` real-hardware measured · `[Ymir]` emulator · `[src]` read at source ·
 `[disasm]` LIBCD.A disassembly · `[SEGA]` in-repo SEGA manuals (MANGFS/MANCDC/MANSTM) ·
-`[est]` estimate/model. **Ymir does not model CD/cart timing** — every latency claim below is
-`[est]` until the R0 instrumentation runs on console.
+`[est]` estimate/model. ~~Ymir does not model CD timing~~ **CORRECTED 2026-07-12 by the R0.2
+k-meter itself** `[Ymir]`: Ymir emulates ~**36-41 ms per GFS command** (k39-41, w≈79 ms on a
+16 K chunk, ld×k≈t consistent across sessions) — a protocol-level model (no physical
+seek/rotation), so **relative** read-strategy A/Bs are partially meaningful on Ymir; absolute
+k and seek behaviour still need the console capture (cart timing + CDDA remain Ymir-blind,
+§7.12).
 
 ---
 
@@ -53,6 +57,15 @@ Tags: `[HW]` real-hardware measured · `[Ymir]` emulator · `[src]` read at sour
 > patches) into purgeable PU_CACHE, keep-free guard 192 K, runs LAST in `P_SetupLevel`
 > (after the texcache carve + the already-present `SAT_SND_PRECACHE` sfx warm-up);
 > overlay row 21 `pl<kb>`. Remaining in flight: R2.3 async pump, R3.4 staging UX, R4.
+>
+> **Ymir validation 2026-07-12 (Doom II front-only disc).** R5.1 PROVEN: 15 s of combat
+> (health 100→79 %, pickups, corpse) with `ld` frozen at 192/413 — zero in-game CD
+> commands; second session +10 commands over 24 s incl. a death fight. k-meter live:
+> k≈39-41 w≈79 t6-8s (see the Ymir-timing correction above); boot CD time on Ymir now
+> ~6 s vs ~90 s that the pre-R1/R3.1 ~2500 per-sector commands would cost at the same
+> per-command rate. Front-only: flat `ld` under combat = rotations never requested
+> (gate armed); the two visual spot-checks (circle-strafed monster stays front-facing,
+> 2p player still rotates) remain to eyeball.
 
 Dependency: R0 → R1 → (R2 ∥ R3) → R5; R4 is orthogonal and gates TNT/Plutonia support.
 The shipped `.DRP`+cart staging path ([`STREAMING_ANALYSIS.md` §7.9–7.12](STREAMING_ANALYSIS.md))

@@ -24,6 +24,13 @@
 #   -- both stay loadable. Needs python on PATH; skipped when the .DRP is already
 #   up to date. Omit -Repack for a raw disc (default, unchanged).
 #
+# -FrontOnly : (with -Repack) strip sprite ROTATION lumps from the .DRP blobs
+#   (PLAY* kept) and flag the header so the engine renders every non-player sprite
+#   front-facing (Hexen-Saturn trick, core sat_sprite_frontonly). Measured: every
+#   Doom II / TNT / Plutonia blob then fits the 4 MB cart -> CDDA on every map,
+#   and in-combat first-sight page-ins shrink ~5x. Cosmetic tradeoff: monster
+#   facing is no longer readable. See STREAMING_FLUIDITY_ROADMAP.md.
+#
 # SRL's shared.mk handles: compile, link, ISO (xorrisofs), CUE generation.
 # CDDA music: place WAV/FLAC/OGG/MP3 files in cd/music/ and create a
 # cd/music/tracklist file listing them in order (one per line, track 02+).
@@ -33,6 +40,7 @@ param(
     [switch]$Clean,
     [string]$Wad,
     [switch]$Repack,
+    [switch]$FrontOnly,
     [switch]$Cdda,
     [switch]$Mus,
     [string]$WarpMap = "",
@@ -102,10 +110,12 @@ if ($Repack) {
     if (-not $py) { throw "-Repack: python not found on PATH (needed to build the .DRP)" }
 
     Write-Host "Repack: ensuring cd/data/DOOMRP.DRP matches the IWAD..."
-    & $py $toolFile $wadFile $infoFile "--emit=$drpFile" "--if-stale"
+    $foArgs = @(); if ($FrontOnly) { $foArgs = @("--front-only") }
+    & $py $toolFile $wadFile $infoFile "--emit=$drpFile" "--if-stale" @foArgs
     if ($LASTEXITCODE -ne 0) { throw "repack_wad.py failed (exit $LASTEXITCODE)" }
     Write-Host "Repack OK ($('{0:N0}' -f (Get-Item $drpFile).Length) bytes)"
 }
+elseif ($FrontOnly) { throw "-FrontOnly requires -Repack (it is a .DRP build flag)" }
 
 function ConvertTo-Msys2Path([string]$p) {
     $p = $p.Replace('\','/')

@@ -210,6 +210,29 @@ extern "C" int sat_cd_loads = 0;
 extern "C" int sat_cd_persector = 0;
 #define SAT_CD_READ_RETRIES 8
 
+/* R0.2 k-meter (STREAMING_FLUIDITY_ROADMAP.md sec.3): FRT-time every chunk command so
+** real hardware finally yields k -- the mean ms per GFS command that every boot/level
+** load estimate in the roadmap hangs on (Ymir reads ~0: it does not model CD latency;
+** only a console capture of row 12 is meaningful).  The master FRT (sysclk/128,
+** ~4.47us/tick) wraps at ~293ms, so a command spanning >=16 vblanks (~267ms: a long
+** physical seek) is timed by the coarse vblank clock instead -- each clock is
+** unambiguous inside its range.  Overlay row 12: k = mean ms/command, w = worst
+** command (ms), t = cumulative seconds spent inside CD commands. */
+extern "C" unsigned short sat_frt(void);        /* dg_saturn.cxx master FRT */
+extern "C" unsigned int   sat_vbl(void);        /* dg_saturn.cxx vblank count */
+extern "C" unsigned int sat_cd_ms10_total = 0;  /* cumulative CD-command wall-clock (tenths of ms) */
+extern "C" unsigned int sat_cd_ms10_worst = 0;  /* worst single command (tenths of ms) */
+
+extern "C" void sat_cd_clock_add(unsigned short f0, unsigned int v0)
+{
+    unsigned int dv   = sat_vbl() - v0;
+    unsigned int ms10 = (dv >= 16u)
+        ? dv * 167u                                                       /* ~16.7ms/vblank */
+        : ((unsigned int)(unsigned short)(sat_frt() - f0) * 447u) / 10000u; /* ~4.47us/tick */
+    sat_cd_ms10_total += ms10;
+    if (ms10 > sat_cd_ms10_worst) sat_cd_ms10_worst = ms10;
+}
+
 /* R2.2 persistent read: absolute sector seek (pointer-only) + blocking Fread on the open
 ** handle.  Same (sector, bytes, dst) contract as the LoadBytes path, so it drops straight
 ** into both the fast path and sat_cd_bounce.  GFS_Fread reads whole sectors but caps the
@@ -223,7 +246,7 @@ static int sat_cd_load_hn(size_t sector, int32_t bytes, void *dst)
     return GFS_Fread(wad_hn, nsct, dst, bytes);
 }
 
-static int sat_cd_load(size_t sector, int32_t bytes, void *dst)
+static int sat_cd_load_raw(size_t sector, int32_t bytes, void *dst)
 {
     sat_cd_loads++;
     int got;
@@ -247,6 +270,17 @@ static int sat_cd_load(size_t sector, int32_t bytes, void *dst)
         sat_cd_read_retries++;
         got = wad_cd_file->LoadBytes(sector, bytes, dst);
     }
+    return got;
+}
+
+/* R0.2: every chunk command passes through the k-meter (retries included -- we time
+** what the game actually waits on, not the ideal command). */
+static int sat_cd_load(size_t sector, int32_t bytes, void *dst)
+{
+    unsigned short f0 = sat_frt();
+    unsigned int   v0 = sat_vbl();
+    int got = sat_cd_load_raw(sector, bytes, dst);
+    sat_cd_clock_add(f0, v0);
     return got;
 }
 

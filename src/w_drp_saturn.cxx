@@ -192,7 +192,15 @@ int sat_drp_read_retries = 0;
 extern "C" int sat_cd_loads;       /* R1 telemetry (defined in w_file_saturn.cxx) */
 extern "C" int sat_cd_persector;   /* R1 per-sector-equivalent baseline */
 
-static int drp_load(size_t sector, int32_t bytes, void *dst)
+/* R0.2 k-meter, shared with the WAD reader (defined in w_file_saturn.cxx). */
+extern "C" unsigned short sat_frt(void);
+extern "C" unsigned int   sat_vbl(void);
+extern "C" void sat_cd_clock_add(unsigned short f0, unsigned int v0);
+
+/* Front-only render gate (core/r_things.c), armed by the .DRP header flag below. */
+extern "C" int sat_sprite_frontonly;
+
+static int drp_load_raw(size_t sector, int32_t bytes, void *dst)
 {
     sat_cd_loads++;
     int got = drp_file->LoadBytes(sector, bytes, dst);
@@ -201,6 +209,15 @@ static int drp_load(size_t sector, int32_t bytes, void *dst)
         sat_drp_read_retries++;
         got = drp_file->LoadBytes(sector, bytes, dst);
     }
+    return got;
+}
+
+static int drp_load(size_t sector, int32_t bytes, void *dst)
+{
+    unsigned short f0 = sat_frt();
+    unsigned int   v0 = sat_vbl();
+    int got = drp_load_raw(sector, bytes, dst);
+    sat_cd_clock_add(f0, v0);          /* R0.2: .DRP commands count toward k too */
     return got;
 }
 
@@ -248,6 +265,12 @@ static void drp_probe(void)
     uint32_t sprh_ofs = rd32(hdr + 24);       /* R3.1 sprite-header index (0 = absent) */
     uint32_t sprh_n   = rd32(hdr + 28);
 
+    /* The codec word doubles as a flags field (tool emits codec | flags<<8):
+       bit 8 = front-only sprites -- monster rotation lumps are stripped from the
+       blobs (PLAY* kept for split-screen readability). */
+    uint32_t drpflags = codec >> 8;
+    codec &= 0xFFu;
+
     if (magic != DRP_MAGIC || codec != DRP_CODEC_LZSS ||
         n_lumps != numlumps || n_maps == 0 || n_maps > DRP_MAX_MAPS)
     {
@@ -276,6 +299,15 @@ static void drp_probe(void)
     {
         drp_sprh_ofs = sprh_ofs;
         drp_sprh_n   = sprh_n;
+    }
+    /* Front-only .DRP: arm the render gate BEFORE any sprite draws -- with the
+       rotations stripped from the blobs, a rotation request would take the full-WAD
+       CD fallback (hitches, and CD traffic under CDDA on cart-staged maps).  Flag and
+       blob content come from the same tool run, so coherence is by construction. */
+    if (drpflags & 1u)
+    {
+        sat_sprite_frontonly = 1;
+        printf("DRP: front-only sprites (rotations stripped, PLAY kept)\n");
     }
     sat_drp_state = 1;
     printf("DRP: active, %u maps (repacked streaming)\n", (unsigned)n_maps);
@@ -309,6 +341,57 @@ extern "C" int sat_drp_sprite_headers(int *width, int *loff, int *toff, int n)
     Z_Free(tmp);
     printf("DRP: sprite index %d ok (1 read)\n", n);   /* validation proof the fast path ran */
     return 1;
+}
+
+/* ------------------------------------------------------------------ */
+/* R5.1 -- budgeted level-load preload of the map's subset             */
+/* (STREAMING_FLUIDITY_ROADMAP.md sec.8)                               */
+/* ------------------------------------------------------------------ */
+/* The selected map's .DRP entry table IS the preload list (superset-safe, computed
+** offline).  Called by P_SetupLevel at the very END of level setup -- after the
+** texcache carve (the slab must win the contiguous-run contest) and the sfx warm-up
+** -- under the load fade: pull lumps into plain purgeable PU_CACHE until the zone's
+** largest allocatable run drops to the keep-free floor.  Pass 0 = sprites + flats
+** (the hitchiest first-sights: a monster type's first frame, a visplane's first
+** flat); pass 1 = the rest (wall patches).  Zone-tight maps hit the guard
+** immediately and behave exactly as today; a purged preload simply reverts that
+** lump to the lazy path.  With the blob cart-staged the preload never touches the
+** CD at all (LZSS decode from cart RAM). */
+extern "C" { extern int firstspritelump, lastspritelump, firstflat, lastflat; }
+
+extern "C" int sat_drp_preload_kb;  int sat_drp_preload_kb = 0;   /* row-21 telemetry */
+#ifndef SAT_DRP_PRELOAD_KEEP_FREE
+#define SAT_DRP_PRELOAD_KEEP_FREE (192*1024)   /* leave this much allocatable for gameplay */
+#endif
+
+extern "C" void sat_drp_preload(void)
+{
+    int done = 0;
+    sat_drp_preload_kb = 0;
+    if (sat_drp_state != 1 || !drp_entries || drp_n_entries <= 0) return;
+
+    for (int pass = 0; pass < 2; pass++)
+    {
+        for (int e = 0; e < drp_n_entries; e++)
+        {
+            const unsigned char *ent = drp_entries + e * DRP_ENT_SZ;
+            uint32_t lump  = rd32(ent + 0);
+            uint32_t usize = rd32(ent + 12);
+            if (usize == 0 || lump >= numlumps) continue;
+            int hot = ((int)lump >= firstspritelump && (int)lump <= lastspritelump) ||
+                      ((int)lump >= firstflat       && (int)lump <= lastflat);
+            if (hot != (pass == 0)) continue;
+            if (lumpinfo[lump].cache) continue;          /* already resident (geometry etc.) */
+            if (Z_LargestAllocatable() < (int)(SAT_DRP_PRELOAD_KEEP_FREE + usize))
+                goto out;                                /* zone budget reached */
+            W_CacheLumpNum((int)lump, PU_CACHE);
+            done += (int)usize;
+        }
+    }
+out:
+    sat_drp_preload_kb = done >> 10;
+    if (done)
+        printf("DRP: preloaded %dK (subset warm)\n", done >> 10);
 }
 
 /* uppercase 8-byte compare of a (lowercase) Doom map lumpname vs a stored name */

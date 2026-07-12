@@ -40,6 +40,19 @@ Tags: `[HW]` real-hardware measured · `[Ymir]` emulator · `[src]` read at sour
 > read-ahead churn + open-handle timing drag; stays a real-CD compile opt-in). **R3.1 sprite
 > half SHIPPED** (core `7d708bd` / port `de8f2de`, + boot trust-but-verify cross-check);
 > **R3.1 texture half CLOSED as MOOT** (§6).
+>
+> **Status 2026-07-12 (second batch).** **R0.2 k-meter SHIPPED**: `sat_cd_load`/`drp_load`
+> FRT+vblank-timed (wrap-safe past 293 ms); overlay row 12 `CD p fb k<mean ms/cmd>
+> w<worst ms> t<total s>` — k is THE calibration number, hardware-only (Ymir reads ~0).
+> **Front-only sprites SHIPPED as a build option** (`build.ps1 -Repack -FrontOnly`):
+> rotation lumps stripped from the blobs (PLAY* kept), header flag bit 8 auto-arms the
+> core render gate `sat_sprite_frontonly` (players exempt) — measured with PLAY kept:
+> every Doom II/TNT/Plutonia blob fits the 4 MB cart (TNT worst 4655 K → **3088 K**),
+> resolving R0.3 for all three IWADs; first-sight page-ins shrink ~5×. **R5.1 SHIPPED**:
+> budgeted level-load preload of the map's `.DRP` subset (sprites+flats first, then
+> patches) into purgeable PU_CACHE, keep-free guard 192 K, runs LAST in `P_SetupLevel`
+> (after the texcache carve + the already-present `SAT_SND_PRECACHE` sfx warm-up);
+> overlay row 21 `pl<kb>`. Remaining in flight: R2.3 async pump, R3.4 staging UX, R4.
 
 Dependency: R0 → R1 → (R2 ∥ R3) → R5; R4 is orthogonal and gates TNT/Plutonia support.
 The shipped `.DRP`+cart staging path ([`STREAMING_ANALYSIS.md` §7.9–7.12](STREAMING_ANALYSIS.md))
@@ -169,6 +182,10 @@ layout), R3.4 staging masking.
   (b) hot-set partial staging + CD cold-fallback masked by the Option-2 music fade
   ([`TRANSITIONS_PLAN.md`](TRANSITIONS_PLAN.md)) for TNT/Plutonia's 4+3 maps; (c) accept
   MUS-synth (no CDDA) on those maps. Recommendation: (a) for Doom II, (a)+(b) for Final Doom.
+  **RESOLVED 2026-07-12 by (d): the `-FrontOnly` build option** — stripping rotation lumps
+  (59 % of sprite bytes) puts every blob of all three IWADs under the cart with ~1 MB
+  headroom (TNT worst 3088 K, PLAY kept). Discs built without `-FrontOnly` still face
+  (a)–(c) on the 8 listed maps.
 - **R0.4 Re-emit + re-validate `.DRP`** with the fixed tool (round-trip self-test), commit the
   tool fix, erratum in `STREAMING_ANALYSIS.md` §7.10 (done alongside this doc).
 
@@ -289,6 +306,11 @@ PU_CACHE (the measured 2p composite-fragmentation OOM).
   (superset-safe, already emitted); missing piece is a ~50-line incremental consumer
   (priority: geometry > flats > textures > sprites) running under the intermission — masks
   first-sight hitches ×N players. Works cartless too (bounded by a byte budget, purgeable).
+  **SHIPPED 2026-07-12** as a level-load preload (`sat_drp_preload`, w_drp_saturn.cxx;
+  called last in `P_SetupLevel` under the load fade): pass 0 sprites+flats, pass 1 wall
+  patches, stop at 192 K largest-run keep-free (`SAT_DRP_PRELOAD_KEEP_FREE`) — zone-tight
+  maps no-op. Row-21 `pl<kb>` telemetry. The *incremental-during-WI* variant stays future
+  work (needs a chunked consumer pumped per WI tic).
 - **R5.2 LRU tuning for 3/4p**: switch texcache aging from per-view to once-per-frame
   ([r_cache.c:133-135](../core/r_cache.c) comment); extend the pool to flats / sprite patches /
   single-patch walls (explicit "not yet cached" follow-up) so 4 disjoint frusta stop churning

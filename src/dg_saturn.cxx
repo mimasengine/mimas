@@ -1313,6 +1313,13 @@ extern "C" unsigned short sat_frt(void)
     return frt_read();
 }
 
+/* R0.2 k-meter companion: the vblank count disambiguates FRT wraps for CD commands
+** longer than ~293ms (w_file_saturn.cxx sat_cd_clock_add). */
+extern "C" unsigned int sat_vbl(void)
+{
+    return vbl_count;
+}
+
 static void vblank_handler(void)
 {
     vbl_count++;
@@ -1881,9 +1888,20 @@ static void fps_update(void)
             if (sat_wad_base == nullptr)   /* CD-streaming mode */
             {
                 extern int sat_cd_persistent, sat_cd_persist_fallbacks;
+                /* R0.2 k-meter (w_file_saturn.cxx): k = mean ms per GFS chunk command
+                   (cumulative, THE calibration number for the whole streaming roadmap),
+                   w = worst single command in ms (a physical seek shows here), t =
+                   cumulative seconds inside CD commands.  Hardware-only signal: Ymir
+                   reads k~0 (no CD latency model) -- capture row 12 on console. */
+                extern unsigned int sat_cd_ms10_total, sat_cd_ms10_worst;
+                extern int sat_cd_loads;
+                unsigned int kml = sat_cd_loads > 0
+                    ? sat_cd_ms10_total / (unsigned int)sat_cd_loads : 0u;
                 static char rR2[45];
-                snprintf(rR2, sizeof rR2, "CD persist p%d fb%d  L+A      ",
-                         sat_cd_persistent, sat_cd_persist_fallbacks);
+                snprintf(rR2, sizeof rR2, "CD p%d fb%d k%u.%u w%u t%us L+A ",
+                         sat_cd_persistent, sat_cd_persist_fallbacks,
+                         kml / 10, kml % 10,
+                         sat_cd_ms10_worst / 10, sat_cd_ms10_total / 10000);
                 if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 12, rR2);
             }
             /* row 18: memory-latency calibration (one-shot cold 32 KB read per bank, FRT
@@ -1934,11 +1952,13 @@ static void fps_update(void)
                in .DRP).  off code: -1 cart/not-stream, -2 no file, -3 hdr, -4 CRC, -5 tbl. */
             extern int sat_drp_state, sat_drp_n_maps, sat_drp_served, sat_drp_read_retries;
             extern int sat_drp_cart, sat_drp_cart_kb;   /* Step 4b: cart-staging status */
+            extern int sat_drp_preload_kb;              /* R5.1: this map's level-load preload */
             static char r21[45];
             if (sat_drp_state == 1)
-                snprintf(r21, sizeof r21, "DRP ON m%d s%d r%d %s%dk",
+                snprintf(r21, sizeof r21, "DRP ON m%d s%d r%d %s%dk pl%dk",
                          sat_drp_n_maps, sat_drp_served, sat_drp_read_retries,
-                         sat_drp_cart ? "CART" : "cd", sat_drp_cart_kb);
+                         sat_drp_cart ? "CART" : "cd", sat_drp_cart_kb,
+                         sat_drp_preload_kb);
             else
                 snprintf(r21, sizeof r21, "DRP off (%d)         ", sat_drp_state);
             (void)r21;   /* DRP streaming-status row cut (not perf/composition) */

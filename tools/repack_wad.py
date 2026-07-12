@@ -386,7 +386,19 @@ def is_map_marker(nm):
 MAP_LUMPS = {'THINGS','LINEDEFS','SIDEDEFS','VERTEXES','SEGS','SSECTORS','NODES',
              'SECTORS','REJECT','BLOCKMAP','BEHAVIOR'}
 
-def compute_subsets(wad_path, info_path):
+def is_rotation_sprite(nm):
+    """True for a sprite lump that ONLY serves rotations >= 2 -- the lumps a front-only
+    build drops.  Sprite lump name = 4-char sprite + frame+rot [+ frame+rot mirrored
+    pair].  Rot '0' is omnidirectional and rot '1' is the front view that the runtime
+    gate (core sat_sprite_frontonly) serves for EVERY angle, so any pair with rot in
+    '01' must stay in the blob."""
+    if len(nm) == 6:
+        return nm[5] not in '01'
+    if len(nm) == 8:
+        return nm[5] not in '01' and nm[7] not in '01'
+    return False
+
+def compute_subsets(wad_path, info_path, front_only=False):
     """Return (d, lumps, byname, maps) where maps = [(name, marker_idx, idx_set)].
     idx_set is a set of ORIGINAL lump indices (not names: map sub-lumps such as
     THINGS share names across maps, so we resolve them by position)."""
@@ -548,13 +560,26 @@ def compute_subsets(wad_path, info_path):
             if ds in byname: sub.add(byname[ds])
         # Music: handled separately (CDDA track or single MUS lump on demand) -- not
         # part of the per-map graphics subset.
+        if front_only:
+            # Front-only sprites (Hexen-Saturn trick): drop every rotation-only sprite
+            # lump -- the runtime gate (core sat_sprite_frontonly, armed by the header
+            # flag) serves the front view for every angle, so these are never requested.
+            # PLAY* keeps its rotations (split-screen readability; the runtime exempts
+            # player mobjs to match).  Measured: rotations = 59% of sprite bytes; every
+            # Doom II / TNT / Plutonia blob then fits the 4 MB cart (CDDA everywhere).
+            s0, e0 = s_rng
+            sub = {ix for ix in sub
+                   if not (s0 < ix < e0
+                           and not lumps[ix][0].startswith('PLAY')
+                           and is_rotation_sprite(lumps[ix][0]))}
         out.append((mapname, mi, sub))
     return d, lumps, byname, out
 
 # ---------------------------------------------------------------- report
-def report(wad, info):
-    d, lumps, byname, maps = compute_subsets(wad, info)
-    print(f"=== per-map SAFE-SUPERSET subset: {wad} (info={info}) ===")
+def report(wad, info, front_only=False):
+    d, lumps, byname, maps = compute_subsets(wad, info, front_only)
+    print(f"=== per-map SAFE-SUPERSET subset: {wad} (info={info})"
+          f"{' FRONT-ONLY' if front_only else ''} ===")
     print(f"  {'map':<8}{'#lumps':>8}{'raw KB':>9}{'lzss KB':>9}{'ratio':>7}")
     cache = {}                 # lump_idx -> (method, payload)
     worst = worstc = 0
@@ -606,8 +631,8 @@ def sprite_headers(d, lumps):
         n += 1
     return bytes(out), n
 
-def emit(wad, info, out_path):
-    d, lumps, byname, maps = compute_subsets(wad, info)
+def emit(wad, info, out_path, front_only=False):
+    d, lumps, byname, maps = compute_subsets(wad, info, front_only)
     n_lumps = len(lumps)
     cache = {}                 # lump_idx -> (method, payload)
     def packed(ix):
@@ -644,10 +669,13 @@ def emit(wad, info, out_path):
     sprh_ofs = cursor if sprh_n else 0
     total = cursor + len(sprh)
 
-    # serialize
+    # serialize.  The codec word doubles as a flags field (loader: codec & 0xFF,
+    # flags = codec >> 8): bit 8 = front-only sprites (rotation lumps stripped from
+    # the blobs; the loader arms core sat_sprite_frontonly so they are never asked).
+    codec_word = CODEC_LZSS | (0x100 if front_only else 0)
     buf = bytearray(total)
     struct.pack_into(HDR_FMT, buf, 0, b'DRP1', n_lumps, dir_crc32(d, lumps),
-                     len(maps), map_tab_ofs, CODEC_LZSS, sprh_ofs, sprh_n)
+                     len(maps), map_tab_ofs, codec_word, sprh_ofs, sprh_n)
     for k, (name, entries, entries_ofs, blob_ofs, blob, blob_size) in enumerate(map_recs):
         nm8 = name.encode('latin1')[:8].ljust(8, b'\x00')
         struct.pack_into(MAP_FMT, buf, map_tab_ofs + k*MAP_SZ,
@@ -666,7 +694,7 @@ def verify(container, d, lumps):
     """Parse `container` from scratch and decode every lump; compare to source."""
     magic, n_lumps, crc, n_maps, map_tab_ofs, codec, sprh_ofs, sprh_n = struct.unpack_from(HDR_FMT, container, 0)
     assert magic == b'DRP1', "bad magic"
-    assert codec == CODEC_LZSS, f"unknown codec {codec}"
+    assert codec & 0xFF == CODEC_LZSS, f"unknown codec {codec}"   # high bits = flags (front-only)
     assert n_lumps == len(lumps), f"n_lumps {n_lumps} != WAD {len(lumps)}"
     assert crc == dir_crc32(d, lumps), "directory CRC mismatch"
     n_lumps_checked = 0
@@ -724,11 +752,13 @@ def main():
     out  = None
     want_report = False
     if_stale = False
+    front_only = False
     for o in opts:
         if o.startswith('--emit='): out = o.split('=',1)[1]
         elif o == '--emit':        out = 'cd/data/DOOMRP.DRP'
         elif o == '--report':      want_report = True
         elif o == '--if-stale':    if_stale = True   # skip emit if the .DRP already matches the WAD
+        elif o == '--front-only':  front_only = True # strip sprite rotations from the blobs (PLAY kept)
         elif o == '--selftest':
             print("codec self-test:", codec_selftest(), "cases OK"); return
 
@@ -739,22 +769,26 @@ def main():
         try:
             h = open(out, 'rb').read(HDR_SZ)
             magic, n_lumps, crc = struct.unpack_from('<4sII', h, 0)
+            codec_word = struct.unpack_from('<I', h, 20)[0]
+            want_word  = CODEC_LZSS | (0x100 if front_only else 0)
             d, lumps, _ = read_wad(wad)
-            if magic == b'DRP1' and n_lumps == len(lumps) and crc == dir_crc32(d, lumps):
-                print(f"{out} already matches {wad} (CRC {crc:#010x}) -- skipping repack.")
+            if (magic == b'DRP1' and n_lumps == len(lumps)
+                    and crc == dir_crc32(d, lumps) and codec_word == want_word):
+                print(f"{out} already matches {wad} (CRC {crc:#010x}"
+                      f"{', front-only' if front_only else ''}) -- skipping repack.")
                 return
-            print(f"{out} stale vs {wad} -- regenerating.")
+            print(f"{out} stale vs {wad} (or flags changed) -- regenerating.")
         except Exception as e:
             print(f"{out} unreadable ({e}) -- regenerating.")
 
     # plain run -> report; --emit -> emit only (single compression pass, for builds);
     # --emit --report -> both.
     if out is None or want_report:
-        report(wad, info)
+        report(wad, info, front_only)
     if out:
-        print(f"\n=== emit + round-trip: {out} ===")
+        print(f"\n=== emit + round-trip: {out}{' FRONT-ONLY' if front_only else ''} ===")
         print("  codec self-test:", codec_selftest(), "cases OK")
-        _, d, lumps = emit(wad, info, out)
+        _, d, lumps = emit(wad, info, out, front_only)
         container = open(out, 'rb').read()       # re-read the artifact from disk (true round-trip)
         nlc, nmaps, worst = verify(container, d, lumps)
         print(f"  wrote {len(container)/1024.0:.0f}K  ({nmaps} maps, {nlc} lump instances)")

@@ -105,6 +105,14 @@ if ($Wad) {
     Write-Host "IWAD: $([System.IO.Path]::GetFileName($src)) -> cd/data/DOOM1.WAD ($('{0:N0}' -f (Get-Item $dst).Length) bytes)"
     # remember which IWAD this is so the finished disc can be stashed per-WAD below
     $wadName = [System.IO.Path]::GetFileNameWithoutExtension($src)
+    # SATURN (stale-stash fix 2026-07-13): a WAD SWAP must force the ISO/.bin to regenerate.
+    # Copy-Item above PRESERVES the source WAD's (old) mtime, so cd/data/DOOM1.WAD looks OLDER than a
+    # prior build's ISO and make/shared.mk skips the rebuild; the DRP --if-stale ALSO skips when the
+    # same WAD was built before (hash unchanged) -> NOTHING regenerates, and the stash copies the OLD
+    # .bin while still printing "OK/Stashed" (the exact silent-stale bug: build/wads/<w>/ kept days-old
+    # bytes across rebuilds).  Delete the outputs so make MUST rebuild them from the freshly-swapped
+    # cd/data/, guaranteeing the stash gets today's bytes.
+    Remove-Item (Join-Path $root "build\Mimas.iso"), (Join-Path $root "build\Mimas.bin") -Force -ErrorAction SilentlyContinue
 }
 
 # Per-level repack: emit cd/data/DOOMRP.DRP before the ISO step (runs after any -Wad

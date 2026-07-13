@@ -386,19 +386,31 @@ def is_map_marker(nm):
 MAP_LUMPS = {'THINGS','LINEDEFS','SIDEDEFS','VERTEXES','SEGS','SSECTORS','NODES',
              'SECTORS','REJECT','BLOCKMAP','BEHAVIOR'}
 
-def is_rotation_sprite(nm):
-    """True for a sprite lump that ONLY serves rotations >= 2 -- the lumps a front-only
-    build drops.  Sprite lump name = 4-char sprite + frame+rot [+ frame+rot mirrored
-    pair].  Rot '0' is omnidirectional and rot '1' is the front view that the runtime
-    gate (core sat_sprite_frontonly) serves for EVERY angle, so any pair with rot in
-    '01' must stay in the blob."""
-    if len(nm) == 6:
-        return nm[5] not in '01'
-    if len(nm) == 8:
-        return nm[5] not in '01' and nm[7] not in '01'
-    return False
+# Sprite-rotation degradation ladder (STREAMING_FLUIDITY_ROADMAP.md).  Doom stores a
+# rotated frame as 5 lumps (A1, A2A8, A3A7, A4A6, A5 -- mirrored pairs), so the levels
+# land on clean per-frame lump costs:
+#   8 = full (5 lumps)  4 = front/back/left/right, name-rots 1/3/5/7 (3 lumps: the
+#   sides share the mirrored A3A7)  2 = front/back, rots 1/5 (2 lumps)  1 = front
+#   only, rot 1 (1 lump -- the Hexen-Saturn trick).
+# MULTI NOTE: 4 and 2 keep the "which player is the monster facing/targeting" cue --
+# each split view quantizes the SAME world facing to its own angle (front-viewer sees
+# the face, back-viewer the back).  1 destroys it for everyone (both players see it
+# face-on), so level 1 is SOLO-oriented; ship 4 (fits the 4MB cart on all three big
+# IWADs, measured) or at minimum 2 for multiplayer discs.
+ROT_KEEP = {8: '012345678', 4: '01357', 2: '015', 1: '01'}
 
-def compute_subsets(wad_path, info_path, front_only=False):
+def rot_lump_kept(nm, keep):
+    """True if this sprite lump serves at least one kept rotation.  Sprite lump name =
+    4-char sprite + frame+rot [+ frame+rot mirrored pair]; rot '0' is omnidirectional
+    (always kept).  The runtime quantizer (core sat_sprite_rotlevel) only ever requests
+    kept rotations, so dropped lumps are never asked of the blob."""
+    if len(nm) == 6:
+        return nm[5] in keep
+    if len(nm) == 8:
+        return nm[5] in keep or nm[7] in keep
+    return True
+
+def compute_subsets(wad_path, info_path, rot_level=8):
     """Return (d, lumps, byname, maps) where maps = [(name, marker_idx, idx_set)].
     idx_set is a set of ORIGINAL lump indices (not names: map sub-lumps such as
     THINGS share names across maps, so we resolve them by position)."""
@@ -560,26 +572,27 @@ def compute_subsets(wad_path, info_path, front_only=False):
             if ds in byname: sub.add(byname[ds])
         # Music: handled separately (CDDA track or single MUS lump on demand) -- not
         # part of the per-map graphics subset.
-        if front_only:
-            # Front-only sprites (Hexen-Saturn trick): drop every rotation-only sprite
-            # lump -- the runtime gate (core sat_sprite_frontonly, armed by the header
-            # flag) serves the front view for every angle, so these are never requested.
-            # PLAY* keeps its rotations (split-screen readability; the runtime exempts
-            # player mobjs to match).  Measured: rotations = 59% of sprite bytes; every
-            # Doom II / TNT / Plutonia blob then fits the 4 MB cart (CDDA everywhere).
+        if rot_level < 8:
+            # Rotation degradation (see ROT_KEEP above): drop the sprite lumps whose
+            # every rotation is outside the kept set -- the runtime quantizer (core
+            # sat_sprite_rotlevel, armed by the header flags) never requests them.
+            # PLAY* keeps ALL its rotations (split-screen readability; the runtime
+            # exempts player mobjs to match).  Measured worst blob (PLAY kept):
+            # L4 3796K / L2 3365K / L1 3088K (TNT MAP20) -- all under the 4MB cart.
+            keep = ROT_KEEP[rot_level]
             s0, e0 = s_rng
             sub = {ix for ix in sub
                    if not (s0 < ix < e0
                            and not lumps[ix][0].startswith('PLAY')
-                           and is_rotation_sprite(lumps[ix][0]))}
+                           and not rot_lump_kept(lumps[ix][0], keep))}
         out.append((mapname, mi, sub))
     return d, lumps, byname, out
 
 # ---------------------------------------------------------------- report
-def report(wad, info, front_only=False):
-    d, lumps, byname, maps = compute_subsets(wad, info, front_only)
+def report(wad, info, rot_level=8):
+    d, lumps, byname, maps = compute_subsets(wad, info, rot_level)
     print(f"=== per-map SAFE-SUPERSET subset: {wad} (info={info})"
-          f"{' FRONT-ONLY' if front_only else ''} ===")
+          f"{f' ROT-LEVEL {rot_level}' if rot_level < 8 else ''} ===")
     print(f"  {'map':<8}{'#lumps':>8}{'raw KB':>9}{'lzss KB':>9}{'ratio':>7}")
     cache = {}                 # lump_idx -> (method, payload)
     worst = worstc = 0
@@ -631,8 +644,13 @@ def sprite_headers(d, lumps):
         n += 1
     return bytes(out), n
 
-def emit(wad, info, out_path, front_only=False):
-    d, lumps, byname, maps = compute_subsets(wad, info, front_only)
+# header flags (codec word bits 8-9) <-> rotation level.  Code 1 = level 1 keeps the
+# original front-only bit-8 semantics, so yesterday's L1 containers stay valid.
+ROT_CODE  = {8: 0, 1: 1, 2: 2, 4: 3}
+CODE_ROT  = {v: k for k, v in ROT_CODE.items()}
+
+def emit(wad, info, out_path, rot_level=8):
+    d, lumps, byname, maps = compute_subsets(wad, info, rot_level)
     n_lumps = len(lumps)
     cache = {}                 # lump_idx -> (method, payload)
     def packed(ix):
@@ -670,9 +688,9 @@ def emit(wad, info, out_path, front_only=False):
     total = cursor + len(sprh)
 
     # serialize.  The codec word doubles as a flags field (loader: codec & 0xFF,
-    # flags = codec >> 8): bit 8 = front-only sprites (rotation lumps stripped from
-    # the blobs; the loader arms core sat_sprite_frontonly so they are never asked).
-    codec_word = CODEC_LZSS | (0x100 if front_only else 0)
+    # flags = codec >> 8): bits 8-9 = rotation level code (ROT_CODE above; the loader
+    # arms core sat_sprite_rotlevel so stripped rotations are never requested).
+    codec_word = CODEC_LZSS | (ROT_CODE[rot_level] << 8)
     buf = bytearray(total)
     struct.pack_into(HDR_FMT, buf, 0, b'DRP1', n_lumps, dir_crc32(d, lumps),
                      len(maps), map_tab_ofs, codec_word, sprh_ofs, sprh_n)
@@ -752,13 +770,17 @@ def main():
     out  = None
     want_report = False
     if_stale = False
-    front_only = False
+    rot_level = 8
     for o in opts:
         if o.startswith('--emit='): out = o.split('=',1)[1]
         elif o == '--emit':        out = 'cd/data/DOOMRP.DRP'
         elif o == '--report':      want_report = True
         elif o == '--if-stale':    if_stale = True   # skip emit if the .DRP already matches the WAD
-        elif o == '--front-only':  front_only = True # strip sprite rotations from the blobs (PLAY kept)
+        elif o.startswith('--rot-level='):           # 8 full / 4 F-B-L-R / 2 F-B / 1 front (solo!)
+            rot_level = int(o.split('=',1)[1])
+            if rot_level not in ROT_KEEP:
+                print(f"--rot-level must be one of {sorted(ROT_KEEP)}"); sys.exit(2)
+        elif o == '--front-only':  rot_level = 1     # legacy alias for --rot-level=1
         elif o == '--selftest':
             print("codec self-test:", codec_selftest(), "cases OK"); return
 
@@ -770,12 +792,12 @@ def main():
             h = open(out, 'rb').read(HDR_SZ)
             magic, n_lumps, crc = struct.unpack_from('<4sII', h, 0)
             codec_word = struct.unpack_from('<I', h, 20)[0]
-            want_word  = CODEC_LZSS | (0x100 if front_only else 0)
+            want_word  = CODEC_LZSS | (ROT_CODE[rot_level] << 8)
             d, lumps, _ = read_wad(wad)
             if (magic == b'DRP1' and n_lumps == len(lumps)
                     and crc == dir_crc32(d, lumps) and codec_word == want_word):
                 print(f"{out} already matches {wad} (CRC {crc:#010x}"
-                      f"{', front-only' if front_only else ''}) -- skipping repack.")
+                      f"{f', rot-level {rot_level}' if rot_level < 8 else ''}) -- skipping repack.")
                 return
             print(f"{out} stale vs {wad} (or flags changed) -- regenerating.")
         except Exception as e:
@@ -784,11 +806,12 @@ def main():
     # plain run -> report; --emit -> emit only (single compression pass, for builds);
     # --emit --report -> both.
     if out is None or want_report:
-        report(wad, info, front_only)
+        report(wad, info, rot_level)
     if out:
-        print(f"\n=== emit + round-trip: {out}{' FRONT-ONLY' if front_only else ''} ===")
+        print(f"\n=== emit + round-trip: {out}"
+              f"{f' ROT-LEVEL {rot_level}' if rot_level < 8 else ''} ===")
         print("  codec self-test:", codec_selftest(), "cases OK")
-        _, d, lumps = emit(wad, info, out, front_only)
+        _, d, lumps = emit(wad, info, out, rot_level)
         container = open(out, 'rb').read()       # re-read the artifact from disk (true round-trip)
         nlc, nmaps, worst = verify(container, d, lumps)
         print(f"  wrote {len(container)/1024.0:.0f}K  ({nmaps} maps, {nlc} lump instances)")

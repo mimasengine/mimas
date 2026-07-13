@@ -24,12 +24,18 @@
 #   -- both stay loadable. Needs python on PATH; skipped when the .DRP is already
 #   up to date. Omit -Repack for a raw disc (default, unchanged).
 #
-# -FrontOnly : (with -Repack) strip sprite ROTATION lumps from the .DRP blobs
-#   (PLAY* kept) and flag the header so the engine renders every non-player sprite
-#   front-facing (Hexen-Saturn trick, core sat_sprite_frontonly). Measured: every
-#   Doom II / TNT / Plutonia blob then fits the 4 MB cart -> CDDA on every map,
-#   and in-combat first-sight page-ins shrink ~5x. Cosmetic tradeoff: monster
-#   facing is no longer readable. See STREAMING_FLUIDITY_ROADMAP.md.
+# -RotLevel <8|4|2|1> : (with -Repack) sprite-rotation degradation ladder -- strip
+#   rotation lumps above the level from the .DRP blobs (PLAY* always kept) and flag
+#   the header so the engine quantizes rotations to match (core sat_sprite_rotlevel).
+#     8 = full (default, no strip)          5 lumps per rotated frame
+#     4 = front/back/left/right             3 lumps -- RECOMMENDED for cart discs:
+#         fits the 4MB cart on Doom II/TNT/Plutonia AND keeps monster facing
+#         readable per split view ("who is it targeting")
+#     2 = front/back                        2 lumps -- minimum for multiplayer
+#     1 = front only (Hexen-Saturn trick)   1 lump  -- SOLO-oriented: in split, every
+#         player sees every monster face-on (the targeting cue dies for everyone)
+#   In-combat first-sight page-ins shrink accordingly (5->3->2->1 lumps per frame).
+# -FrontOnly : legacy alias for -RotLevel 1. See STREAMING_FLUIDITY_ROADMAP.md.
 #
 # SRL's shared.mk handles: compile, link, ISO (xorrisofs), CUE generation.
 # CDDA music: place WAV/FLAC/OGG/MP3 files in cd/music/ and create a
@@ -40,6 +46,7 @@ param(
     [switch]$Clean,
     [string]$Wad,
     [switch]$Repack,
+    [int]$RotLevel = 8,
     [switch]$FrontOnly,
     [switch]$Cdda,
     [switch]$Mus,
@@ -109,13 +116,15 @@ if ($Repack) {
     if (-not $py) { $py = (Get-Command py -ErrorAction SilentlyContinue).Source }
     if (-not $py) { throw "-Repack: python not found on PATH (needed to build the .DRP)" }
 
+    if ($FrontOnly) { $RotLevel = 1 }   # legacy alias
+    if (@(8,4,2,1) -notcontains $RotLevel) { throw "-RotLevel must be 8, 4, 2 or 1" }
     Write-Host "Repack: ensuring cd/data/DOOMRP.DRP matches the IWAD..."
-    $foArgs = @(); if ($FrontOnly) { $foArgs = @("--front-only") }
+    $foArgs = @(); if ($RotLevel -ne 8) { $foArgs = @("--rot-level=$RotLevel") }
     & $py $toolFile $wadFile $infoFile "--emit=$drpFile" "--if-stale" @foArgs
     if ($LASTEXITCODE -ne 0) { throw "repack_wad.py failed (exit $LASTEXITCODE)" }
     Write-Host "Repack OK ($('{0:N0}' -f (Get-Item $drpFile).Length) bytes)"
 }
-elseif ($FrontOnly) { throw "-FrontOnly requires -Repack (it is a .DRP build flag)" }
+elseif ($FrontOnly -or $RotLevel -ne 8) { throw "-RotLevel/-FrontOnly require -Repack (.DRP build flags)" }
 
 function ConvertTo-Msys2Path([string]$p) {
     $p = $p.Replace('\','/')

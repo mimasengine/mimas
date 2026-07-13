@@ -197,8 +197,9 @@ extern "C" unsigned short sat_frt(void);
 extern "C" unsigned int   sat_vbl(void);
 extern "C" void sat_cd_clock_add(unsigned short f0, unsigned int v0);
 
-/* Front-only render gate (core/r_things.c), armed by the .DRP header flag below. */
-extern "C" int sat_sprite_frontonly;
+/* Sprite-rotation ladder gate (core/r_things.c, default 8 = full), armed from the
+   .DRP header flags below.  8 full / 4 F-B-L-R / 2 F-B / 1 front-only. */
+extern "C" int sat_sprite_rotlevel;
 
 static int drp_load_raw(size_t sector, int32_t bytes, void *dst)
 {
@@ -266,8 +267,9 @@ static void drp_probe(void)
     uint32_t sprh_n   = rd32(hdr + 28);
 
     /* The codec word doubles as a flags field (tool emits codec | flags<<8):
-       bit 8 = front-only sprites -- monster rotation lumps are stripped from the
-       blobs (PLAY* kept for split-screen readability). */
+       bits 8-9 = sprite-rotation level code -- 0 full, 1 front-only, 2 front/back,
+       3 front/back/left/right (code 1 keeps the original front-only bit-8 meaning).
+       The blobs carry exactly the kept rotations; PLAY* always complete. */
     uint32_t drpflags = codec >> 8;
     codec &= 0xFFu;
 
@@ -300,14 +302,21 @@ static void drp_probe(void)
         drp_sprh_ofs = sprh_ofs;
         drp_sprh_n   = sprh_n;
     }
-    /* Front-only .DRP: arm the render gate BEFORE any sprite draws -- with the
-       rotations stripped from the blobs, a rotation request would take the full-WAD
-       CD fallback (hitches, and CD traffic under CDDA on cart-staged maps).  Flag and
-       blob content come from the same tool run, so coherence is by construction. */
-    if (drpflags & 1u)
+    /* Rotation-degraded .DRP: arm the render quantizer BEFORE any sprite draws --
+       with rotations stripped from the blobs, a request above the level would take
+       the full-WAD CD fallback (hitches, and CD traffic under CDDA on cart-staged
+       maps).  Flag and blob content come from the same tool run, so coherence is by
+       construction.  Level 1 is solo-oriented (both split players would see every
+       monster face-on -> the "who is it targeting" cue dies); ship 4 (or 2) for
+       multiplayer discs. */
     {
-        sat_sprite_frontonly = 1;
-        printf("DRP: front-only sprites (rotations stripped, PLAY kept)\n");
+        static const int rot_of_code[4] = { 8, 1, 2, 4 };
+        int level = rot_of_code[drpflags & 3u];
+        if (level < 8)
+        {
+            sat_sprite_rotlevel = level;
+            printf("DRP: sprite rot-level %d (rotations stripped, PLAY kept)\n", level);
+        }
     }
     sat_drp_state = 1;
     printf("DRP: active, %u maps (repacked streaming)\n", (unsigned)n_maps);

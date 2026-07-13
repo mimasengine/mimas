@@ -66,6 +66,19 @@ k and seek behaviour still need the console capture (cart timing + CDDA remain Y
 > per-command rate. Front-only: flat `ld` under combat = rotations never requested
 > (gate armed); the two visual spot-checks (circle-strafed monster stays front-facing,
 > 2p player still rotates) remain to eyeball.
+>
+> **Status 2026-07-13 — rotation LADDER (owner feedback baked in).** `-FrontOnly`
+> generalized to **`-RotLevel {8,4,2,1}`** (tool `--rot-level`, header bits 8-9, core
+> `sat_sprite_frontonly` → `sat_sprite_rotlevel` quantizer; level-1 containers keep their
+> bit-8 meaning). Per rotated frame: 5/3/2/1 lumps (mirrored pairs make L4's sides free).
+> Measured worst blob (PLAY kept) — **L4 already fits the cart everywhere**: Doom II
+> 3295 K, TNT 3796 K, Plutonia 3378 K (L2: 2888/3365/2903 K; L1: 2628/3088/2601 K).
+> **Multiplayer rule (the owner's observation)**: split views quantize the SAME world
+> facing to their own angles, so **L4/L2 preserve the "which player is it
+> facing/targeting" cue** (front player sees the face, flanker the back) while **L1
+> destroys it for everyone** (every view face-on) — L1 = solo discs; **ship L4 for
+> multi** (or L2 minimum). The level is a disc-baked CEILING: the runtime may later
+> degrade below it (distance-LOD/SQ rung), never request above.
 
 Dependency: R0 → R1 → (R2 ∥ R3) → R5; R4 is orthogonal and gates TNT/Plutonia support.
 The shipped `.DRP`+cart staging path ([`STREAMING_ANALYSIS.md` §7.9–7.12](STREAMING_ANALYSIS.md))
@@ -198,7 +211,10 @@ layout), R3.4 staging masking.
   **RESOLVED 2026-07-12 by (d): the `-FrontOnly` build option** — stripping rotation lumps
   (59 % of sprite bytes) puts every blob of all three IWADs under the cart with ~1 MB
   headroom (TNT worst 3088 K, PLAY kept). Discs built without `-FrontOnly` still face
-  (a)–(c) on the 8 listed maps.
+  (a)–(c) on the 8 listed maps. **Refined 2026-07-13 into the `-RotLevel` ladder: L4
+  (front/back/left/right) already fits everywhere (TNT worst 3796 K) while keeping the
+  per-view facing cue — the recommended cart-disc default; L1 stays the solo
+  max-compression option.**
 - **R0.4 Re-emit + re-validate `.DRP`** with the fixed tool (round-trip self-test), commit the
   tool fix, erratum in `STREAMING_ANALYSIS.md` §7.10 (done alongside this doc).
 

@@ -572,51 +572,80 @@ def compute_subsets(wad_path, info_path, rot_level=8):
             if ds in byname: sub.add(byname[ds])
         # Music: handled separately (CDDA track or single MUS lump on demand) -- not
         # part of the per-map graphics subset.
-        if rot_level < 8:
-            # Rotation degradation (see ROT_KEEP above): drop the sprite lumps whose
-            # every rotation is outside the kept set -- the runtime quantizer (core
-            # sat_sprite_rotlevel, armed by the header flags) never requests them.
-            # PLAY* keeps ALL its rotations (split-screen readability; the runtime
-            # exempts player mobjs to match).  Measured worst blob (PLAY kept):
-            # L4 3796K / L2 3365K / L1 3088K (TNT MAP20) -- all under the 4MB cart.
-            keep = ROT_KEEP[rot_level]
-            s0, e0 = s_rng
-            sub = {ix for ix in sub
-                   if not (s0 < ix < e0
-                           and not lumps[ix][0].startswith('PLAY')
-                           and not rot_lump_kept(lumps[ix][0], keep))}
-        out.append((mapname, mi, sub))
+        # Rotation degradation (see ROT_KEEP / rot_filter): drop the sprite lumps
+        # whose every rotation is outside the kept set -- the runtime quantizer
+        # (core sat_sprite_rotlevel, armed per map from the v2 map records) never
+        # requests them.  PLAY* keeps ALL its rotations (split-screen readability;
+        # the runtime exempts player mobjs to match).  Measured worst blob (PLAY
+        # kept): L4 3796K / L2 3365K / L1 3088K (TNT MAP20) -- all under the cart.
+        out.append((mapname, mi, rot_filter(sub, lumps, s_rng, rot_level)))
     return d, lumps, byname, out
+
+def rot_filter(sub, lumps, s_rng, rot_level):
+    """Drop the sprite lumps a rot_level build strips (PLAY* always kept)."""
+    if rot_level >= 8:
+        return sub
+    keep = ROT_KEEP[rot_level]
+    s0, e0 = s_rng
+    return {ix for ix in sub
+            if not (s0 < ix < e0
+                    and not lumps[ix][0].startswith('PLAY')
+                    and not rot_lump_kept(lumps[ix][0], keep))}
+
+# --rot-level=auto: per map, the HIGHEST level whose blob fits the 4MB cart (with a
+# one-sector staging headroom -- the blob's first byte lands at cart offset
+# blob_ofs%2048, see w_drp_saturn drp_stage_to_cart).  Maps that fit at 8 keep every
+# rotation; only the over-cart maps degrade, one step at a time.
+AUTO_CART_CAP = 4096 * 1024 - 2048
+
+def auto_map_level(sub, lumps, s_rng, csize):
+    """(level, filtered_sub) for the highest cart-fitting level; worst case level 1
+    (an over-cart L1 map simply streams from CD, like an over-cart uniform build)."""
+    for lvl in (8, 4, 2, 1):
+        fsub = rot_filter(sub, lumps, s_rng, lvl)
+        if sum(csize(ix) for ix in fsub) <= AUTO_CART_CAP:
+            return lvl, fsub
+    return 1, rot_filter(sub, lumps, s_rng, 1)
 
 # ---------------------------------------------------------------- report
 def report(wad, info, rot_level=8):
-    d, lumps, byname, maps = compute_subsets(wad, info, rot_level)
+    auto = (rot_level == 'auto')
+    d, lumps, byname, maps = compute_subsets(wad, info, 8 if auto else rot_level)
+    s_rng = marker_range(lumps, 'S_START', 'S_END')
     print(f"=== per-map SAFE-SUPERSET subset: {wad} (info={info})"
-          f"{f' ROT-LEVEL {rot_level}' if rot_level < 8 else ''} ===")
-    print(f"  {'map':<8}{'#lumps':>8}{'raw KB':>9}{'lzss KB':>9}{'ratio':>7}")
+          f"{' ROT-LEVEL auto' if auto else (f' ROT-LEVEL {rot_level}' if rot_level < 8 else '')} ===")
+    print(f"  {'map':<8}{'#lumps':>8}{'raw KB':>9}{'lzss KB':>9}{'ratio':>7}{'rot':>5}")
     cache = {}                 # lump_idx -> (method, payload)
+    def csize(ix):
+        if ix not in cache:
+            fp, sz = lumps[ix][1], lumps[ix][2]
+            cache[ix] = pack_lump(d[fp:fp+sz])
+        return len(cache[ix][1])
     worst = worstc = 0
     for name, mi, sub in maps:
-        raw = comp = 0
-        for ix in sub:
-            sz = lumps[ix][2]
-            raw += sz
-            if ix not in cache:
-                fp = lumps[ix][1]
-                cache[ix] = pack_lump(d[fp:fp+sz])
-            comp += len(cache[ix][1])
+        lvl = rot_level
+        if auto:
+            lvl, sub = auto_map_level(sub, lumps, s_rng, csize)
+        raw = sum(lumps[ix][2] for ix in sub)
+        comp = sum(csize(ix) for ix in sub)
         kb, ckb = raw/1024.0, comp/1024.0
         ratio = (ckb/kb) if kb else 0
-        print(f"  {name:<8}{len(sub):>8}{kb:>8.0f}K{ckb:>8.0f}K{ratio:>7.0%}")
+        print(f"  {name:<8}{len(sub):>8}{kb:>8.0f}K{ckb:>8.0f}K{ratio:>7.0%}"
+              f"{('L%d' % lvl) if lvl < 8 or auto else '':>5}")
         worst = max(worst, kb); worstc = max(worstc, ckb)
     print(f"  -> {len(maps)} maps; worst raw = {worst:.0f}K, worst lzss = {worstc:.0f}K "
           f"(4MB cart = 4096K).")
 
 # ---------------------------------------------------------------- emit container
+# codec word = CODEC | flags<<8: bits 8-9 rot-level code (uniform builds; 0 for auto),
+# bit 10 = v2 map records (28 B, trailing map_flags -- ALWAYS set by this tool now),
+# bit 11 = auto/per-map levels (bits 8-9 then meaningless; the records rule).
 HDR_FMT = '<4sIIIIIII'    # magic, n_lumps, dir_crc32, n_maps, map_tab_ofs, codec, r0, r1
 HDR_SZ  = 32
-MAP_FMT = '<8sIIII'       # name, n_entries, entries_ofs, blob_ofs, blob_size
-MAP_SZ  = 24
+FLG_V2MAPS = 0x400
+FLG_AUTO   = 0x800
+MAP_FMT = '<8sIIIII'      # name, n_entries, entries_ofs, blob_ofs, blob_size, map_flags(rot code bits 0-1)
+MAP_SZ  = 28
 ENT_FMT = '<IIII'         # lump_idx, data_ofs, csize, usize  (all unsigned/non-negative)
 ENT_SZ  = 16
 CODEC_LZSS = 1
@@ -650,7 +679,9 @@ ROT_CODE  = {8: 0, 1: 1, 2: 2, 4: 3}
 CODE_ROT  = {v: k for k, v in ROT_CODE.items()}
 
 def emit(wad, info, out_path, rot_level=8):
-    d, lumps, byname, maps = compute_subsets(wad, info, rot_level)
+    auto = (rot_level == 'auto')
+    d, lumps, byname, maps = compute_subsets(wad, info, 8 if auto else rot_level)
+    s_rng = marker_range(lumps, 'S_START', 'S_END')
     n_lumps = len(lumps)
     cache = {}                 # lump_idx -> (method, payload)
     def packed(ix):
@@ -658,26 +689,38 @@ def emit(wad, info, out_path, rot_level=8):
             fp, sz = lumps[ix][1], lumps[ix][2]
             cache[ix] = pack_lump(d[fp:fp+sz])
         return cache[ix]
+    def csize(ix):
+        return len(packed(ix)[1])              # stored payload IS the raw lump
 
     # Layout: HEADER | MAP TABLE | (per map: ENTRY TABLE then BLOB)
     map_tab_ofs = HDR_SZ
     cursor = map_tab_ofs + MAP_SZ * len(maps)
-    map_recs = []              # (name, entries[], entries_ofs, blob_ofs, blob_size)
+    map_recs = []              # (name, entries[], entries_ofs, blob_ofs, blob_size, rot_code)
+    lvl_hist = {}
     for name, mi, sub in maps:
+        if auto:
+            lvl, sub = auto_map_level(sub, lumps, s_rng, csize)
+        else:
+            lvl = rot_level
+        lvl_hist[lvl] = lvl_hist.get(lvl, 0) + 1
         entries = []           # (lump_idx, data_ofs, csize, usize)
         blob = bytearray()
         for ix in sorted(sub):
             method, payload = packed(ix)
             usize = lumps[ix][2]
-            csize = len(payload) if method == 1 else usize    # stored: csize==usize
+            csz = len(payload) if method == 1 else usize      # stored: csize==usize
             data_ofs = len(blob)
             blob += payload if method == 1 else d[lumps[ix][1]:lumps[ix][1]+usize]
-            entries.append((ix, data_ofs, csize, usize))
+            entries.append((ix, data_ofs, csz, usize))
         entries_ofs = cursor
         blob_ofs = entries_ofs + ENT_SZ * len(entries)
         blob_size = len(blob)
-        map_recs.append((name, entries, entries_ofs, blob_ofs, bytes(blob), blob_size))
+        map_recs.append((name, entries, entries_ofs, blob_ofs, bytes(blob), blob_size,
+                         ROT_CODE[lvl]))
         cursor = blob_ofs + blob_size
+    if auto:
+        print("  auto rot levels: " +
+              ", ".join(f"{n} map(s) @ L{l}" for l, n in sorted(lvl_hist.items(), reverse=True)))
 
     # SATURN R3.1 boot index: precomputed sprite-header section, appended after the
     # map blobs.  Consumed in one sequential read by R_InitSpriteLumps instead of
@@ -687,17 +730,17 @@ def emit(wad, info, out_path, rot_level=8):
     sprh_ofs = cursor if sprh_n else 0
     total = cursor + len(sprh)
 
-    # serialize.  The codec word doubles as a flags field (loader: codec & 0xFF,
-    # flags = codec >> 8): bits 8-9 = rotation level code (ROT_CODE above; the loader
-    # arms core sat_sprite_rotlevel so stripped rotations are never requested).
-    codec_word = CODEC_LZSS | (ROT_CODE[rot_level] << 8)
+    # serialize.  The codec word doubles as a flags field (see the constants above);
+    # per-map rot codes live in the v2 map records so the loader re-arms the core
+    # quantizer at every sat_drp_select_map.
+    codec_word = CODEC_LZSS | FLG_V2MAPS | (FLG_AUTO if auto else (ROT_CODE[rot_level] << 8))
     buf = bytearray(total)
     struct.pack_into(HDR_FMT, buf, 0, b'DRP1', n_lumps, dir_crc32(d, lumps),
                      len(maps), map_tab_ofs, codec_word, sprh_ofs, sprh_n)
-    for k, (name, entries, entries_ofs, blob_ofs, blob, blob_size) in enumerate(map_recs):
+    for k, (name, entries, entries_ofs, blob_ofs, blob, blob_size, rcode) in enumerate(map_recs):
         nm8 = name.encode('latin1')[:8].ljust(8, b'\x00')
         struct.pack_into(MAP_FMT, buf, map_tab_ofs + k*MAP_SZ,
-                         nm8, len(entries), entries_ofs, blob_ofs, blob_size)
+                         nm8, len(entries), entries_ofs, blob_ofs, blob_size, rcode)
         for e, (lix, dofs, csz, usz) in enumerate(entries):
             struct.pack_into(ENT_FMT, buf, entries_ofs + e*ENT_SZ, lix, dofs, csz, usz)
         buf[blob_ofs:blob_ofs+blob_size] = blob
@@ -712,14 +755,16 @@ def verify(container, d, lumps):
     """Parse `container` from scratch and decode every lump; compare to source."""
     magic, n_lumps, crc, n_maps, map_tab_ofs, codec, sprh_ofs, sprh_n = struct.unpack_from(HDR_FMT, container, 0)
     assert magic == b'DRP1', "bad magic"
-    assert codec & 0xFF == CODEC_LZSS, f"unknown codec {codec}"   # high bits = flags (front-only)
+    assert codec & 0xFF == CODEC_LZSS, f"unknown codec {codec}"   # high bits = flags
+    assert codec & FLG_V2MAPS, "pre-v2 container (24B map records) -- re-emit"
     assert n_lumps == len(lumps), f"n_lumps {n_lumps} != WAD {len(lumps)}"
     assert crc == dir_crc32(d, lumps), "directory CRC mismatch"
     n_lumps_checked = 0
     worst_blob = 0
     for k in range(n_maps):
-        nm8, n_entries, entries_ofs, blob_ofs, blob_size = struct.unpack_from(MAP_FMT, container, map_tab_ofs + k*MAP_SZ)
+        nm8, n_entries, entries_ofs, blob_ofs, blob_size, mflags = struct.unpack_from(MAP_FMT, container, map_tab_ofs + k*MAP_SZ)
         mapname = nm8.split(b'\x00')[0].decode('latin1')
+        assert mflags < 4, f"{mapname}: bad map_flags {mflags}"
         worst_blob = max(worst_blob, blob_size)
         prev = -1
         for e in range(n_entries):
@@ -776,10 +821,14 @@ def main():
         elif o == '--emit':        out = 'cd/data/DOOMRP.DRP'
         elif o == '--report':      want_report = True
         elif o == '--if-stale':    if_stale = True   # skip emit if the .DRP already matches the WAD
-        elif o.startswith('--rot-level='):           # 8 full / 4 F-B-L-R / 2 F-B / 1 front (solo!)
-            rot_level = int(o.split('=',1)[1])
-            if rot_level not in ROT_KEEP:
-                print(f"--rot-level must be one of {sorted(ROT_KEEP)}"); sys.exit(2)
+        elif o.startswith('--rot-level='):           # auto / 8 full / 4 F-B-L-R / 2 F-B / 1 front (solo!)
+            v = o.split('=',1)[1]
+            if v == 'auto':
+                rot_level = 'auto'                   # per map: highest level that fits the 4MB cart
+            else:
+                rot_level = int(v)
+                if rot_level not in ROT_KEEP:
+                    print(f"--rot-level must be auto or one of {sorted(ROT_KEEP)}"); sys.exit(2)
         elif o == '--front-only':  rot_level = 1     # legacy alias for --rot-level=1
         elif o == '--selftest':
             print("codec self-test:", codec_selftest(), "cases OK"); return
@@ -792,12 +841,13 @@ def main():
             h = open(out, 'rb').read(HDR_SZ)
             magic, n_lumps, crc = struct.unpack_from('<4sII', h, 0)
             codec_word = struct.unpack_from('<I', h, 20)[0]
-            want_word  = CODEC_LZSS | (ROT_CODE[rot_level] << 8)
+            want_word  = CODEC_LZSS | FLG_V2MAPS | (FLG_AUTO if rot_level == 'auto'
+                                                    else (ROT_CODE[rot_level] << 8))
             d, lumps, _ = read_wad(wad)
             if (magic == b'DRP1' and n_lumps == len(lumps)
                     and crc == dir_crc32(d, lumps) and codec_word == want_word):
-                print(f"{out} already matches {wad} (CRC {crc:#010x}"
-                      f"{f', rot-level {rot_level}' if rot_level < 8 else ''}) -- skipping repack.")
+                print(f"{out} already matches {wad} (CRC {crc:#010x}, "
+                      f"rot-level {rot_level}) -- skipping repack.")
                 return
             print(f"{out} stale vs {wad} (or flags changed) -- regenerating.")
         except Exception as e:
@@ -808,8 +858,7 @@ def main():
     if out is None or want_report:
         report(wad, info, rot_level)
     if out:
-        print(f"\n=== emit + round-trip: {out}"
-              f"{f' ROT-LEVEL {rot_level}' if rot_level < 8 else ''} ===")
+        print(f"\n=== emit + round-trip: {out} ROT-LEVEL {rot_level} ===")
         print("  codec self-test:", codec_selftest(), "cases OK")
         _, d, lumps = emit(wad, info, out, rot_level)
         container = open(out, 'rb').read()       # re-read the artifact from disk (true round-trip)

@@ -2737,6 +2737,17 @@ extern "C" void DG_Init(void)
             unsigned int t = vbl_count; while (vbl_count - t < 120) ;
         }
     }
+    /* SATURN sprite distance-LOD default (core sat_sprite_rotlod_dist -- ships 0 in
+       the shared core so DoomJo is untouched): beyond ~750 map units a ~56-unit
+       monster is <=~12 px tall, its facing unreadable, so draw the front lump and
+       collapse distant crowds' rotation-lump variety (PU_CACHE/CD churn win, biggest
+       in split where N views multiply it).  Applies in cart AND CD modes; always
+       UNDER the per-map .DRP rotation ceiling (lump[0] exists at every level). */
+    {
+        extern int sat_sprite_rotlod_dist;
+        sat_sprite_rotlod_dist = 768;
+    }
+
     if (!cart_loaded)
     {
         if (cart_sz >= 0x400000u)

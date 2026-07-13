@@ -79,6 +79,21 @@ k and seek behaviour still need the console capture (cart timing + CDDA remain Y
 > destroys it for everyone** (every view face-on) — L1 = solo discs; **ship L4 for
 > multi** (or L2 minimum). The level is a disc-baked CEILING: the runtime may later
 > degrade below it (distance-LOD/SQ rung), never request above.
+>
+> **Status 2026-07-13 (second batch) — per-map + LOD + breadth-first preload.**
+> (1) **`-RotLevel auto` is now the `-Repack` default**: v2 map records (28 B, per-map
+> rot code; header bits 10/11) — each map gets the HIGHEST level whose blob fits the
+> cart; the loader re-arms `sat_sprite_rotlevel` at every `sat_drp_select_map` (raw-WAD
+> fallback maps arm 8). Measured: Doom II auto = **31×L8 + 1×L4** (MAP28), worst blob
+> 3684 K — full rotations almost everywhere AND CDDA everywhere. Old v1 containers
+> still load (24 B stride, header level). (2) **Distance LOD under the ceiling**
+> (`sat_sprite_rotlod_dist`, core default 0/DoomJo-safe, Mimas platform arms ~768 map
+> units at boot): beyond it non-players draw `lump[0]` — facing is unreadable past
+> ~12 px anyway, and distant crowds stop pulling rotation variety (biggest win in
+> split). (3) **R5.1 preload is now breadth-first**: pass 0 = flats + frame letters
+> A–G of EVERY spawned type (walk/attack/pain — the first-sight set), pass 1 =
+> death/gib frames, pass 2 = patches — the budget covers the whole bestiary's first
+> encounter instead of the full sets of the first few types in WAD order.
 
 Dependency: R0 → R1 → (R2 ∥ R3) → R5; R4 is orthogonal and gates TNT/Plutonia support.
 The shipped `.DRP`+cart staging path ([`STREAMING_ANALYSIS.md` §7.9–7.12](STREAMING_ANALYSIS.md))

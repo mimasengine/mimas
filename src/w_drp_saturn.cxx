@@ -151,11 +151,16 @@ static void drp_lzss_decode(const unsigned char *src, unsigned char *dst, int us
 /* .DRP container access                                                */
 /* ------------------------------------------------------------------ */
 #define DRP_HDR_SZ   32
-#define DRP_MAP_SZ   24
+#define DRP_MAP_SZ   24                     /* v1 map record (pre per-map rot levels) */
+#define DRP_MAP_SZ_V2 28                    /* v2: + u32 map_flags (bits 0-1 = rot code) */
 #define DRP_ENT_SZ   16
 #define DRP_MAGIC    0x31505244u            /* "DRP1" little-endian */
 #define DRP_CODEC_LZSS 1
+#define DRP_FLG_V2MAPS 0x4u                 /* (codec>>8) bit: 28-byte map records */
 #define DRP_MAX_MAPS   2048                 /* sanity cap (corrupt-header guard) */
+
+/* rot code (header bits 8-9 / v2 map_flags bits 0-1) -> sat_sprite_rotlevel */
+static const int drp_rot_of_code[4] = { 8, 1, 2, 4 };
 
 static SRL::Cd::File *drp_file  = nullptr;
 
@@ -169,7 +174,9 @@ extern "C" int sat_drp_cart;     int sat_drp_cart    = 0;   /* 1 = current map s
 extern "C" int sat_drp_cart_kb;  int sat_drp_cart_kb = 0;   /* staged blob size (KB) */
 
 static uint32_t       drp_n_maps      = 0;
-static unsigned char *drp_map_tab     = nullptr;  /* n_maps * 24, PU_STATIC */
+static unsigned char *drp_map_tab     = nullptr;  /* n_maps * drp_map_sz, PU_STATIC */
+static uint32_t       drp_map_sz      = DRP_MAP_SZ;   /* 24 (v1) or 28 (v2 records) */
+static int            drp_rot_default = 8;        /* header-level rot (v1 uniform builds) */
 
 /* R3.1 boot index: precomputed sprite-header section (byte offset + count of
    sprite lumps).  0 count = the .DRP predates R3.1 -> classic per-lump boot path. */
@@ -267,9 +274,12 @@ static void drp_probe(void)
     uint32_t sprh_n   = rd32(hdr + 28);
 
     /* The codec word doubles as a flags field (tool emits codec | flags<<8):
-       bits 8-9 = sprite-rotation level code -- 0 full, 1 front-only, 2 front/back,
-       3 front/back/left/right (code 1 keeps the original front-only bit-8 meaning).
-       The blobs carry exactly the kept rotations; PLAY* always complete. */
+       bits 8-9 = UNIFORM sprite-rotation level code (0 full, 1 front-only, 2
+       front/back, 3 F/B/L/R -- code 1 keeps the original front-only bit-8 meaning),
+       bit 10 = v2 map records (28 B, per-map rot code in the trailing map_flags;
+       sat_drp_select_map re-arms the quantizer per map), bit 11 = auto/per-map
+       build (bits 8-9 then 0; the records rule).  Blobs carry exactly the kept
+       rotations; PLAY* always complete. */
     uint32_t drpflags = codec >> 8;
     codec &= 0xFFu;
 
@@ -285,9 +295,10 @@ static void drp_probe(void)
         sat_drp_state = -4; drp_file = nullptr; return;
     }
 
-    /* cache the map table resident */
-    drp_map_tab = (unsigned char *)Z_Malloc((int)(n_maps * DRP_MAP_SZ), PU_STATIC, NULL);
-    if (drp_read(maptabof, drp_map_tab, (int)(n_maps * DRP_MAP_SZ)) < (int)(n_maps * DRP_MAP_SZ))
+    /* cache the map table resident (v2 records carry the per-map rot code) */
+    drp_map_sz = (drpflags & DRP_FLG_V2MAPS) ? DRP_MAP_SZ_V2 : DRP_MAP_SZ;
+    drp_map_tab = (unsigned char *)Z_Malloc((int)(n_maps * drp_map_sz), PU_STATIC, NULL);
+    if (drp_read(maptabof, drp_map_tab, (int)(n_maps * drp_map_sz)) < (int)(n_maps * drp_map_sz))
     {
         printf("DRP: map table read failed -> raw streaming\n");
         Z_Free(drp_map_tab); drp_map_tab = nullptr; drp_file = nullptr;
@@ -302,21 +313,21 @@ static void drp_probe(void)
         drp_sprh_ofs = sprh_ofs;
         drp_sprh_n   = sprh_n;
     }
-    /* Rotation-degraded .DRP: arm the render quantizer BEFORE any sprite draws --
-       with rotations stripped from the blobs, a request above the level would take
-       the full-WAD CD fallback (hitches, and CD traffic under CDDA on cart-staged
-       maps).  Flag and blob content come from the same tool run, so coherence is by
-       construction.  Level 1 is solo-oriented (both split players would see every
-       monster face-on -> the "who is it targeting" cue dies); ship 4 (or 2) for
-       multiplayer discs. */
+    /* Rotation-degraded .DRP: remember the header (uniform) level and arm the render
+       quantizer BEFORE any sprite draws -- with rotations stripped from the blobs, a
+       request above the level would take the full-WAD CD fallback (hitches, and CD
+       traffic under CDDA on cart-staged maps).  Flag and blob content come from the
+       same tool run, so coherence is by construction.  v2/auto containers refine this
+       PER MAP at sat_drp_select_map (a map that fits the cart at full keeps all 8
+       rotations; only over-cart maps degrade).  Level 1 is solo-oriented (both split
+       players would see every monster face-on -> the "who is it targeting" cue dies);
+       ship auto (or >=2) for multiplayer discs. */
+    drp_rot_default = drp_rot_of_code[drpflags & 3u];
+    if (drp_rot_default < 8)
     {
-        static const int rot_of_code[4] = { 8, 1, 2, 4 };
-        int level = rot_of_code[drpflags & 3u];
-        if (level < 8)
-        {
-            sat_sprite_rotlevel = level;
-            printf("DRP: sprite rot-level %d (rotations stripped, PLAY kept)\n", level);
-        }
+        sat_sprite_rotlevel = drp_rot_default;
+        printf("DRP: sprite rot-level %d (rotations stripped, PLAY kept)\n",
+               drp_rot_default);
     }
     sat_drp_state = 1;
     printf("DRP: active, %u maps (repacked streaming)\n", (unsigned)n_maps);
@@ -379,7 +390,17 @@ extern "C" void sat_drp_preload(void)
     sat_drp_preload_kb = 0;
     if (sat_drp_state != 1 || !drp_entries || drp_n_entries <= 0) return;
 
-    for (int pass = 0; pass < 2; pass++)
+    /* Breadth-first fill (the entry table is in WAD order = whole monster type after
+       whole monster type, so a naive walk exhausts the budget on the FULL sets --
+       deaths and gibs included -- of the first few types and leaves the last types
+       stone cold).  Instead:
+         pass 0: flats + the frames a type shows on FIRST SIGHT (frame letters A..G:
+                 walk / attack / pain for the whole bestiary) -- every spawned type
+                 gets its first-encounter frames warm before any death frame loads;
+         pass 1: the remaining sprite lumps (death / xdeath / raise -- seen only
+                 after the fight starts, when the lazy path has slack);
+         pass 2: wall patches and the rest. */
+    for (int pass = 0; pass < 3; pass++)
     {
         for (int e = 0; e < drp_n_entries; e++)
         {
@@ -387,9 +408,18 @@ extern "C" void sat_drp_preload(void)
             uint32_t lump  = rd32(ent + 0);
             uint32_t usize = rd32(ent + 12);
             if (usize == 0 || lump >= numlumps) continue;
-            int hot = ((int)lump >= firstspritelump && (int)lump <= lastspritelump) ||
-                      ((int)lump >= firstflat       && (int)lump <= lastflat);
-            if (hot != (pass == 0)) continue;
+            int cls;
+            if ((int)lump >= firstflat && (int)lump <= lastflat)
+                cls = 0;
+            else if ((int)lump >= firstspritelump && (int)lump <= lastspritelump)
+            {
+                const char *nm = lumpinfo[lump].name;    /* NUL-padded 8; nm[4]/nm[6] = frame letters */
+                cls = ((nm[4] >= 'A' && nm[4] <= 'G') ||
+                       (nm[6] >= 'A' && nm[6] <= 'G')) ? 0 : 1;
+            }
+            else
+                cls = 2;
+            if (cls != pass) continue;
             if (lumpinfo[lump].cache) continue;          /* already resident (geometry etc.) */
             if (Z_LargestAllocatable() < (int)(SAT_DRP_PRELOAD_KEEP_FREE + usize))
                 goto out;                                /* zone budget reached */
@@ -478,17 +508,33 @@ extern "C" void sat_drp_select_map(const char *lumpname)
     drp_n_entries = 0;
     drp_blob_ofs  = 0;
     drp_cart_staged = 0; drp_cart_blob = nullptr; sat_drp_cart = 0; sat_drp_cart_kb = 0;
+
+    /* Per-map rotation level: default FULL (8) on every path that ends up reading
+       the raw WAD (no .DRP / map not in it / corrupt record) -- the full WAD always
+       carries all rotations.  A matched map re-arms below from its v2 record (or the
+       v1 header level). */
+    sat_sprite_rotlevel = 8;
     if (sat_drp_state != 1) return;
 
     for (uint32_t m = 0; m < drp_n_maps; m++)
     {
-        const unsigned char *rec = drp_map_tab + m * DRP_MAP_SZ;
+        const unsigned char *rec = drp_map_tab + m * drp_map_sz;
         if (!name8_ieq(lumpname, rec)) continue;
 
         uint32_t n_entries   = rd32(rec + 8);
         uint32_t entries_ofs = rd32(rec + 12);
         uint32_t blob_ofs    = rd32(rec + 16);
         uint32_t blob_size   = rd32(rec + 20);
+
+        /* arm this map's rotation ceiling (v2 record flags, else the v1 header) */
+        {
+            int level = (drp_map_sz == DRP_MAP_SZ_V2)
+                        ? drp_rot_of_code[rd32(rec + 24) & 3u]
+                        : drp_rot_default;
+            sat_sprite_rotlevel = level;
+            if (level < 8)
+                printf("DRP: %s rot-level %d\n", lumpname, level);
+        }
         if (n_entries == 0 || n_entries > numlumps) return;   /* corrupt -> raw for this map */
 
         int bytes = (int)(n_entries * DRP_ENT_SZ);

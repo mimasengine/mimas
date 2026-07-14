@@ -214,6 +214,7 @@ extern "C" int   r_visplane_peak;
 extern "C" int   r_drawseg_peak;   /* core r_bsp.c: running high-water of drawsegs used (vs MAXDRAWSEGS 256) */
 extern "C" int   r_opening_ovf;    /* core r_plane.c: openings-pool overflow redirects THIS frame (0 = fine; >0 = garde-OPENINGS sinking) */
 extern "C" int   r_composite_ovf;  /* core r_data.c: # textures stubbed by garde-COMPOSITE (0 = fine; >0 = a composite OOM was crash-proofed) */
+extern "C" int   r_readlump_short; /* core w_wad.c: # streaming reads sunk by garde-W_ReadLump (0 = fine; >0 = a short CD read was zero-filled not I_Error-frozen) */
 extern "C" int   sightcounts[2];   /* core p_sight.c: [0]=REJECT trivial-rejects, [1]=full BSP LOS walks */
 extern "C" int   sat_floor_vq_cur, sat_floor_vq_peak;  /* VDP1-floor inc-0 estimate, shown on row 2 */
 extern "C" unsigned int sat_sky_px, sat_floor_px;  /* sky-vs-floor coverage classifier (row 13) */
@@ -1847,9 +1848,9 @@ static void fps_update(void)
                (VP_POOL_PLANES=96 span-pool overflow -> r_visplane_pool_ovf is a GRACEFUL flat
                glitch, not a freeze -- tracked separately, not shown here.) */
             static char rLIM[48];
-            snprintf(rLIM, sizeof rLIM, "LIM vp%d ds%d zf%dk lg%dk op%d tc%d",   /* caps: vp/ds vs 256; /256 dropped for tc width */
+            snprintf(rLIM, sizeof rLIM, "LIM vp%d ds%d zf%dk lg%dk op%d tc%d rl%d",   /* caps: vp/ds vs 256; rl = garde-W_ReadLump short reads sunk */
                      r_visplane_peak, r_drawseg_peak,
-                     Z_FreeMemory() >> 10, Z_LargestAllocatable() >> 10, r_opening_ovf, r_composite_ovf);
+                     Z_FreeMemory() >> 10, Z_LargestAllocatable() >> 10, r_opening_ovf, r_composite_ovf, r_readlump_short);
             if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 11, rLIM);
             r_visplane_peak = 0;   /* zero the core running-maxes -> next window re-accumulates its own peak */
             r_drawseg_peak  = 0;
@@ -1880,28 +1881,34 @@ static void fps_update(void)
                      fb_cur_px >> 10, fb_pk_px >> 10,
                      fb_cur_wclamp, sat_wall_clamp ? '+' : '-');
             (void)rFB;   /* FBK wall-fallback sizer row cut */
-            /* row 12: R2 CD-streaming persistent-handle A/B (CD mode only -- cart mode reads
-               from RAM).  p = sat_cd_persistent (1 = GFS_Seek+Fread on the open handle, rides
-               read-ahead; 0 = LoadBytes per read).  fb = persistent reads that fell back to
-               LoadBytes (should stay 0; climbing = flaky handle).  Toggle live with pad L+A and
-               compare level-load feel on HW (Ymir can't time the CD).  See STREAMING_FLUIDITY R2. */
+            /* row 12: CD-streaming HEALTH + the texture cache that is supposed to tame it (CD
+               mode only -- cart mode reads from RAM).  Reads left-to-right as the thrash story:
+                 p  = persistent-handle A/B (pad L+A; default 0 = LoadBytes per read)
+                 k  = mean ms per GFS chunk command (R0.2 k-meter, the calibration number)
+                 t  = cumulative seconds spent INSIDE CD commands -- THE thrash magnitude; on a
+                      well-fed level it creeps, on a thrashing one it races (this is what inflates
+                      the derived render `R` on row 1 into hundreds of ms).
+               Then the streaming texture cache (core/r_cache.c) meant to amortize that traffic by
+               keeping recently-visible composites resident:
+                 TX = live pool KB -- 0 = NO pool carved => cacheless => every miss re-reads CD.
+                 e  = cumulative evictions this level -- high + climbing = the pool is too small
+                      for the working set (churn); the smoking gun of the fragmentation-thrash.
+                 lf = largest free block (KB) at the carve attempt -- small lf => zone too tight
+                      to carve a useful pool (root cause, not a bug).
+               Ymir now models CD latency (~36-41 ms/cmd) so k/t are meaningful here, not HW-only. */
             if (sat_wad_base == nullptr)   /* CD-streaming mode */
             {
-                extern int sat_cd_persistent, sat_cd_persist_fallbacks;
-                /* R0.2 k-meter (w_file_saturn.cxx): k = mean ms per GFS chunk command
-                   (cumulative, THE calibration number for the whole streaming roadmap),
-                   w = worst single command in ms (a physical seek shows here), t =
-                   cumulative seconds inside CD commands.  Hardware-only signal: Ymir
-                   reads k~0 (no CD latency model) -- capture row 12 on console. */
-                extern unsigned int sat_cd_ms10_total, sat_cd_ms10_worst;
+                extern int sat_cd_persistent;
+                extern unsigned int sat_cd_ms10_total;
                 extern int sat_cd_loads;
                 unsigned int kml = sat_cd_loads > 0
                     ? sat_cd_ms10_total / (unsigned int)sat_cd_loads : 0u;
                 static char rR2[45];
-                snprintf(rR2, sizeof rR2, "CD p%d fb%d k%u.%u w%u t%us L+A ",
-                         sat_cd_persistent, sat_cd_persist_fallbacks,
+                snprintf(rR2, sizeof rR2, "CD p%d k%u.%u t%us TX%dk e%d lf%dk ",
+                         sat_cd_persistent,
                          kml / 10, kml % 10,
-                         sat_cd_ms10_worst / 10, sat_cd_ms10_total / 10000);
+                         sat_cd_ms10_total / 10000,
+                         sat_texcache_poolkb, sat_texcache_evicts, sat_texcache_carve_lf);
                 if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 12, rR2);
             }
             /* row 18: memory-latency calibration (one-shot cold 32 KB read per bank, FRT

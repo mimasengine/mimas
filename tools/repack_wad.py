@@ -841,15 +841,19 @@ def main():
             h = open(out, 'rb').read(HDR_SZ)
             magic, n_lumps, crc = struct.unpack_from('<4sII', h, 0)
             codec_word = struct.unpack_from('<I', h, 20)[0]
+            sprh_n     = struct.unpack_from('<I', h, 28)[0]   # R3.1 index (0 = pre-R3.1 .DRP)
             want_word  = CODEC_LZSS | FLG_V2MAPS | (FLG_AUTO if rot_level == 'auto'
                                                     else (ROT_CODE[rot_level] << 8))
             d, lumps, _ = read_wad(wad)
+            # Require sprh_n > 0 too: a WAD-unchanged .DRP that predates the R3.1 sprite
+            # index would else pass the CRC/flags check and ship without the section.
             if (magic == b'DRP1' and n_lumps == len(lumps)
-                    and crc == dir_crc32(d, lumps) and codec_word == want_word):
+                    and crc == dir_crc32(d, lumps) and codec_word == want_word
+                    and sprh_n > 0):
                 print(f"{out} already matches {wad} (CRC {crc:#010x}, "
                       f"rot-level {rot_level}) -- skipping repack.")
                 return
-            print(f"{out} stale vs {wad} (or flags changed) -- regenerating.")
+            print(f"{out} stale vs {wad} (or flags / R3.1 index changed) -- regenerating.")
         except Exception as e:
             print(f"{out} unreadable ({e}) -- regenerating.")
 

@@ -686,10 +686,12 @@ extern int sat_thing_emit_cap;         /* core: max things emitted/frame -- we A
      (RP_AuxWait) at the top of R_RenderPlayerView.  Watch dg/MST (rows 1/0).
    sat_near_sprites (R+X): FastDoom nearSprites cull of far decorations (defined in core/r_things.c).
      Watch SPR n<projected> (row 15) fall + MST.
-   sat_aimd_damp (L+X): damped things-AIMD (learned floor + overrun hysteresis) so ec does not collapse
-     to 0 and stick on the noisy HW EDSR-CEF.  Watch SPR ec/ef (row 15) hold up. */
+   sat_aimd_damp (L+X cycles 0/1/2): things-AIMD mode.  0 = plain (-2 back-off, collapses on the noisy
+     CEF); 1 = damped (learned floor + overrun hysteresis, the default); 2 = WBUDGET (1p: drive ec from
+     the real VDP1 command-budget headroom, ignoring the CEF -> monsters onto full-res VDP1 when there
+     is room).  Watch SPR ec/th (row 15) + VD1 w% (row 9) + flicker. */
 extern "C" int sat_clear_slave = 1;    /* default ON: HW-validated -2..-3ms dg (R+C to A/B off) */
-extern "C" int sat_aimd_damp   = 1;    /* default ON: inert until VDP1 things emit ec>0 (L+X to A/B off) */
+extern "C" int sat_aimd_damp   = 1;    /* default 1=damped; L+X -> 2=wbudget (1p VDP1-things experiment) */
 extern int     sat_near_sprites;       /* defined in core/r_things.c; default ON there (R+X to A/B off) */
 /* AIMD-damp state (read by fps_update row 15 + the two back-off sites): learned floor never lets ec
    collapse to 0, overrun-run gives 2-frame hysteresis against the noisy HW EDSR-CEF. */
@@ -763,6 +765,19 @@ static int sq_wall = SQ_FULL, sq_floor = SQ_LD, sq_ceil = SQ_LD;   /* floor+ceil
 static int sq_sprite = SQ_FULL;
 static const char *const sq_name[4] = { "full", "ld", "band", "flat" };
 static int wall_potato_mode = 0;            /* VDP1 wall style: 0=tex 1=banded 2=flat (SQ_wall-derived) */
+/* SATURN split-context SQ (2026-07-15, docs/LOWRES_RENDER_STUDY.md §SQ-PER-VIEW): the co-op split
+   viewports get their OWN wall/floor/ceil software quality, INDEPENDENT of the 1p sq_* above -- so a
+   split can run BAND walls + FLAT floors to cut the per-view Bp+P (the measured 3/4p bottleneck; M7
+   low-res proved USELESS there -- fill is a minority) WITHOUT degrading 1p.  Per-VIEW arrays: the
+   live toggles write all four uniformly (the common case), but sat_view_sq_apply(i) reads per view,
+   so per-viewport asymmetry (e.g. the RBG0-elected view crisp, others cheap) is a 1-combo follow-up.
+   Default = the 1p defaults -> byte-identical until toggled in a split.  CONSTRAINT: SQ_LD is NOT
+   offered for split WALLS -- it drives the GLOBAL detailshift (a whole-frame projection lever set
+   once before the split loop, cannot vary per view); the split wall cycle is FULL->BAND->FLAT.
+   Floor/ceil LD ARE per-view-safe (half-rate texel fetch, read inside the plane fill). */
+static int sq_wall_view[4]  = { SQ_FULL, SQ_FULL, SQ_FULL, SQ_FULL };
+static int sq_floor_view[4] = { SQ_LD,   SQ_LD,   SQ_LD,   SQ_LD   };
+static int sq_ceil_view[4]  = { SQ_LD,   SQ_LD,   SQ_LD,   SQ_LD   };
 /* Platform VDP1-claim gates, read ONLY by sat_floor_vdp1_emit -- split leftover-floors vs
    ceilings independently so M2 (floors only) and M3 (ceilings only) isolate each offload. */
 static int sat_vdp1_floor_claim = 1;        /* leftover floors -> VDP1 tiles (M1,M2) */
@@ -888,16 +903,51 @@ static void sat_apply_mode(void)
                                                                  full-claims -> no near-band to clamp, and it
                                                                  drops the Bp wall-clamp cost (pad R+A re-arms) */
 
-    /* SATURN M7 = M4 + LOW-RES (docs/LOWRES_RENDER_STUDY.md).  sat_lowres drives the core (viewwidth 160
-       PACKED render) + the platform (VDP2 x2 NBG1 zoom + 160-byte blit).  Gated to 1p (split uses
-       R_SetViewWindow, out of scope).  R_SetLowRes sets setsizeneeded -> a ~74ms R_ExecuteSetViewSize
-       recompute, so flip ONLY on a real state change (sat_apply_mode also runs on every SQ pad tap). */
+    /* SATURN M7 = M4 + LOW-RES (docs/LOWRES_RENDER_STUDY.md).  sat_lowres drives the core (packed
+       half-width render) + the platform (VDP2 x2 NBG1 zoom + 160-byte blit).  1p: viewwidth 160
+       packed into fb[0,160).  M7-MULTI 2p: each half renders viewwidth 80 packed (P1 fb[0,80),
+       P2 fb[80,160), quadrants likewise via R_SetViewWindow's packed columnofs base) and the SAME
+       whole-layer x2 zoom restores them all -- split boundaries fall clean under x2.  The compact
+       split HUD (2p panels / 3-4p bands) is captured onto un-zoomed VDP1 prio-7 sprites so it stays
+       crisp; RBG0 is off in 3/4p (software floor, packs+zooms fine).  R_SetLowRes sets setsizeneeded
+       -> a ~74ms R_ExecuteSetViewSize recompute, so flip ONLY on a real state change. */
     {
         extern int sat_local_players;
-        int want_lr = (M == M7_LOWRES && sat_local_players <= 1);
+        int want_lr = (M == M7_LOWRES);   /* M7-multi: 1p + 2p + 3/4p (all pack into fb[0,160)) */
         if (want_lr != sat_lowres)
             R_SetLowRes(want_lr);
     }
+}
+
+/* SATURN split-context SQ: apply viewport v's software quality to the SAME core render flags
+   sat_apply_mode maps from the 1p sq_* (lines above), MINUS detailshift/sat_split_lowdetail (a
+   whole-frame projection lever -- excluded, so split walls never offer SQ_LD).  Called PER VIEW in
+   d_main's split loop before each R_RenderPlayerView; sat_view_sq_restore() re-applies the 1p set
+   after the loop so the HUD/menu/1p paths see the normal globals.  No sat_apply_mode() call: only
+   the per-surface software-quality flags move, not the M-axis offload tuple. */
+extern "C" void sat_view_sq_apply(int v)
+{
+    extern int sat_floor_ld, sat_ceil_potato, sat_ceil_ld;
+    if (v < 0 || v > 3) v = 0;
+    int w = sq_wall_view[v], f = sq_floor_view[v], c = sq_ceil_view[v];
+    wall_potato_mode  = (w == SQ_BAND) ? 1 : (w == SQ_FLAT) ? 2 : 0;
+    sat_potato_walls  = (w == SQ_FLAT);
+    sat_wall_nocpu    = (w == SQ_BAND || w == SQ_FLAT);
+    sat_potato_floors = (f == SQ_FLAT);
+    sat_floor_ld      = (f == SQ_LD);
+    sat_ceil_potato   = (c == SQ_FLAT);
+    sat_ceil_ld       = (c == SQ_LD);
+}
+extern "C" void sat_view_sq_restore(void)
+{
+    extern int sat_floor_ld, sat_ceil_potato, sat_ceil_ld;
+    wall_potato_mode  = (sq_wall == SQ_BAND) ? 1 : (sq_wall == SQ_FLAT) ? 2 : 0;
+    sat_potato_walls  = (sq_wall == SQ_FLAT);
+    sat_wall_nocpu    = (sq_wall == SQ_BAND || sq_wall == SQ_FLAT);
+    sat_potato_floors = (sq_floor == SQ_FLAT);
+    sat_floor_ld      = (sq_floor == SQ_LD);
+    sat_ceil_potato   = (sq_ceil == SQ_FLAT);
+    sat_ceil_ld       = (sq_ceil == SQ_LD);
 }
 #define GS_LEVEL 0
 #define GS_INTERMISSION 1                   /* gamestate_t: WI owns the 200..223 band (meta line + grain-extended art) */
@@ -1005,16 +1055,42 @@ static void hud2p_apply_flash(void)
     if (!hud2p_flash_built) hud2p_flash_build();
     int l1 = ST_PlayerPaletteIndex(0);
     int l2 = ST_PlayerPaletteIndex(1);
+    /* M7-multi (sat_lowres in 2p): the caller (D_DrawFrame HUD composite) already guarantees
+       GS_LEVEL && !menuactive && 2p, so sat_lowres alone means the framebuffer is PACKED.  The
+       3D-view rows [0,160) hold P1 in fb[0,80) and P2 in fb[80,160) (the x2 NBG1 zoom restores
+       them); the HUD panels below (rows 160-223) are still drawn full-320 and 2:1-decimated at
+       blit time.  So wash the VIEW rows in packed half-width (80) and the HUD rows in full
+       screen-width (160) -- matching the blit's split at hud_top=160.  Non-lowres: one screen-x
+       [x0,x0+160) wash over all 224 rows, exactly as before. */
+    int packed = sat_lowres;
     for (int half = 0; half < 2; ++half)
     {
         int lvl = half ? l2 : l1;
         if (lvl <= 0 || lvl >= HUD2P_NPAL) continue;
         const unsigned char *lut = hud2p_flash_lut[lvl];
-        int x0 = half ? 160 : 0;
-        for (int y = 0; y < 224; ++y)
+        if (packed)
         {
-            unsigned char *row = framebuffer + y * 320 + x0;
-            for (int x = 0; x < 160; ++x) row[x] = lut[row[x]];
+            int vx0 = half ? 80 : 0;                    /* packed 3D-view half (fb cols) */
+            for (int y = 0; y < 160; ++y)
+            {
+                unsigned char *row = framebuffer + y * 320 + vx0;
+                for (int x = 0; x < 80; ++x) row[x] = lut[row[x]];
+            }
+            int hx0 = half ? 160 : 0;                   /* full-320 HUD panel (decimated at blit) */
+            for (int y = 160; y < 224; ++y)
+            {
+                unsigned char *row = framebuffer + y * 320 + hx0;
+                for (int x = 0; x < 160; ++x) row[x] = lut[row[x]];
+            }
+        }
+        else
+        {
+            int x0 = half ? 160 : 0;
+            for (int y = 0; y < 224; ++y)
+            {
+                unsigned char *row = framebuffer + y * 320 + x0;
+                for (int x = 0; x < 160; ++x) row[x] = lut[row[x]];
+            }
         }
     }
 }
@@ -1032,10 +1108,31 @@ static void hud4p_apply_flash(int n)
         int lvl = ST_PlayerPaletteIndex(q);
         if (lvl <= 0 || lvl >= HUD2P_NPAL) continue;
         const unsigned char *lut = hud2p_flash_lut[lvl];
-        for (int y = 0; y < HUD4P_QUAD_H; ++y)
+        /* M7 3/4p: the quad's VIEW rows are packed to half-width (fb x qx>>1, 80 wide); its BAND
+           rows [+96,+112) stay full-320 (captured onto the un-zoomed VDP1 band sprite).  Wash the
+           view portion packed + the band portion full-width.  Non-lowres: one full-320 quad wash. */
+        if (sat_lowres)
         {
-            unsigned char *row = framebuffer + (qy[q] + y) * 320 + qx[q];
-            for (int x = 0; x < 160; ++x) row[x] = lut[row[x]];
+            int vh  = HUD4P_QUAD_H - HUD4P_H;             /* view rows = 112-16 = 96 */
+            int vx0 = qx[q] >> 1;                         /* packed view half (0 or 80) */
+            for (int y = 0; y < vh; ++y)
+            {
+                unsigned char *row = framebuffer + (qy[q] + y) * 320 + vx0;
+                for (int x = 0; x < 80; ++x) row[x] = lut[row[x]];
+            }
+            for (int y = vh; y < HUD4P_QUAD_H; ++y)       /* band rows: full-320 (VDP1 capture) */
+            {
+                unsigned char *row = framebuffer + (qy[q] + y) * 320 + qx[q];
+                for (int x = 0; x < 160; ++x) row[x] = lut[row[x]];
+            }
+        }
+        else
+        {
+            for (int y = 0; y < HUD4P_QUAD_H; ++y)
+            {
+                unsigned char *row = framebuffer + (qy[q] + y) * 320 + qx[q];
+                for (int x = 0; x < 160; ++x) row[x] = lut[row[x]];
+            }
         }
     }
 }
@@ -1676,6 +1773,22 @@ static void fps_update(void)
         sprintf(r1, "R%u T%u S%u b%u.%u%c%c dg%u pr%u.%u    ",
                 _rec, _tic, _snd, bmt / 10, bmt % 10, blit_c, blit_w, _dg, _pr10 / 10, _pr10 % 10);
         if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 1, r1);
+        /* row 17: SPLIT per-view render times, ms (the CLEAN probe for "does M7 lowres actually
+           save time in 3/4p?").  v0..v3 = each R_RenderPlayerView (d_ms-bracketed in d_main's split
+           loop), k = the single VDP1 flush/kick, =S = sum of the per-view renders.  M7 lowres halves
+           ONLY the software pixel-fill INSIDE each v_i (planes + per-column clip + sprite fill),
+           NOT the per-view BSP traversal / sprite+seg projection / VDP1 command emission -- so in
+           the SHORT 96-row 3/4p quadrants (fill is a MINORITY of v_i) each v_i barely drops M4->M7,
+           while in the TALL 160-row 2p halves it drops hard.  Cycle M4<->M7 (pad Z) on the SAME 4p
+           scene and compare v0..v3 + k: if v_i is ~flat, 3/4p is emission/BSP-bound (lowres can't
+           help); if k dominates, it's VDP1-fill-bound.  Split-only (values are stale in 1p). */
+        if (sat_dbg_overlay_mode == 0 && sat_local_players > 1) {
+            static char r17[40];
+            unsigned int vsum = sat_spl_v0 + sat_spl_v1 + sat_spl_v2 + sat_spl_v3;
+            snprintf(r17, sizeof r17, "SPL %u %u %u %u k%u =%u   ",
+                     sat_spl_v0, sat_spl_v1, sat_spl_v2, sat_spl_v3, sat_spl_kick, vsum);
+            SRL::Debug::Print(0, 17, r17);
+        }
         /* window reset -- read the row-1 composition ABOVE before this zeroes the sums.  The
            dead RAM/TXC/ZON sizer block (TEX/SPL/TXC/ZON, all display-off) was cut with the
            overlay clean-up; re-add from git if a memory-lever session needs it. */
@@ -1786,11 +1899,16 @@ static void fps_update(void)
                quality per zone (f=full l=ld b=band x=flat).  The old fl/cl/sk/wl routing chars were
                dropped -- they are all-on in M4/M6 and all-off in M0, i.e. redundant with M. */
             static const char sqch[4] = { 'f', 'l', 'b', 'x' };   /* full / ld / band / flat */
+            /* In a co-op split the SQ toggles drive the SPLIT set (sq_*_view) -- show THAT so the
+               photo matches the active config; 1p shows the global sq_*.  Sprite stays global. */
+            int sqw = (sat_local_players > 1) ? sq_wall_view[0]  : sq_wall;
+            int sqf = (sat_local_players > 1) ? sq_floor_view[0] : sq_floor;
+            int sqc = (sat_local_players > 1) ? sq_ceil_view[0]  : sq_ceil;
             static char r7[40];
             snprintf(r7, sizeof r7, "M%d %s ms%d pm%d SQ:%c%c%c%c cs%dns%dad%d lr%d",
                      sat_m, sat_m_name[sat_m], sat_mark_suppress,
                      sat_plane_rowsplit ? 2 : sat_plane_tas,
-                     sqch[sq_wall & 3], sqch[sq_floor & 3], sqch[sq_ceil & 3], sqch[sq_sprite & 3],
+                     sqch[sqw & 3], sqch[sqf & 3], sqch[sqc & 3], sqch[sq_sprite & 3],
                      sat_clear_slave, sat_near_sprites, sat_aimd_damp, sat_lowres);
             if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 7, r7);
             /* row 8: RELIABLE VDP1 load (replaces the CEF-aliased Dr%).  w%/f% = wall/floor
@@ -3208,7 +3326,7 @@ static int          vdp1_bank;     /* weapon bank VDP1 is currently displaying *
 static int          vdp1_wbank;    /* bank being written this frame */
 static int          vdp1_wnext;    /* next command slot in the write bank */
 static int          vdp1_wactive;  /* 1 = R_DrawPlayerSprites ran this frame */
-static unsigned int vdp1_hud_csum = 0xFFFFFFFFu;  /* status-bar change detector */
+static int vdp1_hud_force_recopy = 0;   /* palette change (level load / flash) -> force a HUD recopy next capture */
 
 /* HUD on VDP1 (docs/LOWRES_RENDER_STUDY.md Phase 2): the 1p status bar (framebuffer rows
    192-223, composed by ST_Drawer) is re-drawn as a VDP1 prio-7 NORMAL sprite so it is
@@ -3351,6 +3469,14 @@ static inline unsigned short pal_rgb555(int idx)
 #define WTEX_WIDE_BASE (WTEX_BASE + WTEX_NARROW_N * WTEX_NARROW_SZ) /* 0x25C45000 */
 #define WTEX_SLOTS     (WTEX_NARROW_N + WTEX_WIDE_N)                /* 22; ends 0x25C75000 */
 #define WALL_CMD_CAP   (VDP1_BANK_CMDS - 8)   /* walls stop here -> room for end + margin */
+/* RUNTIME wall cap = the view-count-scaled reservation (sat_walls_kick sets it before the flush).
+   1p keeps WALL_CMD_CAP.  In a co-op split the walls saturate the bank and the OVERLAYS emitted
+   after them (weapon copy-2 per view + the HUD band strip(s) + the HU message, all guarded at
+   VDP1_CMD_GUARD) had only VDP1_BANK_CMDS-2 - WALL_CMD_CAP = 6 slots -> in 3/4p the 4 weapons ate
+   them and the HUD dropped (the doubled-band artifact).  Reserving more (below) drops the FARTHEST
+   walls instead (already the overflow tail) so the weapon + HUD always fit.  Read by the wall-emit
+   guards; never above WALL_CMD_CAP. */
+static int vdp1_wall_cap = WALL_CMD_CAP;
 
 /* 8BPP PALETTE LIGHTING (replaces gouraud, which can't light a 256-colour BANK: VDP1 applies
    gouraud to the palette CODE before the CRAM lookup -> it shifts the index, not the RGB).
@@ -3734,7 +3860,7 @@ static void wall_emit_band(int x1, int x2, int yl1, int yh1, int yl2, int yh2,
 
     if (xspan <= 0 || du == 0 || texw <= 0)            /* degenerate -> single quad */
     {
-        if (vdp1_wnext >= WALL_CMD_CAP) return;
+        if (vdp1_wnext >= vdp1_wall_cap) return;
         memset(cmd, 0, sizeof cmd);
         cmd[0] = 0x0002; cmd[2] = 0x00E0;                 /* DISTORSP | COLOR_4 8bpp | SPD | ECD-off */
         cmd[3] = colr;                                    /* CMDCOLR = CRAM light-bank base */
@@ -3761,7 +3887,7 @@ static void wall_emit_band(int x1, int x2, int yl1, int yh1, int yl2, int yh2,
     int winset = 0, ntiles = 0;
     for (int ub = umin & ~(texw - 1); ub < umax && ntiles < MAXWALLTILES; ub += texw, ++ntiles)
     {
-        if (vdp1_wnext >= WALL_CMD_CAP) break;
+        if (vdp1_wnext >= vdp1_wall_cap) break;
         int xs = x1 + WDIV((long long)(ub        - u1) * xspan * sdu, adu, inv_du);  /* /du */
         int xe = x1 + WDIV((long long)(ub + texw - u1) * xspan * sdu, adu, inv_du);  /* /du */
         int lo = (xs < xe) ? xs : xe, hi = (xs < xe) ? xe : xs;
@@ -3796,7 +3922,7 @@ static void wall_emit_band(int x1, int x2, int yl1, int yh1, int yl2, int yh2,
                 cmd[10] = (short)wx2;  cmd[11] = (short)vyb;  /* lower-right (XC,YC) = view band bottom */
                 vdp1_cmd_at(VDP1_BANK[vdp1_wbank], vdp1_wnext++, cmd);
                 winset = 1;
-                if (vdp1_wnext >= WALL_CMD_CAP) break;
+                if (vdp1_wnext >= vdp1_wall_cap) break;
             }
             /* Phase-1 vertical [0,223] clamp REMOVED (owner's red diagnosis 2026-07-02).  With the
                SPAN routing reverted, a wall that projects off the TOP of the screen renders CORRECTLY
@@ -3879,7 +4005,7 @@ static void wall_emit(int wi)
     int v = v0, nb = 0;
     while (v < v1 && nb < MAXVBANDS)
     {
-        if (vdp1_wnext >= WALL_CMD_CAP) break;
+        if (vdp1_wnext >= vdp1_wall_cap) break;
         int vmod = ((v % H) + H) % H;                  /* texel within the texture (wraps) */
         int rows = H - vmod;                           /* down to the next tile seam */
         if (v + rows > v1) rows = v1 - v;              /* last (partial) band */
@@ -3904,7 +4030,7 @@ static void wall_emit(int wi)
    lit by the SAME CRAM bank as the textured walls and flashes via CRAM too.  1px generous. */
 static void wall_emit_flat(int wi)
 {
-    if (vdp1_wnext >= WALL_CMD_CAP) return;
+    if (vdp1_wnext >= vdp1_wall_cap) return;
     int x1 = wall_acc[wi].x1, x2 = wall_acc[wi].x2;
     int yl1 = wall_acc[wi].yl1, yh1 = wall_acc[wi].yh1;
     int yl2 = wall_acc[wi].yl2, yh2 = wall_acc[wi].yh2;
@@ -3969,8 +4095,15 @@ static void wall_emit_banded(int wi)
     wall_emit_band(x1, x2, yl1, yh1, yl2, yh2, u1, u2, texw, ca, cs, colr, vx, vxr, vyt, vyb);
 }
 
-/* the VDP1 wall mode (0=textured 1=banded 2=flat).  Global per level (set in sat_apply_mode from
-   SQ_wall); the flush forces flat for a wall with no texture slot, and forces textured for special walls. */
+/* the VDP1 wall mode (0=textured 1=banded 2=flat).  Global (set in sat_apply_mode from the 1p SQ_wall,
+   or per split frame -- UNIFORMLY -- by sat_view_sq_apply); the flush forces flat for a wall with no
+   texture slot, and forces textured for special walls.
+   SPLIT-ASYMMETRY TRAP (review 2026-07-15): this ignores `wi` and returns the SINGLE global, read at
+   FLUSH time = the value the LAST split-loop iteration left.  Safe TODAY only because the split wall SQ
+   is uniform across views (the pad toggle writes all four sq_wall_view[] the same).  If per-viewport
+   asymmetry is ever wired (sq_wall_view differing per view), the VDP1 walls of ALL views would render
+   in view[n-1]'s style (floor/ceil DO differ per view -- read during each view's fill).  To fix THEN:
+   capture wall_potato_mode into a wall_acc[wi] field at ACCUMULATE time and return that here. */
 static int wall_potato(int wi)
 {
     (void)wi;
@@ -4744,7 +4877,7 @@ static void vdp1_floors_flush(void)   /* legacy step-1: flat quads into the wall
     unsigned short cmd[16];
     for (int i = 0; i < floor_acc_n; ++i)
     {
-        if (vdp1_wnext >= WALL_CMD_CAP) break;
+        if (vdp1_wnext >= vdp1_wall_cap) break;
         memset(cmd, 0, sizeof cmd);
         cmd[0] = 0x0004; cmd[2] = 0x00C0; cmd[3] = floor_acc[i].col;   /* FUNC_Polygon flat | SPD | ECD-off */
         cmd[6]  = (unsigned short)floor_acc[i].x1; cmd[7]  = (unsigned short)floor_acc[i].ytl;   /* A far-left  */
@@ -4955,7 +5088,7 @@ static void vdp1_walls_flush(void)
        this is ALGEBRAICALLY identical to the old single-budget reservation
        (extra_used + (c-1) <= budget-n  <=>  used + c + (n-i-1) <= budget). */
     extern int sat_split_active, sat_local_players;     /* core: split flag + live player count */
-    int budget = WALL_CMD_CAP - vdp1_wnext;
+    int budget = vdp1_wall_cap - vdp1_wnext;
     int nv = sat_local_players; if (nv < 1) nv = 1; else if (nv > 4) nv = 4;
     int nviews = sat_split_active ? nv : 1;             /* d_main renders nv views in split (2..4) */
     int surplus = budget - wall_acc_n;                 /* cmds available beyond the all-flat baseline */
@@ -5120,7 +5253,7 @@ extern "C" void sat_vdp1_wpn_begin(void)
     if (palette_changed)
     {
         for (int i = 0; i < WPN_CACHE_N; ++i) { wpn_cache[i].lump = -1; wpn_cache[i].used = 0; }
-        vdp1_hud_csum = 0xFFFFFFFFu;
+        vdp1_hud_force_recopy = 1;   /* consumed by vdp1_hud_begin -> invalidates every region's csum */
     }
 #if SAT_WORLD_THINGS_VDP1
     if (!thing_acc_open)   /* split queued this frame's things PRE-kick: its open reset the
@@ -5439,7 +5572,7 @@ extern "C" int sat_vdp1_thing_draw(patch_t *patch, int lump, const unsigned char
         for (int i = 0; i < THINGS_TEX_SLOTS; ++i) thing_cache[np][i].used = 0;
     }
     if (split ? (thing_acc_n >= THING_ACC_MAX)
-              : (vdp1_wnext >= WALL_CMD_CAP - 1))   /* direct path needs 2 cmds (clip + quad) */
+              : (vdp1_wnext >= vdp1_wall_cap - 1))   /* direct path needs 2 cmds (clip + quad) */
     { sat_things_decl++; return 0; }
 
     W    = (int)bswap16((unsigned short)patch->width);
@@ -5549,7 +5682,7 @@ static void vdp1_things_flush(void)
     int i;
     for (i = 0; i < thing_acc_n; ++i)
     {
-        if (vdp1_wnext >= WALL_CMD_CAP - THING_FLUSH_MARGIN) break;
+        if (vdp1_wnext >= vdp1_wall_cap - THING_FLUSH_MARGIN) break;
         memset(cmd, 0, sizeof cmd);
         cmd[0]  = 0x0008;                          /* FUNC_UserClip */
         cmd[6]  = thing_acc[i].cx0; cmd[7]  = thing_acc[i].cy0;
@@ -5601,41 +5734,73 @@ static void vdp1_things_flush(void)
    after the weapon) draws it.  A status bar ticks slowly -> the 1-frame lag is imperceptible.
    ADDITIVE: the software bar is still blitted underneath (fallback), fully covered by this
    opaque prio-7 sprite -> it never vanishes even if a heavy plot cuts the emit. */
-static int vdp1_hud_ready = 0;   /* 1 = VDP1_HUD_TEX holds a valid captured bar */
+/* VDP1 HUD regions (crisp split HUD, docs/LOWRES_RENDER_STUDY.md).  Under the M7 x2 NBG1 zoom the
+   software HUD garbles, so each mode's HUD is captured from the framebuffer into VDP1_HUD_TEX and
+   emitted as an un-zoomed prio-7 sprite.  Region count by mode: 1p bar = 1 (rows 192..223, 320x32),
+   2p panels = 1 (rows 160..223, 320x64), 3/4p bands = 2 strips (rows 96..111 + 208..223, 320x16 each
+   -- the compact bands are interleaved with the packed views so they cannot ride a single tail).
+   VRAM: stacked from VDP1_HUD_TEX (0x25C78000); worst = 2p 20KB -> 0x25C7D000, inside the 1p-HUD
+   region (1p-only) + the head of the ftex F-banks (both UNWRITTEN when sat_vdp1_floor=0 = all of
+   {M0,M4,M6,M7}, and things end exactly at 0x25C78000) -> safe in every reachable split-M7 mode. */
+#define VDP1_HUD_REGIONS 2
+static struct vdp1_hud_region { short hy, hh, spd; unsigned int tex, csum; } vdp1_hud_reg[VDP1_HUD_REGIONS];
+static int          vdp1_hud_nreg  = 0;   /* regions captured this frame (0 = no VDP1 HUD -> software stands) */
+static int          vdp1_hud_ready = 0;
+static unsigned int vdp1_hud_texoff = 0;  /* running VDP1_HUD_TEX offset while adding regions */
 
-/* Capture the composed 1p status bar (framebuffer rows 192..223) into the 8bpp VDP1 texture.
-   Rows 192..223 are contiguous (32*320 B) and already palette-indexed -> ONE raw memcpy, no
-   pal convert.  Checksum-gated: re-copy only when the bar actually changed. */
-static void vdp1_hud_capture(void)
+static void vdp1_hud_begin(void)
 {
-    const unsigned int *s32 = (const unsigned int *)(framebuffer + HUD_Y * 320);
-    unsigned int csum = 2166136261u;
-    for (int i = 0; i < HUD_W * HUD_H / 4; ++i) csum = (csum ^ s32[i]) * 16777619u;
-    if (csum != vdp1_hud_csum)
+    vdp1_hud_nreg = 0; vdp1_hud_texoff = 0;
+    if (vdp1_hud_force_recopy)   /* palette change: invalidate geometry so vdp1_hud_add recopies */
     {
-        vdp1_hud_csum = csum;
-        memcpy((unsigned char *)VDP1_HUD_TEX, framebuffer + HUD_Y * 320, HUD_W * HUD_H);
+        for (int i = 0; i < VDP1_HUD_REGIONS; ++i) vdp1_hud_reg[i].hy = -1;
+        vdp1_hud_force_recopy = 0;
     }
-    vdp1_hud_ready = 1;
 }
 
-/* Emit the captured bar as a prio-7 NORMAL sprite (1:1, no scale -> crisp, VDP1 ignores the
-   NBG1 zoom).  1p only; the split panels keep their own software HUD band. */
+/* Add one HUD strip: framebuffer rows [hy,hy+hh) (full 320) -> VDP1_HUD_TEX + running offset.
+   spd 1 = opaque (SPD SET, idx0 drawn: 1p bar / 2p panels); 0 = SPD-off (idx0 transparent: 3/4p
+   bands, so the empty minimap-slot area of a strip does not paint).  Checksum-gated per region;
+   a geometry/offset change forces a recopy. */
+static void vdp1_hud_add(int hy, int hh, int spd)
+{
+    if (vdp1_hud_nreg >= VDP1_HUD_REGIONS) return;
+    struct vdp1_hud_region *r = &vdp1_hud_reg[vdp1_hud_nreg];
+    unsigned int tex = VDP1_HUD_TEX + vdp1_hud_texoff;
+    const unsigned int *s32 = (const unsigned int *)(framebuffer + hy * 320);
+    unsigned int csum = 2166136261u;
+    for (int i = 0; i < 320 * hh / 4; ++i) csum = (csum ^ s32[i]) * 16777619u;
+    if (csum != r->csum || r->hy != hy || r->hh != hh || r->tex != tex)   /* change/geometry -> recopy */
+    {
+        r->csum = csum;
+        memcpy((unsigned char *)tex, framebuffer + hy * 320, 320 * hh);
+    }
+    r->hy = (short)hy; r->hh = (short)hh; r->spd = (short)spd; r->tex = tex;
+    vdp1_hud_nreg++;
+    vdp1_hud_texoff += 320u * (unsigned)hh;
+}
+
+/* Emit every captured HUD region as a prio-7 NORMAL sprite (1:1 -> crisp, VDP1 ignores the NBG1
+   zoom).  The capture site sets the regions (1p / 2p-M7 / 3-4p-M7) and clears them for non-M7 /
+   non-level, where the software HUD stands.  ADDITIVE: the software HUD is still (decimated-)blitted
+   underneath as a never-vanish fallback, covered by these sprites. */
 static void vdp1_hud_emit(void)
 {
-    extern int sat_local_players;
-    if (sat_local_players > 1 || !vdp1_hud_ready
-        || !vdp1_wactive || vdp1_wnext >= VDP1_CMD_GUARD) return;
-
-    unsigned short cmd[16];
-    memset(cmd, 0, sizeof cmd);
-    cmd[0] = 0x0000;                                   /* NORMAL sprite (native size, no scale) */
-    cmd[2] = 0x00E0;                                   /* 256-bank | ECD-off | SPD SET (opaque, idx0 drawn) */
-    cmd[3] = WPN_CMDCOLR;                              /* prio 7 (above NBG1) | CRAM bank 1 (= colors[]) */
-    cmd[4] = (unsigned short)((VDP1_HUD_TEX - VDP1_VRAM_BASE) >> 3);
-    cmd[5] = (unsigned short)(((HUD_W >> 3) << 8) | HUD_H);   /* charSize 0x2820 (40 cols x 32 px) */
-    cmd[6] = 0; cmd[7] = HUD_Y;                         /* top-left (0,192) */
-    vdp1_cmd_at(VDP1_BANK[vdp1_wbank], vdp1_wnext++, cmd);
+    if (!vdp1_hud_ready || !vdp1_wactive) return;
+    for (int i = 0; i < vdp1_hud_nreg; ++i)
+    {
+        if (vdp1_wnext >= VDP1_CMD_GUARD) break;
+        const struct vdp1_hud_region *r = &vdp1_hud_reg[i];
+        unsigned short cmd[16];
+        memset(cmd, 0, sizeof cmd);
+        cmd[0] = 0x0000;                                   /* NORMAL sprite (native size, no scale) */
+        cmd[2] = r->spd ? 0x00E0 : 0x00A0;                 /* SPD SET opaque / SPD-off idx0 transparent */
+        cmd[3] = WPN_CMDCOLR;                              /* prio 7 (above NBG1) | CRAM bank 1 (= colors[]) */
+        cmd[4] = (unsigned short)((r->tex - VDP1_VRAM_BASE) >> 3);
+        cmd[5] = (unsigned short)(((HUD_W >> 3) << 8) | r->hh);   /* 40 cols x hh px */
+        cmd[6] = 0; cmd[7] = (unsigned short)r->hy;         /* top-left (0, hy) */
+        vdp1_cmd_at(VDP1_BANK[vdp1_wbank], vdp1_wnext++, cmd);
+    }
 }
 
 /* HU MESSAGE on VDP1 (LOWRES only, docs/LOWRES_RENDER_STUDY.md Phase 2): the pickup/message line
@@ -5656,7 +5821,10 @@ static int          vdp1_hud_msg_active = 0;
    view).  Lowres only; skipped when no message was on. */
 static void vdp1_hud_msg_emit(void)
 {
-    if (!sat_lowres || !vdp1_hud_msg_active || !vdp1_hud_msg_emit_addr
+    extern int sat_local_players;
+    /* 1p only (the message VRAM redirect is armed only in 1p): also gate on the CURRENT count so a
+       1p-M7 -> split drop-in can't emit last frame's stale 1p message over the new split view. */
+    if (sat_local_players != 1 || !sat_lowres || !vdp1_hud_msg_active || !vdp1_hud_msg_emit_addr
         || !vdp1_wactive || vdp1_wnext >= VDP1_CMD_GUARD) return;
     unsigned short cmd[16];
     memset(cmd, 0, sizeof cmd);
@@ -5779,6 +5947,36 @@ extern "C" void sat_walls_kick(void)
 #endif
     {   /* SATURN PERF: time the VDP1 present (close bank + flip root LINK) -> overlay 'pr'. */
         unsigned short pk0 = frt_read();
+        /* VDP1 command RESERVATION (fixes the 3/4p HUD-drop / doubled-band): cap the walls short of
+           VDP1_CMD_GUARD by the overlays the split emits AFTER them -- weapon copy-2 (one per view)
+           + the HUD band strip(s) + the HU message + margin.  1p is unchanged (WALL_CMD_CAP); only
+           the split reserves more, yielding its farthest walls (the overflow tail) so weapon+HUD
+           always plot.  Set BEFORE vdp1_walls_flush; read by every wall-emit guard. */
+        {
+            int nv = sat_split_active ? sat_local_players : 1;
+            if (nv < 1) nv = 1; else if (nv > 4) nv = 4;
+            if (nv <= 1) vdp1_wall_cap = WALL_CMD_CAP;        /* 1p: 1 weapon + 1 HUD fit the nominal 6-slot margin */
+            else {
+                int nhud    = (nv >= 3) ? 2 : 1;              /* 3/4p = 2 band strips; 2p-M7 = 1 panel region */
+                int reserve = 3 * nv + nhud + 3;             /* <=3 cmds/view for weapon(2) [clip+gun+flash] + HUD
+                                                                strip(s) + HU msg + margin: GUARANTEES the HUD/panel
+                                                                always plots (far walls yield instead).  2p INCLUDED:
+                                                                its M7 VDP1 HUD needs 7 overlay slots > the old 6-slot
+                                                                margin (WALL_CMD_CAP), so a dense 2p-both-firing frame
+                                                                dropped the panel -- same bug class as 3/4p (review
+                                                                2026-07-15).  2p reserve=10 -> cap 244 (drops ~4 far
+                                                                walls only when saturated). */
+                int cap     = VDP1_CMD_GUARD - reserve;
+                if (cap > WALL_CMD_CAP)        cap = WALL_CMD_CAP;         /* never above the nominal wall budget */
+                if (cap < WALL_ACC_MAX + 16)   cap = WALL_ACC_MAX + 16;    /* floor: keep budget >= wall_acc_n so the
+                                                                             flush can give every accumulated wall at
+                                                                             least a FLAT quad (mode!=0); below
+                                                                             WALL_ACC_MAX far walls would VANISH to sky,
+                                                                             not degrade.  Unreachable at the current
+                                                                             reserves (min cap 237) -- kept coherent. */
+                vdp1_wall_cap = cap;
+            }
+        }
         sat_vdp1_wpn_begin();       /* reset the bank + local-coord (walls flushed BETWEEN the copies) */
 #if SAT_WPN_VDP1
         /* DOUBLE-EMIT the player weapon -- VDP1 has NO z-buffer: it rasterises every command into
@@ -5821,7 +6019,23 @@ extern "C" void sat_walls_kick(void)
            = VDP1 already near full -> flickered at only th4).  So grow the cap slowly while the plot
            FINISHED (vdp1_prev_done, EDSR CEF), back off fast (-2) when it OVERRAN (would drop+vanish
            things).  It settles just under the per-scene flicker threshold: high outdoors, low indoors. */
-        if (vdp1_prev_done) {
+        /* ad2 = WBUDGET experiment (1p; L+X cycles ad0/1/2): the normal growth waits on the noisy
+           EDSR-CEF (vdp1_prev_done), which false-throttles ec to ~1 even when the VDP1 command list
+           is 78% empty (row VD1 w%, row SPR th0/0) -> monsters stay software.  Instead drive ec
+           straight from the REAL remaining command budget: the walls (+weapon copy 1) just flushed
+           into vdp1_wnext, so (free slots / ~2 cmds-per-thing) = how many things DEFINITELY fit this
+           frame.  Bypasses the CEF entirely; a real plot-TIME overrun (not command count) would still
+           show as flicker -- that IS the diagnostic.  Split keeps the damped path (its own hard
+           per-view budget + viewport-res sprites). */
+        if (sat_aimd_damp == 2 && !sat_split_active) {
+            int room = vdp1_wall_cap - vdp1_wnext - THING_FLUSH_MARGIN;
+            int budget_cap = (room > 0) ? (room >> 1) : 0;      /* ~2 VDP1 cmds per emitted thing */
+            if (budget_cap > THING_ADAPT_MAX) budget_cap = THING_ADAPT_MAX;
+            if (sat_thing_emit_cap < budget_cap)      sat_thing_emit_cap += 2;         /* smooth ramp up */
+            else if (sat_thing_emit_cap > budget_cap) sat_thing_emit_cap = budget_cap; /* snap down to fit */
+            if (sat_thing_emit_cap < 0) sat_thing_emit_cap = 0;
+            thing_overrun_run = 0; thing_cap_clean = 0;
+        } else if (vdp1_prev_done) {
             thing_overrun_run = 0;                        /* clean plot resets the hysteresis run */
             if (++thing_cap_clean >= THING_CAP_GROW)
             { if (sat_thing_emit_cap < THING_ADAPT_MAX) sat_thing_emit_cap++; thing_cap_clean = 0;
@@ -5947,7 +6161,10 @@ extern "C" void DG_DrawFrame(void)
        sat_sky_view in the NEXT frame's split loop (leaving that view's sky region index-0); the window
        + scroll below aim the single NBG0 layer at the SAME view THIS frame -- steady-state the choice is
        constant, so there is no phase skew.  Re-poke the W0 window only when the elected band changes. */
-    int hwsky_split = (hwsky_split_on && sat_local_players >= 2 && gamestate == GS_LEVEL && !automapactive);
+    int hwsky_split = (hwsky_split_on && sat_local_players >= 2 && gamestate == GS_LEVEL && !automapactive
+                       && !sat_lowres);   /* M7: the NBG0 sky is un-zoomed full-320 while the NBG1 view is
+                                             x2-zoomed -> horizontal misalignment; fall back to the software
+                                             sky, which packs into fb[0,160) + zooms WITH the view. */
     sat_sky_view = hwsky_split ? 0 : -1;
     {
         static int sky_win_view = -2;   /* last NBG0-window state: -2 uninit, -1 full screen, 0..3 band */
@@ -6242,6 +6459,15 @@ extern "C" void DG_DrawFrame(void)
            loop, or an open automap, would get a split HUD painted over a view d_main did NOT
            split-render.  usergame is externed as int elsewhere in this file (matches core). */
         extern int sat_local_players, usergame;
+        /* W5 FIX (2026-07-15): track the split player-count at FRAME level (updates even in 1p, so it
+           sits OUTSIDE the players>1 gate) -> a return to 2p after ANY excursion (1p or 3-4p) forces
+           the panel repaint below.  The 2p panel is W5-signature-gated, but its framebuffer rows
+           [160,224) get CLOBBERED whenever we leave 2p (1p status bar / 3-4p bands overwrite them),
+           so a return with an unchanged HUD signature would else skip the repaint = stale/blank
+           panels.  (Pre-existing bug, surfaced by the count cycle; unrelated to lowres.) */
+        static int hud_split_last_lp = -1;
+        int hud_lp_changed = (sat_local_players != hud_split_last_lp);
+        hud_split_last_lp = sat_local_players;
         /* !menuactive: the platform paints the split HUD band AFTER the core drew the pause
            menu into the framebuffer, so painting it here would cover the menu.  Skip the
            repaint while the menu is up -> the menu (NBG1) stays on top of the band. */
@@ -6252,12 +6478,12 @@ extern "C" void DG_DrawFrame(void)
                 /* 2p: two 160x64 compact-HUD panels in the bottom 64 rows (P1 left, P2 right),
                    each player's widgets on top, then a per-half damage/pickup flash.  W5 (runtime
                    blit_cfg[].w5): only repaint (and mark the band dirty) when a player's HUD
-                   signature changed -- else skip the paint AND the blit skips [160,224).  w5=0:
-                   always repaint (the flag then also always blits, below). */
+                   signature changed OR the count just changed -- else skip the paint AND the blit
+                   skips [160,224).  w5=0: always repaint (the flag then also always blits, below). */
                 static unsigned int w5_2p_sig = ~0u;
                 int w5_2p = blit_cfg[blit_mode].w5;
                 unsigned int sig = ST_SplitHudSig();
-                if (!w5_2p || sig != w5_2p_sig)
+                if (!w5_2p || sig != w5_2p_sig || hud_lp_changed)
                 {
                     w5_2p_sig = sig;
                     hud2p_blit_panels();
@@ -6292,9 +6518,29 @@ extern "C" void DG_DrawFrame(void)
        NBG1 zoom (1-frame latent).  Status bar = every mode; HU message = lowres only (the core
        redirect draws directly into a VDP1 VRAM slot, double-buffered here for the NEXT frame). */
     {
-        extern int sat_local_players;
-        int hud1p = (sat_local_players == 1 && gamestate == GS_LEVEL);
-        if (hud1p) vdp1_hud_capture();
+        extern int sat_local_players, usergame;
+        /* Under the M7 x2 zoom the software split HUD garbles -> capture it for a crisp prio-7 VDP1
+           sprite.  The split predicates MUST mirror the split-HUD PAINT gate (usergame && GS_LEVEL &&
+           !automap && !menu) -- NOT just sat_lr -- else on the attract/demo loop with a leftover co-op
+           count the paint is skipped (d_main renders the demo 1p) but the capture would snapshot the
+           demo VIEW rows as garbage HUD strips.  1p bar keeps its historical GS_LEVEL-only gate. */
+        int lvl_ok   = (usergame && gamestate == GS_LEVEL && !menuactive && !automapactive);
+        int hud1p    = (sat_local_players == 1 && gamestate == GS_LEVEL);
+        int hud2p_lr = (sat_local_players == 2 && sat_lowres && lvl_ok);
+        int hud34_lr = (sat_local_players >= 3 && sat_lowres && lvl_ok);
+        vdp1_hud_begin();
+        if (hud1p)         vdp1_hud_add(HUD_Y, HUD_H, 1);         /* 1p bar    rows 192..223 (320x32) opaque */
+        else if (hud2p_lr) vdp1_hud_add(HUD2P_TOP, HUD2P_H, 1);   /* 2p panels rows 160..223 (320x64) opaque */
+        else if (hud34_lr) {                                      /* 3/4p bands: 2 strips, SPD-ON (opaque) */
+            /* SPD-ON (not off): the band art is all-opaque, and in 3p the empty q3/minimap-slot area of
+               the bottom strip is index-0 -> with SPD-ON it paints CRAM bank-1 idx0 (near-black) OVER
+               the x2-zoomed right-half of P3's band that NBG1 shows there = a clean corner (SPD-off left
+               that garble visible).  In 4p the slot holds an opaque band so SPD is a no-op.  Also closes
+               any stray index-0 pixel in the band art punching a see-through hole. */
+            vdp1_hud_add(96,  HUD4P_H, 1);                        /* top    strip rows  96..111 (q0/q1 bands)   */
+            vdp1_hud_add(208, HUD4P_H, 1);                        /* bottom strip rows 208..223 (q2[/q3] bands) */
+        }
+        vdp1_hud_ready = (vdp1_hud_nreg > 0);
         if (hud1p && sat_lowres) {
             /* The core drew this frame's message into the armed VRAM slot (sat_hu_msg_buf); latch it
                for the next kick's emit.  Then arm+clear the OTHER slot for frame N+1 (double-buffer)
@@ -6357,13 +6603,17 @@ extern "C" void DG_DrawFrame(void)
     RP_AuxWait();
 #endif
     unsigned short blit_t0 = frt_read();   /* SATURN PERF: time the blit (-> sat_blit_ms10) */
-    /* SATURN lowres (docs/LOWRES_RENDER_STUDY.md): the software render is packed 160-wide;
-       VDP2 hardware-enlarges NBG1 x2 horizontal so it fills the screen.  Re-applied EVERY
-       frame (a one-shot scale can be dropped by the SGL vblank register re-push).  1p only
-       (split uses its own viewports); off/split -> 1:1.  If the picture SHRINKS to the left
-       on HW instead of enlarging, the SGL convention is inverse -> set VDP2_ZOOM_FACTOR 0.5. */
-    int sat_lr = (sat_lowres && sat_local_players == 1
-                  && gamestate == GS_LEVEL && !menuactive);   /* menus/intermission draw full-320 -> no zoom */
+    /* SATURN lowres (docs/LOWRES_RENDER_STUDY.md): the software render is packed into the LEFT
+       160 columns; VDP2 hardware-enlarges NBG1 x2 horizontal so it fills the screen.  Re-applied
+       EVERY frame (a one-shot scale can be dropped by the SGL vblank register re-push).  M7-multi:
+       1p AND 2p (2p packs P1 fb[0,80)+P2 fb[80,160) -> the SAME whole-layer zoom restores both to
+       their screen halves); 3/4p + non-lowres -> 1:1.  If the picture SHRINKS to the left on HW
+       instead of enlarging, the SGL convention is inverse -> set VDP2_ZOOM_FACTOR 0.5. */
+    int sat_lr = (sat_lowres
+                  && gamestate == GS_LEVEL && !menuactive && !automapactive);
+                  /* menus/intermission/full-screen automap draw full-320 -> no zoom (else their
+                     un-packed content would be x2-stretched into the left half; the 3D view is
+                     not rendered while the automap is up, so dropping the zoom costs nothing) */
     slScrScaleNbg1(toFIXED(sat_lr ? VDP2_ZOOM_FACTOR : 1.0), toFIXED(1.0));
     /* W5: split the copy at hud_top (= the clear boundary).  [0,hud_top) is the re-rendered
        3D view -> always blit.  [hud_top,224) is the HUD band -> blit only when it changed
@@ -6379,8 +6629,10 @@ extern "C" void DG_DrawFrame(void)
     w5_last_players = sat_local_players;
     w5_last_lowres  = sat_lr;
     int hud_blit = !blit_cfg[blit_mode].w5 || sat_hud_dirty || hud_force;
-    if (blit_cfg[blit_mode].dma)
-    {
+    if (blit_cfg[blit_mode].dma && !sat_lr)
+    {   /* M7-multi: the opt-in DMA path copies a flat 320 B/row with NO lowres HUD decimation,
+           so under the x2 zoom it would mis-stretch the HUD -> fall through to the CPU (sat_lr)
+           path, which packs the view (160 B/row) + 2:1-decimates the HUD band. */
         /* Inc 1 (docs/BLIT_DMA_PLAN.md) -- synchronous on-chip-DMAC blit via SGL slDMACopy, the
            wolf4sdl pattern: one slDMACopy per row (HWRAM framebuffer -> VDP2 VRAM, 320 B) then a
            single slDMAWait.  The framebuffer is write-through so RAM is already current -> NO
@@ -6405,14 +6657,25 @@ extern "C" void DG_DrawFrame(void)
         cache_purge();
         if (sat_lr)
         {
-            /* LOWRES: the 3D view is packed in the LEFT 160 columns -> copy 160 B/row
-               (half the blit).  The HUD (rows hud_top..223) is still drawn full-320 by
-               ST_Drawer, so 2:1 horizontally DECIMATE it into the left 160 cols (read
-               every other source byte) so the x2 zoom restores it -- chunky (the face is
-               the quality to judge for a Phase-2 VDP1-HUD migration).  Framebuffer stays
-               intact (decimation reads, never writes it), so ST's dirty-refresh is safe. */
+            /* LOWRES: the 3D view is packed in the LEFT 160 columns -> copy 160 B/row (half the
+               blit).  The HUD is drawn full-320, so 2:1 DECIMATE it into the left 160 cols (read
+               every other source byte) so the x2 zoom restores it -- chunky (crisp when the VDP1
+               HUD sprite covers it).  1p/2p: the HUD is a contiguous tail [hud_top,224).  3/4p: the
+               compact bands are INTERLEAVED (rows 96..111 top quads + 208..223 bottom quads) inside
+               the [0,224) view range, so decimate THOSE rows too -- else the un-decimated band rides
+               the packed 160B copy and the x2 zoom DOUBLES q0/q2's band across the full width (the
+               "software HUD doubled in x" seen on HW whenever the crisp VDP1 band is dropped under a
+               full VDP1 command budget in 4p).  Framebuffer stays intact (decimate only reads it). */
+            int is34 = (sat_local_players >= 3);
             for (int y = 0; y < hud_top; ++y)
-                memcpy(DOOM_VRAM + (y + VIEW_Y_OFFSET) * DOOM_VRAM_STRIDE, framebuffer + y * 320, 160);
+            {
+                unsigned char       *d = DOOM_VRAM + (y + VIEW_Y_OFFSET) * DOOM_VRAM_STRIDE;
+                const unsigned char *s = framebuffer + y * 320;
+                if (is34 && (((unsigned)(y - 96) < 16u) || ((unsigned)(y - 208) < 16u)))
+                    for (int x = 0; x < 160; ++x) d[x] = s[x << 1];   /* 3/4p band row -> decimate */
+                else
+                    memcpy(d, s, 160);                                /* packed view row */
+            }
             if (hud_blit)
                 for (int y = hud_top; y < 224; ++y)
                 {
@@ -6635,6 +6898,21 @@ static void poll_pad(void)
     if (vbl_count == last_poll_frame) return;
     last_poll_frame = vbl_count;
 
+    /* M7-multi: re-apply the render mode whenever a live drop-in (START on pad 2 -> sat_dropin_want
+       -> G_SatDropInSetPlayers) changes sat_local_players WITHOUT a pad tap.  Since want_lr = (M ==
+       M7_LOWRES) is now COUNT-INDEPENDENT, the R_SetLowRes flip inside is a guarded no-op on a pure
+       count change (M7 stays lowres across 1p/2p/3-4p) -- this call is belt-and-suspenders that keeps
+       the rest of sat_apply_mode's per-mode state coherent; the R_SetViewWindow satvw cache re-fits
+       the views automatically on the viewport-height change.  Runs before the pad-connect early-out. */
+    {
+        static int last_lp = -1;
+        if (sat_local_players != last_lp)
+        {
+            last_lp = sat_local_players;
+            sat_apply_mode();
+        }
+    }
+
     if (Smpc_Peripheral[0].id == PER_ID_NotConnect) return;
 
     unsigned short cur     = Smpc_Peripheral[0].data;
@@ -6709,7 +6987,8 @@ static void poll_pad(void)
        used (L/R + d-pad would eat movement in normal play).  R+C = clear-on-slave (R+C was the freed M5
        staging slot); R+X = nearSprites cull; L+X = AIMD damp.  X's TAB (automap) is suppressed below
        whenever L or R is held, and the mp split-VDP1 X toggle is gated to X-alone, so these never
-       collide.  Row 7 shows cs/ns/ad; row 15 SPR shows the AIMD ec/ef effect. */
+       collide.  Row 7 shows cs/ns/ad; row 15 SPR shows the AIMD ec/ef effect.  L+X now CYCLES the
+       AIMD mode ad0/1/2 (2 = wbudget: 1p command-budget-driven emit cap -> monsters to VDP1). */
     if (!(cur & PER_DGT_TR) && (cur & PER_DGT_TL)                 /* R held, L released */
         && (changed & PER_DGT_TC) && !(cur & PER_DGT_TC))
         sat_clear_slave ^= 1;
@@ -6718,7 +6997,7 @@ static void poll_pad(void)
         sat_near_sprites ^= 1;
     if (!(cur & PER_DGT_TL) && (cur & PER_DGT_TR)                 /* L held, R released */
         && (changed & PER_DGT_TX) && !(cur & PER_DGT_TX))
-        sat_aimd_damp ^= 1;
+        sat_aimd_damp = (sat_aimd_damp + 1) % 3;   /* ad0 plain / ad1 damped (default) / ad2 wbudget */
     /* (Low-res is no longer a pad toggle -- it is render MODE M7 in the pad-Z cycle, since it is
        whole-view (shared projection + whole-layer VDP2 zoom), not a per-zone lever.  sat_apply_mode
        sets sat_lowres when M7 is selected.  This freed the old L+R+X binding.) */
@@ -6738,7 +7017,12 @@ static void poll_pad(void)
        fallback + the VDP1 wall style (band/flat).  (Was the RBG0 floor A/B -- folded into the M
        axis.)  R taps '.' to Doom -- the established diag-chord pattern. */
     if (!(cur & PER_DGT_TR) && (changed & PER_DGT_TY) && !(cur & PER_DGT_TY))
-    { sq_wall = (sq_wall + 1) & 3; sat_apply_mode(); }
+    {
+        if (sat_local_players > 1)   /* split: cycle the split WALL SQ (FULL->BAND->FLAT; NO LD -- detailshift is whole-frame) for all views */
+        { int w = (sq_wall_view[0]==SQ_FULL) ? SQ_BAND : (sq_wall_view[0]==SQ_BAND) ? SQ_FLAT : SQ_FULL;
+          for (int k=0;k<4;k++) sq_wall_view[k] = w; }
+        else { sq_wall = (sq_wall + 1) & 3; sat_apply_mode(); }
+    }
 #if !RBG0_TUNE_PAD   /* was gated on !RBG0_LINECOL_TEST too -- a coherence bug: the parked line-color
                         fog (mode 0, never on C) has nothing to do with the plane-split toggle, and
                         RBG0_LINECOL_TEST=1 was silently killing pad C.  Only RBG0_TUNE_PAD really uses C. */
@@ -6852,13 +7136,23 @@ static void poll_pad(void)
        skipped (meaningless for a flat: the potato span is already distance-shaded per row). */
     if ((cur & PER_DGT_TL) && (cur & PER_DGT_TR)
         && (changed & PER_DGT_TY) && !(cur & PER_DGT_TY))
-    { sq_floor = (sq_floor == SQ_FULL) ? SQ_LD : (sq_floor == SQ_LD) ? SQ_FLAT : SQ_FULL; sat_apply_mode(); }
+    {
+        if (sat_local_players > 1)   /* split: cycle the split FLOOR SQ (FULL->LD->FLAT) for all views */
+        { int f = (sq_floor_view[0]==SQ_FULL) ? SQ_LD : (sq_floor_view[0]==SQ_LD) ? SQ_FLAT : SQ_FULL;
+          for (int k=0;k<4;k++) sq_floor_view[k] = f; }
+        else { sq_floor = (sq_floor == SQ_FULL) ? SQ_LD : (sq_floor == SQ_LD) ? SQ_FLAT : SQ_FULL; sat_apply_mode(); }
+    }
     /* Pad L+Y (R released) cycles the CEILING software quality SQ (full/ld/band/flat), independent
        of the floor (core sat_ceil_potato/sat_ceil_ld).  (Was the slave-F-build A/B -- sl1 kept as
        the compile default.)  Active-low: !(cur&TL) = L held. */
     if (!(cur & PER_DGT_TL) && (cur & PER_DGT_TR)
         && (changed & PER_DGT_TY) && !(cur & PER_DGT_TY))
-    { sq_ceil = (sq_ceil == SQ_FULL) ? SQ_LD : (sq_ceil == SQ_LD) ? SQ_FLAT : SQ_FULL; sat_apply_mode(); }
+    {
+        if (sat_local_players > 1)   /* split: cycle the split CEILING SQ (FULL->LD->FLAT) for all views */
+        { int c = (sq_ceil_view[0]==SQ_FULL) ? SQ_LD : (sq_ceil_view[0]==SQ_LD) ? SQ_FLAT : SQ_FULL;
+          for (int k=0;k<4;k++) sq_ceil_view[k] = c; }
+        else { sq_ceil = (sq_ceil == SQ_FULL) ? SQ_LD : (sq_ceil == SQ_LD) ? SQ_FLAT : SQ_FULL; sat_apply_mode(); }
+    }
     /* Pad R+A: live A/B of the Phase-1 WALL CLAMP (partially-occluded tiers kept on VDP1 via the
        world-anchored cut + software wedge, core sat_wall_cut_floor/_ceil).  Row 6 W<n><+/-> = tiers
        kept + state.  (MOVED off L+R+Y -- the L+R chord fires the overlay toggle, so L+R+Y was

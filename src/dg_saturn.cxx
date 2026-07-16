@@ -189,6 +189,19 @@ extern "C" void sat_vdp1_floors_done(void);     /* fwd: builds+flips the F floor
 extern "C" int sat_floor_punch_nrow;            /* core: mode-3 NEAR tile limit (screen row)    */
 static int ftex_claim_px;                       /* projected tile fill CLAIMED so far this frame
                                                    (claim-time budget; reset by vdp1_ftex_flush) */
+/* DEPORT-PREVIEW (pad R+X, revives the dead SAT_FLOOR_PERFSIM): dry-run M5's convex-exact classifier
+   over every secondary plane and tally what it WOULD deport, split floor vs ceiling.  Ceilings are
+   geometry-eligible but blocked by the NBG1(6)>VDP1(5)>RBG0(4) layer order -> shown SEPARATELY, they
+   are NOT usable margin.  classify-only makes sat_floor_vdp1_emit charge the px budget (so eligibility
+   respects FTEX_PX_BUDGET exactly like real M5) then roll the accumulation back -> no VDP1 emit.
+   Eligible planes are punched to backdrop so their on-screen footprint = what M5 would grab, and the
+   REC/P rows measure the offload ceiling.  See sat_floor_perfsim_deport_hook. */
+static int floor_deport_preview = 0;            /* R+X toggles; apply_mode installs the dry-run hook */
+static int ftex_classify_only   = 0;            /* set around the dry-run call (budget charged, no emit) */
+static int dep_floor_n, dep_floor_px, dep_ceil_n, dep_ceil_px, dep_resid_px;           /* this frame */
+static int dep_d_floor_n, dep_d_floor_px, dep_d_ceil_n, dep_d_ceil_px, dep_d_resid_px; /* flush snapshot */
+extern "C" int sat_floor_vdp1_emit(int,int,int,int,const unsigned char*,const unsigned char*,int);
+extern "C" int sat_floor_perfsim_deport_hook(int,int,int,int,const unsigned char*,const unsigned char*,int);
 #endif
 
 /* VDP1 command double-buffer.  0 = single bank, 1 = double bank.  Single-bank TESTED = BAD:
@@ -644,6 +657,7 @@ extern "C" int          (*sat_floor_vdp1_hook)(int, int, int, int, const unsigne
 extern "C" int            sat_floor_vdp1_emit(int, int, int, int, const unsigned char *, const unsigned char *, int);
 #endif
 extern "C" int            sat_local_players; /* core: LIVE local-coop player count (1 = single) */
+extern "C" void           SAT_CycleCheat(void);  /* core p_tick.c: cycle test cheat off->god->god+noclip */
 extern "C" int            sat_split_vdp1;    /* core: split keeps walls on VDP1 (views 0/1); pad-X A/B */
 extern "C" int            sat_plane_tas;     /* core: TAS.B plane work-steal (shipped default; A/B removed 2026-07-16) */
 #if VDP1_FLOOR_TEST || SAT_FLOOR_PERFSIM
@@ -685,12 +699,8 @@ extern int sat_thing_emit_cap;         /* core: max things emitted/frame -- we A
      (RP_AuxWait) at the top of R_RenderPlayerView.  Watch dg/MST (rows 1/0).
    sat_near_sprites (R+X): FastDoom nearSprites cull of far decorations (defined in core/r_things.c).
      Watch SPR n<projected> (row 15) fall + MST.
-   sat_aimd_damp (L+X cycles 0/1/2): things-AIMD mode.  0 = plain (-2 back-off, collapses on the noisy
-     CEF); 1 = damped (learned floor + overrun hysteresis, the default); 2 = WBUDGET (1p: drive ec from
-     the real VDP1 command-budget headroom, ignoring the CEF -> monsters onto full-res VDP1 when there
-     is room).  Watch SPR ec/th (row 15) + VD1 w% (row 9) + flicker. */
+   (things-AIMD is no longer a toggle: wbudget is baked for 1p -- see the emit-budget block.) */
 extern "C" int sat_clear_slave = 1;    /* default ON: HW-validated -2..-3ms dg (R+C to A/B off) */
-extern "C" int sat_aimd_damp   = 1;    /* default 1=damped; L+X -> 2=wbudget (1p VDP1-things experiment) */
 extern int     sat_near_sprites;       /* defined in core/r_things.c; default ON there (R+X to A/B off) */
 /* AIMD-damp state (read by fps_update row 15 + the two back-off sites): learned floor never lets ec
    collapse to 0, overrun-run gives 2-frame hysteresis against the noisy HW EDSR-CEF. */
@@ -735,9 +745,15 @@ void sat_walls_kick(void);                /* platform: flush + kick the VDP1 wal
    tuples exist, and each M activates ONLY the subsystems it needs (see the plan).
    Pad: Z cycles M (0..4); R+A/B/C cycle SQ wall/floor/ceil.  The MODE overlay row
    shows the resolved composition so a capture always pins the exact state.
-   M1 reproduces the historical default (RBG0 dominant + VDP1 leftover + VDP1 walls
-   + NBG0 sky) verbatim -- the regression anchor. */
-enum { M0_SOFT, M1_FULL, M2_FLOORS, M3_CEILS, M4_RBG0, M5_CONVEX, M6_NOSPR, M7_LOWRES, M_COUNT };
+   HISTORY: the parked M1/M2/M3 (full/floors-only/ceilings-only VDP1 tile deport)
+   were REMOVED 2026-07-16 -- HW-settled net-negative (memory-bound F-build, not
+   fill; M4 +44% vs M1) and structurally dead for ceilings (layer order inverted).
+   M5_CONVEX (convex-exact floor deport) is KEPT: it emits 1 exact quad per convex
+   distant plane (NOT tessellated tiles), so it sidesteps the F-build death -- its
+   value on stair/multi-ceiling scenes is what the DEPORT-PREVIEW perf-sim measures. */
+/* M1_FULL/M2_FLOORS/M3_CEILS removed 2026-07-16 (HW-dead tile deport); M5_CONVEX kept (see above).
+   sat_m is only ever compared to these tokens (never a literal int), so the renumber is safe. */
+enum { M0_SOFT, M4_RBG0, M5_CONVEX, M6_NOSPR, M7_LOWRES, M_COUNT };
 static int sat_m = M7_LOWRES;               /* boot = M4 (RBG0 dominant floor + VDP1 walls + VDP1 weapon +
                                                VDP1 world things) + LOW-RES: the shipped default in EVERY
                                                player-count (1p/2p/3-4p all pack into fb[0,160) and x2-zoom).
@@ -749,9 +765,9 @@ static int sat_m = M7_LOWRES;               /* boot = M4 (RBG0 dominant floor + 
                                                full-res, only the SOFTWARE leftovers (ceilings/minor-floors/
                                                fallbacks) go half-res.  Lowres is WHOLE-VIEW (shared projection +
                                                whole-layer zoom) so it is a MODE, not a per-zone SQ.  Pad Z cycles
-                                               {M0, M4, M6, M7}; M1/M2/M3/M5 are PARKED (off the cycle). */
-static const char *const sat_m_name[M_COUNT] = { "soft", "full", "flr", "ceil", "rbg0", "cvx", "nospr", "lowr" };
-/* Pad-Z cycle: the live modes only (parked M1/M2/M3/M5 stay reachable only via code). */
+                                               {M0, M4, M6, M7}; M5 is PARKED (off the cycle). */
+static const char *const sat_m_name[M_COUNT] = { "soft", "rbg0", "cvx", "nospr", "lowr" };
+/* Pad-Z cycle: the live modes only (parked M5 stays reachable only via code / the deport-preview). */
 static const int sat_m_cycle[] = { M0_SOFT, M4_RBG0, M6_NOSPR, M7_LOWRES };
 #define SAT_M_CYCLE_N ((int)(sizeof(sat_m_cycle) / sizeof(sat_m_cycle[0])))
 enum { SQ_FULL, SQ_LD, SQ_BAND, SQ_FLAT };
@@ -863,13 +879,13 @@ static void sat_apply_mode(void)
     extern int sat_floor_ld;                   /* core r_plane.c: half-rate floor texel fetch */
     extern int sat_ceil_potato, sat_ceil_ld;   /* core r_plane.c: independent ceiling SQ (step 2) */
     extern int sat_sprite_ld;                  /* core r_things.c: half-res software sprite fill (indep. of detailshift) */
-    int M = sat_m; if (M < 0 || M >= M_COUNT) { M = M1_FULL; sat_m = M; }
+    int M = sat_m; if (M < 0 || M >= M_COUNT) { M = M4_RBG0; sat_m = M; }
 
     /* ---- Axis A: offload targets ---- */
-    int rbg0_want  = (M != M0_SOFT);           /* RBG0 dominant floor (M1..M4) */
-    int vdp1_walls = (M != M0_SOFT);           /* VDP1 one-sided walls  (M1..M4) */
-    sat_vdp1_floor_claim = (M == M1_FULL || M == M2_FLOORS || M == M5_CONVEX);   /* leftover floors -> VDP1 */
-    sat_vdp1_ceil_claim  = (M == M1_FULL || M == M3_CEILS  || M == M5_CONVEX);   /* ceilings        -> VDP1 */
+    int rbg0_want  = (M != M0_SOFT);           /* RBG0 dominant floor (every mode but M0) */
+    int vdp1_walls = (M != M0_SOFT);           /* VDP1 one-sided walls  (every mode but M0) */
+    sat_vdp1_floor_claim = (M == M5_CONVEX);   /* convex-exact leftover floors   -> VDP1 (M5 only) */
+    sat_vdp1_ceil_claim  = (M == M5_CONVEX);   /* convex-exact leftover ceilings -> VDP1 (M5 only) */
     int hook_consult = (sat_vdp1_floor_claim || sat_vdp1_ceil_claim);   /* any leftover -> VDP1 */
 
     sat_vdp2_sky            = rbg0_want ? 1 : 0;   /* M0 -> sat_vdp2_sky=0: core draws the software sky */
@@ -878,21 +894,39 @@ static void sat_apply_mode(void)
     sat_wall_skip           = vdp1_walls ? 1 : 0;  /* M0 -> core draws software one-sided walls */
     sat_things_hw           = (M != M0_SOFT && M != M6_NOSPR); /* world sprites -> VDP1 prio-7 (M4); M6 = SOFTWARE
                                                      sprites (same walls+floor as M4) = the sprite-only A/B */
-    sat_vdp1_floor          = hook_consult ? 1 : 0;/* core: consult the emit hook (M1..M3) */
+    sat_vdp1_floor          = hook_consult ? 1 : 0;/* core: consult the emit hook (M5 only) */
     /* sat_ftex_mode: 4 = M0 (legacy all-software path drops the VDP1 wall_acc); 6 = M5 CONVEX-EXACT
        (distant planes whose every run is ONE linear trapezoid -> 1 exact quad; non-convex or near ->
-       software -- the cheap deport); 3 = the full tile deport (M1-M3).  M4's hook is not consulted
-       (sat_vdp1_floor=0) so its value is inert there. */
+       software -- the cheap deport).  M4/M6/M7 fall to the inert 3 (their hook is not consulted,
+       sat_vdp1_floor=0).  The DEPORT-PREVIEW perf-sim forces mode 6 to dry-run M5's classifier. */
     sat_ftex_mode           = (M == M0_SOFT) ? 4 : (M == M5_CONVEX) ? 6 : 3;
 
     /* VRAM INTERLOCK (see THINGS_TEX_BASE / FTEX_SLOT_BASE): both texture pools live at
        0x25C71000 and cannot coexist (28KB things + 42KB ftex > 44KB tail).  They are safe in the
-       reachable pad-Z modes M0/M4/M6 (things and floor-deport never both on), but M1/M2/M3/M5
-       (parked) DO request both -> they would silently corrupt VDP1 VRAM.  Enforce the invariant:
-       when world-things are on VDP1, the ftex floor deport yields (things is the shipped default).
-       No-op in every reachable mode (M4: floor already 0; M0/M6: things already 0); only bites a
-       future un-park of M1/M2/M3/M5, where it prevents the corruption until the VRAM is separated. */
+       reachable pad-Z modes M0/M4/M6 (things and floor-deport never both on), but parked M5
+       (and the deport-preview) DO request both -> they would silently corrupt VDP1 VRAM.  Enforce
+       the invariant: when world-things are on VDP1, the ftex floor deport yields (things is the
+       shipped default).  No-op in every reachable mode (M4: floor already 0; M0/M6: things already
+       0); the deport-preview sidesteps it by running world-things SOFTWARE (sat_things_hw=0) so the
+       classifier can dry-run; only bites a future un-park of M5, until the VRAM is separated. */
     if (sat_things_hw && sat_vdp1_floor) { sat_vdp1_floor = 0; sat_ftex_mode = 4; }
+
+#if SAT_FLOOR_TEX
+    /* DEPORT-PREVIEW (pad R+X): install the dry-run classifier hook + force the M5 convex-exact
+       predicate regardless of M.  World-things go SOFTWARE (sat_things_hw=0) so the ftex/things VRAM
+       interlock above does not disable the floor deport.  classify-only emits no VDP1 floor. */
+    if (floor_deport_preview)
+    {
+        sat_things_hw        = 0;
+        sat_vdp1_floor_claim = 1;
+        sat_vdp1_ceil_claim  = 1;
+        sat_vdp1_floor       = 1;                 /* core consults the hook per secondary plane */
+        sat_ftex_mode        = 6;                 /* M5 CONVEX-EXACT predicate (dry-run) */
+        sat_floor_vdp1_hook  = sat_floor_perfsim_deport_hook;
+    }
+    else
+        sat_floor_vdp1_hook  = sat_floor_vdp1_emit;   /* normal: the real emit (consulted only in M5) */
+#endif
 
     /* ---- Axis B: per-zone software quality (bites only on software zones / fallback slivers;
        HW-owned zones ignore it -- no detail level on hardware) ---- */
@@ -1745,7 +1779,7 @@ static void fps_update(void)
            so each A/B run starts a clean min/avg/max window -- no manual button needed
            (the pad is already saturated: Y=SQ X=split Z=mode-M L+A=blit). */
         {
-            static int l_map=-1, l_m=-1, l_sq=-1, l_blit=-1, l_ms=-1, l_cls=-1, l_ns=-1, l_ad=-1;
+            static int l_map=-1, l_m=-1, l_sq=-1, l_blit=-1, l_ms=-1, l_cls=-1, l_ns=-1;
 #if SAT_FLOOR_PERFSIM
             static int l_perfsim=-1;   /* reset the REC window on a pad-Y perf-sim toggle => clean per-mode numbers */
 #endif
@@ -1754,7 +1788,7 @@ static void fps_update(void)
 #endif
             if (gamemap != l_map || sat_m != l_m || (sq_wall<<6|sq_sprite<<4|sq_floor<<2|sq_ceil) != l_sq || blit_mode != l_blit
                 || sat_mark_suppress != l_ms
-                || sat_clear_slave != l_cls || sat_near_sprites != l_ns || sat_aimd_damp != l_ad
+                || sat_clear_slave != l_cls || sat_near_sprites != l_ns
 #if SAT_FLOOR_PERFSIM
                 || floor_perfsim_mode != l_perfsim
 #endif
@@ -1767,7 +1801,7 @@ static void fps_update(void)
                 fb_pk_clamp = fb_pk_mag = fb_pk_starve = fb_pk_px = 0;   /* Phase-0: clean fallback A/B window */
                 blit10_sum = blit10_cnt = 0;   /* row-1 'b' precise window: fresh sample on the L+A toggle */
                 l_map=gamemap; l_m=sat_m; l_sq=(sq_wall<<6|sq_sprite<<4|sq_floor<<2|sq_ceil); l_blit=blit_mode; l_ms=sat_mark_suppress;
-                l_cls=sat_clear_slave; l_ns=sat_near_sprites; l_ad=sat_aimd_damp;
+                l_cls=sat_clear_slave; l_ns=sat_near_sprites;
 #if SAT_FLOOR_PERFSIM
                 l_perfsim=floor_perfsim_mode;
 #endif
@@ -1960,11 +1994,11 @@ static void fps_update(void)
             { extern int detailshift;
               if (detailshift) { if (sqf==SQ_LD) sqf=SQ_FULL; if (sqc==SQ_LD) sqc=SQ_FULL; if (sqs==SQ_LD) sqs=SQ_FULL; } }
             static char r7[40];
-            snprintf(r7, sizeof r7, "M%d %s ms%d pm%d SQ:%c%c%c%c cs%dns%dad%d lr%d",
+            snprintf(r7, sizeof r7, "M%d %s ms%d pm%d SQ:%c%c%c%c cs%dns%d lr%d",
                      sat_m, sat_m_name[sat_m], sat_mark_suppress,
                      sat_plane_tas,
                      sqch[sqw & 3], sqch[sqf & 3], sqch[sqc & 3], sqch[sqs & 3],
-                     sat_clear_slave, sat_near_sprites, sat_aimd_damp, sat_lowres);
+                     sat_clear_slave, sat_near_sprites, sat_lowres);
             if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 7, r7);
             /* row 8: RELIABLE VDP1 load (replaces the CEF-aliased Dr%).  w%/f% = wall/floor
                command-budget FILL % (100% = bank full, further surfaces spill to CPU); fbw = walls
@@ -2003,14 +2037,10 @@ static void fps_update(void)
                sb = SESSION bake% (mh_bake_sum/mh_emit_sum) = the cache read -- low = high reuse.
                On row 15 (bottom, clear of centre-screen monsters that hide the THp row). */
             unsigned int sbpc = mh_emit_sum ? (mh_bake_sum * 100u / mh_emit_sum) : 0;
-            if (sat_aimd_damp)   /* damp on: show the learned floor ef (drop sb% to keep the row <=40 cols) */
-                snprintf(rSPR, sizeof rSPR, "SPR fl%d.%d n%d/%d th%d/%d ec%d ef%d fb%d ",
-                         sp_fl/10, sp_fl%10, sp_np, sp_nd,
-                         sat_things_n, sat_things_decl, sat_thing_emit_cap, thing_emit_floor, thing_bake_n);
-            else
-                snprintf(rSPR, sizeof rSPR, "SPR fl%d.%d n%d/%d th%d/%d ec%d fb%d sb%u%% ",
-                         sp_fl/10, sp_fl%10, sp_np, sp_nd,
-                         sat_things_n, sat_things_decl, sat_thing_emit_cap, thing_bake_n, sbpc);
+            (void)sbpc;   /* session bake% folded out with the ad-toggle; ef (split floor) shown instead */
+            snprintf(rSPR, sizeof rSPR, "SPR fl%d.%d n%d/%d th%d/%d ec%d ef%d fb%d ",
+                     sp_fl/10, sp_fl%10, sp_np, sp_nd,
+                     sat_things_n, sat_things_decl, sat_thing_emit_cap, thing_emit_floor, thing_bake_n);
             if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 15, rSPR);
             /* rows 9-10: SESSION percentiles (reset ONLY on a MODE change) -- read ONE end-of-level
                capture, no jitter.  THp = world-things emitted/frame p50/p99, declined/frame p99,
@@ -2119,6 +2149,25 @@ static void fps_update(void)
             static char r19[45];
             snprintf(r19, sizeof r19, "PERFSIM %s        ", perfsim_name[floor_perfsim_mode & 3]);
             (void)r19;   /* PERFSIM row cut */
+#endif
+#if SAT_FLOOR_TEX
+            /* row 19: DEPORT-PREVIEW (pad R+X) -- what M5's convex-exact classifier WOULD deport on
+               THIS scene.  F = floor planes / their px (the USABLE margin); C = ceiling planes that
+               are geometry-eligible but blocked by the NBG1>VDP1>RBG0 layer order (NOT margin -- shown
+               apart); R = residual secondary px (near/non-convex/over-budget -> software); m = floor-
+               only deportable share of ALL secondary px.  px in thousands.  Read REC/P (rows 4/5) for
+               the real perf delta.  Only printed while the preview is on. */
+            if (floor_deport_preview)
+            {
+                long tsec = (long)dep_d_floor_px + dep_d_ceil_px + dep_d_resid_px;
+                int  marg = tsec ? (int)((long)dep_d_floor_px * 100 / tsec) : 0;
+                static char rDP[45];
+                snprintf(rDP, sizeof rDP, "DEP F%d/%dk C%d/%dk R%dk m%d%% ",
+                         dep_d_floor_n, (dep_d_floor_px + 500) / 1000,
+                         dep_d_ceil_n,  (dep_d_ceil_px  + 500) / 1000,
+                         (dep_d_resid_px + 500) / 1000, marg);
+                SRL::Debug::Print(0, 19, rDP);
+            }
 #endif
             /* row 13: sky-vs-floor coverage classifier (Romain).  sky/flr = pixels the sky / the
                dominant floor cover this frame.  flr is non-zero only in a perf-sim floor-on mode
@@ -2865,6 +2914,36 @@ extern "C" int sat_floor_perfsim_hook(int picnum, int height, int minx, int maxx
 }
 #endif
 
+#if SAT_FLOOR_TEX
+/* DEPORT-PREVIEW hook (pad R+X): for each secondary plane, DRY-RUN the real M5 classifier
+   (sat_floor_vdp1_emit at ftex_mode 6, classify-only) so eligibility is BYTE-IDENTICAL to M5 -- no
+   drift, no re-implementation.  Eligible planes return 1 -> core skips them to backdrop (the hole =
+   the footprint M5 would deport) and REC/P (rows 4/5) measure the offload.  Tally floor vs ceiling
+   vs residual (view px) for the row-19 DEP overlay: floor px is the usable margin; ceiling px is
+   geometry-eligible but layer-blocked (M3), reported apart so it is not mistaken for margin. */
+extern "C" int sat_floor_perfsim_deport_hook(int picnum, int height, int minx, int maxx,
+                                             const unsigned char *top, const unsigned char *bottom,
+                                             int lightlevel)
+{
+    if (height == sat_vdp2_floor_h && picnum == sat_vdp2_floor_pic)
+        return 0;                                   /* dominant is RBG0's -- not a secondary plane */
+    long area = 0;
+    for (int xx = minx; xx <= maxx; ++xx)
+        if (top[xx] <= bottom[xx]) area += (int)bottom[xx] - (int)top[xx] + 1;
+    ftex_classify_only = 1;
+    int verdict = sat_floor_vdp1_emit(picnum, height, minx, maxx, top, bottom, lightlevel);
+    ftex_classify_only = 0;
+    if (verdict == 1 || verdict == 2)               /* convex-exact eligible -> M5 would deport it */
+    {
+        if (height > viewz) { dep_ceil_n++;  dep_ceil_px  += (int)area; }   /* ceiling: layer-blocked */
+        else                { dep_floor_n++; dep_floor_px += (int)area; }   /* floor: usable margin   */
+        return 1;                                   /* punch to backdrop = show the deportable footprint */
+    }
+    dep_resid_px += (int)area;                      /* near / non-convex / over-budget -> stays software */
+    return 0;
+}
+#endif
+
 extern "C" void DG_Init(void)
 {
     if (TVSTAT & 1)
@@ -3132,7 +3211,7 @@ extern "C" void DG_Init(void)
     /* Route one-sided (solid) walls to the VDP1 world renderer AND skip their
        software column draw -> see the VDP1 coverage + the perf it buys back. */
     sat_wall_hook = sat_wall_vdp1;
-    /* sat_wall_skip is owned by sat_apply_mode (M-gated: 1 in M1..M4, 0 in M0 software walls). */
+    /* sat_wall_skip is owned by sat_apply_mode (M-gated: 1 in every mode but M0-software-walls). */
     /* kick VDP1 right after the BSP walk (parallel with the CPU floors/sprites) so the
        walls present the SAME frame as the framebuffer (no 1-frame lag / sky-at-the-seam). */
     sat_walls_done_hook = sat_walls_kick;
@@ -3428,10 +3507,10 @@ static int vdp1_hud_force_recopy = 0;   /* palette change (level load / flash) -
 /* VRAM UNION (see FTEX_SLOT_BASE, ~line 4306): this pool 0x25C71000..0x25C78000 (28KB) ALIASES the
    ftex flat-cache tail 0x25C71000..0x25C7B800 (42KB).  The 44KB tail cannot hold BOTH -- they share
    it, and it is safe ONLY because they are mutually exclusive by render mode: world-things on VDP1
-   (sat_things_hw) is live in M1..M4; the ftex floor deport (sat_vdp1_floor) is live in M1/M2/M3/M5.
+   (sat_things_hw) is live in M4; the ftex floor deport (sat_vdp1_floor) is live in M5.
    In the three REACHABLE modes (pad-Z cycle M0/M4/M6) they NEVER coactivate (M4: things on, floor
-   off; M0/M6: things off), so there is no runtime collision.  Only reviving a parked M1/M2/M3/M5
-   would run both at once -> sat_apply_mode() enforces the interlock (floor deport yields to things).
+   off; M0/M6: things off), so there is no runtime collision.  Only reviving parked M5 (or the
+   deport-preview) would run both at once -> sat_apply_mode() enforces the interlock (floor yields).
    If a real coexistence is ever needed, separate the VRAM first (cede wall-pool space). */
 #define THINGS_TEX_BASE   0x25C71000u
 #define THINGS_TEX_SLOTS  4                /* slots PER parity == max distinct things offloaded/frame (VRAM cap) */
@@ -4362,9 +4441,9 @@ extern "C" int sat_floor_vdp1_emit(int picnum, int height, int minx, int maxx,
 {
     if (height == sat_vdp2_floor_h && picnum == sat_vdp2_floor_pic) return 0;   /* dominant stays (RBG0/software) */
     if (maxx < minx) return 0;
-    /* SATURN M: per-surface VDP1 claim gate.  M2 = leftover floors only (ceilings -> software);
-       M3 = ceilings only (leftover floors -> software); M1 = both (gate is a no-op).  A rejected
-       surface returns 0 so the core draws it with the software span path at its SQ quality. */
+    /* SATURN M: per-surface VDP1 claim gate.  M5 claims BOTH leftover floors AND ceilings
+       (both flags set); the DEPORT-PREVIEW perf-sim also sets both to classify each surface.
+       A rejected surface returns 0 so the core draws it with the software span path at its SQ. */
     if ((height > viewz) ? !sat_vdp1_ceil_claim : !sat_vdp1_floor_claim) return 0;
 #if SAT_FLOOR_TEX
     int claim_add = 0;                   /* claim-budget charge, applied ONLY on a successful claim */
@@ -4565,6 +4644,10 @@ extern "C" int sat_floor_vdp1_emit(int picnum, int height, int minx, int maxx,
     if (floor_acc_n == save_n) return 0;   /* nothing emitted -> software */
 #if SAT_FLOOR_TEX
     ftex_claim_px += claim_add;            /* the plane really claims -> charge the shared budget */
+    if (ftex_classify_only)                /* DEPORT-PREVIEW dry-run: budget charged (eligibility
+                                              tracks FTEX_PX_BUDGET like real M5) but roll the
+                                              accumulation back -> nothing is emitted this frame. */
+    { floor_acc_n = save_n; return 1; }
     if (sat_ftex_mode == 3)
     {
         /* PARTIAL claim: per-column split edge = the tiles' chunk-clip interiors (identical
@@ -4639,8 +4722,8 @@ extern "C" int sat_floor_vdp1_emit(int picnum, int height, int minx, int maxx,
    0x25C7C000..0x25C80000.  The VDP1 status-bar texture VDP1_HUD_TEX (0x25C78000, 8bpp 10KB ->
    ..0x25C7A800) is LIVE again (vdp1_hud_capture/emit); it sits exactly at the things-pool end
    and clears both the flat-slot F banks (0x25C7C000) and the M4/M7-off ftex floor -> reachable
-   in every mode.  Only the PARKED ftex-floor modes (M1/M2/M3/M5) would overlap flat slots 6-7
-   with it; safe until one is un-parked (then move the HUD, as with the things union).
+   in every mode.  Only the PARKED ftex-floor mode M5 (and the deport-preview) would overlap flat
+   slots 6-7 with it; safe until un-parked (then move the HUD, as with the things union).
    NB: the world-things pool THINGS_TEX_BASE (0x25C71000..0x25C78000, 28KB) ALIASES flat slots
    0-4 of this run.  Not a bug in shipping: things (sat_things_hw) and this ftex fill
    (sat_vdp1_floor) are mode-exclusive and never both live in the reachable M0/M4/M6 cycle;
@@ -4974,6 +5057,10 @@ static void vdp1_ftex_flush(void)
     ftexd_acc = floor_acc_n;                                 /* trapezoids claimed this frame */
     ftex_tiles = ftex_skips = ftex_trunc = ftex_bakes = 0; ftex_px = 0;
     ftex_claim_px = 0;                                       /* re-arm the claim-time budget */
+    /* DEPORT-PREVIEW: snapshot this frame's dry-run tally for the row-19 overlay, then re-arm. */
+    dep_d_floor_n = dep_floor_n; dep_d_floor_px = dep_floor_px;
+    dep_d_ceil_n  = dep_ceil_n;  dep_d_ceil_px  = dep_ceil_px;  dep_d_resid_px = dep_resid_px;
+    dep_floor_n = dep_ceil_n = 0; dep_floor_px = dep_ceil_px = dep_resid_px = 0;
     if (!ftex_wjump_addr) return;                    /* no wall list this frame (menu) */
     unsigned int wroot = (unsigned int)((VDP1_BANK[fbk] - VDP1_VRAM_BASE) >> 3);
     if (fmode == 4 || floor_acc_n == 0)
@@ -6073,15 +6160,14 @@ extern "C" void sat_walls_kick(void)
            = VDP1 already near full -> flickered at only th4).  So grow the cap slowly while the plot
            FINISHED (vdp1_prev_done, EDSR CEF), back off fast (-2) when it OVERRAN (would drop+vanish
            things).  It settles just under the per-scene flicker threshold: high outdoors, low indoors. */
-        /* ad2 = WBUDGET experiment (1p; L+X cycles ad0/1/2): the normal growth waits on the noisy
-           EDSR-CEF (vdp1_prev_done), which false-throttles ec to ~1 even when the VDP1 command list
-           is 78% empty (row VD1 w%, row SPR th0/0) -> monsters stay software.  Instead drive ec
-           straight from the REAL remaining command budget: the walls (+weapon copy 1) just flushed
-           into vdp1_wnext, so (free slots / ~2 cmds-per-thing) = how many things DEFINITELY fit this
-           frame.  Bypasses the CEF entirely; a real plot-TIME overrun (not command count) would still
-           show as flicker -- that IS the diagnostic.  Split keeps the damped path (its own hard
-           per-view budget + viewport-res sprites). */
-        if (sat_aimd_damp == 2 && !sat_split_active) {
+        /* THINGS emit budget.  1p = WBUDGET (baked default): drive ec from the REAL remaining VDP1
+           command budget -- the walls (+weapon copy 1) just flushed into vdp1_wnext, so (free slots /
+           ~2 cmds-per-thing) = how many things fit this frame.  This BYPASSES the EDSR-CEF, which
+           false-latches 30-60% "not done" on real HW and used to collapse ec to 0 (monsters never
+           reached VDP1 -- HW-proven, [[aimd-wbudget-hw-cef-collapse]]).  A real plot-TIME overrun (not
+           command count) would still show as tail flicker -- that IS the diagnostic.  Split keeps the
+           CEF-driven damped path below (its own hard per-view budget + viewport-res sprites). */
+        if (!sat_split_active) {
             int room = vdp1_wall_cap - vdp1_wnext - THING_FLUSH_MARGIN;
             int budget_cap = (room > 0) ? (room >> 1) : 0;      /* ~2 VDP1 cmds per emitted thing */
             if (budget_cap > THING_ADAPT_MAX) budget_cap = THING_ADAPT_MAX;
@@ -6093,14 +6179,11 @@ extern "C" void sat_walls_kick(void)
             thing_overrun_run = 0;                        /* clean plot resets the hysteresis run */
             if (++thing_cap_clean >= THING_CAP_GROW)
             { if (sat_thing_emit_cap < THING_ADAPT_MAX) sat_thing_emit_cap++; thing_cap_clean = 0;
-              if (sat_aimd_damp) {                        /* a cap that survives GROW clean frames is safe -> */
-                  int f = sat_thing_emit_cap - 2;         /* ratchet the learned floor toward it (never above cap-2) */
-                  if (f > thing_emit_floor) thing_emit_floor = f;
-              } }
-        } else if (sat_aimd_damp) {
-            /* DAMPED back-off: the HW EDSR-CEF latches noisily (30-60% false "not done") and the plain
-               -2-to-0 rule then collapses ec to 0 and sticks (the captured ec0/th0).  Require 2
-               consecutive overruns (hysteresis), decrease MULTIPLICATIVELY toward the learned floor,
+              int f = sat_thing_emit_cap - 2;             /* ratchet the learned floor toward it (<= cap-2) */
+              if (f > thing_emit_floor) thing_emit_floor = f; }
+        } else {
+            /* split DAMPED back-off: the HW EDSR-CEF latches noisily (30-60% false "not done"); require
+               2 consecutive overruns (hysteresis), decrease MULTIPLICATIVELY toward the learned floor,
                and only shed the floor itself (slowly) once pinned there and STILL overrunning. */
             if (++thing_overrun_run >= 2) {
                 thing_overrun_run = 0;
@@ -6112,9 +6195,6 @@ extern "C" void sat_walls_kick(void)
                     thing_emit_floor--; sat_thing_emit_cap = thing_emit_floor;
                 }
             }
-            thing_cap_clean = 0;
-        } else {
-            sat_thing_emit_cap -= 2; if (sat_thing_emit_cap < 0) sat_thing_emit_cap = 0;
             thing_cap_clean = 0;
         }
         /* World sprites to VDP1 prio 7, AFTER the walls and BEFORE weapon (2) so the gun stays on
@@ -6996,7 +7076,7 @@ static void poll_pad(void)
         }
         else
 #endif
-        {   /* Z: cycle only the LIVE modes {M0, M4, M6}; M1/M2/M3/M5 are parked (off the cycle). */
+        {   /* Z: cycle only the LIVE modes {M0, M4, M6, M7}; M5 is parked (off the cycle). */
             int ci = 0;
             for (int i = 0; i < SAT_M_CYCLE_N; ++i) if (sat_m_cycle[i] == sat_m) { ci = i; break; }
             sat_m = sat_m_cycle[(ci + 1) % SAT_M_CYCLE_N];
@@ -7041,10 +7121,26 @@ static void poll_pad(void)
     if (!(cur & PER_DGT_TR) && (cur & PER_DGT_TL)                 /* R held, L released */
         && (changed & PER_DGT_TC) && !(cur & PER_DGT_TC))
         sat_clear_slave ^= 1;
-    /* (Pad R+X nearSprites A/B CUT 2026-07-16: shipped default-ON (core), perf settled -> baked. R+X freed.) */
-    if (!(cur & PER_DGT_TL) && (cur & PER_DGT_TR)                 /* L held, R released */
+#if SAT_FLOOR_TEX
+    /* Pad R+X: DEPORT-PREVIEW perf-sim (freed by the nearSprites bake).  Dry-runs M5's convex-exact
+       classifier over every secondary plane WITHOUT emitting VDP1: deportable planes show BACKDROP
+       (their footprint = what M5 would grab) while REC/P (rows 4/5) measure the offload ceiling and
+       row 19 DEP tallies floor vs ceiling vs residual px.  World-things forced software (interlock).
+       R held, L released (mirrors R+C; distinct from the L+X AIMD chord); TAB suppressed while R. */
+    if (!(cur & PER_DGT_TR) && (cur & PER_DGT_TL)                 /* R held, L released */
         && (changed & PER_DGT_TX) && !(cur & PER_DGT_TX))
-        sat_aimd_damp = (sat_aimd_damp + 1) % 3;   /* ad0 plain / ad1 damped (default) / ad2 wbudget */
+    { floor_deport_preview ^= 1; sat_apply_mode(); }
+#endif
+    /* (L+X AIMD ad0/1/2 toggle CUT 2026-07-16: wbudget baked as the 1p default -- the damped ad1 was
+       HW-proven to collapse thing-emit to 0 via the false-latching EDSR-CEF; ad0/ad1-1p are dead.
+       L+X is free.  See [[aimd-wbudget-hw-cef-collapse]].) */
+    /* Pad R + Down: TEST cheat cycle -- off -> GOD -> GOD+NOCLIP -> off, applied to every local
+       player and re-established each tic by core P_Ticker (survives level/map warp, deaths, the
+       E1M8 super-damage floor).  R held, L released, Down edge (free chord -- R+Down was the cut
+       plane-Z knob); the incidental back-step tap to Doom is harmless.  A HUD line confirms state. */
+    if (!(cur & PER_DGT_TR) && (cur & PER_DGT_TL)                 /* R held, L released */
+        && (changed & PER_DGT_KD) && !(cur & PER_DGT_KD))
+        SAT_CycleCheat();
     /* SATURN split perf levers (co-op split ONLY -- gated on sat_local_players>1 so 1p is untouched).
        L + d-pad (L+Left/Right freed when WALL_PX_BUDGET was cut).  The incidental one-tap strafe/turn
        is harmless (tune while standing).  L+Left = piste-3 split thing-cull (drop tiny-projected

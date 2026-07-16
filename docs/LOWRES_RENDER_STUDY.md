@@ -323,6 +323,46 @@ split-detailshift control is a follow-up" note; (c) in the attract loop with lef
 **HW-verify:** in 4p M7, cycle split walls→BAND + floors→FLAT and watch `Bp`/`P`/`SPL` fall; confirm
 the HUD band no longer doubles (VDP1 budget); confirm 1p and default-split render unchanged.
 
+### MORE 2/3/4p LEVERS (2026-07-15, uncommitted) — pistes from the SLV-idle / 86%-render analysis
+
+Framing (from the row-17 `SPL` A/B): 4p is **86% render** (140ms views + 13ms kick), and the debug
+shows **`SLV b3% id97%`** — the slave SH-2 is ~97% IDLE in split. So the game is cutting the 4
+sequential per-view renders. Levers implemented as toggles:
+
+- **Piste 3 — split thing cull** (`sat_split_thingcull`, pad **L+Left**, split-only, default off;
+  core/r_things.c). In `R_ProjectSprite`, after `xscale`, drop sprites that project to near-nothing
+  (cut the per-view vissprite alloc + sort + emit × N views). Two buckets: SHOOTABLE actors **AND
+  MISSILES** use the conservative near-1px `ACTOR` floor (a split player must see incoming shots —
+  review fix); decorations + pickups use the harsher `DECOR` floor (~5px of a 64px sprite). `xscale`
+  is a depth proxy so big bosses subtend ~2× the quoted px. Overlay row 17 `tc`.
+- **Piste 5 — rotating SQ balance** (`sat_split_balance`, pad **L+Right**, cycle 0/1/2, split-only;
+  sat_view_sq_apply). Spread the split's degraded SQ over views+frames so no view stays permanently
+  ugly. `1` = 1 view degraded/frame (rotating; 2p = each half every other frame) → min fps hit / best
+  quality; `2` = 2 views/frame. "Degraded" = the cheap split SQ (`sq_*_view`, which you set); "full"
+  = FULL/LD preset. Each view degraded a fair fraction (rotation verified; no starvation). Overlay
+  row 17 `bal`.
+- **Per-view wall STYLE capture** (`wall_acc[].pot`) — required by piste 5: the VDP1 wall style is now
+  captured per view at accumulate (was read globally at flush = only the last view's). Removes the
+  documented asymmetry trap; byte-identical for uniform/1p.
+
+**Piste 1 — segloop-micro: INVESTIGATED, NOT implemented.** `R_RenderSegLoop` is already SATURN-
+optimized (texture/light/`dc_iscale` divide skipped when VDP1 owns every tier); the residual per-
+column cost is inherent `byte` writes to visplane spans + clip arrays. A base-pointer hoist is <2% on
+byte arrays and touches the core clip logic — poor risk/reward. (The "only profiled" note in the
+slave study overstated the opportunity.)
+
+**Piste 2 — wake the idle slave: NOT a toggle.** The slave is 97% idle in split *because* M4/M7
+already offloaded walls→VDP1, floors→RBG0/small-software, sprites→VDP1 — little parallelizable
+*software* work remains. The dominant master cost (BSP + seg processing + VDP1 command build) needs
+renderer state; a 2nd copy overflows 2MB (dead ×3, memory-bound — [[wall-offload-vdp1-slave-dead]],
+[[slave-second-renderer-bp-study]]). The one faint angle (view-pipelining with quadrant-sized state)
+is walled by the statically SCREENWIDTH-sized visplane pools — a large re-architecture, not a lever.
+**Recommend: realize pistes 3+5 first; revisit slave only as a dedicated project.**
+
+**Adversarial review (3 lenses):** no corruption; balance rotation verified fair. Fixed: piste-3
+missile bucket (→ ACTOR threshold), overlay-row comment (17 not 7). HW-verify: 4p thingcull on →
+`M`/`SPR n` (row 15) fall, no visible monster/missile pops; balance 1/2 → `SPL`/fps trade vs quality.
+
 ### KNOWN LIMITATIONS / Phase 2 (deferred)
 1. **HU pickup-message in 2p M7** — the VDP1 message-redirect is still 1p-only; in 2p the software
    message draws full-320 into the packed view and is x2-stretched. Transient/cosmetic (on pickup).

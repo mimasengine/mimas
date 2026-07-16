@@ -645,8 +645,7 @@ extern "C" int            sat_floor_vdp1_emit(int, int, int, int, const unsigned
 #endif
 extern "C" int            sat_local_players; /* core: LIVE local-coop player count (1 = single) */
 extern "C" int            sat_split_vdp1;    /* core: split keeps walls on VDP1 (views 0/1); pad-X A/B */
-extern "C" int            sat_plane_tas;     /* core: TAS.B plane work-steal A/B (pad-C 'pm1') */
-extern "C" int            sat_plane_rowsplit;/* core: row-split plane balancer (pad-C 'pm2') */
+extern "C" int            sat_plane_tas;     /* core: TAS.B plane work-steal (shipped default; A/B removed 2026-07-16) */
 #if VDP1_FLOOR_TEST || SAT_FLOOR_PERFSIM
 extern "C" int            sat_vdp1_floor;   /* core: skip secondary floors/ceilings (=> VDP1 strips) */
 extern "C" int          (*sat_floor_vdp1_hook)(int picnum, int height, int minx, int maxx,
@@ -739,9 +738,12 @@ void sat_walls_kick(void);                /* platform: flush + kick the VDP1 wal
    M1 reproduces the historical default (RBG0 dominant + VDP1 leftover + VDP1 walls
    + NBG0 sky) verbatim -- the regression anchor. */
 enum { M0_SOFT, M1_FULL, M2_FLOORS, M3_CEILS, M4_RBG0, M5_CONVEX, M6_NOSPR, M7_LOWRES, M_COUNT };
-static int sat_m = M4_RBG0;                 /* boot = RBG0 dominant floor + VDP1 walls + VDP1 weapon + VDP1
-                                               world things.  M6 = same but world things SOFTWARE (the
-                                               sprite-only A/B).  M7 = M4 + LOW-RES (docs/LOWRES_RENDER_STUDY.md):
+static int sat_m = M7_LOWRES;               /* boot = M4 (RBG0 dominant floor + VDP1 walls + VDP1 weapon +
+                                               VDP1 world things) + LOW-RES: the shipped default in EVERY
+                                               player-count (1p/2p/3-4p all pack into fb[0,160) and x2-zoom).
+                                               Pad Z still cycles down to M4/M6/M0 for A/B.  M6 = same but
+                                               world things SOFTWARE (the sprite-only A/B).  M7 = M4 + LOW-RES
+                                               (docs/LOWRES_RENDER_STUDY.md):
                                                software render at viewwidth 160 + VDP2 x2 NBG1 zoom -- the
                                                HW-owned elements (VDP1 walls/weapon/sprites, RBG0 floor) stay
                                                full-res, only the SOFTWARE leftovers (ceilings/minor-floors/
@@ -778,6 +780,19 @@ static int wall_potato_mode = 0;            /* VDP1 wall style: 0=tex 1=banded 2
 static int sq_wall_view[4]  = { SQ_FULL, SQ_FULL, SQ_FULL, SQ_FULL };
 static int sq_floor_view[4] = { SQ_LD,   SQ_LD,   SQ_LD,   SQ_LD   };
 static int sq_ceil_view[4]  = { SQ_LD,   SQ_LD,   SQ_LD,   SQ_LD   };
+
+/* SATURN: cycle a PLANE (floor/ceil) software quality full->ld->flat->full, but SKIP ld when
+   detailshift is on (M7 / split-lowdetail) where floor/ceil ld is a NO-OP (the half-rate texel
+   path R_TexturedSpan is high-detail only, r_plane.c) -> never land on a dead 'l'.  Walls keep their
+   own cycle (wall ld is what DRIVES detailshift, so it is meaningful). */
+static inline int sq_plane_cycle(int cur)
+{
+    extern int detailshift;
+    if (cur == SQ_FULL) return detailshift ? SQ_FLAT : SQ_LD;
+    if (cur == SQ_LD)   return SQ_FLAT;
+    return SQ_FULL;
+}
+
 /* Platform VDP1-claim gates, read ONLY by sat_floor_vdp1_emit -- split leftover-floors vs
    ceilings independently so M2 (floors only) and M3 (ceilings only) isolate each offload. */
 static int sat_vdp1_floor_claim = 1;        /* leftover floors -> VDP1 tiles (M1,M2) */
@@ -919,6 +934,17 @@ static void sat_apply_mode(void)
     }
 }
 
+/* SATURN piste-5 (rotating split-SQ balance, pad R+Right): spread the split's degraded SQ over
+   views+frames so no single viewport stays permanently ugly, at a chosen cost fraction.  0 = off
+   (every view uses its split SQ, as set).  1 = ONE view degraded per frame (rotating) -> 3/4 views
+   full = minimal fps hit / best quality; 2p = each half degraded every other frame.  2 = TWO views
+   degraded per frame (rotating) -> bigger cut.  A view is "degraded" = it uses the cheap split SQ
+   (sq_*_view, which YOU set via R+Y/Y/L+Y); a "full" view uses the FULL/LD preset.  Needs the
+   per-wall wall_acc.pot capture so each view's VDP1 walls take its own style (else all walls would
+   flicker to the last view's style).  Tick advances once per split frame (on v==0). */
+static int          sat_split_balance = 0;
+static unsigned int sat_split_bal_tick = 0;
+
 /* SATURN split-context SQ: apply viewport v's software quality to the SAME core render flags
    sat_apply_mode maps from the 1p sq_* (lines above), MINUS detailshift/sat_split_lowdetail (a
    whole-frame projection lever -- excluded, so split walls never offer SQ_LD).  Called PER VIEW in
@@ -928,8 +954,29 @@ static void sat_apply_mode(void)
 extern "C" void sat_view_sq_apply(int v)
 {
     extern int sat_floor_ld, sat_ceil_potato, sat_ceil_ld;
+    extern int sat_local_players;
     if (v < 0 || v > 3) v = 0;
-    int w = sq_wall_view[v], f = sq_floor_view[v], c = sq_ceil_view[v];
+    /* piste-5 balance: pick whether THIS view runs the cheap split SQ or the full preset this frame */
+    int use_split = 1;
+    if (sat_split_balance) {
+        if (v == 0) sat_split_bal_tick++;                       /* once per split frame */
+        int nv = sat_local_players; if (nv < 1) nv = 1; else if (nv > 4) nv = 4;
+        int ndeg = (sat_split_balance >= 2) ? 2 : 1; if (ndeg > nv) ndeg = nv;
+        int start = (int)(sat_split_bal_tick % (unsigned)nv);   /* rotating window origin */
+        int rel = v - start; rel %= nv; if (rel < 0) rel += nv;
+        use_split = (rel < ndeg);                               /* in the degraded window this frame? */
+    }
+    int w, f, c;
+    if (use_split) {
+        w = sq_wall_view[v]; f = sq_floor_view[v]; c = sq_ceil_view[v];
+        /* BALANCE flicker guard (user 2026-07-15): a per-frame LD<->FLAT alternation on floor/ceil is
+           too jarring (esp. at low split fps = slow strobe).  Under balance, clamp the degraded
+           floor/ceil to LD -- the alternation on those planes becomes FULL/LD<->LD (subtle), while the
+           WALLS still alternate (band/flat wall shimmer is far less visible than a floor going
+           textured<->solid).  No clamp when balance is off (uniform, no alternation -> FLAT is fine). */
+        if (sat_split_balance) { if (f == SQ_FLAT) f = SQ_LD; if (c == SQ_FLAT) c = SQ_LD; }
+    }
+    else           { w = SQ_FULL;         f = SQ_LD;            c = SQ_LD; }   /* FULL-quality preset */
     wall_potato_mode  = (w == SQ_BAND) ? 1 : (w == SQ_FLAT) ? 2 : 0;
     sat_potato_walls  = (w == SQ_FLAT);
     sat_wall_nocpu    = (w == SQ_BAND || w == SQ_FLAT);
@@ -1764,8 +1811,8 @@ static void fps_update(void)
         unsigned int _used = _tic + _snd + _blit + _dg;
         unsigned int _rec  = (mst > _used) ? (mst - _used) : 0u;         /* derived render */
         static char r1[45];
-        char blit_c = blit_cfg[blit_mode].dma ? 'd' : 'c';   /* blit path: c=CPU, d=slDMACopy (parked) */
-        char blit_w = blit_cfg[blit_mode].w5  ? '5' : '-';   /* W5 HUD-skip: 5=on, -=off (L+A)  */
+        char blit_c = 'c';   /* blit path baked to CPU memcpy 2026-07-16 */
+        char blit_w = '5';   /* W5 HUD-skip baked permanently ON */
         /* 'b' = PRECISE blit mean in tenths-ms (FRT sat_blit_ms10, windowed since the last L+A
            toggle) -> resolves the ~1.5ms W5/DMA deltas the old integer rounded away.  Folded into
            THIS field (no new overlay row -- rows are saturated across dg_saturn + r_parallel). */
@@ -1783,10 +1830,12 @@ static void fps_update(void)
            scene and compare v0..v3 + k: if v_i is ~flat, 3/4p is emission/BSP-bound (lowres can't
            help); if k dominates, it's VDP1-fill-bound.  Split-only (values are stale in 1p). */
         if (sat_dbg_overlay_mode == 0 && sat_local_players > 1) {
-            static char r17[40];
+            extern int sat_split_thingcull;   /* core piste-3 */
+            static char r17[48];
             unsigned int vsum = sat_spl_v0 + sat_spl_v1 + sat_spl_v2 + sat_spl_v3;
-            snprintf(r17, sizeof r17, "SPL %u %u %u %u k%u =%u   ",
-                     sat_spl_v0, sat_spl_v1, sat_spl_v2, sat_spl_v3, sat_spl_kick, vsum);
+            snprintf(r17, sizeof r17, "SPL %u %u %u %u k%u =%u tc%d bal%d ",
+                     sat_spl_v0, sat_spl_v1, sat_spl_v2, sat_spl_v3, sat_spl_kick, vsum,
+                     sat_split_thingcull, sat_split_balance);
             SRL::Debug::Print(0, 17, r17);
         }
         /* window reset -- read the row-1 composition ABOVE before this zeroes the sums.  The
@@ -1904,11 +1953,17 @@ static void fps_update(void)
             int sqw = (sat_local_players > 1) ? sq_wall_view[0]  : sq_wall;
             int sqf = (sat_local_players > 1) ? sq_floor_view[0] : sq_floor;
             int sqc = (sat_local_players > 1) ? sq_ceil_view[0]  : sq_ceil;
+            int sqs = sq_sprite;
+            /* SATURN honesty: floor/ceil/sprite LD is a NO-OP under detailshift (M7 / split-lowdetail;
+               the half-rate path is high-detail only, r_plane.c) -> show 'f', not a misleading 'l'.
+               Walls untouched (wall LD is what DRIVES detailshift). */
+            { extern int detailshift;
+              if (detailshift) { if (sqf==SQ_LD) sqf=SQ_FULL; if (sqc==SQ_LD) sqc=SQ_FULL; if (sqs==SQ_LD) sqs=SQ_FULL; } }
             static char r7[40];
             snprintf(r7, sizeof r7, "M%d %s ms%d pm%d SQ:%c%c%c%c cs%dns%dad%d lr%d",
                      sat_m, sat_m_name[sat_m], sat_mark_suppress,
-                     sat_plane_rowsplit ? 2 : sat_plane_tas,
-                     sqch[sqw & 3], sqch[sqf & 3], sqch[sqc & 3], sqch[sq_sprite & 3],
+                     sat_plane_tas,
+                     sqch[sqw & 3], sqch[sqf & 3], sqch[sqc & 3], sqch[sqs & 3],
                      sat_clear_slave, sat_near_sprites, sat_aimd_damp, sat_lowres);
             if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 7, r7);
             /* row 8: RELIABLE VDP1 load (replaces the CEF-aliased Dr%).  w%/f% = wall/floor
@@ -3646,7 +3701,7 @@ static int wall_px_acc;    /* fill claimed so far this frame (reset with wall_ac
    the left view, 160..319 for the right).  x1/x2 are stored ALREADY offset by viewwindowx, so the
    emit works in absolute framebuffer coords; vx/vxr drive the per-view user-clip window. */
 static struct { short x1, yl1, yh1, x2, yl2, yh2, slot, v0, v1, vx, vxr, vyt, vyb; int texnum, u1, u2;
-                unsigned char mode, special, view; const unsigned char *cmap; } wall_acc[WALL_ACC_MAX];
+                unsigned char mode, special, view, pot; const unsigned char *cmap; } wall_acc[WALL_ACC_MAX];
 static int wall_acc_n;
 
 /* core hook (per one-sided seg, during the BSP walk): stash the wall.  x1/x2 arrive VIEW-relative
@@ -3696,6 +3751,10 @@ extern "C" int sat_wall_vdp1(int x1, int yl1, int yh1, int x2, int yl2, int yh2,
     wall_acc[i].vyb = (short)(vy + viewheight - 1);     /* clips the VDP1 walls vertically (3/4p quadrants) */
     wall_acc[i].view = (unsigned char)sat_split_view;   /* 4-way budget bin (0..3) */
     wall_acc[i].special = (unsigned char)(sat_wall_textured ? 1 : 0);   /* force textured in pot2 */
+    wall_acc[i].pot = (unsigned char)wall_potato_mode;  /* CAPTURE the VDP1 wall STYLE per view at
+                                                           accumulate time (walls flush after the split
+                                                           loop, when wall_potato_mode = the LAST view's;
+                                                           per-view/rotating SQ needs this per-wall value) */
     return 0;                            /* queued for VDP1 */
 }
 
@@ -4095,19 +4154,14 @@ static void wall_emit_banded(int wi)
     wall_emit_band(x1, x2, yl1, yh1, yl2, yh2, u1, u2, texw, ca, cs, colr, vx, vxr, vyt, vyb);
 }
 
-/* the VDP1 wall mode (0=textured 1=banded 2=flat).  Global (set in sat_apply_mode from the 1p SQ_wall,
-   or per split frame -- UNIFORMLY -- by sat_view_sq_apply); the flush forces flat for a wall with no
-   texture slot, and forces textured for special walls.
-   SPLIT-ASYMMETRY TRAP (review 2026-07-15): this ignores `wi` and returns the SINGLE global, read at
-   FLUSH time = the value the LAST split-loop iteration left.  Safe TODAY only because the split wall SQ
-   is uniform across views (the pad toggle writes all four sq_wall_view[] the same).  If per-viewport
-   asymmetry is ever wired (sq_wall_view differing per view), the VDP1 walls of ALL views would render
-   in view[n-1]'s style (floor/ceil DO differ per view -- read during each view's fill).  To fix THEN:
-   capture wall_potato_mode into a wall_acc[wi] field at ACCUMULATE time and return that here. */
+/* the VDP1 wall mode (0=textured 1=banded 2=flat) for wall wi, CAPTURED per view at accumulate time
+   (wall_acc[wi].pot).  The flush forces flat for a wall with no texture slot, and textured for special
+   walls.  Per-wall (was the global read-at-flush) so per-view / rotating split SQ styles the VDP1 walls
+   of each viewport correctly -- the flush runs after the split loop, when the global wall_potato_mode is
+   only the LAST view's.  1p / uniform split -> identical value, so byte-identical there. */
 static int wall_potato(int wi)
 {
-    (void)wi;
-    return wall_potato_mode;
+    return (wi >= 0 && wi < wall_acc_n) ? (int)wall_acc[wi].pot : wall_potato_mode;
 }
 
 /* drain accumulated walls into the current bank (from vdp1_wpn_begin, behind the weapon).
@@ -6468,6 +6522,21 @@ extern "C" void DG_DrawFrame(void)
         static int hud_split_last_lp = -1;
         int hud_lp_changed = (sat_local_players != hud_split_last_lp);
         hud_split_last_lp = sat_local_players;
+        /* SATURN 3/4p floor+ceil default = FLAT ("fxxf").  In 3+ player split RBG0 is OFF (floors are
+           software) AND -- if running M7 -- the LD half-rate path is a NO-OP (R_TexturedSpan is
+           high-detail only, r_plane.c:810), so an "l" floor silently costs FULL.  Solid-colour
+           floors/ceilings drop that; walls + sprites stay FULL.  2p keeps LD (its P1 floor is
+           RBG0-HW).  Applied ONCE per count transition -> a live pad SQ override (Y floor / L+Y ceil)
+           in 3/4p sticks.  Dial back to fll* / full live via those pads. */
+        if (hud_lp_changed)
+        {
+            int flat34 = (sat_local_players >= 3) ? SQ_FLAT : SQ_LD;
+            for (int k = 0; k < 4; k++)
+            {
+                sq_floor_view[k] = flat34;
+                sq_ceil_view[k]  = flat34;
+            }
+        }
         /* !menuactive: the platform paints the split HUD band AFTER the core drew the pause
            menu into the framebuffer, so painting it here would cover the menu.  Skip the
            repaint while the menu is up -> the menu (NBG1) stays on top of the band. */
@@ -6481,7 +6550,7 @@ extern "C" void DG_DrawFrame(void)
                    signature changed OR the count just changed -- else skip the paint AND the blit
                    skips [160,224).  w5=0: always repaint (the flag then also always blits, below). */
                 static unsigned int w5_2p_sig = ~0u;
-                int w5_2p = blit_cfg[blit_mode].w5;
+                int w5_2p = 1;   /* W5 permanently ON (blit baked c5) */
                 unsigned int sig = ST_SplitHudSig();
                 if (!w5_2p || sig != w5_2p_sig || hud_lp_changed)
                 {
@@ -6628,30 +6697,9 @@ extern "C" void DG_DrawFrame(void)
                  || menuactive || (gamestate != GS_LEVEL);   /* overlays / layout change */
     w5_last_players = sat_local_players;
     w5_last_lowres  = sat_lr;
-    int hud_blit = !blit_cfg[blit_mode].w5 || sat_hud_dirty || hud_force;
-    if (blit_cfg[blit_mode].dma && !sat_lr)
-    {   /* M7-multi: the opt-in DMA path copies a flat 320 B/row with NO lowres HUD decimation,
-           so under the x2 zoom it would mis-stretch the HUD -> fall through to the CPU (sat_lr)
-           path, which packs the view (160 B/row) + 2:1-decimates the HUD band. */
-        /* Inc 1 (docs/BLIT_DMA_PLAN.md) -- synchronous on-chip-DMAC blit via SGL slDMACopy, the
-           wolf4sdl pattern: one slDMACopy per row (HWRAM framebuffer -> VDP2 VRAM, 320 B) then a
-           single slDMAWait.  The framebuffer is write-through so RAM is already current -> NO
-           cache_purge (unlike the CPU paths below).  slDMACopy = the SH-2 ON-CHIP DMAC (disasm-
-           proven; spins-per-row -> bus-bound, HW-confirmed no win).  UNVALIDATED-async paths ->
-           boot stays single-CPU (blit_mode 0); L+A opts in.  Watch for RBG0 snow (B-bus contention
-           boot stays single-CPU (blit_mode 0); L+A opts in.  Watch for RBG0 snow (B-bus contention
-           with the VDP2 fetch) + Dr (VDP1 shares the bus) when validating. */
-        for (int y = 0; y < hud_top; ++y)                     /* 3D view: always */
-            slDMACopy(framebuffer + y * 320,
-                      DOOM_VRAM + (y + VIEW_Y_OFFSET) * DOOM_VRAM_STRIDE, 320);
-        if (hud_blit)
-            for (int y = hud_top; y < 224; ++y)               /* HUD band: only when changed (W5) */
-                slDMACopy(framebuffer + y * 320,
-                          DOOM_VRAM + (y + VIEW_Y_OFFSET) * DOOM_VRAM_STRIDE, 320);
-        slDMAWait();
-    }
-    else
-    {
+    int hud_blit = sat_hud_dirty || hud_force;   /* W5 permanently ON (blit baked c5) */
+    {   /* blit baked to c5 (CPU memcpy + W5) 2026-07-16; the opt-in slDMACopy DMA path was
+           HW-dead (B-bus write-bandwidth-bound, no win) -> removed.  docs/TOGGLE_AUDIT.md. */
         /* Single-CPU blit: master copies the picture.  W5: 3D-view
            rows always, HUD band only when changed. */
         cache_purge();
@@ -6910,6 +6958,12 @@ static void poll_pad(void)
         {
             last_lp = sat_local_players;
             sat_apply_mode();
+            /* SATURN 2026-07-15 (HW-measured ~4% on a dense 4p Bp scene, 191->183 SPL): mark-suppress
+               DEFAULT-ON in 3/4p ONLY, OFF in 1p AND 2p.  Restricted to 3/4p because that is where RBG0
+               is FULLY off (2p still drives the P1-half HW floor, whose re-election reads the visplane
+               coverage counter mark-suppress perturbs -> keep 2p at the safe off default until A/B'd).
+               Re-asserted on each count change; L+B still overrides within a count for A/B. */
+            sat_mark_suppress = (sat_local_players >= 3) ? 1 : 0;
         }
     }
 
@@ -6958,14 +7012,9 @@ static void poll_pad(void)
        own P1HW path).  R taps '.' + Up nudges forward once -- harmless.  Overlay row 5 shows fl:B/fl:C. */
     if (!sat_split_p1hw && !(cur & PER_DGT_TR) && (changed & PER_DGT_KU) && !(cur & PER_DGT_KU))
         rbg0_kind_want = (rbg0_kind_want == RBG0_KIND_BITMAP) ? RBG0_KIND_CELL : RBG0_KIND_BITMAP;
-    /* Pad R + Down (1p, cell mode): A/B the cell coefficient K_ON (perspective) <-> K_OFF (flat). */
-    if (!sat_split_p1hw && !(cur & PER_DGT_TR) && (changed & PER_DGT_KD) && !(cur & PER_DGT_KD)
-        && rbg0_kind == RBG0_KIND_CELL)
-        { rbg0_cell_koff = !rbg0_cell_koff; rbg0_reinit_force = 1; }
-    /* Pad R + Left (1p, cell mode): DROP the NBG1 framebuffer to judge the cell floor in isolation. */
-    if (!sat_split_p1hw && !(cur & PER_DGT_TR) && (changed & PER_DGT_KL) && !(cur & PER_DGT_KL)
-        && rbg0_kind == RBG0_KIND_CELL)
-        { rbg0_cell_nofb = !rbg0_cell_nofb; rbg0_reinit_force = 1; }
+    /* (Pad R+Down cell-coeff A/B + R+Left drop-framebuffer A/B CUT 2026-07-16: both probes answered
+       -- 4bpp cells are snow-free with K_ON perspective AND the framebuffer ON.  Chords freed, and
+       the rbg0_reinit_force gray-flash they triggered is gone.  docs/TOGGLE_AUDIT.md.) */
 #endif
 
     /* (Pad L+A blit A/B ring CUT 2026-07-07: W5 HUD-skip is a real idle win -> now permanently ON
@@ -6992,12 +7041,21 @@ static void poll_pad(void)
     if (!(cur & PER_DGT_TR) && (cur & PER_DGT_TL)                 /* R held, L released */
         && (changed & PER_DGT_TC) && !(cur & PER_DGT_TC))
         sat_clear_slave ^= 1;
-    if (!(cur & PER_DGT_TR) && (cur & PER_DGT_TL)                 /* R held, L released */
-        && (changed & PER_DGT_TX) && !(cur & PER_DGT_TX))
-        sat_near_sprites ^= 1;
+    /* (Pad R+X nearSprites A/B CUT 2026-07-16: shipped default-ON (core), perf settled -> baked. R+X freed.) */
     if (!(cur & PER_DGT_TL) && (cur & PER_DGT_TR)                 /* L held, R released */
         && (changed & PER_DGT_TX) && !(cur & PER_DGT_TX))
         sat_aimd_damp = (sat_aimd_damp + 1) % 3;   /* ad0 plain / ad1 damped (default) / ad2 wbudget */
+    /* SATURN split perf levers (co-op split ONLY -- gated on sat_local_players>1 so 1p is untouched).
+       L + d-pad (L+Left/Right freed when WALL_PX_BUDGET was cut).  The incidental one-tap strafe/turn
+       is harmless (tune while standing).  L+Left = piste-3 split thing-cull (drop tiny-projected
+       sprites per view); L+Right = piste-5 rotating SQ-balance cycle (0 off / 1 = 1 view degraded per
+       frame / 2 = 2 views).  Row 17 (SPL, split-only) shows tc<0/1> bal<0/1/2>. */
+    if (sat_local_players > 1 && !(cur & PER_DGT_TL) && (cur & PER_DGT_TR)   /* L held, R released */
+        && (changed & PER_DGT_KL) && !(cur & PER_DGT_KL))
+    { extern int sat_split_thingcull; sat_split_thingcull ^= 1; }
+    if (sat_local_players > 1 && !(cur & PER_DGT_TL) && (cur & PER_DGT_TR)   /* L held, R released */
+        && (changed & PER_DGT_KR) && !(cur & PER_DGT_KR))
+        sat_split_balance = (sat_split_balance + 1) % 3;
     /* (Low-res is no longer a pad toggle -- it is render MODE M7 in the pad-Z cycle, since it is
        whole-view (shared projection + whole-layer VDP2 zoom), not a per-zone lever.  sat_apply_mode
        sets sat_lowres when M7 is selected.  This freed the old L+R+X binding.) */
@@ -7023,22 +7081,9 @@ static void poll_pad(void)
           for (int k=0;k<4;k++) sq_wall_view[k] = w; }
         else { sq_wall = (sq_wall + 1) & 3; sat_apply_mode(); }
     }
-#if !RBG0_TUNE_PAD   /* was gated on !RBG0_LINECOL_TEST too -- a coherence bug: the parked line-color
-                        fog (mode 0, never on C) has nothing to do with the plane-split toggle, and
-                        RBG0_LINECOL_TEST=1 was silently killing pad C.  Only RBG0_TUNE_PAD really uses C. */
-    /* Pad C cycles the plane-split mode (overlay row1 'pm'): 0 = static half-split, 1 = TAS plane
-       work-steal, 2 = ROW-SPLIT (the universal balancer -- both SH-2 split the screen ROWS, so a
-       dominant plane is balanced too, which pm0/pm1 cannot).  Watch w / SLVidle (row 3): pm2 should
-       drop the master-wait in dominant-plane rooms.  (C also taps RSHIFT/run -- harmless.) */
-    /* (L/R excluded: L+C = HW split sky, R+C = M5 staging A/B -- C alone cycles pmode.) */
-    if ((cur & PER_DGT_TL) && (cur & PER_DGT_TR) && (changed & PER_DGT_TC) && !(cur & PER_DGT_TC))
-    {
-        static int pmode = 1;   /* boot default = TAS (sat_plane_tas=1); first press -> row-split */
-        pmode = (pmode + 1) % 3;
-        sat_plane_tas      = (pmode == 1);
-        sat_plane_rowsplit = (pmode == 2);
-    }
-#endif
+    /* (Pad C 3-way plane-split cycle CUT 2026-07-16: TAS is the shipped winner, static + row-split
+       were HW-proven losers -> RP_DrawPlanesSplit is now unconditional TAS.  C-alone chord freed.
+       docs/TOGGLE_AUDIT.md.) */
 #if RBG0_NBG3
     /* Pad L+R (chord) toggles the NBG3 debug overlay (default OFF).  The B1 cycle is reserved at
        init (slScrAutoDisp(NBG3ON) + no scrub), so this only flips BGON.  (L/R also tap ','/'.' to
@@ -7137,10 +7182,10 @@ static void poll_pad(void)
     if ((cur & PER_DGT_TL) && (cur & PER_DGT_TR)
         && (changed & PER_DGT_TY) && !(cur & PER_DGT_TY))
     {
-        if (sat_local_players > 1)   /* split: cycle the split FLOOR SQ (FULL->LD->FLAT) for all views */
-        { int f = (sq_floor_view[0]==SQ_FULL) ? SQ_LD : (sq_floor_view[0]==SQ_LD) ? SQ_FLAT : SQ_FULL;
+        if (sat_local_players > 1)   /* split: cycle the split FLOOR SQ (skips LD when M7/lowdetail) for all views */
+        { int f = sq_plane_cycle(sq_floor_view[0]);
           for (int k=0;k<4;k++) sq_floor_view[k] = f; }
-        else { sq_floor = (sq_floor == SQ_FULL) ? SQ_LD : (sq_floor == SQ_LD) ? SQ_FLAT : SQ_FULL; sat_apply_mode(); }
+        else { sq_floor = sq_plane_cycle(sq_floor); sat_apply_mode(); }
     }
     /* Pad L+Y (R released) cycles the CEILING software quality SQ (full/ld/band/flat), independent
        of the floor (core sat_ceil_potato/sat_ceil_ld).  (Was the slave-F-build A/B -- sl1 kept as
@@ -7148,10 +7193,10 @@ static void poll_pad(void)
     if (!(cur & PER_DGT_TL) && (cur & PER_DGT_TR)
         && (changed & PER_DGT_TY) && !(cur & PER_DGT_TY))
     {
-        if (sat_local_players > 1)   /* split: cycle the split CEILING SQ (FULL->LD->FLAT) for all views */
-        { int c = (sq_ceil_view[0]==SQ_FULL) ? SQ_LD : (sq_ceil_view[0]==SQ_LD) ? SQ_FLAT : SQ_FULL;
+        if (sat_local_players > 1)   /* split: cycle the split CEILING SQ (skips LD when M7/lowdetail) for all views */
+        { int c = sq_plane_cycle(sq_ceil_view[0]);
           for (int k=0;k<4;k++) sq_ceil_view[k] = c; }
-        else { sq_ceil = (sq_ceil == SQ_FULL) ? SQ_LD : (sq_ceil == SQ_LD) ? SQ_FLAT : SQ_FULL; sat_apply_mode(); }
+        else { sq_ceil = sq_plane_cycle(sq_ceil); sat_apply_mode(); }
     }
     /* Pad R+A: live A/B of the Phase-1 WALL CLAMP (partially-occluded tiers kept on VDP1 via the
        world-anchored cut + software wedge, core sat_wall_cut_floor/_ceil).  Row 6 W<n><+/-> = tiers

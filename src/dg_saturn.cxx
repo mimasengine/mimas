@@ -225,6 +225,8 @@ extern "C" byte *I_VideoBuffer;
 extern "C" int   gametic;
 extern "C" int   r_visplane_peak;
 extern "C" int   r_drawseg_peak;   /* core r_bsp.c: running high-water of drawsegs used (vs MAXDRAWSEGS 256) */
+extern "C" int   r_solidseg_peak;  /* core r_bsp.c: solidsegs high-water (vs MAXSEGS 32); ==32 => guard fired = M7 freeze root-cause */
+extern "C" int   r_solidseg_ovf;   /* core r_bsp.c: latched '!' when a solidsegs post was dropped (over-budget view) */
 extern "C" int   r_opening_ovf;    /* core r_plane.c: openings-pool overflow redirects THIS frame (0 = fine; >0 = garde-OPENINGS sinking) */
 extern "C" int   r_composite_ovf;  /* core r_data.c: # textures stubbed by garde-COMPOSITE (0 = fine; >0 = a composite OOM was crash-proofed) */
 extern "C" int   r_readlump_short; /* core w_wad.c: # streaming reads sunk by garde-W_ReadLump (0 = fine; >0 = a short CD read was zero-filled not I_Error-frozen) */
@@ -2068,13 +2070,14 @@ static void fps_update(void)
                either climbs toward 256 on Doom II MAP13/15 that is the cap that crashes next.
                (VP_POOL_PLANES=96 span-pool overflow -> r_visplane_pool_ovf is a GRACEFUL flat
                glitch, not a freeze -- tracked separately, not shown here.) */
-            static char rLIM[48];
-            snprintf(rLIM, sizeof rLIM, "LIM vp%d ds%d zf%dk lg%dk op%d tc%d rl%d",   /* caps: vp/ds vs 256; rl = garde-W_ReadLump short reads sunk */
-                     r_visplane_peak, r_drawseg_peak,
+            static char rLIM[56];
+            snprintf(rLIM, sizeof rLIM, "LIM vp%d ds%d ss%d%s zf%dk lg%dk op%d tc%d rl%d",   /* SATURN: ss = solidsegs peak vs MAXSEGS 32, '!' = overflow guard fired (M7 freeze root-cause) */
+                     r_visplane_peak, r_drawseg_peak, r_solidseg_peak, r_solidseg_ovf ? "!" : "",
                      Z_FreeMemory() >> 10, Z_LargestAllocatable() >> 10, r_opening_ovf, r_composite_ovf, r_readlump_short);
             if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 11, rLIM);
             r_visplane_peak = 0;   /* zero the core running-maxes -> next window re-accumulates its own peak */
             r_drawseg_peak  = 0;
+            r_solidseg_peak = 0;   /* r_solidseg_ovf stays latched (sticky) so a single overflow event stays visible */
             /* row 17: FLOOR offload sizers.  Vs/Vp = VDP1-floor candidate quad count this
                frame / window peak (go/no-go: GO if Vp fits the VDP1 cmd budget).  d% = the
                dominant single-flat share of plane pixels, n = visplane count (RBG0 sweet
@@ -6521,15 +6524,22 @@ extern "C" void DG_DrawFrame(void)
        presents the same frame.  Only kick HERE when it did NOT fire (menu/intermission: no
        R_RenderPlayerView) -> the empty bank clears any stale walls.  Both before the
        palette_changed reset so the wall cache re-tints on a damage/pickup flash. */
+    /* SATURN M7 FREEZE ROOT-CAUSE FIX (2026-07-17, HW): rewind the SGL slave work-area pointers
+       (GBR+72 write / GBR+68 read) on EVERY frame, not only no-render frames.  On render frames the
+       reset normally comes from the slave PLANE DISPATCH (rp_restart & co, r_parallel.c) -- but in
+       M7/lowres the planes render MASTER-INLINE (r_plane.c !detailshift gate sends non-potato planes
+       off the slave worklist), so NO plane dispatch fires and NOTHING rewinds the pointer.  Meanwhile
+       vdp1_kicked_this_frame==1 (walls kicked) skips the no-render branch below too -> in M7 the
+       pointer is NEVER reset.  The un-gated RBG0 block above still calls slSetScreenDist each frame
+       (+8B GBR+72 bump, LIBSGL sglC23.o) -> ~280 B/s creep -> overruns the GBR+20 vblank user-callback
+       after ~1-2 min -> _BlankIn jsr to garbage = TOTAL FREEZE (everywhere, even standing still; the
+       W72 overlay row shows the live d+ creep).  rp_sgl_workptr_reset() joins any pending aux first
+       and restores to the post-init base, so this is idempotent with the M4 dispatch reset and safe
+       on the (idle) M7 slave.  [[m7-lowres-fill-bound-not-34p]] */
+    rp_sgl_workptr_reset();
     if (!vdp1_kicked_this_frame) {
-        /* NO-RENDER frame (menu/intermission/automap): rewind the SGL slave work-area pointers.
-           Every render frame gets this from the dispatch sites (rp_restart & co), but here NOBODY
-           resets them while the un-gated RBG0 block above still calls slSetScreenDist each frame,
-           which bump-allocates +8B from the GBR+72 transient buffer (LIBSGL sglC23.o, same pattern
-           as slSlaveFunc's +12) -> ~280 B/s creep -> overruns the vblank user-callback pointer at
-           GBR+20 after ~1-2 min -> _BlankIn jsr to garbage = the idle menu/intermission FREEZE.
-           No aux job is in flight on these frames, so the embedded RP_AuxWait join is free. */
-        rp_sgl_workptr_reset();
+        /* NO-RENDER frame (menu/intermission/automap): also kick the empty bank so no stale walls
+           stay rooted (the reset above already rewound the SGL work pointers for this path). */
         unsigned short pk0 = frt_read();   /* SATURN PERF: present-kick ms (menu/intermission path) */
         sat_vdp1_wpn_begin(); vdp1_wpn_kick();
         sat_present_frt += (unsigned short)(frt_read() - pk0);
@@ -6841,7 +6851,15 @@ extern "C" void DG_DrawFrame(void)
     {
         extern int sat_local_players;
         int clear_rows = (sat_local_players >= 3) ? 224 : (sat_local_players == 2 ? 160 : 192);
-        if (sat_clear_slave && gamestate == GS_LEVEL) {
+        extern int sat_lowres;
+        /* SATURN M7 FREEZE ROOT-CAUSE FIX (2026-07-17, HW-confirmed via pad R+C): in M7/lowres the
+           slave does NO plane-split (planes render master-inline at detailshift=1, r_plane.c gate), so
+           the slave is idle during render and the clear-on-slave aux dispatch/join handshake is no
+           longer covered by the plane-split's TAS sync -- it corrupts the r_bsp .bss (ds_p stomped ->
+           ds=1.4e9 -> HARD FREEZE on real HW, Ymir-clean; toggling sat_clear_slave OFF via R+C launched
+           the level).  Clear on the MASTER in lowres (M4/M6 keep the slave-clear win); the ~2-3ms cost
+           is on the packed M7 frame only.  [[clear-slave-nearsprites-aimd-shipped]] listed this risk. */
+        if (sat_clear_slave && gamestate == GS_LEVEL && !sat_lowres) {
             /* offload to the idle slave; a render (R_RenderPlayerView) is guaranteed next frame to
                join it.  Non-GS_LEVEL frames clear on the master (no render would join a slave clear
                before a menu/intermission redraws fb -> gate keeps those on the master). */

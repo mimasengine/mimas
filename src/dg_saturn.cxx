@@ -767,10 +767,15 @@ static int sat_m = M7_LOWRES;               /* boot = M4 (RBG0 dominant floor + 
                                                full-res, only the SOFTWARE leftovers (ceilings/minor-floors/
                                                fallbacks) go half-res.  Lowres is WHOLE-VIEW (shared projection +
                                                whole-layer zoom) so it is a MODE, not a per-zone SQ.  Pad Z cycles
-                                               {M0, M4, M6, M7}; M5 is PARKED (off the cycle). */
+                                               {M4, M6, M7}; M0+M5 are PARKED (off the cycle). */
 static const char *const sat_m_name[M_COUNT] = { "soft", "rbg0", "cvx", "nospr", "lowr" };
-/* Pad-Z cycle: the live modes only (parked M5 stays reachable only via code / the deport-preview). */
-static const int sat_m_cycle[] = { M0_SOFT, M4_RBG0, M6_NOSPR, M7_LOWRES };
+/* Pad-Z cycle: the live PLAYABLE modes only (parked M0=all-software-0fps + M5 stay reachable only
+   via code / the deport-preview). */
+/* SATURN (2026-07-18): M0_SOFT dropped from the pad-Z ring -- all-software is ~0fps in a heavy
+   scene, so cycling THROUGH it from M7 stranded the user (couldn't reach M6 for the M4/M6 flicker
+   A/B).  M0 is now PARKED off the ring like M5 (still a valid mode, set via code).  Ring = the
+   three playable modes {M4, M6, M7}; from M7: Z->M4->M6->M7, no dead stop. */
+static const int sat_m_cycle[] = { M4_RBG0, M6_NOSPR, M7_LOWRES };
 #define SAT_M_CYCLE_N ((int)(sizeof(sat_m_cycle) / sizeof(sat_m_cycle[0])))
 enum { SQ_FULL, SQ_LD, SQ_BAND, SQ_FLAT };
 static int sq_wall = SQ_FULL, sq_floor = SQ_LD, sq_ceil = SQ_LD;   /* floor+ceil ld by default (HW-tested "fll":
@@ -872,6 +877,13 @@ extern "C" int sat_mark_suppress;
    ~21ms + fps UNCHANGED (the win is inc-2).  Row 1 shows wp<state>. */
 extern "C" int sat_wallprep_slave;
 extern "C" int sat_wallprep_defer;
+/* SATURN (2026-07-18): frames of forced VDP1 erase after a render-MODE change.  Consumed by
+   vdp1_walls_flush (takes the empty-bank present path instead of the coherent-pair HOLD) so the
+   new mode does not keep showing the PREVIOUS mode's walls until its own pair completes.  M0 used
+   to clear this by side effect (all-software = no VDP1 walls); dropping M0 from the pad-Z ring
+   exposed the stale-wall-on-switch, so we now clear it explicitly, independent of M0. */
+static int sat_vdp1_switch_clear = 0;
+
 /* The single writer of every render backend flag.  Maps (sat_m, sq_*) -> a coherent
    per-surface tuple; each M leaves ON only the subsystems it needs.  Called at init, on any
    M/SQ change, and per-view in the split (the per-frame block downgrades RBG0 off P1). */
@@ -882,6 +894,14 @@ static void sat_apply_mode(void)
     extern int sat_ceil_potato, sat_ceil_ld;   /* core r_plane.c: independent ceiling SQ (step 2) */
     extern int sat_sprite_ld;                  /* core r_things.c: half-res software sprite fill (indep. of detailshift) */
     int M = sat_m; if (M < 0 || M >= M_COUNT) { M = M4_RBG0; sat_m = M; }
+
+    /* On a REAL render-mode change, force 2 VDP1-erase frames so the coherent-pair present does not
+       keep showing the previous mode's walls (see sat_vdp1_switch_clear).  Guarded on an actual sat_m
+       change -- sat_apply_mode is also called at init and per-view in split with sat_m unchanged. */
+    {
+        static int prev_applied_m = -1;
+        if (sat_m != prev_applied_m) { sat_vdp1_switch_clear = 2; prev_applied_m = sat_m; }
+    }
 
     /* ---- Axis A: offload targets ---- */
     int rbg0_want  = (M != M0_SOFT);           /* RBG0 dominant floor (every mode but M0) */
@@ -6008,7 +6028,10 @@ static void vdp1_wpn_kick(void)
 #endif
     sat_fb_clamp_t = sat_fb_mag_t = sat_fb_starve_t = sat_fb_px = 0;   /* reset each frame (also when SHOW_FPS off) */
     sat_fb_wclamp_t = 0;
-    if (vdp1_wactive)
+    /* SATURN mode-switch VDP1 erase: while sat_vdp1_switch_clear is armed, skip the coherent-pair
+       HOLD and take the empty-bank present path below -> the old mode's walls are wiped in 2 frames
+       (the new mode rebuilds its pair from the very next frame). */
+    if (vdp1_wactive && sat_vdp1_switch_clear == 0)
     {
         unsigned short end[16];
         memset(end, 0, sizeof end);
@@ -6041,6 +6064,7 @@ static void vdp1_wpn_kick(void)
     }
     else
     {
+        if (sat_vdp1_switch_clear > 0) sat_vdp1_switch_clear--;   /* SATURN: consume a mode-switch erase frame */
         link = (VDP1_BANKE_ADDR - VDP1_VRAM_BASE) >> 3;
 #if VDP1_WALL_TEST && SAT_VDP1_FLOOR && SAT_FLOOR_TEX
         ftex_wjump_addr = 0;                         /* no wall list -> nothing to chain onto */
@@ -7094,7 +7118,7 @@ static void poll_pad(void)
         }
         else
 #endif
-        {   /* Z: cycle only the LIVE modes {M0, M4, M6, M7}; M5 is parked (off the cycle). */
+        {   /* Z: cycle only the LIVE playable modes {M4, M6, M7}; M0+M5 are parked (off the cycle). */
             int ci = 0;
             for (int i = 0; i < SAT_M_CYCLE_N; ++i) if (sat_m_cycle[i] == sat_m) { ci = i; break; }
             sat_m = sat_m_cycle[(ci + 1) % SAT_M_CYCLE_N];

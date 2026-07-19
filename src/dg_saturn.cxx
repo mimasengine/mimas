@@ -769,13 +769,13 @@ static int sat_m = M7_LOWRES;               /* boot = M4 (RBG0 dominant floor + 
                                                whole-layer zoom) so it is a MODE, not a per-zone SQ.  Pad Z cycles
                                                {M4, M6, M7}; M0+M5 are PARKED (off the cycle). */
 static const char *const sat_m_name[M_COUNT] = { "soft", "rbg0", "cvx", "nospr", "lowr" };
-/* Pad-Z cycle: the live PLAYABLE modes only (parked M0=all-software-0fps + M5 stay reachable only
-   via code / the deport-preview). */
-/* SATURN (2026-07-18): M0_SOFT dropped from the pad-Z ring -- all-software is ~0fps in a heavy
-   scene, so cycling THROUGH it from M7 stranded the user (couldn't reach M6 for the M4/M6 flicker
-   A/B).  M0 is now PARKED off the ring like M5 (still a valid mode, set via code).  Ring = the
-   three playable modes {M4, M6, M7}; from M7: Z->M4->M6->M7, no dead stop. */
-static const int sat_m_cycle[] = { M4_RBG0, M6_NOSPR, M7_LOWRES };
+/* SATURN (2026-07-19, user-requested): ALL modes except M7_LOWRES are PARKED.  sat_m boots at M7
+   and never changes -- so none of the mode-SWITCH machinery (RBG0/VDP1/viewwidth re-init, coherent-
+   pair wash, slave re-dispatch) ever runs.  That machinery is where every switch corruption / stale-
+   wall / M0-crash lived; with one mode there is nothing to break.  M0/M4/M5/M6 remain valid modes in
+   the code (sat_apply_mode still maps them) reachable only by editing THIS ring; pad-Z is now a no-op
+   (cycles M7->M7).  Re-add a mode here ONLY once switching has been made atomic. */
+static const int sat_m_cycle[] = { M7_LOWRES };
 #define SAT_M_CYCLE_N ((int)(sizeof(sat_m_cycle) / sizeof(sat_m_cycle[0])))
 enum { SQ_FULL, SQ_LD, SQ_BAND, SQ_FLAT };
 static int sq_wall = SQ_FULL, sq_floor = SQ_LD, sq_ceil = SQ_LD;   /* floor+ceil ld by default (HW-tested "fll":
@@ -7089,6 +7089,26 @@ static void poll_pad(void)
         }
     }
 
+    /* SATURN M7 PAUSE FIX (2026-07-19): the lowres render packs the 3D view into the LEFT 160 cols and
+       a VDP2 x2 zoom stretches it back -- but the zoom is dropped whenever a menu is up (so full-320
+       menu text is not stretched, DG_DrawFrame ~line 6811).  Zoom off + still-PACKED view = the view's
+       SOFTWARE layers (ceiling + walls) fill only the left half while the RBG0 floor (HW, full-screen)
+       stays => the reported "ceiling gone on the right when paused".  The 3D view IS re-rendered every
+       paused frame (core d_main.c:351 has no menuactive gate), so we just render it FULL-RES while a
+       menu is up over a 1p level -> the frozen view AND the menu are both full-320 and correct.
+       CONTINUOUS-ENFORCE but call R_SetLowRes ONLY on a real mismatch: no per-frame recompute (the
+       ~74ms R_ExecuteSetViewSize is one-time at the open/close transition), and anything that flips
+       sat_lowres mid-pause self-corrects in one frame.  Split (players>1) is left untouched -- its
+       packed multi-view layout depends on lowres.  R_SetLowRes only sets sat_lowres + setsizeneeded
+       (the recompute runs before the next render), so it is safe to call from here. */
+    {
+        int mode_lowres    = (sat_m == M7_LOWRES);              /* sat_lowres's value during normal play */
+        int pause_over_lvl = menuactive && gamestate == GS_LEVEL && !automapactive
+                             && sat_local_players <= 1;
+        int want_lowres    = pause_over_lvl ? 0 : mode_lowres;
+        if (sat_lowres != want_lowres) R_SetLowRes(want_lowres);
+    }
+
     if (Smpc_Peripheral[0].id == PER_ID_NotConnect) return;
 
     unsigned short cur     = Smpc_Peripheral[0].data;
@@ -7316,8 +7336,11 @@ static void poll_pad(void)
 #if SAT_FLOOR_TEX
     /* Pad Y (alone, L/R released) cycles the FLOOR software quality SQ, applied to the software
        floor spans + the VDP1-floor CPU-fallback slivers.  Flats cycle full/ld/flat -- band is
-       skipped (meaningless for a flat: the potato span is already distance-shaded per row). */
-    if ((cur & PER_DGT_TL) && (cur & PER_DGT_TR)
+       skipped (meaningless for a flat: the potato span is already distance-shaded per row).
+       SATURN 2026-07-19: gated on !menuactive -- Y is ALSO Doom's 'y' confirm (line 7017), so the
+       "start a new game? (press y)" prompt was firing this toggle too (floor->FLAT = the reported
+       fxff-on-new-game).  A menu is up -> Y is a confirm, not an SQ toggle. */
+    if (!menuactive && (cur & PER_DGT_TL) && (cur & PER_DGT_TR)
         && (changed & PER_DGT_TY) && !(cur & PER_DGT_TY))
     {
         if (sat_local_players > 1)   /* split: cycle the split FLOOR SQ (skips LD when M7/lowdetail) for all views */
@@ -7328,8 +7351,8 @@ static void poll_pad(void)
     /* Pad L+Y (R released) cycles the CEILING software quality SQ (full/ld/band/flat), independent
        of the floor (core sat_ceil_potato/sat_ceil_ld).  (Was the slave-F-build A/B -- sl1 kept as
        the compile default.)  Active-low: !(cur&TL) = L held. */
-    if (!(cur & PER_DGT_TL) && (cur & PER_DGT_TR)
-        && (changed & PER_DGT_TY) && !(cur & PER_DGT_TY))
+    if (!menuactive && !(cur & PER_DGT_TL) && (cur & PER_DGT_TR)
+        && (changed & PER_DGT_TY) && !(cur & PER_DGT_TY))   /* !menuactive: Y is also Doom's confirm (see floor above) */
     {
         if (sat_local_players > 1)   /* split: cycle the split CEILING SQ (skips LD when M7/lowdetail) for all views */
         { int c = sq_plane_cycle(sq_ceil_view[0]);

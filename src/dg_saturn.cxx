@@ -6192,8 +6192,10 @@ extern "C" void sat_walls_kick(void)
            ~2 cmds-per-thing) = how many things fit this frame.  This BYPASSES the EDSR-CEF, which
            false-latches 30-60% "not done" on real HW and used to collapse ec to 0 (monsters never
            reached VDP1 -- HW-proven, [[aimd-wbudget-hw-cef-collapse]]).  A real plot-TIME overrun (not
-           command count) would still show as tail flicker -- that IS the diagnostic.  Split keeps the
-           CEF-driven damped path below (its own hard per-view budget + viewport-res sprites). */
+           command count) would still show as tail flicker -- that IS the diagnostic.  Split now uses the
+           SAME WBUDGET (2026-07-20): the old CEF-driven damped path collapsed ec to 0 on HW, dumping every
+           world sprite to the slave-disabled master software fill in M7 (the MP fps killer) -- so split
+           drives the same command budget, just divided per view (nv views each emit up to ec). */
         if (!sat_split_active) {
             int room = vdp1_wall_cap - vdp1_wnext - THING_FLUSH_MARGIN;
             int budget_cap = (room > 0) ? (room >> 1) : 0;      /* ~2 VDP1 cmds per emitted thing */
@@ -6202,27 +6204,24 @@ extern "C" void sat_walls_kick(void)
             else if (sat_thing_emit_cap > budget_cap) sat_thing_emit_cap = budget_cap; /* snap down to fit */
             if (sat_thing_emit_cap < 0) sat_thing_emit_cap = 0;
             thing_overrun_run = 0; thing_cap_clean = 0;
-        } else if (vdp1_prev_done) {
-            thing_overrun_run = 0;                        /* clean plot resets the hysteresis run */
-            if (++thing_cap_clean >= THING_CAP_GROW)
-            { if (sat_thing_emit_cap < THING_ADAPT_MAX) sat_thing_emit_cap++; thing_cap_clean = 0;
-              int f = sat_thing_emit_cap - 2;             /* ratchet the learned floor toward it (<= cap-2) */
-              if (f > thing_emit_floor) thing_emit_floor = f; }
         } else {
-            /* split DAMPED back-off: the HW EDSR-CEF latches noisily (30-60% false "not done"); require
-               2 consecutive overruns (hysteresis), decrease MULTIPLICATIVELY toward the learned floor,
-               and only shed the floor itself (slowly) once pinned there and STILL overrunning. */
-            if (++thing_overrun_run >= 2) {
-                thing_overrun_run = 0;
-                if (sat_thing_emit_cap > thing_emit_floor) {
-                    int dec = sat_thing_emit_cap >> 2; if (dec < 1) dec = 1;
-                    sat_thing_emit_cap -= dec;
-                    if (sat_thing_emit_cap < thing_emit_floor) sat_thing_emit_cap = thing_emit_floor;
-                } else if (thing_emit_floor > 0) {
-                    thing_emit_floor--; sat_thing_emit_cap = thing_emit_floor;
-                }
-            }
-            thing_cap_clean = 0;
+            /* SPLIT WBUDGET (2026-07-20): identical command-budget policy to the 1p branch above, but
+               sat_thing_emit_cap is PER-VIEW and nv views each emit up to it into the shared queue, so
+               the free room is divided by 2*nv (nv=1 would give the 1p room>>1).  Replaces the old
+               EDSR-CEF damped back-off, which the false "not done" latch (30-60% on HW) collapsed to
+               ec0 -- every world sprite then fell to the software masked fill, which in M7 (sat_lowres,
+               slave off) runs entirely on the master = the MP fps collapse.  The hard flush guard
+               (vdp1_things_flush stops at wall_cap - THING_FLUSH_MARGIN) still bounds a mispredict, and
+               the nearest-first rank keeps the monsters you are fighting crisp on VDP1. */
+            int nv = sat_local_players;                  /* sat_split_active is true here */
+            if (nv < 1) nv = 1; else if (nv > 4) nv = 4;
+            int room = vdp1_wall_cap - vdp1_wnext - THING_FLUSH_MARGIN;
+            int budget_cap = (room > 0) ? (room / (2 * nv)) : 0;   /* per-view slots (~2 cmds/thing) */
+            if (budget_cap > THING_ADAPT_MAX) budget_cap = THING_ADAPT_MAX;
+            if (sat_thing_emit_cap < budget_cap)      sat_thing_emit_cap += 2;         /* smooth ramp up */
+            else if (sat_thing_emit_cap > budget_cap) sat_thing_emit_cap = budget_cap; /* snap down to fit */
+            if (sat_thing_emit_cap < 0) sat_thing_emit_cap = 0;
+            thing_overrun_run = 0; thing_cap_clean = 0;
         }
         /* World sprites to VDP1 prio 7, AFTER the walls and BEFORE weapon (2) so the gun stays on
            top.  Occlusion = FUNC_UserClip; fuzz/translated/oversize/over-budget stay software.

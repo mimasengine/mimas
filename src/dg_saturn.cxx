@@ -6882,7 +6882,12 @@ extern "C" void DG_DrawFrame(void)
            ds=1.4e9 -> HARD FREEZE on real HW, Ymir-clean; toggling sat_clear_slave OFF via R+C launched
            the level).  Clear on the MASTER in lowres (M4/M6 keep the slave-clear win); the ~2-3ms cost
            is on the packed M7 frame only.  [[clear-slave-nearsprites-aimd-shipped]] listed this risk. */
-        if (sat_clear_slave && gamestate == GS_LEVEL && !sat_lowres) {
+        if (sat_clear_slave && gamestate == GS_LEVEL && !sat_lowres && sat_local_players <= 1) {
+            /* SATURN 2026-07-20 (freeze fix, cont.): ALSO require single-player.  The same New-Game-into-
+               coop race that now skips the plane-split (r_plane.c) leaves the slave IDLE during a
+               sat_lowres=0 split frame -- so a clear-slave dispatch here would hit the very r_bsp .bss
+               corruption described above (idle-slave clear, no plane-split TAS sync to cover it).  MP
+               clears on the master too (split is master-only in the parked world regardless of count). */
             /* offload to the idle slave; a render (R_RenderPlayerView) is guaranteed next frame to
                join it.  Non-GS_LEVEL frames clear on the master (no render would join a slave clear
                before a menu/intermission redraws fb -> gate keeps those on the master). */

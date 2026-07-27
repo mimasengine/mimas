@@ -26,6 +26,11 @@ If `--check` reports the patch is already applied, the tree is up to date.
   `fix(boot): defer SGL sound init out of Core::Initialize` commit.
 - **`saturnringlib/shared.mk`** — drop a stray `@` in the `CONVERT_AUDIO_TO_RAW`
   shell function (a shell-syntax fix in SRL's audio-to-raw helper).
+- **`saturnringlib/shared.mk`** — drop the stray `;` in the `SRL_IPBIN`
+  override (`IPFILE = $(SRL_IPBIN);`): the semicolon reached the xorrisofs
+  command line and split it at the shell, breaking `create_iso`. Load-bearing
+  for the project IP.BIN (`Makefile` `SRL_IPBIN` + `pre.makefile` →
+  `tools/make_ip.py` — maker/product/title/version stamped at build time).
 
 ## Refresh this file after changing the submodule
 

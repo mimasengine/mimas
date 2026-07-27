@@ -1,7 +1,16 @@
 diff --git a/saturnringlib/shared.mk b/saturnringlib/shared.mk
-index b97f776..871bc07 100644
+index b97f776..16e87b1 100644
 --- a/saturnringlib/shared.mk
 +++ b/saturnringlib/shared.mk
+@@ -15,7 +15,7 @@ LIBS = $(SGLLDIR)/LIBCPK.A $(SGLLDIR)/SEGA_SYS.A $(SGLLDIR)/LIBCD.A $(SGLLDIR)/L
+ 
+ # Allow custom IPBIN
+ ifneq ($(strip $(SRL_IPBIN)),)
+-	IPFILE = $(SRL_IPBIN);
++	IPFILE = $(SRL_IPBIN)
+ endif
+ 
+ # include preloader first
 @@ -323,7 +323,7 @@ create_bin_cue: create_iso
  # Usage: convert_audio_to_raw audiofile rawfile [filter_option]
  define CONVERT_AUDIO_TO_RAW

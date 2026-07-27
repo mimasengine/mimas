@@ -170,6 +170,22 @@ extern "C" void RP_AuxWait(void);
 extern "C" void RP_AuxArm(void (*fn)(void));   /* piggyback: armed at the flush, taken by the
                                                   masked slave body right after MASK_DONE */
 extern "C" int  RP_AuxKick(void);              /* DG-entry consumer (fallback dispatch)     */
+/* SATURN VDP1 layer routing + ISOLATION modes (core r_things.c / r_segs.c).  The real VDP1 limiter is
+   command count + OVERDRAW (near walls iterate off-screen spans -> "transfer-over", SEGA VDP1 UM p.53),
+   NOT pixel fill (fill is abundant, ~2.5ms/screen).  So the old distance-prioritized FILL budget
+   (sat_vdp1_unibudget / fill_budget / fill_reserve, 2026-07-21) was REMOVED 2026-07-25 -- the HW test
+   proved the weapon-fill lever inert.  What stays are the LAYER gates the isolation cycle uses to find
+   WHAT overruns the list: sat_wpn_soft (weapon off VDP1 -> software), sat_things_hw (core, world sprites
+   off VDP1), sat_iso_flat (force every VDP1 wall FLAT).  See sat_iso_mode + docs/VDP1_LIMITS_SOURCED.md. */
+extern "C" int sat_wpn_soft;
+extern "C" int sat_thing_vdp1_fill, sat_thing_vdp1_kept, sat_thing_vdp1_spill;
+/* VDP1 isolation (pad L+Z, 1p): 0 all / 1 no-things / 2 flat-walls.  The weapon stays ON VDP1 in every
+   mode (routing it off = pre-existing VDP1 transition glitch), so isolation varies things + flat only.
+   Applied by sat_apply_iso() (drives sat_things_hw + sat_iso_flat); re-applied at the end of
+   sat_apply_mode so a mode cycle preserves it.  0 = no change (byte-identical to ship). */
+static int sat_iso_mode = 0;
+static int sat_iso_flat = 0;     /* mode 4: every VDP1 wall -> FLAT primitive (overdraw-vs-fill discriminator) */
+static void sat_apply_iso(void); /* fwd: defined near the pad handler */
 static int sat_ftex_slave = 1;
 /* BLIT<->F-BUILD DECOUPLE (pad R+Z, HW-A/B via composition-row 'b').  The captures showed 'b'
    (= RP_AuxWait + copy) inflated to ~17-23ms on heavy textured floors: the master IDLES in
@@ -694,6 +710,8 @@ void R_EmitWorldThingsVDP1(void);      /* core: emit world sprites to VDP1 at th
 extern int sat_things_occ;             /* core: fully-occluded sprites skipped this frame (metric) */
 extern int sat_thing_cap;              /* core: granted distinct textures/frame (we set = VRAM slots) */
 extern int sat_thing_emit_cap;         /* core: max things emitted/frame -- we AIMD-adapt it (raster budget) */
+extern int sat_wall_cpu_span;          /* core r_segs.c: near-wall->software CPU-entry span -- LOD-driven */
+extern int sat_wall_cpu_v1;            /* core r_segs.c: VDP1-exit span (kept = span + prewarm band) -- LOD-driven */
 
 /* SATURN live A/B toggles (2026-07-09) -- three perf levers, each a one-HW-session flip (see poll_pad):
    sat_clear_slave (R+C): dispatch the end-of-frame fb clear to the idle slave SH-2 (docs/BLIT_DMA_PLAN
@@ -988,6 +1006,30 @@ static void sat_apply_mode(void)
         if (want_lr != sat_lowres)
             R_SetLowRes(want_lr);
     }
+
+    /* Re-apply the VDP1 isolation mode (sat_things_hw / sat_wpn_soft / sat_iso_flat) so a mode cycle
+       preserves it.  sat_iso_mode==0 (ship default) restores the all-layers-on-VDP1 state. */
+    sat_apply_iso();
+}
+
+/* VDP1 isolation modes (pad L+Z, 1p): find what overruns the command list ("transfer-over" = the
+   flicker) by varying which layers ride VDP1.  The player WEAPON stays ON VDP1 in every mode --
+   routing it OFF (sat_wpn_soft) triggers a PRE-EXISTING VDP1 transition glitch (walls not re-cleared;
+   reproducible with L+X alone, HW-confirmed), and the weapon is a minor fixed cost that the LP% probe
+   already shows being cut at the list tail.  So isolation varies THINGS + FLAT only.  Read LP% per mode:
+     0 all       things + weapon + TEXTURED walls (ship default -- no change)
+     1 no-things weapon + TEXTURED walls          (LP delta vs 0 = the THINGS' share of the overrun)
+     2 flat      weapon + FLAT walls (1 cyc/px vs 2): if LP recovers vs mode 1 it was per-pixel texel
+                 FILL; if not, it is command/overdraw GEOMETRY (the SEGA near-wall off-screen span). */
+static void sat_apply_iso(void)
+{
+    extern int sat_things_hw;   /* core r_things.c: world sprites on VDP1 (1) / software (0) */
+    switch (sat_iso_mode) {
+        default: sat_things_hw = 1; sat_iso_flat = 0; break;  /* 0 all */
+        case 1:  sat_things_hw = 0; sat_iso_flat = 0; break;  /* no things */
+        case 2:  sat_things_hw = 0; sat_iso_flat = 1; break;  /* flat walls */
+    }
+    sat_wpn_soft = 0;   /* weapon ALWAYS on VDP1 (off = pre-existing transition glitch); keep the gun crisp */
 }
 
 /* SATURN piste-5 (rotating split-SQ balance, pad R+Right): spread the split's degraded SQ over
@@ -1311,6 +1353,11 @@ extern "C" void sat_debug_row0(const char *s)
     SRL::Debug::Print(0, 1, s);
 }
 
+/* WPROBE/CPROBE death-screen reporter (defined with the probe block below):
+   every fatal photo then carries the CD-path CRC verdict (WP row 2) and the
+   cart-copy directory CRC boot vs death (CP row 3). */
+static void wprobe_fatal_rows(void);
+
 extern "C" void DG_Fatal(const char *msg)
 {
     /* Row 0: full message (44 chars max, no format args so % is literal) */
@@ -1321,6 +1368,7 @@ extern "C" void DG_Fatal(const char *msg)
         tmp[i] = '\0';
         SRL::Debug::Print(0, 1, tmp);
     }
+    wprobe_fatal_rows();
     console_enabled = 1;
     sat_console_putc('\n');
     while (*msg)
@@ -1602,6 +1650,30 @@ extern "C" int rp_timeout_count;
 extern "C" unsigned int rp_master_ms;   /* master frame ms -> prefixes r_parallel.c's row-18 SLV line */
 static unsigned int dg_frame_count = 0;
 static int vdp1_last_cmds = 0;
+/* VDP1 transfer-over meter (SEGA VDP1 UM p.52-53).  The real flicker signal: did the plot finish the
+   command list in the frame?  LOPR/COPR are cmd addrs in (VRAM byte offset)>>3 units. */
+static unsigned short vdp1_lopr = 0, vdp1_copr = 0;   /* raw LOPR (last op, prev frame) / COPR (current op) -- both help the HW unit-check */
+static unsigned short vdp1_endca = 0;                 /* computed end-of-list cmd addr (same /8 unit) = LP reference */
+static int vdp1_lp_pct  = 100;                        /* % of the list LOPR reached (100 = finished; <100 = transfer-over) */
+static int vdp1_tx_used = 0;                          /* wtex cache slots occupied (VRAM limiter) */
+/* MEASURED VDP1 budget (2026-07-26) = the heart of the budget-driven LOD.  vdp1_budget_cmds = how
+   many VDP1 commands the frame's plot TIME actually paid for, READ from LOPR (not guessed): on an
+   overrun it IS the exact reach; on a clean frame it drifts up +1 / THING_LP_CLEAN to re-probe
+   headroom.  The things AIMD and the wall-span LOD both allocate against THIS number instead of the
+   static slot cap -- so the "default" cap is the real measured per-frame budget, not a guess. */
+#define THING_LP_CLEAN 24                             /* clean (LP=100) frames before the budget drifts up +1 */
+static int vdp1_budget_cmds  = 0;                     /* measured budget in commands (0 until first sample; WALL_CMD_CAP-bounded) */
+static int vdp1_budget_clean = 0;                     /* consecutive clean frames (drift-up counter) */
+/* Two-engine LOD tuning knobs (HW-tune these -- read rp_master_ms on the row-18 SLV line to calibrate
+   SOFT_BUDGET_MS).  The wall LOD only engages when things are already shed and the walls ALONE still
+   overrun the VDP1 budget, AND the master (software) has room to take them (else it would cause the
+   decrochage we are avoiding).  Relaxes back to the core default when VDP1 fits or the master fills. */
+#define SOFT_BUDGET_MS        50                      /* rp_master_ms above this = software saturated -> stop offloading walls */
+#define WALL_LOD_TRIGGER       4                      /* VDP1 commands left for things <= this = walls are eating the budget */
+#define SAT_WALL_CPU_SPAN_DEF 480                     /* == core r_segs.c default; span relaxes back up to here */
+#define WALL_SPAN_MIN         200                     /* floor: cap how many near walls we push to software */
+#define WALL_SPAN_STEP         40                     /* per-frame span adjust (AIMD ramp; < BAND so a wall crosses over >=2 frames) */
+#define WALL_PREWARM_BAND      96                     /* = core (V1 576 - span 480); kept constant so the CPU/VDP1 handoff band survives the shift */
 
 /* ============================================================================
    SATURN world-things-on-VDP1: SESSION percentile metrics -- so ONE end-of-level capture tells
@@ -1893,6 +1965,31 @@ static void fps_update(void)
                      sat_spl_v0, sat_spl_v1, sat_spl_v2, sat_spl_v3, sat_spl_kick, vsum,
                      sat_split_thingcull, sat_split_balance);
             SRL::Debug::Print(0, 17, r17);
+        }
+        /* row 12 (1p): VDP1 REAL-limiter probe (docs/VDP1_LIMITS_SOURCED.md).  Moved off row 17
+           (2026-07-25) where the VDP1 weapon sprite covered part of it -- row 12 is empty above LOS
+           in the 1p cart/MUS build (rR2/CD-streaming only fills it in a CD build; split owns row 17).
+           The flicker = "transfer-over" (SEGA VDP1 UM p.53): the plot does not finish the command
+           list within the frame.  This row shows the budget-driven LOD ALLOCATOR working.  Fields:
+             c  = commands emitted last frame (cap WALL_CMD_CAP=248; the raw COUNT)
+             B  = MEASURED VDP1 budget in commands (read from LOPR) -- what the plot TIME actually paid
+                  for; when c > B the tail overran.  This is the number we allocate against (0 = not yet
+                  measured -> unlimited).
+             LP = % of the list LOPR reached last frame -- 100 = finished, <100 = OVERRAN (the flicker)
+             ec = things emitted to VDP1 (allocator output; the rest shed to the SOFTWARE fill)
+             ws = near-wall->software span (LOD lowers it when the walls alone overrun + master has room)
+             tx = wtex cache slots occupied of WTEX_SLOTS=22 (the VRAM limiter)
+             i  = isolation mode (L+Z: 0 all / 1 no-things / 2 flat-walls; weapon always on VDP1)
+           HW-VERIFIED 2026-07-26: LOPR tracks on real HW -- a scene that OVERRUNS reads a mid-bank LOPR
+           (LP<100 = the flicker; e.g. L6c0/6e8 = 94% -> B = 0.94*c), one that FINISHES reads Lc (LP=100).
+           Ymir doesn't model LOPR (never overruns anyway), so LP=100 / B unmeasured there is correct.
+           (rp_master_ms -- the B_s software budget the wall LOD gates on -- is on the row-18 SLV line.) */
+        if (sat_dbg_overlay_mode == 0 && sat_local_players <= 1) {
+            static char rV1[56];   /* trailing spaces clear the tail when a field narrows (else "i3"->"i33" ghost) */
+            snprintf(rV1, sizeof rV1, "V1 c%d B%d LP%d%% ec%d ws%d tx%d i%d      ",
+                     vdp1_last_cmds, vdp1_budget_cmds, vdp1_lp_pct,
+                     sat_thing_emit_cap, sat_wall_cpu_span, vdp1_tx_used, sat_iso_mode);
+            SRL::Debug::Print(0, 12, rV1);
         }
         /* window reset -- read the row-1 composition ABOVE before this zeroes the sums.  The
            dead RAM/TXC/ZON sizer block (TEX/SPL/TXC/ZON, all display-off) was cut with the
@@ -2235,13 +2332,13 @@ static void fps_update(void)
         }
 #endif
         /* fps-only mode: SRL::Debug tiles persist, so a row we stop writing would GHOST.  Blank
-           rows 1-16 (every per-frame row: 1-8 the core B/P/M/REC/PK/SLV block, 11 LIM, 13 LOS,
-           15 SPR -- all gated on mode==0 for both writers, so nothing re-fills them here) so only
-           row 0 (fps + MST) remains -> the mode0<->mode1 fps delta is clean.  Mode 2 hides the
-           whole NBG3 layer (nbg3_show=0), so no blanking is needed there. */
+           rows 1-19 (every per-frame row: 1-8 the core B/P/M/REC/PK/SLV block, 11 LIM, 12 V1 probe,
+           13 LOS, 15 SPR, 17 SPL, 18 SLV, 19 DEP -- all gated on mode==0 for both writers, so nothing
+           re-fills them here) so only row 0 (fps + MST) remains -> the mode0<->mode1 fps delta is
+           clean.  Mode 2 hides the whole NBG3 layer (nbg3_show=0), so no blanking is needed there. */
         if (sat_dbg_overlay_mode == 1) {
             static const char bl[] = "                                        ";
-            for (int rr = 1; rr <= 16; ++rr) SRL::Debug::Print(0, rr, (char *)bl);
+            for (int rr = 1; rr <= 19; ++rr) SRL::Debug::Print(0, rr, (char *)bl);
         }
         t0     = now;
         frames = 0;
@@ -2967,6 +3064,208 @@ extern "C" int sat_floor_perfsim_deport_hook(int picnum, int height, int minx, i
 }
 #endif
 
+/* ------------------------------------------------------------------ */
+/* SAROO boot read-integrity probe (2026-07-23).  First SAROO field test
+   died in R_InitTextures ("Missing patch in texture BRNSMALL") = a WAD
+   lump-name lookup failed, i.e. the directory or the PNAMES content came
+   back wrong from the ODE's CDC emulation (boot log showed the MUS path,
+   no CD involved before that).  Read header + directory + PNAMES TWICE
+   each and CRC both passes: c1 != c2 on a photo PROVES unstable reads
+   with no expected value needed; stable-but-crashing points at a
+   deterministic misread (or the cart path) instead.  ~50 KB of extra
+   boot reads through the same LoadBytes path the game uses; console-log
+   output only; the 3 s STARTING countdown right after keeps the lines
+   photographable.  Retire once SAROO boots clean. */
+
+/* Scratch lives in LWRAM, NOT HWRAM .bss: the first WPROBE build carried two
+   2 KB static buffers + ~2.7 KB code and sank the HWRAM TLSF pool 8.4 -> 1.7 KB
+   -> tlsf_add_pool rejected it at boot = black screen on HW (the exact
+   boot-loop-starvation failure the pre-flight rule exists for; build.ps1 now
+   gates on the map).  LWRAM is dead at DG_Init time (Doom zone + RP ring are
+   set up much later in D_DoomMain), so the top of it is free boot scratch. */
+#define WPROBE_BUF    ((unsigned char *)0x002F0000)  /* one-sector CD bounce */
+#define WPROBE_BIG    ((unsigned char *)0x002C0000)  /* assembled range, <=128 KB */
+#define WPROBE_BUFSZ  2048
+
+/* Verdicts latched for the death screen (wprobe_fatal_rows, called by
+   DG_Fatal): rows 2-3 of ANY fatal photo then carry the CD-path CRCs (WP)
+   and the cart-copy directory CRC boot vs death (CP) -- the 2026-07-24 field
+   photos (missing patch BRNSMALL then DOORBLU, different per boot) never
+   showed the probe lines because they scroll off before the fatal.
+   Known-good stripped-shareware values: dir 34db0cd8, pnames a41a9ba2. */
+static uint32_t wprobe_dir_c1, wprobe_dir_c2, wprobe_pn_c1, wprobe_pn_c2;
+static int      wprobe_state = -1;   /* -1 never ran, 0 ok, 1 bad */
+static uint32_t cprobe_dir_boot = 0; /* cart-copy dir CRC at boot (cached window) */
+static int      cprobe_ran = 0;
+
+/* !! LoadBytes' first parameter is a SECTOR offset, not a byte offset
+   (srl_cd.hpp: "sectorOffset ... Number of sectors to skip" -> GFS_Load) --
+   same convention as the proven cart path (sat_cart_load_region's
+   `size_t sector`).  The first WPROBE build passed BYTE offsets: the
+   directory read asked GFS for sector 4,155,420 (~8.5 GB), failed, and left
+   the CD block wedged so even the game's own "DOOM1.WAD" lookups died
+   ("not found on CDB", Ymir 2026-07-24, no-boot).  This reader does the
+   byte->sector math itself: whole-sector LoadBytes into WPROBE_BUF with the
+   game's 8-retry pattern, sliced into dst. */
+static int wadprobe_read(SRL::Cd::File *f, int32_t off, int32_t len,
+                         int32_t fsize, unsigned char *dst)
+{
+    if (off < 0 || len <= 0 || off > fsize - len)
+        return 0;
+    int32_t end = off + len;
+    for (int32_t sec = off / WPROBE_BUFSZ; sec * WPROBE_BUFSZ < end; sec++)
+    {
+        int32_t base = sec * WPROBE_BUFSZ;
+        int32_t want = fsize - base;              /* last sector: partial */
+        if (want > WPROBE_BUFSZ) want = WPROBE_BUFSZ;
+        int32_t got = -1;
+        for (int r = 0; r < 8 && got != want; r++)
+            got = f->LoadBytes((size_t)sec, want, WPROBE_BUF);
+        if (got != want)
+            return 0;
+        int32_t s = (off > base) ? off - base : 0;
+        int32_t e = (end < base + want) ? end - base : want;
+        memcpy(dst + (base + s) - off, WPROBE_BUF + s, (size_t)(e - s));
+    }
+    return 1;
+}
+
+static uint32_t wadprobe_crc32(const unsigned char *p, int32_t len)
+{
+    uint32_t crc = 0xFFFFFFFFu;
+    for (int32_t i = 0; i < len; i++)
+    {
+        crc ^= p[i];
+        for (int b = 0; b < 8; b++)
+            crc = (crc >> 1) ^ (0xEDB88320u & (0u - (crc & 1u)));
+    }
+    return crc ^ 0xFFFFFFFFu;
+}
+
+static void wadprobe_boot(void)
+{
+    SRL::Cd::File f("DOOM1.WAD");
+    unsigned char *hdr = WPROBE_BUF;   /* aligned LWRAM; fields extracted before reuse */
+    int bad = 0;
+    wprobe_state = 1;                  /* pessimistic until the probe completes */
+    if (f.LoadBytes(0, 12, hdr) != 12)
+    {
+        printf("WPROBE: header read fail\n");
+        return;
+    }
+    int32_t numlumps = (int32_t)(hdr[4] | (hdr[5] << 8) | (hdr[6] << 16) | (hdr[7] << 24));
+    int32_t diroff   = (int32_t)(hdr[8] | (hdr[9] << 8) | (hdr[10] << 16) | (hdr[11] << 24));
+    printf("WPROBE hdr %c%c%c%c n=%d dir@%d\n",
+           hdr[0], hdr[1], hdr[2], hdr[3], (int)numlumps, (int)diroff);
+    int32_t dirlen = numlumps * 16;
+    int32_t fsize  = diroff + dirlen;   /* the dir sits at the END of a WAD */
+    if (numlumps <= 0 || numlumps > 8000 || diroff <= 0 || dirlen > 0x20000)
+        return;
+
+    int ok1 = wadprobe_read(&f, diroff, dirlen, fsize, WPROBE_BIG);
+    uint32_t d1 = ok1 ? wadprobe_crc32(WPROBE_BIG, dirlen) : 0;
+    int ok2 = wadprobe_read(&f, diroff, dirlen, fsize, WPROBE_BIG);
+    uint32_t d2 = ok2 ? wadprobe_crc32(WPROBE_BIG, dirlen) : 0;
+    int rderr = !(ok1 && ok2);
+    if (rderr || d1 != d2) bad = 1;
+    printf("WPROBE dir c1=%08lx c2=%08lx %s\n",
+           (unsigned long)d1, (unsigned long)d2,
+           rderr ? "RDERR" : (d1 == d2 ? "stable" : "UNSTABLE"));
+    wprobe_dir_c1 = d1;
+    wprobe_dir_c2 = d2;
+
+    /* PNAMES content: patch-name lookups (the op that failed on SAROO) read
+       names out of this lump, so a misread here crashes identically to a
+       misread directory.  Scan the ASSEMBLED directory (WPROBE_BIG still
+       holds pass 2) -- also immune to records straddling sector boundaries,
+       which the first chunked scan mishandled. */
+    if (ok2)
+    {
+        int32_t pn_off = 0, pn_len = 0;
+        for (int32_t r = 0; r + 16 <= dirlen; r += 16)
+        {
+            if (memcmp(WPROBE_BIG + r + 8, "PNAMES\0\0", 8) == 0)
+            {
+                pn_off = (int32_t)(WPROBE_BIG[r]     | (WPROBE_BIG[r + 1] << 8) |
+                                   (WPROBE_BIG[r + 2] << 16) | (WPROBE_BIG[r + 3] << 24));
+                pn_len = (int32_t)(WPROBE_BIG[r + 4] | (WPROBE_BIG[r + 5] << 8) |
+                                   (WPROBE_BIG[r + 6] << 16) | (WPROBE_BIG[r + 7] << 24));
+                break;
+            }
+        }
+        if (pn_off > 0 && pn_len > 0 && pn_len < 0x20000)
+        {
+            int okp1 = wadprobe_read(&f, pn_off, pn_len, fsize, WPROBE_BIG);
+            uint32_t p1 = okp1 ? wadprobe_crc32(WPROBE_BIG, pn_len) : 0;
+            int okp2 = wadprobe_read(&f, pn_off, pn_len, fsize, WPROBE_BIG);
+            uint32_t p2 = okp2 ? wadprobe_crc32(WPROBE_BIG, pn_len) : 0;
+            int prderr = !(okp1 && okp2);
+            if (prderr || p1 != p2) bad = 1;
+            printf("WPROBE pnames c1=%08lx c2=%08lx %s\n",
+                   (unsigned long)p1, (unsigned long)p2,
+                   prderr ? "RDERR" : (p1 == p2 ? "stable" : "UNSTABLE"));
+            wprobe_pn_c1 = p1;
+            wprobe_pn_c2 = p2;
+        }
+        else
+        {
+            printf("WPROBE: PNAMES not found in dir!\n");
+            bad = 1;
+        }
+    }
+
+    wprobe_state = bad;
+
+    if (bad)
+    {
+        /* Freeze the evidence on screen long enough for a photo. */
+        SRL::Debug::Print(0, 2, "WPROBE UNSTABLE - PHOTO THIS");
+        unsigned int t = vbl_count;
+        while (vbl_count - t < 600) ;
+        SRL::Debug::Print(0, 2, "                            ");
+    }
+}
+
+/* CRC the lump directory of the cart-resident WAD copy through the CACHED
+   window -- the exact path R_InitTextures reads in cart mode.  With
+   [Mimas-Eng] exmem_4M active on SAROO, the whole WAD lives in the emulated
+   cart and ALL lump reads exercise the same cached A-Bus path as Tethys's
+   resource heap (the OTw suspect).  Compare with WPROBE's CD value /
+   34db0cd8 known-good. */
+static uint32_t cprobe_dir_cart(void)
+{
+    const unsigned char *w = CART_RAM_CACHED;
+    int32_t numlumps = (int32_t)(w[4] | (w[5] << 8) | (w[6] << 16) | (w[7] << 24));
+    int32_t diroff   = (int32_t)(w[8] | (w[9] << 8) | (w[10] << 16) | (w[11] << 24));
+    if (numlumps <= 0 || numlumps > 8000 || diroff <= 0 ||
+        (uint32_t)diroff + (uint32_t)numlumps * 16u > (uint32_t)CART_RAM_SIZE)
+        return 0;
+    return wadprobe_crc32(w + diroff, numlumps * 16);
+}
+
+/* Death-screen rows 2-3: WP = CD-path double-read CRCs ('=' both passes
+   agreed, '!' split), CP = cart directory CRC at boot vs re-CRC'd NOW at
+   death -- DRIFT here = the cart copy/read degraded during gameplay. */
+static void wprobe_fatal_rows(void)
+{
+    if (wprobe_state >= 0)
+    {
+        SRL::Debug::Print(0, 2, "WP d%x%c p%x%c %s ",
+                          (unsigned)wprobe_dir_c1,
+                          (wprobe_dir_c1 == wprobe_dir_c2) ? '=' : '!',
+                          (unsigned)wprobe_pn_c1,
+                          (wprobe_pn_c1 == wprobe_pn_c2) ? '=' : '!',
+                          wprobe_state ? "BAD" : "ok");
+    }
+    if (cprobe_ran)
+    {
+        uint32_t now = cprobe_dir_cart();
+        SRL::Debug::Print(0, 3, "CP b%x n%x %s ",
+                          (unsigned)cprobe_dir_boot, (unsigned)now,
+                          (now == cprobe_dir_boot && now != 0) ? "ok" : "DRIFT");
+    }
+}
+
 extern "C" void DG_Init(void)
 {
     if (TVSTAT & 1)
@@ -2993,6 +3292,9 @@ extern "C" void DG_Init(void)
 
     /* CD filesystem init (SRL wraps GFS) */
     SRL::Cd::Initialize();
+
+    SRL::Debug::Print(0, 1, "WAD PROBE...");
+    wadprobe_boot();       /* SAROO read-integrity diag -- see above */
 
     SRL::Debug::Print(0, 1, "INIT CART...");
     cart_enable();
@@ -3031,6 +3333,14 @@ extern "C" void DG_Init(void)
         cart_loaded = load_wad();
         if (cart_loaded)
         {
+            /* CPROBE: CRC the cart copy's directory through the CACHED window
+               right after the load -- a mismatch vs the WPROBE CD value means
+               the copy/read is wrong before the game even starts; DG_Fatal
+               re-runs it at death (CP row) to catch in-game drift. */
+            cprobe_dir_boot = cprobe_dir_cart();
+            cprobe_ran = 1;
+            printf("CPROBE cart dir=%08lx (cd %08lx)\n",
+                   (unsigned long)cprobe_dir_boot, (unsigned long)wprobe_dir_c2);
             static char ws[45];
             sprintf(ws, "WAD OK sz=%u", sat_wad_size);
             SRL::Debug::Print(0, 1, ws);
@@ -3401,7 +3711,9 @@ static void sky_cell_init(void)
 #define VDP1_EWDR  (*(volatile unsigned short *)0x25D00006)
 #define VDP1_EWLR  (*(volatile unsigned short *)0x25D00008)
 #define VDP1_EWRR  (*(volatile unsigned short *)0x25D0000A)
-#define VDP1_EDSR  (*(volatile unsigned short *)0x25D00010)   /* status: bit1 CEF = draw done */
+#define VDP1_EDSR  (*(volatile unsigned short *)0x25D00010)   /* status: bit1 CEF = draw done, bit0 BEF = prev-frame overran */
+#define VDP1_LOPR  (*(volatile unsigned short *)0x25D00012)   /* SEGA UM: last op cmd addr (PREV frame) -- transfer-over meter */
+#define VDP1_COPR  (*(volatile unsigned short *)0x25D00014)   /* SEGA UM: current op cmd addr (plot progress) */
 #define VDP1_VRAM_BASE 0x25C00000u
 
 /* DOUBLE-BUFFERED command list (kills the tearing: VDP1 in 1-cycle mode plots every
@@ -3836,7 +4148,7 @@ extern "C" int sat_wall_vdp1(int x1, int yl1, int yh1, int x2, int yl2, int yh2,
         int h1 = yh1 - yl1 + 1; if (h1 < 0) h1 = 0;
         int h2 = yh2 - yl2 + 1; if (h2 < 0) h2 = 0;
         int a  = aw * ((h1 + h2) >> 1);
-        if (wall_px_acc + a > WALL_PX_BUDGET) return 1;   /* -> CPU software fallback */
+        if (wall_px_acc + a > WALL_PX_BUDGET) return 1;   /* overflow guard -> CPU software fallback (far walls shed) */
         wall_px_acc += a;
     }
     int vx = viewwindowx, vy = viewwindowy;
@@ -4209,15 +4521,21 @@ static void wall_emit_flat(int wi)
     unsigned short colr = wall_light_colr(wall_acc[wi].cmap);
     unsigned short col  = (unsigned short)(colr |
                           (unsigned int)(R_WallPotatoColor(wall_acc[wi].texnum) & 0xFF));
+    /* +1px x overlap each side (clamped to THIS view's x-range), mirroring the textured path's
+       seam-fill window (wall_emit_band, ~4365) so adjacent flat quads OVERLAP instead of leaving a
+       1px hairline gap -- visible when every wall is flat (iso mode 2; and far-wall fallbacks). */
+    int fvx = wall_acc[wi].vx, fvxr = wall_acc[wi].vxr;
+    int fx1 = (x1 > fvx)  ? x1 - 1 : fvx;
+    int fx2 = (x2 < fvxr) ? x2 + 1 : fvxr;
     unsigned short cmd[16];
     memset(cmd, 0, sizeof cmd);
     cmd[0] = 0x0004;                                  /* FUNC_Polygon (flat) */
     cmd[2] = 0x00C0;                                  /* SPD (opaque) | ECD-off */
     cmd[3] = col;                                     /* CMDCOLR = bank<<8 | index -> CRAM */
-    cmd[6]  = (short)x1; cmd[7]  = (short)(yl1 - 1);
-    cmd[8]  = (short)x2; cmd[9]  = (short)(yl2 - 1);
-    cmd[10] = (short)x2; cmd[11] = (short)(yh2 + 1);
-    cmd[12] = (short)x1; cmd[13] = (short)(yh1 + 1);
+    cmd[6]  = (short)fx1; cmd[7]  = (short)(yl1 - 1);
+    cmd[8]  = (short)fx2; cmd[9]  = (short)(yl2 - 1);
+    cmd[10] = (short)fx2; cmd[11] = (short)(yh2 + 1);
+    cmd[12] = (short)fx1; cmd[13] = (short)(yh1 + 1);
     vdp1_cmd_at(VDP1_BANK[vdp1_wbank], vdp1_wnext++, cmd);
 }
 
@@ -5232,7 +5550,7 @@ extern "C" void sat_vdp1_floors_done(void)
 static void vdp1_walls_flush(void)
 {
     wtex_bakes = 0;                      /* count this frame's texture re-bakes (the `k` driver) */
-    if (wall_acc_n == 0) { wall_px_acc = 0; return; }   /* ALWAYS re-arm the fill budget: the
+    if (wall_acc_n == 0) { wall_px_acc = 0; return; }   /* re-arm the per-frame overflow guard: the
                              mode-4 wall_acc clear hit this early-return and the stale px_acc
                              then rejected EVERY wall forever (VD1=1, all walls CPU, 10fps --
                              owner overlay capture 2026-07-03) */
@@ -5267,6 +5585,7 @@ static void vdp1_walls_flush(void)
         /* 3-way: 0=textured 1=banded 2=flat; a wall with no texture slot must be flat.  A SPECIAL
            wall (door/switch, wall_acc[i].special) is forced TEXTURED for readability even in pot2. */
         int wmode = (wall_acc[i].slot < 0) ? 2
+                  : sat_iso_flat            ? 2   /* iso mode 4: force every VDP1 wall FLAT (overdraw-vs-fill probe) */
                   : (wall_acc[i].special)  ? 0
                   : wall_potato(i);
         if (wmode != 2)                                        /* textured/banded: charge extra to surplus */
@@ -5303,7 +5622,7 @@ static void vdp1_walls_flush(void)
     }
 
     wall_acc_n = 0;
-    wall_px_acc = 0;   /* the fill budget re-arms with the accumulator */
+    wall_px_acc = 0;   /* re-arm the per-frame overflow guard */
 }
 #endif
 
@@ -5470,8 +5789,8 @@ extern "C" void sat_vdp1_wpn_begin(void)
         wall_acc_n  = 0;  /* mode 4 SOFTWARE reference: the walls were drawn software this frame
                              (sat_wall_skip=0); drop the VDP1 duplicates so they cannot poke over
                              the HW sky through NBG1 index-0. */
-        wall_px_acc = 0;  /* and re-arm the fill budget (its normal reset lives in walls_flush,
-                             which early-returns on an empty accumulator) */
+        wall_px_acc = 0;  /* re-arm the overflow guard; its normal reset lives in walls_flush,
+                             which early-returns on an empty accumulator */
     }
 #endif
 #if SAT_VDP1_FLOOR && !SAT_FLOOR_TEX
@@ -6010,6 +6329,42 @@ static void vdp1_wpn_kick(void)
     unsigned int link;
     vdp1_prev_done = (VDP1_EDSR & 0x0002) ? 1 : 0;   /* did the previous frame's plot finish? */
 #if SHOW_FPS
+    {   /* VDP1 transfer-over meter (SEGA VDP1 UM p.52-53 LOPR/COPR/BEF; docs/VDP1_LIMITS_SOURCED.md).
+           The list VDP1 is displaying used bank vdp1_bank with vdp1_last_cmds cmds -- BOTH still hold the
+           PREVIOUS frame's values HERE (updated just below).  LOPR = the cmd addr where that plot ENDED;
+           compare to the list end to see if it finished ("transfer-over" = the flicker).  Cmd addrs are
+           (VRAM byte offset)>>3, exactly like the CMDLINK writes -- so end = (bank_off + n*32)>>3. */
+        unsigned int bank_off = VDP1_BANK[vdp1_bank & 1] - VDP1_VRAM_BASE;   /* 0x100 (bank0) / 0x2100 (bank1) */
+        unsigned int base_ca  = bank_off >> 3;
+        unsigned int end_ca   = (bank_off + (unsigned int)vdp1_last_cmds * 32u) >> 3;
+        vdp1_lopr  = VDP1_LOPR;
+        vdp1_copr  = VDP1_COPR;
+        vdp1_endca = (unsigned short)end_ca;
+        {   /* LP = how far LOPR got through the W bank.  BOTH "completed" directions read 100:
+               - LOPR ABOVE end  (in the F/floor bank ~0xF800): got>span -> clamp to span -> 100.
+               - LOPR BELOW base (Lc=0xc): the plot FINISHED the W bank and jumped to the empty/idle
+                 chain before we sampled -- HW-VERIFIED 2026-07-26 (short lists that finish read Lc;
+                 long lists that overrun read a mid-bank addr).  This is COMPLETION, not 0%.
+               Only LOPR strictly INSIDE [base,end] is a real transfer-over (LP<100 = the flicker). */
+            int span = (int)end_ca - (int)base_ca;         /* = vdp1_last_cmds * 4 (cmd-addr units) */
+            int got  = (int)vdp1_lopr - (int)base_ca;
+            int overran = 0;
+            if      (got < 0)     vdp1_lp_pct = 100;       /* finished W -> jumped past it (idle/F)   */
+            else if (span <= 0)   vdp1_lp_pct = 100;       /* empty list                              */
+            else if (got >= span) vdp1_lp_pct = 100;       /* finished into the F bank                */
+            else { vdp1_lp_pct = got * 100 / span; overran = 1; }   /* real transfer-over (LP<100)    */
+            /* MEASURED BUDGET (feed-forward, no guess): on an overrun the plot completed exactly
+               (got/4) commands this frame -- that IS the per-frame VDP1 command budget, read straight
+               from the hardware.  Snap to it.  On a clean frame the budget is >= the list and we can't
+               see the surplus, so drift up +1 / THING_LP_CLEAN to re-probe headroom when a scene eases.
+               vdp1_budget_cmds==0 means "not yet measured" -> the AIMD treats it as unlimited (slot cap). */
+            if (overran) { vdp1_budget_cmds = got / 4; vdp1_budget_clean = 0; }
+            else if (vdp1_budget_cmds > 0 && ++vdp1_budget_clean >= THING_LP_CLEAN) {
+                if (vdp1_budget_cmds < WALL_CMD_CAP) vdp1_budget_cmds++;
+                vdp1_budget_clean = 0; } }
+        {   int u = 0; for (int i = 0; i < WTEX_SLOTS; ++i) if (wtex_cache[i].texnum >= 0) u++;
+            vdp1_tx_used = u; }
+    }
     vdp1_last_cmds = vdp1_wactive ? vdp1_wnext : 0;
     vd1_wpct = WALL_CMD_CAP ? (vdp1_last_cmds * 100 / WALL_CMD_CAP) : 0;   /* wall command-budget fill % */
     /* Dr accumulation moved to the OnVblank sampler (vdp1_vblank_dr): per-KICK sampling ran
@@ -6168,7 +6523,7 @@ extern "C" void sat_walls_kick(void)
            per view (R_DrawSplitPlayerSprites).  sat_wall_skip gate -> M0 keeps the SOFTWARE weapon. */
         auto sat_emit_weapon = [](void)
         {
-            if (sat_psprite_early && !viewangleoffset && sat_wall_skip)
+            if (sat_psprite_early && !viewangleoffset && sat_wall_skip && !sat_wpn_soft)
             {
                 extern int sat_split_active;
                 extern void R_DrawSplitPlayerSprites(void);
@@ -6176,7 +6531,7 @@ extern "C" void sat_walls_kick(void)
                 else                  R_DrawPlayerSprites();
             }
         };
-        sat_emit_weapon();          /* (1) FIRST -- guaranteed in the plotted prefix (anti-flicker) */
+        sat_emit_weapon();   /* (1) FIRST -- anti-flicker prefix (weapon plotted before the walls) */
 #endif
 #if VDP1_WALL_TEST
         vdp1_walls_flush();         /* walls BETWEEN the two weapon copies */
@@ -6197,13 +6552,45 @@ extern "C" void sat_walls_kick(void)
            world sprite to the slave-disabled master software fill in M7 (the MP fps killer) -- so split
            drives the same command budget, just divided per view (nv views each emit up to ec). */
         if (!sat_split_active) {
-            int room = vdp1_wall_cap - vdp1_wnext - THING_FLUSH_MARGIN;
+            /* ---- BUDGET-DRIVEN LOD (2026-07-26) --------------------------------------------------
+               Allocate this frame's VDP1 work against the MEASURED budget (vdp1_budget_cmds, read from
+               LOPR) instead of the static slot cap -- so the default IS the real per-frame budget, not
+               a guess.  vdp1_wnext here = the weapon(1)+walls already flushed, so (budget - wnext) =
+               the commands left for THINGS + weapon(2).  Two levers, in gameplay-priority order (shed
+               far THINGS before near WALLS):
+                 (1) THINGS: cap = room>>1; the shed sprites fall to the SOFTWARE fill (crisp->software,
+                     visible + STABLE, never blink); actor-first rank keeps the monsters you fight crisp.
+                 (2) WALLS : only if the walls ALONE eat the budget (room<=trigger) AND the master has
+                     headroom -> push near walls to software (lower sat_wall_cpu_span) to free VDP1.
+                     Gated on rp_master_ms so we NEVER trade a blink for decrochage (two-engine balance). */
+            int cap_cmds = vdp1_wall_cap;                       /* hard SLOT ceiling (248) */
+#if SHOW_FPS
+            if (vdp1_budget_cmds > 0 && vdp1_budget_cmds < cap_cmds)
+                cap_cmds = vdp1_budget_cmds;                    /* measured TIME budget (usually tighter) */
+#endif
+            int room = cap_cmds - vdp1_wnext - THING_FLUSH_MARGIN;
             int budget_cap = (room > 0) ? (room >> 1) : 0;      /* ~2 VDP1 cmds per emitted thing */
             if (budget_cap > THING_ADAPT_MAX) budget_cap = THING_ADAPT_MAX;
             if (sat_thing_emit_cap < budget_cap)      sat_thing_emit_cap += 2;         /* smooth ramp up */
             else if (sat_thing_emit_cap > budget_cap) sat_thing_emit_cap = budget_cap; /* snap down to fit */
             if (sat_thing_emit_cap < 0) sat_thing_emit_cap = 0;
             thing_overrun_run = 0; thing_cap_clean = 0;
+#if SHOW_FPS
+            /* (2) WALL LOD: engage only when things are already shed and the walls STILL overrun the
+               VDP1 budget (room for things <= trigger), AND the master (software) has room to take them.
+               Lower the span -> more near walls -> software (CPU), freeing VDP1; relax back to the core
+               default when VDP1 fits again OR the master is saturated (never worsen decrochage). */
+            {   int room_for_things = cap_cmds - vdp1_wnext;    /* commands left after the walls */
+                int master_ok = (rp_master_ms > 0 && rp_master_ms < SOFT_BUDGET_MS);
+                if (vdp1_budget_cmds > 0 && room_for_things <= WALL_LOD_TRIGGER && master_ok) {
+                    if (sat_wall_cpu_span > WALL_SPAN_MIN)         sat_wall_cpu_span -= WALL_SPAN_STEP;
+                } else if (sat_wall_cpu_span < SAT_WALL_CPU_SPAN_DEF) {
+                    sat_wall_cpu_span += WALL_SPAN_STEP;
+                    if (sat_wall_cpu_span > SAT_WALL_CPU_SPAN_DEF) sat_wall_cpu_span = SAT_WALL_CPU_SPAN_DEF;
+                }
+                sat_wall_cpu_v1 = sat_wall_cpu_span + WALL_PREWARM_BAND;   /* keep the pre-warm band width -> V1 is the real VDP1-exit */
+            }
+#endif
         } else {
             /* SPLIT WBUDGET (2026-07-20): identical command-budget policy to the 1p branch above, but
                sat_thing_emit_cap is PER-VIEW and nv views each emit up to it into the shared queue, so
@@ -6223,6 +6610,9 @@ extern "C" void sat_walls_kick(void)
             if (sat_thing_emit_cap < 0) sat_thing_emit_cap = 0;
             thing_overrun_run = 0; thing_cap_clean = 0;
         }
+        /* (VDP1 thing FILL budget removed 2026-07-25: fill is not the limiter -- sat_thing_fill_budget
+           stays 0 (core default = off).  The count budget above (WBUDGET, command-slot-driven) is what
+           actually bounds VDP1 things.) */
         /* World sprites to VDP1 prio 7, AFTER the walls and BEFORE weapon (2) so the gun stays on
            top.  Occlusion = FUNC_UserClip; fuzz/translated/oversize/over-budget stay software.
            1p: emit directly (vissprites still live).  Split: the views already emitted per view
@@ -7142,7 +7532,13 @@ static void poll_pad(void)
         }
         else
 #endif
-        {   /* Z: cycle only the LIVE playable modes {M4, M6, M7}; M0+M5 are parked (off the cycle). */
+        if (!(cur & PER_DGT_TL) && (cur & PER_DGT_TR))   /* L+Z (R released): cycle the VDP1 ISOLATION mode */
+        {
+            sat_iso_mode = (sat_iso_mode + 1) % 3;
+            sat_apply_iso();                             /* all / walls-only / walls+things / walls+weapon / flat */
+        }
+        else
+        {   /* Z (no modifier): cycle only the LIVE playable modes {M7}; M0+M5 are parked (off the cycle). */
             int ci = 0;
             for (int i = 0; i < SAT_M_CYCLE_N; ++i) if (sat_m_cycle[i] == sat_m) { ci = i; break; }
             sat_m = sat_m_cycle[(ci + 1) % SAT_M_CYCLE_N];
@@ -7199,7 +7595,19 @@ static void poll_pad(void)
 #endif
     /* (L+X AIMD ad0/1/2 toggle CUT 2026-07-16: wbudget baked as the 1p default -- the damped ad1 was
        HW-proven to collapse thing-emit to 0 via the false-latching EDSR-CEF; ad0/ad1-1p are dead.
-       L+X is free.  See [[aimd-wbudget-hw-cef-collapse]].) */
+       See [[aimd-wbudget-hw-cef-collapse]].) */
+    /* Pad L+X toggles the WEAPON off VDP1 -> SOFTWARE -- the monster-blink lever.  VDP1 plot order is
+       weapon(1) -> walls -> things -> weapon(2); the weapon (~18k px, plotted before the things) is a
+       fixed fill that pushes a plot-time overrun into the things (they vanish).  SOFT moves it to the
+       software layer (half-res weapon in M7, but the ENEMIES stay crisp on VDP1 and now plot).  Watch
+       row 10 `D%` jump + the monsters stop vanishing.  L held, R released, X edge (TAB suppressed
+       while L held).  Default vdp1 = zero change. */
+    if (!(cur & PER_DGT_TL) && (cur & PER_DGT_TR)                 /* L held, R released */
+        && (changed & PER_DGT_TX) && !(cur & PER_DGT_TX))
+        sat_wpn_soft ^= 1;
+    /* (Pad L+Left/Right 1p VDP1 fill-budget A/B REMOVED 2026-07-25: fill is not the flicker limiter --
+       see docs/VDP1_LIMITS_SOURCED.md.  L+Left/Right are free again in 1p; the VDP1 isolation cycle is
+       on L+Z.  The split levers below still take L+Left/Right at players>1.) */
     /* Pad R + Down: TEST cheat cycle -- off -> GOD -> GOD+NOCLIP -> off, applied to every local
        player and re-established each tic by core P_Ticker (survives level/map warp, deaths, the
        E1M8 super-damage floor).  R held, L released, Down edge (free chord -- R+Down was the cut

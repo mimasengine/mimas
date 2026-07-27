@@ -57,7 +57,8 @@ param(
     [switch]$Mus,
     [string]$WarpMap = "",
     [string]$WarpSkill = "4",
-    [switch]$SegsFirst
+    [switch]$SegsFirst,
+    [switch]$TestGod
 )
 
 $ErrorActionPreference = "Stop"
@@ -147,7 +148,15 @@ function ConvertTo-Msys2Path([string]$p) {
 function Invoke-Msys2([string]$cmd) {
     # sh2eb-elf-gcc lives in SaturnRingLib/Compiler/sh2eb-elf/bin (extracted by setup_compiler.bat)
     $compilerBin = ConvertTo-Msys2Path (Join-Path $root "SaturnRingLib\Compiler\sh2eb-elf\bin")
-    & $bash --login -c "export MSYSTEM=MINGW64; source /etc/profile 2>/dev/null; export PATH='$compilerBin':`$PATH; $cmd"
+    # The --login shell rebuilds a minimal PATH without the Windows python/git;
+    # pre.makefile (make_ip.py, IP.BIN identity + V0.<git count>) needs both.
+    # APPEND them (never prepend): the WindowsApps dir holding the python alias
+    # also holds the WSL bash.exe alias, which would shadow MSYS /usr/bin/bash
+    # for any 'bash ...' recipe line.
+    $toolsPath = ""
+    try { $toolsPath += ":" + (ConvertTo-Msys2Path (Split-Path (Get-Command python -ErrorAction Stop).Source)) } catch {}
+    try { $toolsPath += ":" + (ConvertTo-Msys2Path (Split-Path (Get-Command git -ErrorAction Stop).Source)) } catch {}
+    & $bash --login -c "export MSYSTEM=MINGW64; source /etc/profile 2>/dev/null; export PATH='$compilerBin':`$PATH'$toolsPath'; $cmd"
     if ($LASTEXITCODE -ne 0) { throw "MSYS2 command failed (exit $LASTEXITCODE)" }
 }
 
@@ -252,6 +261,11 @@ try {
     # M5 staging-order A/B (Makefile SAT_BSP_STAGE_SEGS_FIRST -> core/p_setup.c):
     # verts -> segs -> subsectors -> nodes instead of nodes-first (overlay: st29/40 vs st17/40).
     if ($SegsFirst) { $makeArgs += " SAT_BSP_STAGE_SEGS_FIRST=1" }
+    # -TestGod (Makefile SAT_TEST_GOD -> core/g_game.c): flicker-test build = spawn invincible + full
+    # kit so the HW tester stands in a horde without dying.  g_game.c must be touched too (make does
+    # not track CFLAGS changes, so toggling it off would otherwise leave a godded .o).  Pair -WarpMap.
+    $touchExtra = ""
+    if ($TestGod) { $makeArgs += " SAT_TEST_GOD=1"; $touchExtra = " core/g_game.c" }
 
     Write-Host "Building Mimas$(if ($cddaAppend) {' (CDDA)'})..."
     # Touch the file carrying the on-screen build stamp (dg_saturn.cxx -> row 18
@@ -260,7 +274,37 @@ try {
     # files changed (which otherwise leaves dg_saturn.o, and its __TIME__, stale).
     # core/p_setup.c is touched too: the M5 staging-order define lives there and make does
     # not track CFLAGS changes, so toggling -SegsFirst would otherwise leave a stale .o.
-    Invoke-Msys2 "cd '$rootMsys' && touch src/dg_saturn.cxx core/p_setup.c && make $makeTarget $makeArgs"
+    Invoke-Msys2 "cd '$rootMsys' && touch src/dg_saturn.cxx core/p_setup.c$touchExtra && make $makeTarget $makeArgs"
+
+    # TLSF pre-flight: the HWRAM TLSF pool (_end..__heap_end in build/Mimas.map)
+    # must keep >= 4 KB or SRL's tlsf_add_pool rejects it at boot -> black
+    # screen / boot loop.  Learned the hard way on the 2026-07-23 WPROBE image
+    # (two 2 KB static .bss buffers sank the pool 8.4 -> 1.7 KB and the image
+    # died at INIT CD on hardware).  Mirrors the Tethys build.ps1 gate.
+    $mapPath = Join-Path $root "build\Mimas.map"
+    if (Test-Path $mapPath) {
+        $map   = Get-Content $mapPath -Raw
+        $endM  = [regex]::Match($map, '0x([0-9a-f]+)\s+_end\b')
+        $heapM = [regex]::Match($map, '0x([0-9a-f]+)\s+__heap_end\b')
+        if ($endM.Success -and $heapM.Success) {
+            $pool   = [Convert]::ToInt64($heapM.Groups[1].Value, 16) - [Convert]::ToInt64($endM.Groups[1].Value, 16)
+            $poolKB = [math]::Round($pool / 1024, 2)
+            Write-Host "pre-flight: HWRAM TLSF pool = $poolKB KB (_end..__heap_end)"
+            if ($pool -lt 4096) {
+                throw "PRE-FLIGHT FAIL: HWRAM TLSF pool $poolKB KB < 4 KB -- tlsf_add_pool will reject it at boot (black screen). Diet .text/.bss (or move buffers to LWRAM) before shipping."
+            }
+            if ($pool -lt 7168) {
+                # The real boot-loop floor DRIFTS with SRL's init allocs (3.5 KB
+                # boot-looped once; 6.7 KB booted on another config) -- 4 KB is
+                # a bare floor, 7 KB the comfort target. Warn, don't block.
+                Write-Warning "pre-flight: pool $poolKB KB is above the 4 KB floor but below the 7 KB comfort target -- confirm boot on HW before handing off"
+            }
+        } else {
+            Write-Warning "pre-flight: _end/__heap_end not found in build/Mimas.map -- cannot verify TLSF pool"
+        }
+    } else {
+        Write-Warning "pre-flight: build/Mimas.map missing -- cannot verify TLSF pool"
+    }
 
     # SRL outputs to build/Mimas.bin + build/Mimas.cue
     $binPath = Join-Path $root "build\Mimas.bin"

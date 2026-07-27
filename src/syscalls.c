@@ -52,12 +52,13 @@ char **environ = __env;
    ~6 KB peak), so the heap is trimmed 88 -> 32 KB, returning ~56 KB to the TLSF pool.
    Watch row-22 `hp` (dg_heap_peak) stays < HEAP_SIZE on a full E1 run; trim further toward
    the measured peak if you want even more pool, or raise back if a hidden libc alloc appears. */
-#define HEAP_SIZE (20 * 1024)   /* 32->24->20KB (20KB 2026-07-15): reclaim 4KB HWRAM .bss to the TLSF pool
-                                    for the M7-multi split-lowres .text (which had pushed the pool below
-                                    the 4KB boot-loop floor -> 3776B; now ~8KB pool).  Peak is ~6KB
-                                    (lumpinfo is in LWRAM, no big-IWAD spike) so 20KB keeps ~14KB headroom
-                                    -- deliberately NOT 16KB, to stay conservative for un-measured big-WAD
-                                    (TNT/Plutonia) libc transients; watch row-22 hp < 20KB on a big-WAD run.
+#define HEAP_SIZE (16 * 1024)   /* 32->24->20->18->16KB (16KB 2026-07-24): +2KB more to the TLSF pool for
+                                    the CPROBE cart-CRC diag .text (pool was 6.55KB < the 7KB comfort
+                                    target; the boot-loop floor DRIFTS, 4KB is optimistic).  Peak is ~6KB
+                                    (lumpinfo is in LWRAM, no big-IWAD spike) so 16KB still holds 2.6x
+                                    peak -- acceptable for the SAROO diag image which only runs shareware
+                                    DOOM1; RESTORE >=18KB before any big-WAD (TNT/Plutonia) campaign or
+                                    when the WPROBE/CPROBE diag retires (watch row-22 hp).
                                     WALL_ACC_MAX stays 128 -- never rob the wall budget for the pool. */
 static char heap[HEAP_SIZE] __attribute__((aligned(8)));
 static char *heap_end = heap;

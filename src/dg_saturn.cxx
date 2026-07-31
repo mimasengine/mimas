@@ -1648,6 +1648,11 @@ static int sat_things_n = 0, sat_things_decl = 0, thing_bake_n = 0;   /* 'th' em
 #if SHOW_FPS
 extern "C" int rp_timeout_count;
 extern "C" int rp_to_site[4];            /* core r_parallel.c: per-wait-site timeout split A/P/M/W */
+/* SATURN L5 near-wall edge split: the core-side hook pointer + this file's implementation of it. */
+extern "C" int (*sat_wall_edge_hook)(int, int, int, int, int, int, int, int, int,
+                                     int *, int *, int *, int *, int *);
+extern "C" int sat_wall_edge_split(int, int, int, int, int, int, int, int, int,
+                                   int *, int *, int *, int *, int *);
 extern "C" unsigned int rp_master_ms;   /* master frame ms -> prefixes r_parallel.c's row-18 SLV line */
 extern "C" int sat_opt;                  /* core r_segs.c: cumulative perf-lever level L1..L4 (pad L+C) */
 static unsigned int dg_frame_count = 0;
@@ -1666,6 +1671,22 @@ static int vdp1_tx_used = 0;                          /* wtex cache slots occupi
 #define THING_LP_CLEAN 24                             /* clean (LP=100) frames before the budget drifts up +1 */
 static int vdp1_budget_cmds  = 0;                     /* measured budget in commands (0 until first sample; WALL_CMD_CAP-bounded) */
 static int vdp1_budget_clean = 0;                     /* consecutive clean frames (drift-up counter) */
+/* WEAPON-ALWAYS-VISIBLE reserve (2026-07-31, replaces the double-emit hedge).  The gun is the LAST
+   world command (it must be: VDP1 is a painter, so "above the walls AND above the monsters" = drawn
+   after both), which makes "was it displayed?" DIRECTLY observable instead of inferred -- LOPR >=
+   its slot.  The reserve is in COMMAND-EQUIVALENTS, not slots: the gun occupies ~3 command slots but
+   costs many slots' worth of plot TIME (large sprite), and that ratio is scene- and weapon-dependent,
+   so it is LEARNED by AIMD on the direct observation rather than guessed.  Grows fast on a cut (the
+   gun must not blink twice for the same cause), decays slowly when the plot keeps reaching it. */
+#define WPN_RESERVE_MIN   6                           /* floor = the weapon's own slot cost (clip+gun+flash+slack) */
+#define WPN_RESERVE_MAX  64                           /* ceiling: past this we would starve the world to save the gun */
+#define WPN_RESERVE_UP    8                           /* AIMD grow step on a cut                                     */
+#define WPN_SAFE_DECAY   48                           /* consecutive reached-frames before giving one back           */
+static int vdp1_wpn_slot_end  = 0;                    /* slot just past the weapon in the list being BUILT           */
+static int vdp1_wpn_slot_disp = 0;                    /* ... in the list currently PLOTTED (what LOPR refers to)     */
+static int vdp1_wpn_reserve   = WPN_RESERVE_MIN;      /* command-equivalents withheld from things/walls              */
+static int vdp1_wpn_cut       = 0;                    /* frames whose plot did NOT reach the weapon (window count)   */
+static int vdp1_wpn_safe      = 0;                    /* consecutive reached-frames (decay counter)                  */
 /* Two-engine LOD tuning knobs (HW-tune these -- read rp_master_ms on the row-18 SLV line to calibrate
    SOFT_BUDGET_MS).  The wall LOD only engages when things are already shed and the walls ALONE still
    overrun the VDP1 budget, AND the master (software) has room to take them (else it would cause the
@@ -1809,6 +1830,16 @@ extern "C" int gamemap;   /* core doomstat: drives the per-map window reset */
    VDP1 bank full (Phase-1 worsens); px = clampable fill-work proxy (span*cols = the master
    software cost Phase-1 removes).  A big clamp/px => build the clamp; mostly mag/starve => reconsider. */
 extern "C" int sat_fb_clamp_t, sat_fb_mag_t, sat_fb_starve_t, sat_fb_px;
+extern "C" int sat_fb_edge_t;     /* L5: tiers saved by the CPU-borders/VDP1-core near-wall split */
+extern "C" int sat_fb_edge_w;     /* L5: tiers that ASKED for the split (the denominator)          */
+extern "C" int sat_fb_edge_b[4];  /* L5 bail causes: lateral / magnitude / too-thin / refused      */
+static int fb_pk_edge = 0, fb_pk_edge_w = 0, fb_pk_edge_b[4] = {0,0,0,0};
+/* RATES, not peaks (owner 2026-07-31: "je n'arrive pas a saisir les moments ou e monte, c'est trop
+   rare pour prendre des captures").  A peak says only "it happened once in this window" and forces
+   the reader to CATCH the event with a camera; a per-frame rate is stationary -- walk the level and
+   read a stable number.  Rarity then reads directly off the number instead of off a failed capture:
+   an `e` rate near 0 IS the verdict that the lever cannot pay, no lucky screenshot required. */
+static unsigned int fb_tot_edge = 0, fb_tot_edge_w = 0, fb_tot_mag = 0, fb_win_frames = 0;
 extern "C" int sat_fb_wclamp_t;   /* Phase-1: tiers KEPT on VDP1 by the cut+wedge clamp */
 static int fb_cur_clamp = 0, fb_cur_mag = 0, fb_cur_px = 0;             /* last rendered frame */
 static int fb_cur_wclamp = 0;
@@ -1875,7 +1906,7 @@ static void fps_update(void)
            so each A/B run starts a clean min/avg/max window -- no manual button needed
            (the pad is already saturated: Y=SQ X=split Z=mode-M L+A=blit). */
         {
-            static int l_map=-1, l_m=-1, l_sq=-1, l_blit=-1, l_ms=-1, l_cls=-1, l_ns=-1;
+            static int l_map=-1, l_m=-1, l_sq=-1, l_blit=-1, l_ms=-1, l_cls=-1, l_ns=-1, l_opt=-1;
 #if SAT_FLOOR_PERFSIM
             static int l_perfsim=-1;   /* reset the REC window on a pad-Y perf-sim toggle => clean per-mode numbers */
 #endif
@@ -1885,6 +1916,9 @@ static void fps_update(void)
             if (gamemap != l_map || sat_m != l_m || (sq_wall<<6|sq_sprite<<4|sq_floor<<2|sq_ceil) != l_sq || blit_mode != l_blit
                 || sat_mark_suppress != l_ms
                 || sat_clear_slave != l_cls || sat_near_sprites != l_ns
+                || sat_opt != l_opt          /* pad L+C: the perf-lever ladder IS an A/B -> flush the
+                                                profiler + every windowed peak, else /o4 vs /o5 is read
+                                                through numbers latched before the switch */
 #if SAT_FLOOR_PERFSIM
                 || floor_perfsim_mode != l_perfsim
 #endif
@@ -1894,10 +1928,13 @@ static void fps_update(void)
                ) {
                 RP_ProfReset();
                 vd1_win_done = vd1_win_tot = 0;
-                fb_pk_clamp = fb_pk_mag = fb_pk_starve = fb_pk_px = 0;   /* Phase-0: clean fallback A/B window */
+                fb_pk_clamp = fb_pk_mag = fb_pk_starve = fb_pk_px = fb_pk_edge = 0;   /* Phase-0: clean fallback A/B window */
+                fb_pk_edge_w = 0;
+                fb_pk_edge_b[0] = fb_pk_edge_b[1] = fb_pk_edge_b[2] = fb_pk_edge_b[3] = 0;
+                fb_tot_edge = fb_tot_edge_w = fb_tot_mag = fb_win_frames = 0;   /* fresh rate window */
                 blit10_sum = blit10_cnt = 0;   /* row-1 'b' precise window: fresh sample on the L+A toggle */
                 l_map=gamemap; l_m=sat_m; l_sq=(sq_wall<<6|sq_sprite<<4|sq_floor<<2|sq_ceil); l_blit=blit_mode; l_ms=sat_mark_suppress;
-                l_cls=sat_clear_slave; l_ns=sat_near_sprites;
+                l_cls=sat_clear_slave; l_ns=sat_near_sprites; l_opt=sat_opt;
 #if SAT_FLOOR_PERFSIM
                 l_perfsim=floor_perfsim_mode;
 #endif
@@ -1995,15 +2032,24 @@ static void fps_update(void)
              ws = near-wall->software span (LOD lowers it when the walls alone overrun + master has room)
              tx = wtex cache slots occupied of WTEX_SLOTS=22 (the VRAM limiter)
              i  = isolation mode (L+Z: 0 all / 1 no-things / 2 flat-walls; weapon always on VDP1)
+             W  = weapon guarantee, reserve/cuts.  The gun is emitted ONCE, as the LAST world command
+                  (above walls AND monsters), so "did it display" is read straight from LOPR instead
+                  of hedged with a second copy.  reserve = command-equivalents currently withheld
+                  from things/walls so the plot always reaches it (AIMD-learned, WPN_RESERVE_MIN..MAX);
+                  cuts = frames the plot did NOT reach it since the window reset.  **cuts must stay 0**
+                  -- that is the whole acceptance test.  A rising reserve with cuts 0 means the loop
+                  is holding the line and paying for it in shed sprites; cuts>0 with reserve at MAX
+                  means the scene cannot fit the gun even after shedding everything sheddable.
            HW-VERIFIED 2026-07-26: LOPR tracks on real HW -- a scene that OVERRUNS reads a mid-bank LOPR
            (LP<100 = the flicker; e.g. L6c0/6e8 = 94% -> B = 0.94*c), one that FINISHES reads Lc (LP=100).
            Ymir doesn't model LOPR (never overruns anyway), so LP=100 / B unmeasured there is correct.
            (rp_master_ms -- the B_s software budget the wall LOD gates on -- is on the row-18 SLV line.) */
         if (sat_dbg_overlay_mode == 0 && sat_local_players <= 1) {
             static char rV1[56];   /* trailing spaces clear the tail when a field narrows (else "i3"->"i33" ghost) */
-            snprintf(rV1, sizeof rV1, "V1 c%d B%d LP%d%% ec%d ws%d tx%d i%d      ",
+            snprintf(rV1, sizeof rV1, "V1 c%d B%d LP%d%% ec%d ws%d tx%d i%d W%d/%d   ",
                      vdp1_last_cmds, vdp1_budget_cmds, vdp1_lp_pct,
-                     sat_thing_emit_cap, sat_wall_cpu_span, vdp1_tx_used, sat_iso_mode);
+                     sat_thing_emit_cap, sat_wall_cpu_span, vdp1_tx_used, sat_iso_mode,
+                     vdp1_wpn_reserve, vdp1_wpn_cut);
             SRL::Debug::Print(0, 12, rV1);
         }
         /* window reset -- read the row-1 composition ABOVE before this zeroes the sums.  The
@@ -2137,10 +2183,33 @@ static void fps_update(void)
             /* row 8: RELIABLE VDP1 load (replaces the CEF-aliased Dr%).  w%/f% = wall/floor
                command-budget FILL % (100% = bank full, further surfaces spill to CPU); fbw = walls
                dumped to CPU because the bank filled (windowed peak); fbf = floor tiles dropped
-               (trunc).  fbw|fbf > 0 = VDP1 genuinely over budget this window (the master pays). */
+               (trunc).  fbw|fbf > 0 = VDP1 genuinely over budget this window (the master pays).
+               L5 near-wall split as PER-FRAME RATES (one decimal), not peaks: e<got>/<want> = tiers
+               split / tiers that ASKED, m = tiers the subdiv squish guard dumped to SOFTWARE (the
+               OTHER, much larger population -- what L5 does NOT reach).  Rates because a peak only
+               says "it happened once in this window" and forces the reader to photograph a rare
+               moment; a rate is stationary, so rarity reads straight off the number: e0.0 with
+               w>0 = never fires, e~=w = full coverage, and e<<m = L5 is aimed at the small pile.
+               b<L><M><T><R> (still peaks, 1 digit) = why the rest bailed: L lateral (outside the
+               view window +/- wall_ext, RESCUABLE by widening), M magnitude (tile leaves the +/-1024
+               frame-buffer plane -- HARDWARE, VDP1 UM p.21; no screen split can EVER fix it, only a
+               narrower BAKED sub-texture), T interior thinner than SAT_WALL_EDGE_MIN, R refused
+               (floor-clearance proof / bank full).  The rate window resets with the profiler, so
+               changing /o (pad L+C) starts a clean count for the A/B. */
             static char rVD[45];
-            snprintf(rVD, sizeof rVD, "VD1 w%d%% f%d%% fbw%d fbf%d   ",
-                     vd1_wpct, vd1_fpct, fb_pk_starve, ftexd_trunc);
+            {   unsigned int wf = fb_win_frames ? fb_win_frames : 1;
+                unsigned int e10 = fb_tot_edge   * 10u / wf;   /* tenths of a tier PER FRAME */
+                unsigned int w10 = fb_tot_edge_w * 10u / wf;
+                unsigned int m10 = fb_tot_mag    * 10u / wf;
+                if (e10 > 999) e10 = 999;  if (w10 > 999) w10 = 999;  if (m10 > 999) m10 = 999;
+                snprintf(rVD, sizeof rVD, "VD1 w%d%% fbw%d fbf%d e%u.%u/%u.%u m%u.%u b%d%d%d%d ",
+                         vd1_wpct, fb_pk_starve, ftexd_trunc,
+                         e10 / 10, e10 % 10, w10 / 10, w10 % 10, m10 / 10, m10 % 10,
+                         fb_pk_edge_b[0], fb_pk_edge_b[1], fb_pk_edge_b[2], fb_pk_edge_b[3]);
+            }
+            (void)vd1_fpct;   /* f%% dropped from row 8 for width: it is the VDP1-floor tile fill of
+                                 the REMOVED M1-M3 plane modes, structurally 0 in M4/M7; fbf (the
+                                 truncation signal) still carries the only over-budget bit that matters */
             if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 8, rVD);
             /* row 5 (free): LINE-OF-SIGHT volume this ~1s window -- the game-tic (T, row 1) cost
                driver.  rej = P_CheckSight calls the REJECT table trivially rejected in O(1); walk =
@@ -3559,6 +3628,8 @@ extern "C" void DG_Init(void)
     /* Route one-sided (solid) walls to the VDP1 world renderer AND skip their
        software column draw -> see the VDP1 coverage + the perf it buys back. */
     sat_wall_hook = sat_wall_vdp1;
+    /* SATURN L5: the near-wall edge splitter (core asks which columns VDP1 will actually accept). */
+    sat_wall_edge_hook = sat_wall_edge_split;
     /* sat_wall_skip is owned by sat_apply_mode (M-gated: 1 in every mode but M0-software-walls). */
     /* kick VDP1 right after the BSP walk (parallel with the CPU floors/sprites) so the
        walls present the SAME frame as the framebuffer (no 1-frame lag / sky-at-the-seam). */
@@ -4457,6 +4528,82 @@ static void wall_emit_band(int x1, int x2, int yl1, int yh1, int yl2, int yh2,
             vdp1_cmd_at(VDP1_BANK[vdp1_wbank], vdp1_wnext++, cmd);
         }
     }
+}
+
+/* SATURN L5 -- NEAR-WALL EDGE SPLIT, platform half (core/r_segs.c sat_wall_try_edge is the caller).
+   Replay wall_emit_band's tile loop above and report the widest run of tiles it will ACCEPT, so the
+   core can keep only the REJECTED border columns on the CPU instead of dumping the whole wall there.
+   This lives here, next to the emitter, on purpose: the acceptance test IS the emitter's guard, and
+   duplicating it in core would let the two drift silently.
+   `why` on failure: 1 = LATERAL (the tile lands outside the view window +/- wall_ext) -- borders can
+   rescue that; 2 = MAGNITUDE (texw * magnification blows the 13-bit coordinate field) -- no
+   screen-space split can ever help, only a narrower baked sub-texture. */
+extern "C" int sat_wall_edge_split(int x1, int yl1, int yh1, int x2, int yl2, int yh2,
+                                   int u1, int u2, int texw,
+                                   int *oxL, int *oxR, int *ouL, int *ouR, int *why)
+{
+    extern int detailshift, viewwidth;
+    int vx = viewwindowx, vy = viewwindowy;
+    int X1 = (x1 << detailshift) + vx, X2 = (x2 << detailshift) + vx;
+    int vxr = vx + (viewwidth << detailshift) - 1;
+    int YL1 = yl1 + vy, YH1 = yh1 + vy, YL2 = yl2 + vy, YH2 = yh2 + vy;
+    int xspan = X2 - X1, du = u2 - u1;
+    int adu, sdu, inv_du, inv_xspan, ubase, uu1, uu2, umin, umax, ub;
+    int bestA = 0, bestB = 0, curA = 0, have = 0, run = 0;
+    int lateral = 0, magnitude = 0;
+    int xa, xb, xL, xR, uAtL, uAtR;
+
+    *why = 0;
+    if (xspan <= 0 || du == 0 || texw <= 1) return 0;
+    adu = (du < 0) ? -du : du; sdu = (du < 0) ? -1 : 1;
+    inv_du = wrecip(adu); inv_xspan = wrecip(xspan);
+    ubase = u1 & ~(texw - 1);
+    uu1 = u1 - ubase; uu2 = u2 - ubase;
+    umin = (uu1 < uu2) ? uu1 : uu2;
+    umax = (uu1 < uu2) ? uu2 : uu1;
+
+    for (ub = umin & ~(texw - 1); ub < umax; ub += texw)
+    {
+        int xs = X1 + WDIV((long long)(ub        - uu1) * xspan * sdu, adu, inv_du);
+        int xe = X1 + WDIV((long long)(ub + texw - uu1) * xspan * sdu, adu, inv_du);
+        int lo = (xs < xe) ? xs : xe, hi = (xs < xe) ? xe : xs;
+        int yls, yhs, yle, yhe, inwin, ok;
+        if (hi < X1 || lo > X2) continue;                  /* tile outside the visible range */
+        yls = YL1 + WDIV((long long)(YL2 - YL1) * (xs - X1), xspan, inv_xspan);
+        yhs = YH1 + WDIV((long long)(YH2 - YH1) * (xs - X1), xspan, inv_xspan);
+        yle = YL1 + WDIV((long long)(YL2 - YL1) * (xe - X1), xspan, inv_xspan);
+        yhe = YH1 + WDIV((long long)(YH2 - YH1) * (xe - X1), xspan, inv_xspan);
+        inwin = (lo >= vx - wall_ext && hi <= vxr + wall_ext);
+        ok = inwin && lo > -1000 && hi < 1000
+             && yls > -1000 && yls < 1000 && yhs > -1000 && yhs < 1000
+             && yle > -1000 && yle < 1000 && yhe > -1000 && yhe < 1000;
+        if (ok)
+        {
+            if (!run) { curA = ub; run = 1; }
+            if (!have || (ub + texw - curA) > (bestB - bestA))
+                { bestA = curA; bestB = ub + texw; have = 1; }
+        }
+        else
+        {
+            run = 0;
+            if (!inwin) lateral = 1; else magnitude = 1;
+        }
+    }
+    if (!have) { *why = lateral ? 1 : (magnitude ? 2 : 0); return 0; }
+
+    /* back to screen columns through the SAME linear map (interpolation between the anchors) */
+    xa = X1 + WDIV((long long)(bestA - uu1) * xspan * sdu, adu, inv_du);
+    xb = X1 + WDIV((long long)(bestB - uu1) * xspan * sdu, adu, inv_du);
+    xL = (xa < xb) ? xa : xb;  xR = (xa < xb) ? xb : xa;
+    uAtL = (xa < xb) ? bestA : bestB;
+    uAtR = (xa < xb) ? bestB : bestA;
+    if (xL < X1) xL = X1;
+    if (xR > X2) xR = X2;
+    *oxL = (xL - vx) >> detailshift;      /* back to the core's view-local column space */
+    *oxR = (xR - vx) >> detailshift;
+    *ouL = uAtL + ubase;
+    *ouR = uAtR + ubase;
+    return (*oxR > *oxL);
 }
 
 /* Emit a wall: split the visible texel range [v0,v1) into VERTICAL bands aligned to the texture
@@ -6376,11 +6523,33 @@ static void vdp1_wpn_kick(void)
             if (overran) { vdp1_budget_cmds = got / 4; vdp1_budget_clean = 0; }
             else if (vdp1_budget_cmds > 0 && ++vdp1_budget_clean >= THING_LP_CLEAN) {
                 if (vdp1_budget_cmds < WALL_CMD_CAP) vdp1_budget_cmds++;
-                vdp1_budget_clean = 0; } }
+                vdp1_budget_clean = 0; }
+            /* WEAPON GUARANTEE (closed loop).  The gun is the last world command, so the plot
+               reached it iff the list completed OR LOPR passed its slot.  This is the ONLY place
+               the guarantee is actually verified -- everything else is allocation policy. */
+            if (vdp1_wpn_slot_disp > 0)
+            {
+                if (!overran || (got / 4) >= vdp1_wpn_slot_disp)
+                {
+                    if (++vdp1_wpn_safe >= WPN_SAFE_DECAY)
+                    {   /* sustained headroom -> hand one command-equivalent back to the world */
+                        if (vdp1_wpn_reserve > WPN_RESERVE_MIN) vdp1_wpn_reserve--;
+                        vdp1_wpn_safe = 0;
+                    }
+                }
+                else
+                {   /* the gun was cut: shed things (then far walls) BEFORE it, starting next frame */
+                    vdp1_wpn_cut++;
+                    vdp1_wpn_safe = 0;
+                    vdp1_wpn_reserve += WPN_RESERVE_UP;
+                    if (vdp1_wpn_reserve > WPN_RESERVE_MAX) vdp1_wpn_reserve = WPN_RESERVE_MAX;
+                }
+            } }
         {   int u = 0; for (int i = 0; i < WTEX_SLOTS; ++i) if (wtex_cache[i].texnum >= 0) u++;
             vdp1_tx_used = u; }
     }
     vdp1_last_cmds = vdp1_wactive ? vdp1_wnext : 0;
+    vdp1_wpn_slot_disp = vdp1_wactive ? vdp1_wpn_slot_end : 0;   /* the list LOPR will report on next kick */
     vd1_wpct = WALL_CMD_CAP ? (vdp1_last_cmds * 100 / WALL_CMD_CAP) : 0;   /* wall command-budget fill % */
     /* Dr accumulation moved to the OnVblank sampler (vdp1_vblank_dr): per-KICK sampling ran
        once per GAME frame while 1-cycle-auto replots every VBLANK -> the rate aliased with
@@ -6395,6 +6564,20 @@ static void vdp1_wpn_kick(void)
     if (sat_fb_mag_t    > fb_pk_mag)    fb_pk_mag    = sat_fb_mag_t;
     if (sat_fb_starve_t > fb_pk_starve) fb_pk_starve = sat_fb_starve_t;
     if (sat_fb_px       > fb_pk_px)     fb_pk_px     = sat_fb_px;
+    if (sat_fb_edge_t   > fb_pk_edge)   fb_pk_edge   = sat_fb_edge_t;
+    if (sat_fb_edge_w   > fb_pk_edge_w) fb_pk_edge_w = sat_fb_edge_w;
+    fb_tot_edge   += (unsigned int)sat_fb_edge_t;    /* rate accumulators (see fb_win_frames) */
+    fb_tot_edge_w += (unsigned int)sat_fb_edge_w;
+    fb_tot_mag    += (unsigned int)sat_fb_mag_t;     /* the OTHER population: tiers dumped to
+                                                        SOFTWARE by the subdiv squish guard */
+    fb_win_frames++;
+    for (int _b = 0; _b < 4; _b++)
+    {
+        if (sat_fb_edge_b[_b] > fb_pk_edge_b[_b]) fb_pk_edge_b[_b] = sat_fb_edge_b[_b];
+        if (fb_pk_edge_b[_b] > 9) fb_pk_edge_b[_b] = 9;   /* one digit each on row 8 */
+        sat_fb_edge_b[_b] = 0;
+    }
+    sat_fb_edge_t = 0; sat_fb_edge_w = 0;
 #endif
     sat_fb_clamp_t = sat_fb_mag_t = sat_fb_starve_t = sat_fb_px = 0;   /* reset each frame (also when SHOW_FPS off) */
     sat_fb_wclamp_t = 0;
@@ -6517,25 +6700,25 @@ extern "C" void sat_walls_kick(void)
         }
         sat_vdp1_wpn_begin();       /* reset the bank + local-coord (walls flushed BETWEEN the copies) */
 #if SAT_WPN_VDP1
-        /* DOUBLE-EMIT the player weapon -- VDP1 has NO z-buffer: it rasterises every command into
-           ONE framebuffer in painter order, so where the gun and a wall overlap the LAST-drawn
-           command wins that pixel (its priority then only decides that pixel vs NBG1, it can't undo
-           an overwrite).  So "on top of the walls" needs the weapon drawn AFTER them -- but "after"
-           is the tail a HW 1-cycle-auto plot OVERRUN cuts (= the flicker: weapon drops, walls fine).
-           On-top and no-flicker are in direct tension, so we draw the weapon TWICE:
-             (1) FIRST, before the walls -> always in the plotted PREFIX, never fully flickers out;
-                 the walls (drawn after) overwrite it only where they OVERLAP.
-             (2) LAST, after the walls   -> redraws the overlap ON TOP.  If a plot overrun cuts (2),
-                 copy (1) still shows the weapon -- gun-top just reverts to behind-the-walls that
-                 frame.  Net: whole weapon ALWAYS visible; on top when the plot completes; only the
-                 gun/wall overlap goes behind-walls in dense overrun frames.
-           TODO (revisit): the clean fix is a VDP1 plot that always COMPLETES, so weapon-LAST alone
-           is on top + flicker-free.  The manual / draw-gated present is a SETTLED DEAD END here
-           (tried 4-5x, too many tradeoffs -- do NOT go back).  Find another route: shorten the wall
-           list, a VDP1 command/time budget, or an L2-relocated cmd buffer.
-           Emitted HERE (after the BSP walk, before the end-of-planes present -- the only pre-flip
-           window); sat_psprite_early makes R_DrawMasked skip the late software draw.  SPLIT fans out
-           per view (R_DrawSplitPlayerSprites).  sat_wall_skip gate -> M0 keeps the SOFTWARE weapon. */
+        /* SINGLE-EMIT the player weapon, LAST (owner 2026-07-31).  VDP1 has NO z-buffer: it
+           rasterises every command into ONE framebuffer in painter order, so where the gun overlaps
+           a wall or a monster the LAST-drawn command wins that pixel (priority only decides that
+           pixel vs NBG1, it cannot undo an overwrite).  "Gun above walls AND above monsters" is
+           therefore a HARD ordering requirement: walls -> things -> weapon -> HUD.
+           The old design drew the weapon TWICE (a copy before the walls as an anti-flicker prefix,
+           a copy after them for the on-top) because "after" is the tail a plot OVERRUN cuts.  That
+           traded a real cost for a hedge: the gun is a large sprite, so copy (1) paid its FULL fill
+           time every frame -- inside the very budget whose exhaustion it was insuring against.
+           Removing it gives that time back to the plot, which the LOPR budget re-probes upward on
+           its own (vdp1_budget_cmds drifts +1 / THING_LP_CLEAN clean frames).
+           "Always displayed" is no longer a hedge but a CLOSED LOOP: the weapon is the last world
+           command, so "did the plot reach it" is directly observable (LOPR >= its slot) instead of
+           inferred.  vdp1_wpn_slot_end records where it lands; vdp1_wpn_kick checks LOPR against the
+           DISPLAYED list's copy and grows vdp1_wpn_reserve when it was cut, so the next frame sheds
+           things/far walls BEFORE the gun.  See the reserve block below.
+           Emitted after the BSP walk, before the end-of-planes present (the only pre-flip window);
+           sat_psprite_early makes R_DrawMasked skip the late software draw.  SPLIT fans out per view
+           (R_DrawSplitPlayerSprites).  sat_wall_skip gate -> M0 keeps the SOFTWARE weapon. */
         auto sat_emit_weapon = [](void)
         {
             if (sat_psprite_early && !viewangleoffset && sat_wall_skip && !sat_wpn_soft)
@@ -6544,9 +6727,11 @@ extern "C" void sat_walls_kick(void)
                 extern void R_DrawSplitPlayerSprites(void);
                 if (sat_split_active) R_DrawSplitPlayerSprites();   /* per-view weapons */
                 else                  R_DrawPlayerSprites();
+                vdp1_wpn_slot_end = vdp1_wnext;   /* slot the plot must reach for a visible gun */
             }
+            else vdp1_wpn_slot_end = 0;   /* no VDP1 gun this frame (M0 / software weapon / side view)
+                                             -> nothing to guarantee; leave the reserve loop idle */
         };
-        sat_emit_weapon();   /* (1) FIRST -- anti-flicker prefix (weapon plotted before the walls) */
 #endif
 #if VDP1_WALL_TEST
         vdp1_walls_flush();         /* walls BETWEEN the two weapon copies */
@@ -6583,7 +6768,10 @@ extern "C" void sat_walls_kick(void)
             if (vdp1_budget_cmds > 0 && vdp1_budget_cmds < cap_cmds)
                 cap_cmds = vdp1_budget_cmds;                    /* measured TIME budget (usually tighter) */
 #endif
-            int room = cap_cmds - vdp1_wnext - THING_FLUSH_MARGIN;
+            /* vdp1_wpn_reserve is withheld FIRST: the gun is emitted after the things, so anything
+               the things allocate here is spent ahead of it in the plot.  THING_FLUSH_MARGIN keeps
+               its SLOTS free; the reserve keeps its plot TIME free (the resource that actually cuts). */
+            int room = cap_cmds - vdp1_wnext - THING_FLUSH_MARGIN - vdp1_wpn_reserve;
             int budget_cap = (room > 0) ? (room >> 1) : 0;      /* ~2 VDP1 cmds per emitted thing */
             if (budget_cap > THING_ADAPT_MAX) budget_cap = THING_ADAPT_MAX;
             if (sat_thing_emit_cap < budget_cap)      sat_thing_emit_cap += 2;         /* smooth ramp up */
@@ -6595,7 +6783,7 @@ extern "C" void sat_walls_kick(void)
                VDP1 budget (room for things <= trigger), AND the master (software) has room to take them.
                Lower the span -> more near walls -> software (CPU), freeing VDP1; relax back to the core
                default when VDP1 fits again OR the master is saturated (never worsen decrochage). */
-            {   int room_for_things = cap_cmds - vdp1_wnext;    /* commands left after the walls */
+            {   int room_for_things = cap_cmds - vdp1_wnext - vdp1_wpn_reserve;  /* left after walls + gun */
                 int master_ok = (rp_master_ms > 0 && rp_master_ms < SOFT_BUDGET_MS);
                 if (vdp1_budget_cmds > 0 && room_for_things <= WALL_LOD_TRIGGER && master_ok) {
                     if (sat_wall_cpu_span > WALL_SPAN_MIN)         sat_wall_cpu_span -= WALL_SPAN_STEP;
@@ -6617,7 +6805,7 @@ extern "C" void sat_walls_kick(void)
                the nearest-first rank keeps the monsters you are fighting crisp on VDP1. */
             int nv = sat_local_players;                  /* sat_split_active is true here */
             if (nv < 1) nv = 1; else if (nv > 4) nv = 4;
-            int room = vdp1_wall_cap - vdp1_wnext - THING_FLUSH_MARGIN;
+            int room = vdp1_wall_cap - vdp1_wnext - THING_FLUSH_MARGIN - vdp1_wpn_reserve;
             int budget_cap = (room > 0) ? (room / (2 * nv)) : 0;   /* per-view slots (~2 cmds/thing) */
             if (budget_cap > THING_ADAPT_MAX) budget_cap = THING_ADAPT_MAX;
             if (sat_thing_emit_cap < budget_cap)      sat_thing_emit_cap += 2;         /* smooth ramp up */
@@ -6636,7 +6824,7 @@ extern "C" void sat_walls_kick(void)
         else                  R_EmitWorldThingsVDP1();
 #endif
 #if SAT_WPN_VDP1
-        sat_emit_weapon();          /* (2) LAST  -- on top of the walls when the plot completes */
+        sat_emit_weapon();          /* LAST world command -- above the walls AND above the monsters */
 #endif
         vdp1_hud_emit();            /* (3) status bar ON TOP of the weapon (1p; prev frame's capture) */
         vdp1_hud_msg_emit();        /* (4) HU message glyphs, crisp over the view (lowres only) */
@@ -7605,9 +7793,11 @@ static void poll_pad(void)
        (core sat_opt, defined + fully documented in core/r_segs.c).
          0 = all off (the 2026-07-29 reference)   1 = +L1 span fill (r_plane.c)
          2 = +L2 clip-scan hoist (r_segs.c)       3 = +L3 SAT_VROWS reciprocal hoist (r_segs.c)
-         4 = +L4 wall subdivision cap 6->3 (r_segs.c) -- the ONLY step that changes pixels.
-       Levels 1-3 are byte-identical to 0, so any fps delta they show is pure cost, not quality.
-       Default 4.  This chord REPLACES the removed sat_m7_slave level cycle (the M7 slave stack is
+         4 = +L4 wall subdivision cap 6->3        5 = +L5 near-wall CPU-borders/VDP1-core split
+       Levels 1-3 are byte-identical to 0, so any fps delta they show is pure cost, not quality;
+       4 and 5 change pixels.  L5 targets the ~22ms nose-to-wall Bp: watch row-2 `Bp` AND row-8 `e`
+       (tiers actually split -- `e0` means it never engaged, so a flat Bp says nothing).
+       Default 5.  This chord REPLACES the removed sat_m7_slave level cycle (the M7 slave stack is
        now hard-wired ON, HW-validated).  Same posture rule as before: C is the RUN button and "both
        shoulders released" is the default play stance, so the chord needs a deliberate strafe-hold and
        cannot fire from neutral.  1p-gated: in split, L+C stays the hwsky toggle (inert in 1p).
@@ -7615,7 +7805,7 @@ static void poll_pad(void)
        L2/L3 must move Bp, L4 moves Bp + row-8 `VD1 w%`. */
     if (sat_local_players <= 1 && !(cur & PER_DGT_TL) && (cur & PER_DGT_TR)   /* L held, R released, 1p */
         && (changed & PER_DGT_TC) && !(cur & PER_DGT_TC))
-        sat_opt = (sat_opt + 1) % 5;                                         /* 0->1->2->3->4->0 */
+        sat_opt = (sat_opt + 1) % 6;                                    /* 0->1->2->3->4->5->0 */
 #if SAT_FLOOR_TEX
     /* Pad R+X: DEPORT-PREVIEW perf-sim (freed by the nearSprites bake).  Dry-runs M5's convex-exact
        classifier over every secondary plane WITHOUT emitting VDP1: deportable planes show BACKDROP

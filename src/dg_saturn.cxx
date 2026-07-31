@@ -4409,6 +4409,11 @@ static inline int wrmul_(long long num, int recip)   /* ~= num/den, rounded, sig
 #define WDIV(numP, denP, recip)  ((int)((long long)(numP) / (denP)))
 #endif
 
+/* 0 = texture-EXACT quad (default); 1 = legacy 1px top/bottom grow that closed vertical seams at
+   the cost of misaligning the texture against the software renderer (see the quad emission below).
+   Flat/untextured quads (wall_emit_flat) keep their grow unconditionally -- no texels to shift. */
+static int sat_wall_grow = 0;
+
 static void wall_emit_band(int x1, int x2, int yl1, int yh1, int yl2, int yh2,
                            int u1, int u2, int texw,
                            unsigned short charAddr, unsigned short charSize, unsigned short colr,
@@ -4490,16 +4495,30 @@ static void wall_emit_band(int x1, int x2, int yl1, int yh1, int yl2, int yh2,
                no black.  The old clamp trimmed the texel with a SINGLE cut from one corner, which on a
                sloped-top tile (yls != yle) squished the texture AND left a black wedge under the clamped
                edge at the wall/screen-edge.  Full-quad + system-clip is the fix (overdraw = idle fill). */
-            /* grow the quad 1px top+bottom -> close vertical seams; the overspill into the
-               (software NBG1) floor/ceiling is hidden by the layer inversion. */
+            /* VERTICAL GEOMETRY vs TEXTURE ALIGNMENT (owner 2026-07-31: "les textures des murs
+               software / vdp1 ne sont pas alignees").  This quad used to be grown 1px top AND
+               bottom to close vertical seams -- but DISTORSP maps the WHOLE character corner to
+               corner, so growing the vertices without being able to grow the character stretches
+               `rows` texels over (span + 2) screen rows and shifts them up one row.  The resulting
+               error is 0 at the band centre and 1 SCREEN PIXEL at each band edge -- which is
+               rows/span TEXELS.  Near walls (span ~200, rows 128) barely notice it; a FAR wall
+               (span ~20) misaligns by ~6 texels, and it repeats at EVERY texture-height band down
+               the wall.  Software draws the same texture with the exact mapping, so a VDP1 wall and
+               a software wall side by side visibly disagree -- worse the further away they are.
+               Exact seam closure with an exact mapping is IMPOSSIBLE in one quad: 1 screen row
+               corresponds to rows/span texels, never a whole texel, so the character cannot be
+               extended to match a grown vertex.  The choice is real, so it is now explicit and the
+               default favours the mapping: sat_wall_grow 0 = texture-exact (adjacent v-bands still
+               abut exactly by construction -- band k's yh1b IS band k+1's yl1b), 1 = the legacy
+               grow if a 1px seam against the software floor/ceiling turns out to be worse. */
             memset(cmd, 0, sizeof cmd);
             cmd[0] = 0x0002; cmd[2] = 0x04E0;  /* DISTORSP | Window_In | COLOR_4 8bpp | SPD | ECD-off */
             cmd[3] = colr;                                 /* CMDCOLR = CRAM light-bank base */
             cmd[4] = charAddr; cmd[5] = charSize;
-            cmd[6]  = (short)xs; cmd[7]  = (short)(yls - 1);   /* A col0  top */
-            cmd[8]  = (short)xe; cmd[9]  = (short)(yle - 1);   /* B colW  top */
-            cmd[10] = (short)xe; cmd[11] = (short)(yhe + 1);   /* C colW  bot */
-            cmd[12] = (short)xs; cmd[13] = (short)(yhs + 1);   /* D col0  bot */
+            cmd[6]  = (short)xs; cmd[7]  = (short)(yls - sat_wall_grow);   /* A col0  top */
+            cmd[8]  = (short)xe; cmd[9]  = (short)(yle - sat_wall_grow);   /* B colW  top */
+            cmd[10] = (short)xe; cmd[11] = (short)(yhe + sat_wall_grow);   /* C colW  bot */
+            cmd[12] = (short)xs; cmd[13] = (short)(yhs + sat_wall_grow);   /* D col0  bot */
             vdp1_cmd_at(VDP1_BANK[vdp1_wbank], vdp1_wnext++, cmd);
         }
         else                                             /* grazing -> clamp + squish */

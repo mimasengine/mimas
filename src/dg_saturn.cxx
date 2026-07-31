@@ -1647,7 +1647,9 @@ static int sat_things_n = 0, sat_things_decl = 0, thing_bake_n = 0;   /* 'th' em
 
 #if SHOW_FPS
 extern "C" int rp_timeout_count;
+extern "C" int rp_to_site[4];            /* core r_parallel.c: per-wait-site timeout split A/P/M/W */
 extern "C" unsigned int rp_master_ms;   /* master frame ms -> prefixes r_parallel.c's row-18 SLV line */
+extern "C" int sat_opt;                  /* core r_segs.c: cumulative perf-lever level L1..L4 (pad L+C) */
 static unsigned int dg_frame_count = 0;
 static int vdp1_last_cmds = 0;
 /* VDP1 transfer-over meter (SEGA VDP1 UM p.52-53).  The real flicker signal: did the plot finish the
@@ -1918,9 +1920,22 @@ static void fps_update(void)
            mode0<->mode1 fps delta measures the overlay's own per-frame tax. */
         unsigned int mst = inst10 ? (10000u / inst10) : 0u;
         static char r0[45];
-        sprintf(r0, "%u.%ufps a%u.%u MST%u to%d cd%d ld%d/%d ",
+        /* SATURN 2026-07-31: `to` used to be ONE never-reset aggregate over five wait sites, so it
+           could not distinguish a level-load burst from a steady leak, nor say WHICH wait failed --
+           it could not support any conclusion.  Now `to<rate>:<A><P><M><W>`: rate = timeouts in THIS
+           ~1s window (the number that actually matters), then the cumulative per-site split --
+           A=aux/clear-on-slave, P=plane-split, M=masked-split, W=wall-prep(+1p-dead REC).  Digits are
+           clamped to 9 to hold the ~40-column line (a 3-digit MST may clip the trailing ld field). */
+        static int to_prev = 0;
+        int to_rate = rp_timeout_count - to_prev;
+        to_prev = rp_timeout_count;
+        if (to_rate > 9) to_rate = 9;
+        sprintf(r0, "%u.%ufps a%u.%u MST%u to%d:%d%d%d%d cd%d ld%d/%d ",
                 inst10 / 10, inst10 % 10, avg10 / 10, avg10 % 10,
-                mst, rp_timeout_count, sat_cd_read_retries, sat_cd_loads, sat_cd_persector);
+                mst, to_rate,
+                rp_to_site[0] > 9 ? 9 : rp_to_site[0], rp_to_site[1] > 9 ? 9 : rp_to_site[1],
+                rp_to_site[2] > 9 ? 9 : rp_to_site[2], rp_to_site[3] > 9 ? 9 : rp_to_site[3],
+                sat_cd_read_retries, sat_cd_loads, sat_cd_persector);
         if (sat_dbg_overlay_mode != 2) SRL::Debug::Print(0, 0, r0);
         /* row 1: MASTER-FRAME COMPOSITION, window-AVERAGED over this 1s tick (ms) -- so a single
            heavy frame is never read as the general case (percentiles are on row 3).  Decomposes MST:
@@ -2112,12 +2127,12 @@ static void fps_update(void)
                Walls untouched (wall LD is what DRIVES detailshift). */
             { extern int detailshift;
               if (detailshift) { if (sqf==SQ_LD) sqf=SQ_FULL; if (sqc==SQ_LD) sqc=SQ_FULL; if (sqs==SQ_LD) sqs=SQ_FULL; } }
-            static char r7[40];
-            snprintf(r7, sizeof r7, "M%d %s ms%d pm%d SQ:%c%c%c%c cs%dns%d lr%d",
+            static char r7[44];
+            snprintf(r7, sizeof r7, "M%d %s ms%d pm%d SQ:%c%c%c%c cs%dns%d lr%d/o%d",
                      sat_m, sat_m_name[sat_m], sat_mark_suppress,
                      sat_plane_tas,
                      sqch[sqw & 3], sqch[sqf & 3], sqch[sqc & 3], sqch[sqs & 3],
-                     sat_clear_slave, sat_near_sprites, sat_lowres);
+                     sat_clear_slave, sat_near_sprites, sat_lowres, sat_opt);   /* /o = perf-lever level 0-4 (pad L+C) */
             if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 7, r7);
             /* row 8: RELIABLE VDP1 load (replaces the CEF-aliased Dr%).  w%/f% = wall/floor
                command-budget FILL % (100% = bank full, further surfaces spill to CPU); fbw = walls
@@ -7272,7 +7287,10 @@ extern "C" void DG_DrawFrame(void)
            ds=1.4e9 -> HARD FREEZE on real HW, Ymir-clean; toggling sat_clear_slave OFF via R+C launched
            the level).  Clear on the MASTER in lowres (M4/M6 keep the slave-clear win); the ~2-3ms cost
            is on the packed M7 frame only.  [[clear-slave-nearsprites-aimd-shipped]] listed this risk. */
-        if (sat_clear_slave && gamestate == GS_LEVEL && !sat_lowres && sat_local_players <= 1) {
+        if (sat_clear_slave && gamestate == GS_LEVEL && sat_local_players <= 1) {
+            /* SATURN M7 2026-07-30: the `!sat_lowres` hard-off is GONE -- the plane-split now runs in M7
+               (r_plane.c), which restores exactly the TAS-sync coverage whose ABSENCE (slave-idle M7, no
+               plane-split) was blamed for the ds_p .bss stomp above.  HW-validated as the default. */
             /* SATURN 2026-07-20 (freeze fix, cont.): ALSO require single-player.  The same New-Game-into-
                coop race that now skips the plane-split (r_plane.c) leaves the slave IDLE during a
                sat_lowres=0 split frame -- so a clear-slave dispatch here would hit the very r_bsp .bss
@@ -7583,6 +7601,21 @@ static void poll_pad(void)
     if (!(cur & PER_DGT_TR) && (cur & PER_DGT_TL)                 /* R held, L released */
         && (changed & PER_DGT_TC) && !(cur & PER_DGT_TC))
         sat_clear_slave ^= 1;
+    /* Pad L+C (L held, R released, 1p only): cycle the CUMULATIVE perf-lever level 0->1->2->3->4->0
+       (core sat_opt, defined + fully documented in core/r_segs.c).
+         0 = all off (the 2026-07-29 reference)   1 = +L1 span fill (r_plane.c)
+         2 = +L2 clip-scan hoist (r_segs.c)       3 = +L3 SAT_VROWS reciprocal hoist (r_segs.c)
+         4 = +L4 wall subdivision cap 6->3 (r_segs.c) -- the ONLY step that changes pixels.
+       Levels 1-3 are byte-identical to 0, so any fps delta they show is pure cost, not quality.
+       Default 4.  This chord REPLACES the removed sat_m7_slave level cycle (the M7 slave stack is
+       now hard-wired ON, HW-validated).  Same posture rule as before: C is the RUN button and "both
+       shoulders released" is the default play stance, so the chord needs a deliberate strafe-hold and
+       cannot fire from neutral.  1p-gated: in split, L+C stays the hwsky toggle (inert in 1p).
+       Row 7 shows /o<lvl>.  Compare row-1 `R` and row-2 `Bw Bp P M` between levels -- L1 must move P,
+       L2/L3 must move Bp, L4 moves Bp + row-8 `VD1 w%`. */
+    if (sat_local_players <= 1 && !(cur & PER_DGT_TL) && (cur & PER_DGT_TR)   /* L held, R released, 1p */
+        && (changed & PER_DGT_TC) && !(cur & PER_DGT_TC))
+        sat_opt = (sat_opt + 1) % 5;                                         /* 0->1->2->3->4->0 */
 #if SAT_FLOOR_TEX
     /* Pad R+X: DEPORT-PREVIEW perf-sim (freed by the nearSprites bake).  Dry-runs M5's convex-exact
        classifier over every secondary plane WITHOUT emitting VDP1: deportable planes show BACKDROP

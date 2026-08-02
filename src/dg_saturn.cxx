@@ -1833,13 +1833,48 @@ extern "C" int sat_fb_clamp_t, sat_fb_mag_t, sat_fb_starve_t, sat_fb_px;
 extern "C" int sat_fb_edge_t;     /* L5: tiers saved by the CPU-borders/VDP1-core near-wall split */
 extern "C" int sat_fb_edge_w;     /* L5: tiers that ASKED for the split (the denominator)          */
 extern "C" int sat_fb_edge_b[4];  /* L5 bail causes: lateral / magnitude / too-thin / refused      */
-static int fb_pk_edge = 0, fb_pk_edge_w = 0, fb_pk_edge_b[4] = {0,0,0,0};
-/* RATES, not peaks (owner 2026-07-31: "je n'arrive pas a saisir les moments ou e monte, c'est trop
-   rare pour prendre des captures").  A peak says only "it happened once in this window" and forces
-   the reader to CATCH the event with a camera; a per-frame rate is stationary -- walk the level and
-   read a stable number.  Rarity then reads directly off the number instead of off a failed capture:
-   an `e` rate near 0 IS the verdict that the lever cannot pay, no lucky screenshot required. */
-static unsigned int fb_tot_edge = 0, fb_tot_edge_w = 0, fb_tot_mag = 0, fb_win_frames = 0;
+/* The L5 RATE instrumentation (row-8 `e<r>/<r> m<r> b<L><M><T><R>`) is REMOVED -- it delivered its
+   verdict and the pool needed the bytes back for the wall-lag band.  What it established, so nobody
+   rebuilds it: over ~5700 frames the split was REQUESTED 0.1x per frame and taken ~0 times, and the
+   alternative population (subdiv squish-guard software dumps, `m`) was ~0 too.  L5 therefore cannot
+   move the average by construction; it only ever targeted the nose-to-wall Bp spike, and that A/B
+   (/o4 vs /o5 with the nose on a wall, reading row-2 Bp) is still the only thing that can decide its
+   fate.  The core counters stay -- they cost one increment and are the hook to re-measure from. */
+/* The LAG vblank probe (r/v/@site/px) is REMOVED -- it had done its job and the TLSF pool went under
+   its 4 KB floor.  What it established, so nobody rebuilds it: all three display commits land in the
+   same field (`r0 v0@1`), so the residual trail is NOT a commit-timing or frame-vs-field-beat
+   problem; the vblank fence that followed from that theory changed nothing but the frame rate and is
+   removed too.  The remaining lag is VDP1's own plot latency, which is irreducible.  See
+   [[m7-vdp1-latency-coherent-pair-hold]]. */
+/* VDP1 YAW ANTICIPATION IS REMOVED -- four HW rejections, so nobody rebuilds it.  Pre-shifting the
+   VDP1 world layer by a predicted frame of yaw was tried as (a) a whole-layer LocalCoord translation,
+   (b) the same applied to wall_acc so the per-wall UserClip window followed, (c) a per-corner
+   re-projection through xtoviewangle[]/viewangletox[] so the quad STRETCHED instead of sliding.
+   The owner's verdict on the last one: "tout a l'air d'empirer par rapport a g0", and on the
+   symmetric gains before it: g-4/g+4 indistinguishable, g-8/g+8 both clearly worse.  A displacement
+   model that is right about the sign has to improve one direction; symmetric worsening at every
+   amplitude means the walls are not DISPLACED.  What replaces it is core/r_segs.c's entry coverage:
+   a wall that just came into view is drawn by the CPU for its first frames, because on that frame
+   the VDP1 quad is not in the wrong place -- it is not on screen at all. */
+extern "C" int sat_wall_entry;    /* core r_segs.c: CPU frames covering a newly-visible VDP1 wall */
+extern "C" int sat_seg_frame;     /* core r_segs.c: per-seg visit tag, advanced once per frame here */
+static int sat_field_lock = 1;    /* 1 = fence the blit to a vblank edge -> the game loop phase-locks
+                                     to the field rate and the VDP1-vs-software BEAT stops (see the
+                                     fence in DG_DrawFrame).  Costs fps quantisation.
+                                     The second (VDP1-age) mode is REMOVED -- measured to change
+                                     nothing, see the fence. */
+static int sat_field_n    = 0;    /* fields the last locked frame occupied -- row-13 readback.  MUST
+                                     be STEADY: a value flipping N/N+1 means the frame sits on a
+                                     field boundary and the beat is back, coarser (judder). */
+static void sat_field_fence(void);   /* defined next to the long note in DG_DrawFrame */
+/* px the VDP1 wall quad is grown top/bottom.  0 = texture-EXACT (default): DISTORSP maps the WHOLE
+   character corner to corner, so moving the vertices without changing the character stretches the
+   texture -- grow*rows/span texels of error at the band edges, worst on FAR walls.  1/2 = the legacy
+   grow, live on pad L+Up.  DEFAULT 2 (owner 2026-08-02: "wg2 ferme les trous existants a l'arret"):
+   since the MATELAS the character grows with the quad, so the mapping is exact wherever the pad
+   covers it and degrades to the old stretch only where it cannot -- the seam is worth more than the
+   residual.  Flat/untextured quads (wall_emit_flat) keep their own grow -- no texels to shift. */
+static int sat_wall_grow = 2;
 extern "C" int sat_fb_wclamp_t;   /* Phase-1: tiers KEPT on VDP1 by the cut+wedge clamp */
 static int fb_cur_clamp = 0, fb_cur_mag = 0, fb_cur_px = 0;             /* last rendered frame */
 static int fb_cur_wclamp = 0;
@@ -1906,7 +1941,7 @@ static void fps_update(void)
            so each A/B run starts a clean min/avg/max window -- no manual button needed
            (the pad is already saturated: Y=SQ X=split Z=mode-M L+A=blit). */
         {
-            static int l_map=-1, l_m=-1, l_sq=-1, l_blit=-1, l_ms=-1, l_cls=-1, l_ns=-1, l_opt=-1;
+            static int l_map=-1, l_m=-1, l_sq=-1, l_blit=-1, l_ms=-1, l_cls=-1, l_ns=-1, l_opt=-1, l_wen=-1, l_wb=-1;
 #if SAT_FLOOR_PERFSIM
             static int l_perfsim=-1;   /* reset the REC window on a pad-Y perf-sim toggle => clean per-mode numbers */
 #endif
@@ -1919,6 +1954,10 @@ static void fps_update(void)
                 || sat_opt != l_opt          /* pad L+C: the perf-lever ladder IS an A/B -> flush the
                                                 profiler + every windowed peak, else /o4 vs /o5 is read
                                                 through numbers latched before the switch */
+                || sat_wall_entry != l_wen   /* pad L+Left/Right: entry coverage costs software columns,
+                                                so En0 vs En1 must be read on a clean Bp window too */
+                || sat_wall_grow != l_wb    /* pad L+Up: the grow adds VDP1 fill -> read its cost on
+                                               a clean window as well */
 #if SAT_FLOOR_PERFSIM
                 || floor_perfsim_mode != l_perfsim
 #endif
@@ -1928,13 +1967,10 @@ static void fps_update(void)
                ) {
                 RP_ProfReset();
                 vd1_win_done = vd1_win_tot = 0;
-                fb_pk_clamp = fb_pk_mag = fb_pk_starve = fb_pk_px = fb_pk_edge = 0;   /* Phase-0: clean fallback A/B window */
-                fb_pk_edge_w = 0;
-                fb_pk_edge_b[0] = fb_pk_edge_b[1] = fb_pk_edge_b[2] = fb_pk_edge_b[3] = 0;
-                fb_tot_edge = fb_tot_edge_w = fb_tot_mag = fb_win_frames = 0;   /* fresh rate window */
+                fb_pk_clamp = fb_pk_mag = fb_pk_starve = fb_pk_px = 0;   /* Phase-0: clean fallback A/B window */
                 blit10_sum = blit10_cnt = 0;   /* row-1 'b' precise window: fresh sample on the L+A toggle */
                 l_map=gamemap; l_m=sat_m; l_sq=(sq_wall<<6|sq_sprite<<4|sq_floor<<2|sq_ceil); l_blit=blit_mode; l_ms=sat_mark_suppress;
-                l_cls=sat_clear_slave; l_ns=sat_near_sprites; l_opt=sat_opt;
+                l_cls=sat_clear_slave; l_ns=sat_near_sprites; l_opt=sat_opt; l_wen=sat_wall_entry; l_wb=sat_wall_grow;
 #if SAT_FLOOR_PERFSIM
                 l_perfsim=floor_perfsim_mode;
 #endif
@@ -2197,16 +2233,8 @@ static void fps_update(void)
                (floor-clearance proof / bank full).  The rate window resets with the profiler, so
                changing /o (pad L+C) starts a clean count for the A/B. */
             static char rVD[45];
-            {   unsigned int wf = fb_win_frames ? fb_win_frames : 1;
-                unsigned int e10 = fb_tot_edge   * 10u / wf;   /* tenths of a tier PER FRAME */
-                unsigned int w10 = fb_tot_edge_w * 10u / wf;
-                unsigned int m10 = fb_tot_mag    * 10u / wf;
-                if (e10 > 999) e10 = 999;  if (w10 > 999) w10 = 999;  if (m10 > 999) m10 = 999;
-                snprintf(rVD, sizeof rVD, "VD1 w%d%% fbw%d fbf%d e%u.%u/%u.%u m%u.%u b%d%d%d%d ",
-                         vd1_wpct, fb_pk_starve, ftexd_trunc,
-                         e10 / 10, e10 % 10, w10 / 10, w10 % 10, m10 / 10, m10 % 10,
-                         fb_pk_edge_b[0], fb_pk_edge_b[1], fb_pk_edge_b[2], fb_pk_edge_b[3]);
-            }
+            snprintf(rVD, sizeof rVD, "VD1 w%d%% fbw%d fbf%d fbm%d ",
+                     vd1_wpct, fb_pk_starve, ftexd_trunc, fb_pk_mag);
             (void)vd1_fpct;   /* f%% dropped from row 8 for width: it is the VDP1-floor tile fill of
                                  the REMOVED M1-M3 plane modes, structurally 0 in M4/M7; fbf (the
                                  truncation signal) still carries the only over-budget bit that matters */
@@ -2223,7 +2251,16 @@ static void fps_update(void)
             int d_sc1 = sightcounts[1] - l_sc1;
             l_sc0 = sightcounts[0]; l_sc1 = sightcounts[1];
             static char rLOS[45];
-            snprintf(rLOS, sizeof rLOS, "LOS rej%d walk%d /win        ", d_sc0, d_sc1);
+            /* En = CPU frames covering a newly-visible VDP1 wall (core sat_wall_entry, pad L+Left/
+               L+Right, 1p).  En0 = off = the pre-2026-08-02 behaviour, where a wall entering the
+               view is drawn by nobody on its first frame and shows sky.  Raising it trades a few
+               software columns on the walls that just appeared for that hole. */
+            /* Wg = VDP1 WALL GROW px (pad L+Up) -- the quad grows by Wg screen px and its character
+               by the matching texels (the matelas), so the seam closes without the texture slipping.
+               Fl = field lock on/off, then the fields the last locked frame occupied. */
+            snprintf(rLOS, sizeof rLOS, "LOS r%d w%d En%d Wg%d Fl%d/%d ",
+                     d_sc0, d_sc1, sat_wall_entry, sat_wall_grow,
+                     sat_field_lock, sat_field_n);
             /* row 13: was row 5, but r_parallel's SLVidle ('SLV') p3 row ALSO writes row 5 in
                the shipping (rp_disabled) config -> they collided.  Moved to the free row 13. */
             if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 13, rLOS);
@@ -2444,6 +2481,43 @@ static void fps_update(void)
    so this needs no slSynch.  Phase-0 = OneAxis (flat, NO coefficient table): a plain
    translate places the plane; perspective (slRotX + a TwoAxis K-table) is Phase-1.
    Mirrors the working SRL sample's SetCurrentTransform (Samples/VDP2 - RBG0 Rotation). */
+/* SATURN M7 ROTATION DECROCHAGE (2026-07-31).  The RPT->VRAM copy, split out of DG_DrawFrame so it
+   can run AFTER the framebuffer blit instead of before it.
+   WHY: M7 added a THIRD display party.  Before it there were two (VDP1 walls + NBG1 software) and
+   the old anticipation (sat_plane_border, r_main.c) covered their offset.  Now the DOMINANT FLOOR
+   lives on RBG0, and its view angle reaches the hardware through this table.  The copy used to sit
+   right after rbg0_set_transform(), i.e. ~250 lines and one full software blit BEFORE the NBG1
+   picture that must line up with it -- and an M7 frame is 25-40 ms, so at least one vblank falls in
+   between.  The hardware floor therefore adopted the new angle up to a FIELD earlier than the
+   ceilings and walls drawn for that same angle: the wall/floor junction slides while turning.
+   Deferring the copy puts the table and the framebuffer on the same side of the blit, so both go
+   live together.  rbg0_rpt_late = 0 restores the old timing (no pad chord -- the free ones are
+   spoken for; say the word and I will wire one for a live A/B). */
+static int rbg0_rpt_late    = 1;   /* 1 = copy the RPT after the blit (decrochage fix) */
+static int rbg0_rpt_pending = 0;   /* set when the frame owes a deferred copy           */
+
+/* (vdp1_flip_late REMOVED 2026-08-02 -- it was permanently 0 and the pool needed the bytes.  The
+   lesson it recorded, so nobody re-adds it: VDP1 needs the OPPOSITE treatment from RBG0.  RBG0's
+   table is a register-side commit -- written late, live at once, so deferring it to the blit aligned
+   it (measured, `r0`).  VDP1's list must be PLOTTED for a field before the hardware shows it, while
+   the NBG1 blit writes displayed VRAM and appears immediately: VDP1 is structurally BEHIND and needs
+   LEAD, not delay.  That is why the original design kicked the walls right after the BSP walk, and
+   why the present now happens at the kick -- see vdp1_wpn_kick.) */
+
+/* (the M7 rotation-decrochage probe statics live up with the other overlay counters -- see LAG) */
+
+#if RBG0_RPT_TRANSFER == 2
+/* Reproduce _BlankIn's RPT DMA (no slSynch).  Source = SGL's RAM RPT buffer through the UNCACHED
+   0x26 alias, so slScrMatSet's cached stores are seen.  RA = the FULL XST..KY block (0x54) written
+   by slScrMatSet, stopping BEFORE KAST (the coefficient-table address is set once by slKtableRA);
+   RB (unused until dual-param) rides +0x68 so it never strays into B1's map when the RPT is in A0. */
+static void rbg0_rpt_to_vram(void)
+{
+    memcpy(rbg0_rpt_vram,                          (const void *)0x260FFE1C, 0x54);
+    memcpy((void *)((char *)rbg0_rpt_vram + 0x68), (const void *)0x260FFE84, 0x30);
+}
+#endif
+
 static void rbg0_set_transform(void)
 {
     /* Mode-7 GROUND matrix: rotate the plane 90deg about X so it
@@ -4040,9 +4114,15 @@ static int vdp1_wall_cap = WALL_CMD_CAP;
    live full-bright PLAYPAL, banks 2..7 = the PLAYPAL pre-shaded by 6 colormap levels.  So a wall
    texel idx -> CRAM[bank*256+idx] = the EXACT (multiplicative) colormap colour, matching the
    software floors/sprites; flash re-tints the banks in CRAM (see wtex_rebuild_banks). */
-static struct { int texnum; unsigned int addr, cap; short padW, H;
+/* vpad = rows of VERTICAL PADDING baked above AND below the texture in this slot (the "matelas").
+   Doom textures tile vertically, so the pad rows are copies of the opposite edge: row -1 IS row
+   H-1.  They exist so a quad grown for the seam can grow its CHARACTER by the matching number of
+   texels and keep the mapping EXACT -- see wall_emit.  0 when the padded bake would not fit the
+   slot (a texture that exactly fills its 16KB/32KB slot); such a texture simply never grows. */
+static struct { int texnum; unsigned int addr, cap; short padW, H, vpad;
                 unsigned int lru; unsigned char locked; }
                 wtex_cache[WTEX_SLOTS];
+#define WTEX_VPAD 2   /* rows each side; also the largest sat_wall_grow that can stay exact */
 static unsigned int wtex_tick;     /* per-frame monotonic clock for LRU */
 
 /* Per-wall light = a CRAM bank.  Bank 1 = full bright (= NBG1 PLAYPAL); the 6 dark banks 2..7
@@ -4241,8 +4321,10 @@ extern "C" int sat_wall_vdp1(int x1, int yl1, int yh1, int x2, int yl2, int yh2,
     int i = wall_acc_n++;
     /* low-detail: x arrives as the HALVED column (0..viewwidth-1); the framebuffer is full width,
        so screen x = vx + (x<<detailshift).  detailshift==0 (1p / hi-detail) => byte-identical. */
-    wall_acc[i].x1 = (short)((x1 << detailshift) + vx); wall_acc[i].yl1 = (short)(yl1 + vy); wall_acc[i].yh1 = (short)(yh1 + vy);
-    wall_acc[i].x2 = (short)((x2 << detailshift) + vx); wall_acc[i].yl2 = (short)(yl2 + vy); wall_acc[i].yh2 = (short)(yh2 + vy);
+    {
+        wall_acc[i].x1 = (short)((x1 << detailshift) + vx); wall_acc[i].yl1 = (short)(yl1 + vy); wall_acc[i].yh1 = (short)(yh1 + vy);
+        wall_acc[i].x2 = (short)((x2 << detailshift) + vx); wall_acc[i].yl2 = (short)(yl2 + vy); wall_acc[i].yh2 = (short)(yh2 + vy);
+    }
     wall_acc[i].texnum = texnum; wall_acc[i].u1 = u1; wall_acc[i].u2 = u2;
     wall_acc[i].v0 = (short)v0; wall_acc[i].v1 = (short)v1; wall_acc[i].cmap = cmap;
     wall_acc[i].vx  = (short)vx;
@@ -4288,8 +4370,20 @@ static int wall_tex_resolve(int texnum, const unsigned char *cmap)
     int H = textureheight[texnum] >> 16;                /* fixed_t -> pixels */
     int padW = (W + 7) & ~7;
     if (W <= 0 || H <= 0) return -1;
-    unsigned int size = (unsigned int)(padW * H) * 1u;  /* 8bpp: 1 byte/texel */
-    if (size > WTEX_WIDE_SZ) return -1;                 /* too big even for a wide slot */
+    /* MATELAS sizing.  Prefer the padded bake, but NEVER let the padding push a texture out of the
+       pool it would otherwise fit: a 128x128 fills a narrow slot exactly, and spending a scarce wide
+       slot on it to gain 2 pad rows would trade cache stability (watch `bk`) for a 1px seam.  Such a
+       texture bakes unpadded and never grows -- it keeps the exact mapping, which is the state the
+       owner asked for in 66e590c. */
+    int vp = (H >= WTEX_VPAD) ? WTEX_VPAD : 0;
+    unsigned int raw = (unsigned int)(padW * H) * 1u;               /* 8bpp: 1 byte/texel */
+    unsigned int pad = (unsigned int)(padW * (H + 2 * vp)) * 1u;
+    unsigned int size;
+    if      (vp && pad <= WTEX_NARROW_SZ) size = pad;
+    else if (raw <= WTEX_NARROW_SZ)     { size = raw; vp = 0; }
+    else if (vp && pad <= WTEX_WIDE_SZ)   size = pad;
+    else if (raw <= WTEX_WIDE_SZ)       { size = raw; vp = 0; }
+    else return -1;                                     /* too big even for a wide slot */
 
     int victim;
     if (size <= WTEX_NARROW_SZ)                         /* narrow: prefer narrow pool */
@@ -4309,16 +4403,27 @@ static int wall_tex_resolve(int texnum, const unsigned char *cmap)
        writes, so 8-bit stores to VDP1 VRAM are not relied on.  The byte layout is identical. */
     volatile unsigned short *t = (volatile unsigned short *)wtex_cache[victim].addr;
     int halfW = padW >> 1;                                    /* 16-bit words per texture row */
+    if (vp && wtex_cache[victim].cap < (unsigned int)(padW * (H + 2 * vp))) vp = 0;  /* victim too small */
     for (int x = 0; x < W; x += 2)
     {
         const unsigned char *c0 = R_GetColumn(texnum, x);        /* even column (high byte) */
         const unsigned char *c1 = (x + 1 < W) ? R_GetColumn(texnum, x + 1) : c0;  /* odd (low) */
         int wx = x >> 1;
         for (int y = 0; y < H; ++y)
-            t[y * halfW + wx] = (unsigned short)(((unsigned int)c0[y] << 8) | c1[y]);
+            t[(y + vp) * halfW + wx] = (unsigned short)(((unsigned int)c0[y] << 8) | c1[y]);
+        /* the pad rows ARE the texture, wrapped: above row 0 comes row H-1, below row H-1 comes
+           row 0.  So the halo is the real neighbouring texel, not a smear or a guessed colour. */
+        for (int k = 0; k < vp; ++k)
+        {
+            int ty = H - vp + k;                                 /* top pad  <- last vp rows  */
+            t[k * halfW + wx] = (unsigned short)(((unsigned int)c0[ty] << 8) | c1[ty]);
+            t[(vp + H + k) * halfW + wx] =                       /* bottom pad <- first vp rows */
+                (unsigned short)(((unsigned int)c0[k] << 8) | c1[k]);
+        }
     }
     wtex_cache[victim].texnum = texnum;
     wtex_cache[victim].padW = (short)padW; wtex_cache[victim].H = (short)H;
+    wtex_cache[victim].vpad = (short)vp;
     wtex_cache[victim].locked = 1;
     wtex_cache[victim].lru = wtex_tick;
     return victim;
@@ -4408,11 +4513,6 @@ static inline int wrmul_(long long num, int recip)   /* ~= num/den, rounded, sig
 #define wrecip(den)              (0)
 #define WDIV(numP, denP, recip)  ((int)((long long)(numP) / (denP)))
 #endif
-
-/* 0 = texture-EXACT quad (default); 1 = legacy 1px top/bottom grow that closed vertical seams at
-   the cost of misaligning the texture against the software renderer (see the quad emission below).
-   Flat/untextured quads (wall_emit_flat) keep their grow unconditionally -- no texels to shift. */
-static int sat_wall_grow = 0;
 
 static void wall_emit_band(int x1, int x2, int yl1, int yh1, int yl2, int yh2,
                            int u1, int u2, int texw,
@@ -4505,20 +4605,18 @@ static void wall_emit_band(int x1, int x2, int yl1, int yh1, int yl2, int yh2,
                (span ~20) misaligns by ~6 texels, and it repeats at EVERY texture-height band down
                the wall.  Software draws the same texture with the exact mapping, so a VDP1 wall and
                a software wall side by side visibly disagree -- worse the further away they are.
-               Exact seam closure with an exact mapping is IMPOSSIBLE in one quad: 1 screen row
-               corresponds to rows/span texels, never a whole texel, so the character cannot be
-               extended to match a grown vertex.  The choice is real, so it is now explicit and the
-               default favours the mapping: sat_wall_grow 0 = texture-exact (adjacent v-bands still
-               abut exactly by construction -- band k's yh1b IS band k+1's yl1b), 1 = the legacy
-               grow if a 1px seam against the software floor/ceiling turns out to be worse. */
+               The seam is closed WITHOUT that cost since 2026-08-02: the grow now happens in
+               wall_emit, which extends the character by the matching number of texels (the MATELAS)
+               and passes the already-grown y's down here.  This quad is therefore always
+               texture-EXACT for whatever y range it is handed -- do not re-introduce a grow here. */
             memset(cmd, 0, sizeof cmd);
             cmd[0] = 0x0002; cmd[2] = 0x04E0;  /* DISTORSP | Window_In | COLOR_4 8bpp | SPD | ECD-off */
             cmd[3] = colr;                                 /* CMDCOLR = CRAM light-bank base */
             cmd[4] = charAddr; cmd[5] = charSize;
-            cmd[6]  = (short)xs; cmd[7]  = (short)(yls - sat_wall_grow);   /* A col0  top */
-            cmd[8]  = (short)xe; cmd[9]  = (short)(yle - sat_wall_grow);   /* B colW  top */
-            cmd[10] = (short)xe; cmd[11] = (short)(yhe + sat_wall_grow);   /* C colW  bot */
-            cmd[12] = (short)xs; cmd[13] = (short)(yhs + sat_wall_grow);   /* D col0  bot */
+            cmd[6]  = (short)xs; cmd[7]  = (short)yls;     /* A col0  top */
+            cmd[8]  = (short)xe; cmd[9]  = (short)yle;     /* B colW  top */
+            cmd[10] = (short)xe; cmd[11] = (short)yhe;     /* C colW  bot */
+            cmd[12] = (short)xs; cmd[13] = (short)yhs;     /* D col0  bot */
             vdp1_cmd_at(VDP1_BANK[vdp1_wbank], vdp1_wnext++, cmd);
         }
         else                                             /* grazing -> clamp + squish */
@@ -4646,10 +4744,12 @@ static void wall_emit(int wi)
     int v0 = wall_acc[wi].v0, v1 = wall_acc[wi].v1, vspan = v1 - v0;
     unsigned short colr = wall_light_colr(wall_acc[wi].cmap);  /* per-wall light = CRAM bank */
 
+    int vp = wtex_cache[slot].vpad;                    /* matelas rows baked each side (0 = none) */
     if (H <= 0 || vspan <= 0)                          /* no valid v-range -> whole texture once */
     {
         int th = (H > 255) ? 255 : (H > 0 ? H : 1);
-        unsigned short ca = (unsigned short)((base - VDP1_VRAM_BASE) >> 3);
+        unsigned short ca = (unsigned short)((base + (unsigned int)vp * (unsigned int)padW
+                                              - VDP1_VRAM_BASE) >> 3);
         unsigned short cs = (unsigned short)(((padW >> 3) << 8) | th);
         wall_emit_band(x1, x2, yl1, yh1, yl2, yh2, u1, u2, texw, ca, cs, colr, vx, vxr, vyt, vyb);
         return;
@@ -4671,10 +4771,40 @@ static void wall_emit(int wi)
         int yh1b = yl1 + WDIV((long long)(vb - v0) * (yh1 - yl1), vspan, inv_vspan);
         int yl2b = yl2 + WDIV((long long)(v  - v0) * (yh2 - yl2), vspan, inv_vspan);
         int yh2b = yl2 + WDIV((long long)(vb - v0) * (yh2 - yl2), vspan, inv_vspan);
-        unsigned int taddr = base + (unsigned int)vmod * (unsigned int)padW * 1u;  /* 8bpp */
+        /* MATELAS (owner 2026-08-02, "wg2 ferme les trous existants a l'arret. Fais le matelas").
+           Grow the quad by g SCREEN pixels top/bottom to cover the seam, and grow the CHARACTER by
+           the MATCHING number of TEXELS so the mapping stays exact.  g screen px is g*rows/span
+           texels; rounding that to dt costs at most half a texel, against the g*rows/span texels
+           the naked quad grow costs (~6 at span 20 -- the misalignment fixed in 66e590c).
+           The texels come from the pad rows, which are the vertically-wrapped neighbours, or from
+           inside the texture when this band does not start/end on a texture seam.
+           The QUAD ALWAYS grows by the pixels asked for.  Refusing to grow when dt did not fit was
+           the first cut, and it silently switched the feature off for most walls (owner: "wg n'a
+           plus l'air de grandir les murs en haut et en bas") -- a 128x128 texture fills a narrow
+           slot EXACTLY so it bakes vpad=0, and any wall under ~43px tall wants dt>=3 from a 2-row
+           pad.  So the character takes as many matching texels as EXIST and the shortfall
+           (2*dt - dtt - dtb texels) degrades to the plain stretch: exact where the pad covers it,
+           partial in between, and never worse than the pre-matelas grow. */
+        int gt = 0, gb = 0, dtt = 0, dtb = 0;
+        if (sat_wall_grow > 0)
+        {
+            int sA = yh1b - yl1b, sB = yh2b - yl2b;
+            int span = sA > sB ? sA : sB;
+            int dt = (span > 0) ? (sat_wall_grow * rows + (span >> 1)) / span : 0;
+            int at = vp + vmod;                        /* texel rows available above this band */
+            int ab = vp + (H - vmod - rows);           /* and below                            */
+            if (at < 0) at = 0;
+            if (ab < 0) ab = 0;
+            dtt = (dt < at) ? dt : at;
+            dtb = (dt < ab) ? dt : ab;
+            while (rows + dtt + dtb > 255) { if (dtb) dtb--; else if (dtt) dtt--; else break; }
+            gt = gb = sat_wall_grow;
+        }
+        unsigned int taddr = base + (unsigned int)(vp + vmod - dtt) * (unsigned int)padW * 1u;  /* 8bpp */
         unsigned short ca = (unsigned short)((taddr - VDP1_VRAM_BASE) >> 3);
-        unsigned short cs = (unsigned short)(((padW >> 3) << 8) | rows);
-        wall_emit_band(x1, x2, yl1b, yh1b, yl2b, yh2b, u1, u2, texw, ca, cs, colr, vx, vxr, vyt, vyb);
+        unsigned short cs = (unsigned short)(((padW >> 3) << 8) | (rows + dtt + dtb));
+        wall_emit_band(x1, x2, yl1b - gt, yh1b + gb, yl2b - gt, yh2b + gb,
+                       u1, u2, texw, ca, cs, colr, vx, vxr, vyt, vyb);
         v = vb; ++nb;
     }
 }
@@ -4749,7 +4879,7 @@ static void wall_emit_banded(int wi)
     /* clamp to the baked tile [vmod, H): the tile is only padW*H bytes, so reading past row H-1
        would sample the NEXT slot's texture (corruption).  Mirrors wall_emit's rows = H - vmod. */
     rows = BAND_ROWS; if (rows > H - vmod) rows = H - vmod; if (rows > 255) rows = 255; if (rows < 1) rows = 1;
-    taddr = base + (unsigned int)vmod * (unsigned int)padW;
+    taddr = base + (unsigned int)(wtex_cache[slot].vpad + vmod) * (unsigned int)padW;  /* skip the matelas */
     ca = (unsigned short)((taddr - VDP1_VRAM_BASE) >> 3);
     cs = (unsigned short)(((padW >> 3) << 8) | rows);
     wall_emit_band(x1, x2, yl1, yh1, yl2, yh2, u1, u2, texw, ca, cs, colr, vx, vxr, vyt, vyb);
@@ -5588,7 +5718,9 @@ static void vdp1_ftex_flush(void)
     if (fmode == 4 || floor_acc_n == 0)
     {
         /* software mode / nothing claimed: the walls' JUMP already targets the empty bank
-           (the kick wrote it) -- just present the fresh pair. */
+           (the kick wrote it) -- just present the fresh pair.
+           THIS IS THE PATH M7 TAKES EVERY FRAME: sat_vdp1_floor is 0 outside the parked M5, so
+           floor_acc_n is always 0 and the textured-floor branch below is dead here. */
         *((volatile unsigned short *)VDP1_ROOT_ADDR + 1) = (unsigned short)wroot;
         ftex_wjump_addr = 0;
         floor_acc_n = 0;
@@ -5837,6 +5969,34 @@ static void vdp1_vblank_present(void)
 }
 #endif
 
+/* FIELD LOCK fence -- see the long note in DG_DrawFrame.
+   Fl1 = wait for the next vblank edge, whatever the frame cost.
+
+   ⚠ The PINNED mode I wrote first (hold one field count, hysteresis) was WORSE on hardware, and the
+   owner caught it: "FL1 a toujours l'air plus stable que fl2".  He is right and the reason is
+   structural.  Fl1 blits on a vblank edge EVERY frame -- the software commit phase is therefore
+   always identical, and only the PERIOD varies (that is judder, not misalignment).  Pinning does the
+   opposite: whenever a frame overruns the pin, the wait condition is already satisfied, the blit
+   happens wherever it happens, and THAT frame is not phase-locked at all.  Fl2 traded a perfect
+   phase for a steady period, which is exactly backwards for this artifact.
+
+   A second mode was tried for the residual slip the owner still sees ("une frame dérape
+   régulièrement") and REMOVED: in 1-cycle auto a list rooted during field K is on screen from K+2
+   (re-read at +1, swapped at +2), the blit is phase-locked but the KICK is not, so a kick drifting
+   across a vblank should make the walls arrive a field late.  Also waiting for
+   `vbl_count - kick_vbl >= 2` changed NOTHING on hardware ("fl2 est aussi stable que fl1, mais on a
+   toujours les ratés") -- so the slip is NOT the VDP1 age, and the mode was not worth an occasional
+   extra field.  The slip remains unexplained; do not re-derive this one. */
+static void sat_field_fence(void)
+{
+    static unsigned int fv_prev = 0;
+    if (fv_prev == 0 || (vbl_count - fv_prev) > 60u) fv_prev = vbl_count;   /* boot / stall -> resync */
+    { unsigned int fv = vbl_count; while (vbl_count == fv) { } }
+    sat_field_n = (int)(vbl_count - fv_prev);
+    if (sat_field_n > 99) sat_field_n = 99;
+    fv_prev = vbl_count;
+}
+
 #if SHOW_FPS
 /* TRUE VDP1 done-rate: sample EDSR.CEF at EVERY VBLANK -- 1-cycle-auto restarts a plot pass
    per vblank, so the old per-KICK sample (once per ~5-10 vblank game frame) aliased with the
@@ -5885,7 +6045,7 @@ static void vdp1_wpn_init(void)
 #if VDP1_WALL_TEST
     wtex_setup();                                    /* fixed per-slot VRAM addr + capacity */
     for (int i = 0; i < WTEX_SLOTS; ++i) { wtex_cache[i].texnum = -1; wtex_cache[i].lru = 0;
-                                           wtex_cache[i].locked = 0; }
+                                           wtex_cache[i].locked = 0; wtex_cache[i].vpad = 0; }
     wtex_tick = 0; wall_acc_n = 0;
 #endif
 
@@ -5939,8 +6099,26 @@ extern "C" void sat_vdp1_wpn_begin(void)
        never read).  Every weapon emission runs AFTER this begin inside sat_walls_kick (1p and
        split), and the menu/intermission fallback caller emits no weapon -> never stale. */
     for (int i = 0; i < WPN_CACHE_N; ++i) wpn_cache[i].used = 0;
+    /* SATURN VDP1 YAW ANTICIPATION (owner 2026-07-31).  The VDP1 walls TRAIL everything else in any
+       motion, by the same amount at both junctions -- so the whole VDP1 world layer is late, and the
+       lag is IRREDUCIBLE: VDP1 must plot its list for a field before the hardware shows it, and the
+       root already flips at the earliest possible point (the kick, right after the BSP walk).
+       Concealment is not available either: the code records two attempts at it (SAT_FLOOR_HOVER,
+       SAT_CEIL_FILL) and both failed for the same reason -- the old border fills a HOLE left by a
+       lagging PLANE, but here it is the WALL that lags, and a displaced wall is not a hole.
+       What is left is to draw the walls where they will BELONG when they appear: predict one frame
+       of view change and pre-shift the layer.  For YAW that is a pure screen translation, and slot 0
+       of this bank is already a LocalCoord -- so the whole world layer (walls AND things, which lag
+       together and must stay together) moves for ONE halfword, no extra command, no fill.
+       Linear-at-centre, the same approximation r_main.c:1049 uses for the old anticipation; exact at
+       the centre, slightly short at the edges, which is the right way to be wrong.
+       NOT handled here: forward/back, which is a perspective SCALE, not a translation.  If the trail
+       persists while walking, the next step is a per-quad scale over wall_acc -- more code, so it
+       waits for evidence that this half is not enough. */
     memset(cmd, 0, sizeof cmd);
-    cmd[0] = 0x000A;                                 /* bank cmd0 = local coord */
+    cmd[0] = 0x000A;                                 /* bank cmd0 = local coord (origin, unshifted:
+                                                        the anticipation moves wall_acc coordinates,
+                                                        which the clip windows derive from too) */
     cmd[7] = VIEW_Y_OFFSET;                          /* local Y origin -> walls centred like NBG1 */
     vdp1_cmd_at(VDP1_BANK[vdp1_wbank], 0, cmd);
     vdp1_wnext   = 1;
@@ -6583,23 +6761,17 @@ static void vdp1_wpn_kick(void)
     if (sat_fb_mag_t    > fb_pk_mag)    fb_pk_mag    = sat_fb_mag_t;
     if (sat_fb_starve_t > fb_pk_starve) fb_pk_starve = sat_fb_starve_t;
     if (sat_fb_px       > fb_pk_px)     fb_pk_px     = sat_fb_px;
-    if (sat_fb_edge_t   > fb_pk_edge)   fb_pk_edge   = sat_fb_edge_t;
-    if (sat_fb_edge_w   > fb_pk_edge_w) fb_pk_edge_w = sat_fb_edge_w;
-    fb_tot_edge   += (unsigned int)sat_fb_edge_t;    /* rate accumulators (see fb_win_frames) */
-    fb_tot_edge_w += (unsigned int)sat_fb_edge_w;
-    fb_tot_mag    += (unsigned int)sat_fb_mag_t;     /* the OTHER population: tiers dumped to
-                                                        SOFTWARE by the subdiv squish guard */
-    fb_win_frames++;
-    for (int _b = 0; _b < 4; _b++)
-    {
-        if (sat_fb_edge_b[_b] > fb_pk_edge_b[_b]) fb_pk_edge_b[_b] = sat_fb_edge_b[_b];
-        if (fb_pk_edge_b[_b] > 9) fb_pk_edge_b[_b] = 9;   /* one digit each on row 8 */
-        sat_fb_edge_b[_b] = 0;
-    }
     sat_fb_edge_t = 0; sat_fb_edge_w = 0;
+    sat_fb_edge_b[0] = sat_fb_edge_b[1] = sat_fb_edge_b[2] = sat_fb_edge_b[3] = 0;
 #endif
     sat_fb_clamp_t = sat_fb_mag_t = sat_fb_starve_t = sat_fb_px = 0;   /* reset each frame (also when SHOW_FPS off) */
     sat_fb_wclamp_t = 0;
+    /* Advance the per-seg visit tag ONE step per rendered frame, HERE and nowhere else: the kick is
+       past this frame's BSP walk and before the next one, and it is per FRAME, not per split VIEW
+       (the views drain into the shared bank above).  A per-view counter -- framecount is one -- would
+       make every seg visible in only ONE view look "not seen last frame" every frame and arm the
+       entry coverage permanently.  See core/r_segs.c sat_seg_entry_cover. */
+    sat_seg_frame++;
     /* SATURN mode-switch VDP1 erase: while sat_vdp1_switch_clear is armed, skip the coherent-pair
        HOLD and take the empty-bank present path below -> the old mode's walls are wiped in 2 frames
        (the new mode rebuilds its pair from the very next frame). */
@@ -6624,6 +6796,21 @@ static void vdp1_wpn_kick(void)
         ftex_wjump_addr = VDP1_BANK[vdp1_wbank] + (unsigned int)vdp1_wnext * 32u;
         ftex_flushed = 0;
         vdp1_bank = vdp1_wbank;                      /* the pair being BUILT (root flips at flush) */
+        /* M7 LATENCY FIX (owner 2026-07-31, observed: the VDP1 walls TRAIL in any motion -- turning
+           AND walking -- proportionally to speed).  The hold above exists to stop a plot pass mixing
+           fresh walls with last frame's floors.  In M7 there ARE no VDP1 floors: sat_vdp1_floor is 0
+           outside the parked M5, so floor_acc_n is always 0 and vdp1_ftex_flush takes its "nothing
+           claimed" exit -- the pair being protected is walls-and-nothing.  The hold is then pure
+           LATENCY: the root waits out the whole of R_DrawPlanes before the plot may even start, and
+           VDP1 only reaches the screen a field after its plot completes (NBG1, written straight into
+           displayed VRAM by the blit, appears at once).  So present immediately when nothing will be
+           chained: the plot gets the rest of the frame to finish and lands with the picture it
+           belongs to.  When floors ARE claimed (M5) the hold still applies, unchanged. */
+        if (!sat_vdp1_floor || sat_ftex_mode == 4)
+        {
+            *((volatile unsigned short *)VDP1_ROOT_ADDR + 1) =
+                (unsigned short)((VDP1_BANK[vdp1_wbank] - VDP1_VRAM_BASE) >> 3);
+        }
         VDP1_PTMR = 0x0002;
         vdp1_wactive = 0;
         return;                                      /* root untouched: old coherent pair shows */
@@ -6740,6 +6927,8 @@ extern "C" void sat_walls_kick(void)
            (R_DrawSplitPlayerSprites).  sat_wall_skip gate -> M0 keeps the SOFTWARE weapon. */
         auto sat_emit_weapon = [](void)
         {
+            /* (no LocalCoord reset needed: the anticipation lives in the world geometry itself, so
+               the gun and the HUD -- which build their own screen coordinates -- never see it.) */
             if (sat_psprite_early && !viewangleoffset && sat_wall_skip && !sat_wpn_soft)
             {
                 extern int sat_split_active;
@@ -7142,9 +7331,13 @@ extern "C" void DG_DrawFrame(void)
            coefficient-table address is written once at init (slKtableRA), NOT by slScrMatSet -- copying it
            would clobber the K-table.  RB (unused) stays 0x30. */
         /* dest = the LIVE RPT base (B1+0x1ff00 bitmap / A0+0x1ff00 cell); RB (unused until dual-param)
-           rides +0x68 relative so it never strays into B1's map when the RPT is in A0. */
-        memcpy(rbg0_rpt_vram,                        (const void *)0x260FFE1C, 0x54);
-        memcpy((void *)((char *)rbg0_rpt_vram + 0x68), (const void *)0x260FFE84, 0x30);
+           rides +0x68 relative so it never strays into B1's map when the RPT is in A0.
+           DEFERRED by default (rbg0_rpt_late): the copy now happens right after the NBG1 blit so the
+           hardware floor and the software picture adopt the new view angle on the SAME field -- see
+           rbg0_rpt_to_vram.  slScrMatSet has already written the RAM buffer here and nothing touches
+           it before the blit, so postponing only the VRAM write is safe. */
+        if (rbg0_rpt_late) rbg0_rpt_pending = 1;
+        else               rbg0_rpt_to_vram();
 #endif
         uint32_t rb_t3 = DG_GetTicksMs();   /* SATURN PERF: split upl/xfm/rpt to pin the stall */
         rbg_upl_sum += rb_t1 - rb_t0;
@@ -7370,6 +7563,36 @@ extern "C" void DG_DrawFrame(void)
         { unsigned int tf = vbl_count; while (vbl_count == tf) { } }   /* fence to the swap vblank */
     }
 #endif
+    /* SATURN FIELD LOCK (owner's diagnosis 2026-08-02: "un probleme de synchronisation d'affichage
+       entre vdp1 et cpu ... toutes les frames ne sont pas erronees, on dirait qu'on a le probleme a
+       une certaine frequence, alors que je tourne de facon continue").
+
+       The two layers commit on DIFFERENT clocks.  VDP1 boots in 1-CYCLE AUTO (VDP1_FBCR = 0, PTMR =
+       plot-at-frame-change, ~5959): it replots its list and swaps its two framebuffers on EVERY
+       VBLANK -- 60 Hz, nothing to do with us.  The software picture commits when this blit runs --
+       once per GAME frame, and the frame is not a whole number of fields (the owner's capture: 56.0
+       fps / MST 17 => ~17.9 ms against a 16.68 ms field).  The ~1.2 ms of drift per frame walks a
+       full field every ~14 frames, so the vblank that makes the new walls visible lands sometimes
+       before and sometimes after the blit: ~4 mismatched frames per second, at a steady cadence, out
+       of a perfectly steady turn.  That is a BEAT, and it is why five geometric corrections in a row
+       failed -- on the good frames they over-correct and on the bad ones they under-correct.
+
+       Nothing is misplaced.  The two clocks just have to stop sliding: fence the blit to a vblank
+       edge and the whole loop phase-locks -- frame period becomes a whole number of fields, the
+       kick/plot/swap/blit offsets stop drifting, and the mismatch becomes CONSTANT instead of
+       periodic (a constant one we can then place, which the beat made impossible).
+
+       The price is fps quantisation to the NEXT WHOLE FIELD COUNT -- not to 30: a 17.9 ms frame
+       becomes 2 fields (30 fps, -46%), 40 ms becomes 3 (20 fps, -17%), a 77 ms M7 frame becomes 5
+       (12 fps, -8%).  The cost collapses as the frame gets slower; 56 fps hurts precisely because it
+       sits just past ONE field.  Failure mode: a frame landing ON a boundary (~50 ms = 3.00 fields)
+       -- jitter then flips the count 3/4 and the beat returns as judder.  sat_field_n reports the
+       count on row 13 so that is READ, not guessed; it must be steady.
+       Deliberately NOT the parked vdp1_couple_nbg1 brick (~7456): that one waits on EDSR.CEF, which
+       Ymir never models, so it would burn VDP1_COUPLE_MAX_VBL vblanks a frame there and lock
+       nothing.  This needs no CEF and behaves the same on Ymir and on hardware.
+       Pad R+Right (1p), row 13 `Fl<mode>/<fields>`.  Default 0 = the free-running loop.
+       Called from just before the blit copy, NOT here -- see the call site for why. */
     uint32_t df1 = DG_GetTicksMs();        /* SATURN PERF: ms split -- end of pre, start of blit */
 #if VDP1_WALL_TEST && SAT_VDP1_FLOOR && SAT_FLOOR_TEX
     /* BLIT<->F-BUILD DECOUPLE (R+Z).  ftex_overlap_flip is set iff the slave build was ARMED to
@@ -7396,6 +7619,15 @@ extern "C" void DG_DrawFrame(void)
        root flip landed ~35ms into game logic, AFTER the mask went live = the v7 mask-vs-pair slip). */
     RP_AuxWait();
 #endif
+    /* FIELD LOCK fence -- see the long note at its declaration.  It sits HERE, immediately before
+       the copy, not up at the end of the render: the NBG1 framebuffer is SINGLE-buffered, so the
+       blit is visible as it is written and its phase against the beam decides whether it tears.
+       Started at the vblank edge the copy runs ~2.5x faster than the beam (224 lines in ~5.5 ms
+       against ~13.5 ms of active display) and stays ahead of it the whole way = no tear.  Fencing
+       further up let RP_AuxWait and the VDP2 setup run first, so the copy actually started several
+       ms INTO the field and crossed the beam -- the owner's "j'ai l'impression de constater plus de
+       déchirures".  The loop still phase-locks either way; only the tearing moved. */
+    if (sat_field_lock && gamestate == GS_LEVEL) sat_field_fence();
     unsigned short blit_t0 = frt_read();   /* SATURN PERF: time the blit (-> sat_blit_ms10) */
     /* SATURN lowres (docs/LOWRES_RENDER_STUDY.md): the software render is packed into the LEFT
        160 columns; VDP2 hardware-enlarges NBG1 x2 horizontal so it fills the screen.  Re-applied
@@ -7477,6 +7709,17 @@ extern "C" void DG_DrawFrame(void)
         if (blit10_cnt < BLIT10_CAP) { blit10_sum += sat_blit_ms10; blit10_cnt++; }  /* row-1 `b` precise A/B */
     }
     }   /* end non-overlap blit path (the flip-before-blit default) */
+    /* SATURN M7 -- RBG0's rotation table lands right after the picture it belongs to (measured
+       aligned; see [[m7-vdp1-latency-coherent-pair-hold]]). */
+#if VDP2_RBG0_TEST && RBG0_RPT_TRANSFER == 2
+    if (rbg0_rpt_pending)
+    {
+        uint32_t rp_t0 = DG_GetTicksMs();
+        rbg0_rpt_to_vram();
+        rbg_rpt_sum += DG_GetTicksMs() - rp_t0;
+        rbg0_rpt_pending = 0;
+    }
+#endif
     uint32_t df2 = DG_GetTicksMs();        /* SATURN PERF: ms split -- end of blit, start of clear */
     /* LAYER INVERSION: clear the 3D VIEW to index 0 so next frame the SKIPPED wall columns stay
        transparent -> the VDP1 walls (below NBG1) show through.  The HUD rows are left intact
@@ -7868,13 +8111,49 @@ static void poll_pad(void)
     if (sat_local_players > 1 && !(cur & PER_DGT_TL) && (cur & PER_DGT_TR)   /* L held, R released */
         && (changed & PER_DGT_KR) && !(cur & PER_DGT_KR))
         sat_split_balance = (sat_split_balance + 1) % 3;
+    /* 1p: the same two chords (free here -- the split levers above are gated on >1 player) dial the
+       WALL ENTRY COVERAGE live: CPU frames drawn over a wall that just came into view, 0..3.  This
+       replaces the removed yaw-anticipation gain on the same chord -- same symptom, opposite model.
+       0 = off = the pre-2026-08-02 behaviour (a wall entering the view shows sky for one frame);
+       1 = the default.  Raise it only if a hole survives at 1: each extra frame is software columns
+       on every wall that just appeared, so watch row-2 `Bp` while you do.  Row 13 shows `En<n>`. */
+    if (sat_local_players <= 1 && !(cur & PER_DGT_TL) && (cur & PER_DGT_TR)
+        && (changed & PER_DGT_KL) && !(cur & PER_DGT_KL))
+    { if (sat_wall_entry > 0) sat_wall_entry--; }
+    if (sat_local_players <= 1 && !(cur & PER_DGT_TL) && (cur & PER_DGT_TR)
+        && (changed & PER_DGT_KR) && !(cur & PER_DGT_KR))
+    { if (sat_wall_entry < 3) sat_wall_entry++; }
+    /* Pad L+Up (L held, R released, 1p): cycle the VDP1 WALL GROW 0 -> 1 -> 2 -> 0 (sat_wall_grow) --
+       the owner's counter-proposal to growing the software plane: grow the LATE layer instead of the
+       one that is on time.  It is the better place in principle (one grown quad covers its own gap
+       on every side at once, instead of every neighbouring plane having to reach out for it).
+       ⚠ It costs exactly what commit 66e590c removed: DISTORSP maps the WHOLE character corner to
+       corner, so moving the vertices without changing the character stretches `rows` texels over
+       `span + 2*grow` rows -- an error of grow*rows/span TEXELS at the band edges, worst on FAR
+       walls (~6 texels at span 20 for grow 1), repeating down the wall.  That IS the software-vs-VDP1
+       misalignment he had me fix.  Judge Wg1 on the gap first; if it closes it, the clean form is a
+       PADDED character (bake texw+2 x rows+2 with the edge texels duplicated and grow the quad to
+       match) -- exact mapping AND a 1px halo, at ~+6% tile VRAM.  Row 13 shows `Wg<n>`. */
+    if (sat_local_players <= 1 && !(cur & PER_DGT_TL) && (cur & PER_DGT_TR)
+        && (changed & PER_DGT_KU) && !(cur & PER_DGT_KU))
+        sat_wall_grow = (sat_wall_grow + 1) % 3;
     /* (Low-res is no longer a pad toggle -- it is render MODE M7 in the pad-Z cycle, since it is
        whole-view (shared projection + whole-layer VDP2 zoom), not a per-zone lever.  sat_apply_mode
        sets sat_lowres when M7 is selected.  This freed the old L+R+X binding.) */
 
     /* (Pad R+Up/Down vertical decrochage-fill + R+Left/Right border-cap knobs CUT 2026-07-07 --
        tuning finished, values baked: sat_plane_vscale=4 (r_main.c), sat_plane_border_max=10
-       (dg_saturn.cxx:~2738).  R+Up/Down/Left/Right are free.) */
+       (dg_saturn.cxx:~2738).  R+Up/Down are taken since; R+Left is the band knob below.) */
+    /* (Pad R+Left SOFTWARE-PLANE-GROW knob REMOVED 2026-08-02: growing the ON-TIME layer to chase
+       the late one is the wrong end of the problem, and the owner measured that it did not close
+       what he sees.  The shipped fix grows the VDP1 WALL -- pad L+Up below.  R+Left is free.) */
+    /* Pad R+Right (R held, L released, 1p): FIELD LOCK on/off -- fence the blit to a vblank edge so
+       the game loop stops sliding against the 60 Hz VDP1 swap.  DEFAULT ON (this is what killed the
+       periodic holes).  Row 13 `Fl<on>/<fields>`; expect fps on a divisor of 60 -- that IS the
+       mechanism, not a regression. */
+    if (sat_local_players <= 1 && !(cur & PER_DGT_TR) && (cur & PER_DGT_TL)
+        && (changed & PER_DGT_KR) && !(cur & PER_DGT_KR))
+        sat_field_lock ^= 1;
 
     /* (Pad L+Left/Right WALL_PX_BUDGET wall-offload A/B CUT 2026-07-07 -- settled-negative on HW
        (net loss); WALL_PX_BUDGET baked to 200k.  L+Left/Right are free.) */

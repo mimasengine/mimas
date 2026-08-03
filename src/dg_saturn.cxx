@@ -556,6 +556,7 @@ extern "C" int            sat_split_p1hw;          /* core: set here -> d_main p
 extern "C" void           sat_setup_view_p1(void);/* core: re-anchor the view globals on P1 for the split RBG0 transform */
 extern "C" int            sat_potato_floors;/* core: solid-colour floors/ceilings */
 extern "C" int            sat_potato_walls; /* core: solid-colour walls (opaque, flat only) */
+extern "C" int            sat_wall_paint;   /* core r_data.c: DEBUG PAINT, bit0 VDP1 green / bit1 CPU red */
 extern "C" int            sat_wall_nocpu;   /* core: banded/flat -> skip close-wall CPU fallback */
 /* Phase-1 wall clamp ([[wall-clamp-world-anchored]], docs/WALL_SUBDIVISION_STUDY.md): 1 = tiers
    partially below floorclip / above a deported ceiling STAY on VDP1, cut at a WHOLE-TEXEL
@@ -1708,11 +1709,14 @@ extern "C" int sat_fb_edge_b[4];  /* L5 bail causes: lateral / magnitude / too-t
    the VDP1 quad is not in the wrong place -- it is not on screen at all. */
 extern "C" int sat_wall_entry;    /* core r_segs.c: CPU frames covering a newly-visible VDP1 wall */
 extern "C" int sat_seg_frame;     /* core r_segs.c: per-seg visit tag, advanced once per frame here */
-static int sat_field_lock = 1;    /* 0 = free-running loop.  1 = fence the blit to a vblank edge ->
-                                     the loop phase-locks to the field rate and the VDP1-vs-software
-                                     BEAT stops.  2 = 1 + hold the blit until the walls are actually
-                                     on screen (age 2), which kills the RESIDUAL beat the fence
-                                     leaves on the un-pinned kick.  Both cost fps; see the fence. */
+/* FIELD LOCK -- PARKED 2026-08-03 (owner: *"supprime wm1, 2, et park wm3"*).  0 = free-running
+   loop = the SHIPPING default and the only reachable position; the pad chord that selected it is
+   gone.  1 = fence the blit to a vblank edge so the loop phase-locks to the field rate and the
+   VDP1-vs-software BEAT stops; 2 = 1 + hold the blit until the walls are actually on screen
+   (age 2).  Both cost fps, and neither closed the motion hole -- that job now belongs to the
+   LEAD-FILL (sat_wall_lead_x).  The fence code below is left intact and inert: flip this to 1 to
+   bring it back for an A/B, no other change needed. */
+static int sat_field_lock = 0;
 static int rbg0_rpt_late  = 2;    /* RBG0 rotation-table copy timing, 0/1/2 -- pad R+Left, row-13
                                      `F<m><rp>` 2nd digit.  Declared up here only so the row-13
                                      overlay can read it; the derivation lives at its old home
@@ -1747,7 +1751,12 @@ static void sat_field_fence(void);   /* defined next to the long note in DG_Draw
    10-20 screen px -- far more than any grow can cover, which is the size the owner reports. */
 static volatile unsigned int vdp1_kick_vbl = 0;
 static int dbg_age_min = 99, dbg_age_max = 0;   /* window min/max, reset when row 13 prints */
+static int vdp1_wall_drop = 0;   /* walls the core handed to VDP1 that the emit silently dropped --
+                                    row 13 `N<orphan>/<drop>`, summed over the window.  See the emit
+                                    dispatch loop for why this is watched at the command pointer. */
 static int dbg_tic_max = 0;                     /* max GAME TICS a single frame advanced, per window */
+extern "C" int sat_wall_lead_x;    /* core r_segs.c: LEAD-FILL depth in frames, 0 = off (pad R+A)     */
+extern "C" int sat_lead_cols;      /* core r_segs.c: extra software column-spans drawn by the fill    */
 /* px the VDP1 wall quad is grown top/bottom.  0 = texture-EXACT (default): DISTORSP maps the WHOLE
    character corner to corner, so moving the vertices without changing the character stretches the
    texture -- grow*rows/span texels of error at the band edges, worst on FAR walls.  1/2 = the legacy
@@ -1756,6 +1765,7 @@ static int dbg_tic_max = 0;                     /* max GAME TICS a single frame 
    covers it and degrades to the old stretch only where it cannot -- the seam is worth more than the
    residual.  Flat/untextured quads (wall_emit_flat) keep their own grow -- no texels to shift. */
 static int sat_wall_grow = 2;
+
 extern "C" int sat_fb_wclamp_t;   /* Phase-1: tiers KEPT on VDP1 by the cut+wedge clamp */
 static int fb_cur_clamp = 0, fb_cur_mag = 0, fb_cur_px = 0;             /* last rendered frame */
 static int fb_cur_wclamp = 0;
@@ -2141,12 +2151,26 @@ static void fps_update(void)
                t = the LARGEST number of game tics a single frame advanced in this window.  Doom's
                logic is 35 Hz fixed; after a long frame (see FMp `mx`) the loop catches up several
                tics at once, so ONE frame moves the camera several tics' worth -- and any residual
-               one-field lag is multiplied by exactly that.  t1 = no catch-up happening. */
-            snprintf(rLOS, sizeof rLOS, "LOS r%d w%d En%d Wg%d Fl%d/%d A%d/%d t%d F%d%d ",
-                     d_sc0, d_sc1, sat_wall_entry, sat_wall_grow,
-                     sat_field_lock, sat_field_n,
-                     (dbg_age_min > 9 ? 9 : dbg_age_min), dbg_age_max, dbg_tic_max,
-                     sky_mode, rbg0_rpt_late);
+               one-field lag is multiplied by exactly that.  t1 = no catch-up happening.
+               L<X>/<spans> = VDP1 LEAD-FILL (pad R+A cycles X = 1/2/3/0; 0 = off).  X = how many
+               RENDERED FRAMES back the "old wall" is taken from -- i.e. how late you believe VDP1
+               is.  The software then draws, per column, the new tier's rows MINUS the rows the old
+               quad already covered (0, 1 or 2 spans).  spans = how many such spans were drawn this
+               window: 0 means the fill did nothing (off, or old == new = VDP1 in phase), a big
+               number means the view moved a lot and the fill is carrying it.  Sweep X and keep the
+               smallest one that closes the hole -- that value IS the VDP1 lag, measured by eye.
+               (`r` = the old d_sc0 sight counter, dropped for the room.) */
+            {   extern int sat_wall_nodraw, sat_wall_flip;
+            snprintf(rLOS, sizeof rLOS, "LOS w%d En%d Wg%d P%d N%d/%d/%d F%d%d L%d/%d ",
+                     d_sc1, sat_wall_entry, sat_wall_grow, sat_wall_paint,
+                     (sat_wall_nodraw > 999 ? 999 : sat_wall_nodraw),
+                     (vdp1_wall_drop  > 999 ? 999 : vdp1_wall_drop),
+                     (sat_wall_flip   > 999 ? 999 : sat_wall_flip),
+                     sky_mode, rbg0_rpt_late,
+                     sat_wall_lead_x, (sat_lead_cols > 9999 ? 9999 : sat_lead_cols));
+            sat_wall_nodraw = 0; vdp1_wall_drop = 0; sat_wall_flip = 0; sat_lead_cols = 0; }
+            dbg_tic_max = 0;   /* tic burst: settled (no correlation), kept off the row */
+            dbg_age_min = 99; dbg_age_max = 0;   /* wall-age probe: settled dead, kept off the row */
             dbg_age_min = 99; dbg_age_max = 0; dbg_tic_max = 0;   /* fresh window each print */
             /* row 13: was row 5, but r_parallel's SLVidle ('SLV') p3 row ALSO writes row 5 in
                the shipping (rp_disabled) config -> they collided.  Moved to the free row 13. */
@@ -3964,12 +3988,17 @@ static void wtex_setup(void)
     }
 }
 
-/* CMDCOLR (= CRAM 256-colour bank base, bank<<8) for a wall's colormap = its light level. */
+/* CMDCOLR (= CRAM 256-colour bank base, bank<<8) for a wall's colormap = its light level.  Every
+   wall command -- textured band, flat, banded -- takes its CMDCOLR from here.
+   (The `vdp1_wall_over` priority bit that briefly rode here, lifting every wall quad ABOVE NBG1 for
+   the double-write modes, went with them on 2026-08-03.  Wall quads keep the priority-select bits
+   CLEAR -> sprite register 0 = 5 = BELOW NBG1, which is the z-invariant the whole path rests on.) */
 static inline unsigned short wall_light_colr(const unsigned char *cmap)
 {
     int L = (int)((cmap - colormaps) >> 8);              /* colormap level 0..33 */
     if (L < 0) L = 0; else if (L > 33) L = 33;
-    return (unsigned short)((unsigned int)wlight_bank_lut[L] << 8);
+    return (unsigned short)(((unsigned int)wlight_bank_lut[L] << 8)
+                            );
 }
 
 /* (Re)shade the 6 dark CRAM light-banks from the LIVE palette (colors[] -- already flashed when
@@ -4642,6 +4671,10 @@ static void wall_emit_flat(int wi)
     unsigned short colr = wall_light_colr(wall_acc[wi].cmap);
     unsigned short col  = (unsigned short)(colr |
                           (unsigned int)(R_WallPotatoColor(wall_acc[wi].texnum) & 0xFF));
+    /* DEBUG PAINT bit0 (core r_data.c sat_wall_paint, pad L+X): flat GREEN, and through CRAM BANK 1
+       (= NBG1's own palette) rather than the wall's light bank, so it stays the SAME green in a dark
+       room -- a distance-shaded green would be hard to tell from the red CPU walls. */
+    if (sat_wall_paint & 1) col = (unsigned short)(0x0100u | 112u);   /* PLAYPAL: bright green */
     /* +1px x overlap each side (clamped to THIS view's x-range), mirroring the textured path's
        seam-fill window (wall_emit_band, ~4365) so adjacent flat quads OVERLAP instead of leaving a
        1px hairline gap -- visible when every wall is flat (iso mode 2; and far-wall fallbacks). */
@@ -4782,9 +4815,21 @@ static void vdp1_walls_flush(void)
        (far last... i.e. near last).  wall_acc is filled near-first by the BSP, so reverse it. */
     for (int i = wall_acc_n - 1; i >= 0; --i)
     {
-        if      (wall_acc[i].mode == 1) wall_emit(i);
+        /* DROP COUNT (2026-08-03).  The core is committed by now: it handed this wall to VDP1 and
+           the software column loop skipped it (that handoff is sound -- sat_wall_vdp1 returns 1 to
+           reject and r_segs falls back to software BEFORE the loop, and the orphan counter reads
+           N0).  So the ONLY way a claimed wall can still vanish is a silent early return in here --
+           the wall-cap guard, a texture slot that will not resolve, a degenerate quad.  Rather than
+           audit every `return` in three emit functions, watch the command pointer: if it did not
+           move, nothing was written and this wall is a hole.  Row 13 `N<orphan>/<drop>`. */
+        unsigned int wn0 = vdp1_wnext;
+        int emitted = 1;
+        if      (sat_wall_paint & 1)    wall_emit_flat(i);   /* DEBUG PAINT: every VDP1 wall green */
+        else if (wall_acc[i].mode == 1) wall_emit(i);
         else if (wall_acc[i].mode == 3) wall_emit_banded(i);
         else if (wall_acc[i].mode == 2) wall_emit_flat(i);
+        else                            emitted = 0;         /* mode 0 = nothing to draw, not a drop */
+        if (emitted && vdp1_wnext == wn0 && vdp1_wall_drop < 9999) vdp1_wall_drop++;
     }
 
     wall_acc_n = 0;
@@ -6516,6 +6561,23 @@ extern "C" void DG_DrawFrame(void)
         int d = gametic - l_gt; l_gt = gametic;
         if (d < 0) d = 0; else if (d > 9) d = 9;
         if (d > dbg_tic_max) dbg_tic_max = d;
+        /* TIC-BURST STAMP (owner's hypothesis 2026-08-02: *"peut-être que ce qu'il reste c'est quand
+           c'est jusqu'à 3 tics"*).  Row 13's `t` is a per-SECOND max, so it can never say whether the
+           ONE frame he captured was a burst -- and capping the tic rate to test it would be a
+           confounded experiment, because it also slows the camera, so the holes would shrink for the
+           wrong reason.  So stamp the frame instead: a white bar at the top-right of the 3D view,
+           8 px wide per EXTRA tic this frame advanced.  Nothing at 1 tic, one block at 2, two at 3.
+           Any capture then carries its own tic count, and "do the holes only appear on burst frames"
+           is answered by looking at the picture -- no behaviour changed, no confound.
+           Written into the framebuffer just before the blit copies it, so it rides the same field as
+           the picture it describes.  Overlay-gated: it vanishes with the debug text. */
+        if (d >= 2 && gamestate == GS_LEVEL && sat_dbg_overlay_mode == 0)
+        {
+            int w = (d - 1) * 8; if (w > 48) w = 48;
+            int xr = sat_lowres ? 160 : 320;      /* lowres packs the view into the left 160 columns */
+            for (int y = 0; y < 6; ++y)
+                memset(framebuffer + y * 320 + (xr - w), 4, (size_t)w);   /* 4 = white in PLAYPAL */
+        }
     }
     unsigned short blit_t0 = frt_read();   /* SATURN PERF: time the blit (-> sat_blit_ms10) */
     /* SATURN lowres (docs/LOWRES_RENDER_STUDY.md): the software render is packed into the LEFT
@@ -6905,13 +6967,9 @@ static void poll_pad(void)
     }
 
 #if VDP2_RBG0_TEST
-    /* Pad R + Up (1p, edge): toggle the RBG0 FLOOR KIND live -- shipping BITMAP <-> 16-colour CELL
-       (snow-free with the framebuffer; dual-param capable).  Dev toggle to compare the two floors on the
-       SAME scene; the real per-map selection lands in Stage 3.  Sets the WANT; DG_DrawFrame calls
-       rbg0_reinit() at a safe point (top of the floor block) when it differs.  1p only (split uses its
-       own P1HW path).  R taps '.' + Up nudges forward once -- harmless.  Overlay row 5 shows fl:B/fl:C. */
-    if (!sat_split_p1hw && !(cur & PER_DGT_TR) && (changed & PER_DGT_KU) && !(cur & PER_DGT_KU))
-        rbg0_kind_want = (rbg0_kind_want == RBG0_KIND_BITMAP) ? RBG0_KIND_CELL : RBG0_KIND_BITMAP;
+    /* (Pad R+Up RBG0 floor-kind toggle REMOVED 2026-08-03 at the owner's request, with the wall
+       modes.  The 4bpp cell floor itself is untouched and still on pause -- rbg0_kind_want just has
+       no runtime writer now, so the build ships whatever RBG0_KIND_* it is initialised with.) */
     /* (Pad R+Down cell-coeff A/B + R+Left drop-framebuffer A/B CUT 2026-07-16: both probes answered
        -- 4bpp cells are snow-free with K_ON perspective AND the framebuffer ON.  Chords freed, and
        the rbg0_reinit_force gray-flash they triggered is gone.  docs/TOGGLE_AUDIT.md.) */
@@ -7016,6 +7074,21 @@ static void poll_pad(void)
        misalignment he had me fix.  Judge Wg1 on the gap first; if it closes it, the clean form is a
        PADDED character (bake texw+2 x rows+2 with the edge texels duplicated and grow the quad to
        match) -- exact mapping AND a 1px halo, at ~+6% tile VRAM.  Row 13 shows `Wg<n>`. */
+    /* Pad L+X (L held, R released, 1p; freed when M5 was cut): WALL PATH PAINT 0 -> 1 -> 2 -> 3.
+       1 = every VDP1 wall a flat GREEN quad, 2 = every CPU wall flat RED, 3 = both.  Answers the
+       owner's question directly -- "certains murs disparaissent en avant/arriere, potentiellement
+       sur un passage vdp1 cpu mais c'est incertain": with both on, a wall changing path CHANGES
+       COLOUR on the exact frame it happens, and a wall drawn by neither is a hole with no texture
+       left to hide it.
+       ⚠ bit1 first drove sat_potato_walls FROM HERE and the owner got no red: sat_apply_mode /
+       sat_apply_sq own that flag and re-derive it from sq_wall, so the write was clobbered.  The
+       paint now ORs itself into `wall_solid` (core r_segs) directly -- no shared flag to fight over.
+       ⚠ AND the solid COLUMN it selects must live in r_draw.c (sat_dc_solid), not in r_parallel's
+       executors: those never run in the shipping config (rp_disabled).  That second miss is why the
+       owner reported "pas de cpu rouge" TWICE. */
+    if (sat_local_players <= 1 && !(cur & PER_DGT_TL) && (cur & PER_DGT_TR)
+        && (changed & PER_DGT_TX) && !(cur & PER_DGT_TX))
+        sat_wall_paint = (sat_wall_paint + 1) & 3;
     /* Pad L+Down (L held, R released, 1p): SKY/FLOOR BOUNDARY MODE 0 -> 1 -> 2 (see sky_mode for
        what each one is; 1 is the shipped fix, 0 is the A/B reference, 2 adds the 8px lift).
        sky_horizon_row = -1 forces the rebuild test true on the next frame so the change takes
@@ -7051,14 +7124,6 @@ static void poll_pad(void)
     if (sat_local_players <= 1 && !(cur & PER_DGT_TR) && (cur & PER_DGT_TL)
         && (changed & PER_DGT_KL) && !(cur & PER_DGT_KL))
         rbg0_rpt_late = (rbg0_rpt_late + 1) % 3;
-    /* Pad R+Right (R held, L released, 1p): FIELD LOCK on/off -- fence the blit to a vblank edge so
-       the game loop stops sliding against the 60 Hz VDP1 swap.  DEFAULT ON (this is what killed the
-       periodic holes).  Row 13 `Fl<on>/<fields>`; expect fps on a divisor of 60 -- that IS the
-       mechanism, not a regression. */
-    if (sat_local_players <= 1 && !(cur & PER_DGT_TR) && (cur & PER_DGT_TL)
-        && (changed & PER_DGT_KR) && !(cur & PER_DGT_KR))
-        sat_field_lock = (sat_field_lock + 1) % 3;   /* 0 free -> 1 fence -> 2 fence + wall-age lock */
-
     /* (Pad L+Left/Right WALL_PX_BUDGET wall-offload A/B CUT 2026-07-07 -- settled-negative on HW
        (net loss); WALL_PX_BUDGET baked to 200k.  L+Left/Right are free.) */
 
@@ -7207,6 +7272,13 @@ static void poll_pad(void)
        (mirrors the R+A wall-clamp chord).  Row 7 SQ 4th char. */
     if (!(cur & PER_DGT_TR) && (changed & PER_DGT_TB) && !(cur & PER_DGT_TB))
     { sq_sprite = (sq_sprite == SQ_FULL) ? SQ_LD : SQ_FULL; sat_apply_mode(); }
+    /* Pad R+A (R held; 1p): VDP1 LEAD-FILL depth X = 1 -> 2 -> 3 -> 0 (row 13 `L<X>/<spans>`).  X is
+       how many RENDERED FRAMES back the "old wall" is read from: the software then draws the new
+       tier MINUS what the quad from frame n-X already covered.  0 = off = the reference.  The
+       incidental FIRE tap is harmless (the muzzle light is a 1-tic flash). */
+    if (sat_local_players <= 1 && !(cur & PER_DGT_TR)
+        && (changed & PER_DGT_TA) && !(cur & PER_DGT_TA))
+        sat_wall_lead_x = (sat_wall_lead_x + 1) & 3;
     /* Pad L+B (R released): live A/B of RBG0 mark-suppress (core R_CheckPlane no-split of the
        dominant floor).  L held, R released, B pressed -> no clash with the R+B sprite chord; the
        incidental USE tap to Doom is harmless.  Watch Bp (rows 2/4) and vp (row 11) fall when on. */

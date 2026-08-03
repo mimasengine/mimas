@@ -1743,19 +1743,12 @@ static int sat_field_n    = 0;    /* fields the last locked frame occupied -- ro
                                      be STEADY: a value flipping N/N+1 means the frame sits on a
                                      field boundary and the beat is back, coarser (judder). */
 static void sat_field_fence(void);   /* defined next to the long note in DG_DrawFrame */
-/* WALL AGE probe (2026-08-02).  vdp1_kick_vbl = vbl_count when the wall root was last flipped.  In
-   1-cycle auto the plot in flight at the flip already read the OLD root, so the new list is plotted
-   during the NEXT field and displayed from kick_vbl + 2.  age = vbl_count - vdp1_kick_vbl AT BLIT
-   TIME is therefore how stale the walls on screen are, in fields, relative to the picture being
-   written.  age 2 = same frame; age 1 = the walls are ONE FRAME behind, and one frame of turning is
-   10-20 screen px -- far more than any grow can cover, which is the size the owner reports. */
-static volatile unsigned int vdp1_kick_vbl = 0;
-static int dbg_age_min = 99, dbg_age_max = 0;   /* window min/max, reset when row 13 prints */
 static int vdp1_wall_drop = 0;   /* walls the core handed to VDP1 that the emit silently dropped --
-                                    row 13 `N<orphan>/<drop>`, summed over the window.  See the emit
-                                    dispatch loop for why this is watched at the command pointer. */
-static int dbg_tic_max = 0;                     /* max GAME TICS a single frame advanced, per window */
+                                    row 13 `N<orphan>/<drop>/<flip>`, summed over the window.  Watched
+                                    at the command pointer, so it catches every early return in
+                                    wall_emit/_flat/_banded without auditing them one by one. */
 extern "C" int sat_wall_lead_x;    /* core r_segs.c: LEAD-FILL depth in frames, 0 = off (pad R+A)     */
+extern "C" int sat_lead_flat;      /* core r_segs.c: draw the difference spans SOLID (pad R+Right)   */
 extern "C" int sat_lead_cols;      /* core r_segs.c: extra software column-spans drawn by the fill    */
 /* px the VDP1 wall quad is grown top/bottom.  0 = texture-EXACT (default): DISTORSP maps the WHOLE
    character corner to corner, so moving the vertices without changing the character stretches the
@@ -2126,14 +2119,12 @@ static void fps_update(void)
                software columns on the walls that just appeared for that hole. */
             /* Wg = VDP1 WALL GROW px (pad L+Up) -- the quad grows by Wg screen px and its character
                by the matching texels (the matelas), so the seam closes without the texture slipping.
-               Fl = field-lock MODE (0 free / 1 fence / 2 fence + wall-age lock, pad R+Right), then
-               the fields the last locked frame occupied.
-               A<min>/<max> = WALL AGE in fields at blit time, over this window (see vdp1_kick_vbl).
-               2 = the walls on screen belong to the frame being blitted.  A 1 anywhere means they
-               are ONE FRAME behind, and one frame of turning is 10-20 screen px -- which IS the size
-               of hole the owner reports, and no grow can cover that.  MEASURED A1/2 in Fl1 on
-               2026-08-02: both ages occur every second, which is what Fl2 exists to flatten -- read
-               A2/2 as "the lock is holding", A1 back in the window as "it is not".
+               P = DEBUG WALL PAINT state (pad L+X): 1 = every VDP1 wall flat GREEN, 2 = every
+               CPU wall flat RED, 3 = both.  This is the "show me what is on VDP1" toggle.
+               (`Wm` wall mode and `Fl`/`A` field-lock + wall-age left the row on 2026-08-03 with the
+               modes and probes they belonged to.  The wall-age verdict, so nobody re-measures it:
+               pinned A2/2 in Fl2 on 4 captures INCLUDING the ones showing the offset -- the walls
+               are NOT late by a field and no presentation-timing experiment is worth running.)
                F<s><rp> = the HARDWARE FLOOR pair, both digits about the RBG0 / HW-sky boundary
                (owner's symptom: the sky comes down OVER the floor's topmost rows).
                s (pad L+Down) = SKY/FLOOR BOUNDARY MODE: 0 legacy (map rewritten mid-frame) / 1
@@ -2161,17 +2152,15 @@ static void fps_update(void)
                smallest one that closes the hole -- that value IS the VDP1 lag, measured by eye.
                (`r` = the old d_sc0 sight counter, dropped for the room.) */
             {   extern int sat_wall_nodraw, sat_wall_flip;
-            snprintf(rLOS, sizeof rLOS, "LOS w%d En%d Wg%d P%d N%d/%d/%d F%d%d L%d/%d ",
+            snprintf(rLOS, sizeof rLOS, "LOS w%d En%d Wg%d P%d N%d/%d/%d F%d%d L%d%c/%d ",
                      d_sc1, sat_wall_entry, sat_wall_grow, sat_wall_paint,
                      (sat_wall_nodraw > 999 ? 999 : sat_wall_nodraw),
                      (vdp1_wall_drop  > 999 ? 999 : vdp1_wall_drop),
                      (sat_wall_flip   > 999 ? 999 : sat_wall_flip),
                      sky_mode, rbg0_rpt_late,
-                     sat_wall_lead_x, (sat_lead_cols > 9999 ? 9999 : sat_lead_cols));
+                     sat_wall_lead_x, sat_lead_flat ? 'f' : '-',
+                     (sat_lead_cols > 9999 ? 9999 : sat_lead_cols));
             sat_wall_nodraw = 0; vdp1_wall_drop = 0; sat_wall_flip = 0; sat_lead_cols = 0; }
-            dbg_tic_max = 0;   /* tic burst: settled (no correlation), kept off the row */
-            dbg_age_min = 99; dbg_age_max = 0;   /* wall-age probe: settled dead, kept off the row */
-            dbg_age_min = 99; dbg_age_max = 0; dbg_tic_max = 0;   /* fresh window each print */
             /* row 13: was row 5, but r_parallel's SLVidle ('SLV') p3 row ALSO writes row 5 in
                the shipping (rp_disabled) config -> they collided.  Moved to the free row 13. */
             if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 13, rLOS);
@@ -5707,9 +5696,6 @@ static void vdp1_wpn_kick(void)
         vdp1_bank = vdp1_wbank;
         *((volatile unsigned short *)VDP1_ROOT_ADDR + 1) =
             (unsigned short)((VDP1_BANK[vdp1_wbank] - VDP1_VRAM_BASE) >> 3);
-        vdp1_kick_vbl = vbl_count;   /* wall-age probe -- THIS is the path M7 takes every frame (a
-                                        wall list exists); the stamp below only covers the empty-bank
-                                        fallback, which normal play never reaches. */
         VDP1_PTMR = 0x0002;
         vdp1_wactive = 0;
         return;
@@ -5721,7 +5707,6 @@ static void vdp1_wpn_kick(void)
     }
     /* atomic single-halfword flip of the root command's jump target */
     *((volatile unsigned short *)VDP1_ROOT_ADDR + 1) = (unsigned short)link;
-    vdp1_kick_vbl = vbl_count;       /* wall-age probe: on screen from here + 2 fields */
     VDP1_PTMR = 0x0002;              /* start the draw (clears EDSR CEF until it finishes) */
 #if VDP1_MANUAL_CHANGE
     if (vdp1_present_manual)
@@ -6534,13 +6519,6 @@ extern "C" void DG_DrawFrame(void)
        ms INTO the field and crossed the beam -- the owner's "j'ai l'impression de constater plus de
        déchirures".  The loop still phase-locks either way; only the tearing moved. */
     if (sat_field_lock && gamestate == GS_LEVEL) sat_field_fence();
-    /* Fl2 WALL AGE LOCK -- hold the software commit until the walls it must agree with are on
-       screen (age 2; see the fence's note for the derivation and for why the old verdict on this
-       mode is void).  At most one extra field: the fence already left us on an edge, and the wait
-       only fires when the post-kick tail did not cross a vblank.  Nothing to bail out of -- if
-       vbl_count stopped, the fence above would already be spinning forever. */
-    if (sat_field_lock >= 2 && gamestate == GS_LEVEL)
-        while ((unsigned int)(vbl_count - vdp1_kick_vbl) < 2u) { }
 #if VDP2_CELL_SKY
     /* SKY MAP, deferred half (sky_mode >= 1).  HERE, at the top of the field the blit is about to
        paint: the map is VRAM and VDP2 reads it during display, so writing it any earlier would show
@@ -6549,36 +6527,6 @@ extern "C" void DG_DrawFrame(void)
        beam reaches the horizon rows. */
     if (sky_map_pending) { sky_cell_write_map(); sky_map_pending = 0; }
 #endif
-    /* WALL AGE + TIC BURST, sampled HERE because this is per-FRAME code.  The first cut put the tic
-       delta inside the row-13 snprintf, which is a once-per-SECOND block (`r`/`w` are per-window
-       deltas) -- so it read ~35 tics and pinned at its clamp.  Same trap the legend documents: a
-       digit stuck on its bound is a measurement that never happened. */
-    {   unsigned int age = vbl_count - vdp1_kick_vbl;
-        int a = (age > 9u) ? 9 : (int)age;
-        if (a < dbg_age_min) dbg_age_min = a;
-        if (a > dbg_age_max) dbg_age_max = a;
-        extern int gametic; static int l_gt = 0;
-        int d = gametic - l_gt; l_gt = gametic;
-        if (d < 0) d = 0; else if (d > 9) d = 9;
-        if (d > dbg_tic_max) dbg_tic_max = d;
-        /* TIC-BURST STAMP (owner's hypothesis 2026-08-02: *"peut-être que ce qu'il reste c'est quand
-           c'est jusqu'à 3 tics"*).  Row 13's `t` is a per-SECOND max, so it can never say whether the
-           ONE frame he captured was a burst -- and capping the tic rate to test it would be a
-           confounded experiment, because it also slows the camera, so the holes would shrink for the
-           wrong reason.  So stamp the frame instead: a white bar at the top-right of the 3D view,
-           8 px wide per EXTRA tic this frame advanced.  Nothing at 1 tic, one block at 2, two at 3.
-           Any capture then carries its own tic count, and "do the holes only appear on burst frames"
-           is answered by looking at the picture -- no behaviour changed, no confound.
-           Written into the framebuffer just before the blit copies it, so it rides the same field as
-           the picture it describes.  Overlay-gated: it vanishes with the debug text. */
-        if (d >= 2 && gamestate == GS_LEVEL && sat_dbg_overlay_mode == 0)
-        {
-            int w = (d - 1) * 8; if (w > 48) w = 48;
-            int xr = sat_lowres ? 160 : 320;      /* lowres packs the view into the left 160 columns */
-            for (int y = 0; y < 6; ++y)
-                memset(framebuffer + y * 320 + (xr - w), 4, (size_t)w);   /* 4 = white in PLAYPAL */
-        }
-    }
     unsigned short blit_t0 = frt_read();   /* SATURN PERF: time the blit (-> sat_blit_ms10) */
     /* SATURN lowres (docs/LOWRES_RENDER_STUDY.md): the software render is packed into the LEFT
        160 columns; VDP2 hardware-enlarges NBG1 x2 horizontal so it fills the screen.  Re-applied
@@ -7124,6 +7072,13 @@ static void poll_pad(void)
     if (sat_local_players <= 1 && !(cur & PER_DGT_TR) && (cur & PER_DGT_TL)
         && (changed & PER_DGT_KL) && !(cur & PER_DGT_KL))
         rbg0_rpt_late = (rbg0_rpt_late + 1) % 3;
+    /* Pad R+Right (R held, L released, 1p): LEAD-FILL difference spans TEXTURED <-> FLAT (row 13
+       `L<X><f>/<spans>`, 'f' = flat).  Those spans are slivers on a moving wall's edge, so flat
+       costs a fraction: it skips R_GetColumn, the memory-bound composite, on exactly the columns
+       this system invents.  Judge it on row-2 `Bp` and on whether you can see the seam. */
+    if (sat_local_players <= 1 && !(cur & PER_DGT_TR) && (cur & PER_DGT_TL)
+        && (changed & PER_DGT_KR) && !(cur & PER_DGT_KR))
+        sat_lead_flat ^= 1;
     /* (Pad L+Left/Right WALL_PX_BUDGET wall-offload A/B CUT 2026-07-07 -- settled-negative on HW
        (net loss); WALL_PX_BUDGET baked to 200k.  L+Left/Right are free.) */
 

@@ -1748,7 +1748,8 @@ static int vdp1_wall_drop = 0;   /* walls the core handed to VDP1 that the emit 
                                     at the command pointer, so it catches every early return in
                                     wall_emit/_flat/_banded without auditing them one by one. */
 extern "C" int sat_wall_lead_x;    /* core r_segs.c: LEAD-FILL depth in frames, 0 = off (pad R+A)     */
-extern "C" int sat_lead_flat;      /* core r_segs.c: draw the difference spans SOLID (pad R+Right)   */
+extern "C" int sat_lead_mode;      /* core r_segs.c: 0 master-tex / 1 SLAVE-tex / 2 master-flat (R+Right) */
+extern "C" int sat_lead_span_drop; /* core r_segs.c: spans the slave list could not hold             */
 extern "C" int sat_lead_cols;      /* core r_segs.c: extra software column-spans drawn by the fill    */
 /* px the VDP1 wall quad is grown top/bottom.  0 = texture-EXACT (default): DISTORSP maps the WHOLE
    character corner to corner, so moving the vertices without changing the character stretches the
@@ -2158,9 +2159,10 @@ static void fps_update(void)
                      (vdp1_wall_drop  > 999 ? 999 : vdp1_wall_drop),
                      (sat_wall_flip   > 999 ? 999 : sat_wall_flip),
                      sky_mode, rbg0_rpt_late,
-                     sat_wall_lead_x, sat_lead_flat ? 'f' : '-',
+                     sat_wall_lead_x,
+                     sat_lead_span_drop ? '!' : "-sf"[sat_lead_mode % 3],
                      (sat_lead_cols > 9999 ? 9999 : sat_lead_cols));
-            sat_wall_nodraw = 0; vdp1_wall_drop = 0; sat_wall_flip = 0; sat_lead_cols = 0; }
+            sat_wall_nodraw = 0; vdp1_wall_drop = 0; sat_wall_flip = 0; sat_lead_cols = 0; sat_lead_span_drop = 0; }
             /* row 13: was row 5, but r_parallel's SLVidle ('SLV') p3 row ALSO writes row 5 in
                the shipping (rp_disabled) config -> they collided.  Moved to the free row 13. */
             if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 13, rLOS);
@@ -7072,13 +7074,15 @@ static void poll_pad(void)
     if (sat_local_players <= 1 && !(cur & PER_DGT_TR) && (cur & PER_DGT_TL)
         && (changed & PER_DGT_KL) && !(cur & PER_DGT_KL))
         rbg0_rpt_late = (rbg0_rpt_late + 1) % 3;
-    /* Pad R+Right (R held, L released, 1p): LEAD-FILL difference spans TEXTURED <-> FLAT (row 13
-       `L<X><f>/<spans>`, 'f' = flat).  Those spans are slivers on a moving wall's edge, so flat
-       costs a fraction: it skips R_GetColumn, the memory-bound composite, on exactly the columns
-       this system invents.  Judge it on row-2 `Bp` and on whether you can see the seam. */
+    /* Pad R+Right (R held, L released, 1p): LEAD-FILL span DRAW MODE 0 -> 1 -> 2 (row 13
+       `L<X><m>/<spans>`): `-` master textured (reference), `s` SLAVE textured (default -- the spans
+       are recorded during the BSP and filled by the 2nd SH-2 while the master draws the planes),
+       `f` master FLAT (skips the composite; the owner judged it visible in motion).  Judge `s`
+       on row-1 `R` and row-2 `Bp`, and on `to<rate>:A...` (row 0) staying at 0 -- an aux timeout
+       here means the slave did not take the job and the master redrew the list serially. */
     if (sat_local_players <= 1 && !(cur & PER_DGT_TR) && (cur & PER_DGT_TL)
         && (changed & PER_DGT_KR) && !(cur & PER_DGT_KR))
-        sat_lead_flat ^= 1;
+        sat_lead_mode = (sat_lead_mode + 1) % 3;
     /* (Pad L+Left/Right WALL_PX_BUDGET wall-offload A/B CUT 2026-07-07 -- settled-negative on HW
        (net loss); WALL_PX_BUDGET baked to 200k.  L+Left/Right are free.) */
 

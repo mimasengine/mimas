@@ -1749,6 +1749,7 @@ static int vdp1_wall_drop = 0;   /* walls the core handed to VDP1 that the emit 
                                     wall_emit/_flat/_banded without auditing them one by one. */
 extern "C" int sat_wall_lead_x;    /* core r_segs.c: LEAD-FILL depth in frames, 0 = off (pad R+A)     */
 extern "C" int sat_lead_mode;      /* core r_segs.c: 0 master-tex / 1 SLAVE-tex / 2 master-flat (R+Right) */
+extern "C" int sat_wall_dwell;     /* core r_segs.c: frames a flipped seg stays CPU-covered (pad R+Up) */
 extern "C" int sat_lead_span_drop; /* core r_segs.c: spans the slave list could not hold             */
 extern "C" int sat_lead_cols;      /* core r_segs.c: extra software column-spans drawn by the fill    */
 /* px the VDP1 wall quad is grown top/bottom.  0 = texture-EXACT (default): DISTORSP maps the WHOLE
@@ -2153,8 +2154,8 @@ static void fps_update(void)
                smallest one that closes the hole -- that value IS the VDP1 lag, measured by eye.
                (`r` = the old d_sc0 sight counter, dropped for the room.) */
             {   extern int sat_wall_nodraw, sat_wall_flip;
-            snprintf(rLOS, sizeof rLOS, "LOS w%d En%d Wg%d P%d N%d/%d/%d F%d%d L%d%c/%d ",
-                     d_sc1, sat_wall_entry, sat_wall_grow, sat_wall_paint,
+            snprintf(rLOS, sizeof rLOS, "LOS w%d En%d/%d Wg%d P%d N%d/%d/%d F%d%d L%d%c/%d ",
+                     d_sc1, sat_wall_entry, sat_wall_dwell, sat_wall_grow, sat_wall_paint,
                      (sat_wall_nodraw > 999 ? 999 : sat_wall_nodraw),
                      (vdp1_wall_drop  > 999 ? 999 : vdp1_wall_drop),
                      (sat_wall_flip   > 999 ? 999 : sat_wall_flip),

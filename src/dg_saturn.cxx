@@ -7075,15 +7075,32 @@ static void poll_pad(void)
     if (sat_local_players <= 1 && !(cur & PER_DGT_TR) && (cur & PER_DGT_TL)
         && (changed & PER_DGT_KL) && !(cur & PER_DGT_KL))
         rbg0_rpt_late = (rbg0_rpt_late + 1) % 3;
-    /* Pad R+Right (R held, L released, 1p): LEAD-FILL span DRAW MODE 0 -> 1 -> 2 (row 13
-       `L<X><m>/<spans>`): `-` master textured (reference), `s` SLAVE textured (default -- the spans
-       are recorded during the BSP and filled by the 2nd SH-2 while the master draws the planes),
-       `f` master FLAT (skips the composite; the owner judged it visible in motion).  Judge `s`
-       on row-1 `R` and row-2 `Bp`, and on `to<rate>:A...` (row 0) staying at 0 -- an aux timeout
-       here means the slave did not take the job and the master redrew the list serially. */
+    /* Pad R+Up (R held, L released, 1p): PATH DWELL 0 -> 4 -> 8 (row 13 `En<entry>/<dwell>`).
+       Frames a seg that just changed CPU<->VDP1 path stays covered by the CPU -- bounds the flip
+       RATE where the hysteresis only widened the threshold.  Pins to the CPU only, never to VDP1:
+       forcing VDP1 could hit a tier with no VDP1 claim and leave it drawn by nobody.  Costs
+       software columns -> watch row-2 `Bp`.  0 = off = the 2-frame exit overlap alone.
+       (Freed when the RBG0 floor-kind chord was removed 2026-08-03.  THIS BLOCK WAS MISSING from
+       the first dwell commit -- the variable and the readout shipped, the chord did not, so R+Up
+       did nothing and the owner read it as a failed idea.) */
+    if (sat_local_players <= 1 && !(cur & PER_DGT_TR) && (cur & PER_DGT_TL)
+        && (changed & PER_DGT_KU) && !(cur & PER_DGT_KU))
+        sat_wall_dwell = (sat_wall_dwell == 0) ? 4 : (sat_wall_dwell == 4) ? 8 : 0;
+    /* Pad R+Right (R held, L released, 1p): the WHOLE LEAD-FILL state, one cycle (row 13
+       `L<X><m>/<spans>`): `1s` `2s` `3s` = depth X on the SLAVE, `1-` = X1 drawn by the MASTER
+       (the offload A/B), `0-` = OFF = the reference.
+       ⚠ X used to be on R+A -- WHICH IS ALREADY sat_wall_clamp'S CHORD (the Phase-1 wall clamp,
+       bound long before).  Every press toggled BOTH, so the owner's X sweeps were silently
+       flipping the floor-crossing wedge under him.  Chord audits must match on PER_DGT_T*, not on
+       the button letter. */
     if (sat_local_players <= 1 && !(cur & PER_DGT_TR) && (cur & PER_DGT_TL)
         && (changed & PER_DGT_KR) && !(cur & PER_DGT_KR))
-        sat_lead_mode = (sat_lead_mode + 1) % 3;
+    {
+        static int lead_sel = 0;
+        lead_sel = (lead_sel + 1) % 5;
+        sat_wall_lead_x = (lead_sel == 4) ? 0 : (lead_sel == 3) ? 1 : lead_sel + 1;
+        sat_lead_mode   = (lead_sel == 3) ? 0 : 1;
+    }
     /* (Pad L+Left/Right WALL_PX_BUDGET wall-offload A/B CUT 2026-07-07 -- settled-negative on HW
        (net loss); WALL_PX_BUDGET baked to 200k.  L+Left/Right are free.) */
 
@@ -7232,13 +7249,6 @@ static void poll_pad(void)
        (mirrors the R+A wall-clamp chord).  Row 7 SQ 4th char. */
     if (!(cur & PER_DGT_TR) && (changed & PER_DGT_TB) && !(cur & PER_DGT_TB))
     { sq_sprite = (sq_sprite == SQ_FULL) ? SQ_LD : SQ_FULL; sat_apply_mode(); }
-    /* Pad R+A (R held; 1p): VDP1 LEAD-FILL depth X = 1 -> 2 -> 3 -> 0 (row 13 `L<X>/<spans>`).  X is
-       how many RENDERED FRAMES back the "old wall" is read from: the software then draws the new
-       tier MINUS what the quad from frame n-X already covered.  0 = off = the reference.  The
-       incidental FIRE tap is harmless (the muzzle light is a 1-tic flash). */
-    if (sat_local_players <= 1 && !(cur & PER_DGT_TR)
-        && (changed & PER_DGT_TA) && !(cur & PER_DGT_TA))
-        sat_wall_lead_x = (sat_wall_lead_x + 1) & 3;
     /* Pad L+B (R released): live A/B of RBG0 mark-suppress (core R_CheckPlane no-split of the
        dominant floor).  L held, R released, B pressed -> no clash with the R+B sprite chord; the
        incidental USE tap to Doom is harmless.  Watch Bp (rows 2/4) and vp (row 11) fall when on. */

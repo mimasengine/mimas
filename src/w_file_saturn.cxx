@@ -220,7 +220,10 @@ extern "C" int sat_cd_persector = 0;
 ** command (ms), t = cumulative seconds spent inside CD commands. */
 extern "C" unsigned short sat_frt(void);        /* dg_saturn.cxx master FRT */
 extern "C" unsigned int   sat_vbl(void);        /* dg_saturn.cxx vblank count */
-extern "C" unsigned int sat_cd_ms10_total = 0;  /* cumulative CD-command wall-clock (tenths of ms) */
+/* The cumulative total moved to CORE (w_wad.c `w_cd_ms10`) 2026-08-07: it is no longer just an
+** overlay field, it is the clock the per-frame texture LOAD BUDGET spends (core r_segs.c
+** R_LoadBudgetLeft), and a core budget cannot read a symbol that only exists in src/. */
+extern "C" unsigned int w_cd_ms10;              /* core w_wad.c -- we are its only writer */
 extern "C" unsigned int sat_cd_ms10_worst = 0;  /* worst single command (tenths of ms) */
 
 extern "C" void sat_cd_clock_add(unsigned short f0, unsigned int v0)
@@ -229,7 +232,7 @@ extern "C" void sat_cd_clock_add(unsigned short f0, unsigned int v0)
     unsigned int ms10 = (dv >= 16u)
         ? dv * 167u                                                       /* ~16.7ms/vblank */
         : ((unsigned int)(unsigned short)(sat_frt() - f0) * 447u) / 10000u; /* ~4.47us/tick */
-    sat_cd_ms10_total += ms10;
+    w_cd_ms10 += ms10;
     if (ms10 > sat_cd_ms10_worst) sat_cd_ms10_worst = ms10;
 }
 

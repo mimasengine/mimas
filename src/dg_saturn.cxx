@@ -647,7 +647,8 @@ extern "C" int sat_flatcache_full;     /* views where every slot was busy -> cla
 extern "C" unsigned int sat_p_kick10;  /* VDP1 wall kick + R_DrawPlayerSprites (weapon), tenths-ms  */
 /* (sat_p_net10 / _draw10 / _join10 removed with the row that printed them -- settled at ~0.) */
 extern "C" int R_TextureIOFree(int tex);  /* core r_data.c: 1 = resolving this texture hits no disc */
-extern "C" int sat_tex_load_spent;     /* core r_segs.c: budget slots used this frame (shared)      */
+extern "C" int sat_tex_load_spent;     /* core r_segs.c: tenths of a ms of disc spent this frame    */
+extern "C" int R_LoadBudgetLeft(void); /* core r_segs.c: 1 = the frame can still afford a fault     */
 extern "C" int R_WallPotatoColorPeek(int tex);  /* core r_data.c: cached dominant colour, -1 = none,
                                                    NEVER loads (R_WallPotatoColor faults the texture
                                                    in through R_GetColumn -- see wall_emit_flat)    */
@@ -2273,8 +2274,10 @@ static void fps_update(void)
                    slot   = every slot already feeds this frame's list => raise THINGS_TEX_SLOTS
                             (the MP case: 4 views + up to 3 other-player colours share 4 slots).
                    budget = command bank / split queue full => raise VDP1_BANK_CMDS.
-                 lb<budget>:<flat>.<nocol> = the per-frame TEXTURE LOAD BUDGET (pad R+X, 0/1/2/4;
-                   0 = off = the old behaviour).  <flat> = wall tiers drawn FLAT this window because
+                 lb<budget>:<flat>.<nocol> = the per-frame TEXTURE LOAD BUDGET, in MILLISECONDS OF
+                   DISC (pad R+X cycles 10/20/40/0; 0 = off = the old ungated behaviour; DEFAULT 20
+                   since 2026-08-07 -- it used to be a count of reads AND default-off, i.e. armed
+                   only by the chord).  <flat> = wall tiers drawn FLAT this window because
                    texturing them would have hit the disc and the budget was spent -- the number to
                    trade against `Bp` on row 2.  <nocol> = of those, how many had NO cached dominant
                    colour and fell back to the neutral index (a texture never yet seen at all; it
@@ -2395,7 +2398,7 @@ static void fps_update(void)
             if (sat_wad_base == nullptr)   /* CD-streaming mode */
             {
                 extern int sat_cd_persistent;
-                extern unsigned int sat_cd_ms10_total;
+                extern unsigned int w_cd_ms10;   /* core w_wad.c -- also the load budget's clock */
                 /* `L<s>s/<n>` = the LAST detected level load: seconds inside CD commands, and how
                    many commands.  This is the number that answers "why is loading slow" -- `t`
                    cannot, it is cumulative over boot + every load + the in-play thrash.
@@ -2420,7 +2423,7 @@ static void fps_update(void)
                    because the CD row gave up `k`, `L`, `S`, `p`, `e` and `lf` as they settled. */
                 extern int r_patch_ovf;
                 snprintf(ovbuf, sizeof ovbuf, "CD t%us px%d ",
-                         sat_cd_ms10_total / 10000, r_patch_ovf);
+                         w_cd_ms10 / 10000, r_patch_ovf);
                 (void)sat_cd_persistent; (void)sat_texcache_evicts;
                 (void)sat_texcache_carve_lf; (void)sat_texcache_poolkb;
                 if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 12, ovbuf);
@@ -4420,15 +4423,15 @@ static int wall_tex_resolve(int texnum, const unsigned char *cmap)
        always-bake behaviour); read `b` on row 20 for refusals and `t` for the resolve pass. */
     if (sat_tex_load_budget && !R_TextureIOFree(texnum))
     {
-        if (sat_tex_load_spent < sat_tex_load_budget)
+        if (R_LoadBudgetLeft())
         {
             /* Pay -- and PRIME the dominant colour first, while we are faulting the texture in
                anyway.  R_WallPotatoColor does the load itself, so the bake loop below then finds
                every column resident: ONE disc read, not two.  Without this the colour cache stays
                empty in normal play (the potato mode is off) and every LATER refusal of this same
                texture would fall back to the neutral index -- measured `nocol` = 100 % of flattened
-               tiers when the software half shipped without priming. */
-            sat_tex_load_spent++;
+               tiers when the software half shipped without priming.  No `spent++`: the budget is
+               a CLOCK now (core r_segs.c), and this call's own disc read is already on it. */
             R_WallPotatoColor(texnum);
         }
         else return -1;                                 /* flat quad this frame, textured later */
@@ -6170,8 +6173,9 @@ extern "C" void sat_walls_kick(void)
            that patch the moment anything else allocates -- the flat treadmill, one lump class over.
            Row-0 `ld` climbing ~16/s while the flat cache is pinned (FLT `ld` flat, `f0`) is what put
            the disc back on trial.  So bracket the CD clock across the same call: `c` = ms inside GFS
-           commands, `n` = how many.  sat_cd_ms10_total is updated SYNCHRONOUSLY inside
-           sat_cd_load_raw, so the delta is exactly this call's disc time. */
+           commands, `n` = how many.  w_cd_ms10 (core w_wad.c) is updated SYNCHRONOUSLY inside
+           sat_cd_load_raw, so the delta is exactly this call's disc time -- which is also why the
+           load budget can spend that same clock per frame (core r_segs.c R_LoadBudgetLeft). */
         { unsigned short g0 = frt_read();
         if (sat_split_active) vdp1_things_flush();
         else                  R_EmitWorldThingsVDP1();
@@ -7271,13 +7275,15 @@ static void poll_pad(void)
        patch, NO DISC) and textures itself over the following frames as the budget refills.
        No distance test: the BSP walk is front-to-back, so the budget is spent on the NEAREST
        walls by construction.  0 = off = every texture faults on sight (the old behaviour).
+       The chord cycles 10 -> 20 -> 40 -> 0 -> 10 MILLISECONDS of disc per frame (it was a count
+       of reads, 0/1/2/4, until 2026-08-07); the DEFAULT is 20, so the gate is armed at boot.
        Read `lb<budget>:<flat>.<nocol>` on row 18.  (R+X was documented for sat_near_sprites but
        NEVER bound -- verified on PER_DGT_TX, the only sites are L+X and split-X.) */
     if (sat_local_players <= 1 && !(cur & PER_DGT_TR) && (cur & PER_DGT_TL)
         && (changed & PER_DGT_TX) && !(cur & PER_DGT_TX))
-        sat_tex_load_budget = (sat_tex_load_budget == 0) ? 1
-                            : (sat_tex_load_budget == 1) ? 2
-                            : (sat_tex_load_budget == 2) ? 4 : 0;
+        sat_tex_load_budget = (sat_tex_load_budget == 10) ? 20
+                            : (sat_tex_load_budget == 20) ? 40
+                            : (sat_tex_load_budget == 40) ? 0  : 10;
     /* Pad R + Down: TEST cheat cycle -- off -> GOD -> GOD+NOCLIP -> off, applied to every local
        player and re-established each tic by core P_Ticker (survives level/map warp, deaths, the
        E1M8 super-damage floor).  R held, L released, Down edge (free chord -- R+Down was the cut

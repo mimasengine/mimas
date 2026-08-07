@@ -186,6 +186,9 @@ static uint32_t       drp_sprh_n      = 0;
 /* current selected map */
 static unsigned char *drp_entries     = nullptr;  /* n_entries * 16, PU_STATIC */
 static int            drp_n_entries   = 0;
+/* >0 = drp_entries is the SHARED boot-time buffer, sized for the worst map: never freed, never
+   re-allocated per level (see drp_probe).  0 = the old per-map path (zone was too tight at boot). */
+static int            drp_max_entries = 0;
 static uint32_t       drp_blob_ofs    = 0;
 
 /* Step 4b: current map's blob staged in cart RAM */
@@ -306,6 +309,39 @@ static void drp_probe(void)
     }
     drp_n_maps    = n_maps;
     sat_drp_n_maps = (int)n_maps;
+
+    /* SATURN 2026-08-07 -- ONE entry table, allocated HERE (boot) at the worst case across every
+       map, instead of one Z_Malloc(PU_STATIC) per level inside sat_drp_select_map.
+
+       WHY: the per-map table is 16 B x n_entries = 30-60 KB of PU_STATIC, and it was carved right
+       at the top of P_SetupLevel -- i.e. wherever the rover happened to sit after Z_FreeTags --
+       which makes it a MID-ZONE WALL in the sense of [[zone-contiguity-wall-loadsegs]].  The first
+       live-.DRP build halted on `Zmalloc fail 35104 t8 (fr208K lg32K st431K lv375K)`: a 34 KB
+       PURGEABLE patch, 208 KB reclaimable, but no 34 KB run left anywhere.  Allocated at boot it
+       lands next to drp_map_tab in the block the colormaps / sprite tables / texture tables
+       already form at the BOTTOM of the zone -- same bytes, but at the edge, where a wall costs
+       nothing.  It also removes a per-level free+alloc cycle, which was its own fragmentation
+       engine (the lesson the resident flat pool already taught).
+
+       Fails soft: if the zone cannot take it here, drp_max_entries stays 0 and select_map keeps
+       its original per-map allocation -- the boot win is worth more than this placement. */
+    {
+        uint32_t mx = 0;
+        for (uint32_t m = 0; m < drp_n_maps; m++)
+        {
+            uint32_t ne = rd32(drp_map_tab + m * drp_map_sz + 8);
+            if (ne <= n_lumps && ne > mx) mx = ne;      /* same corruption bound as select_map */
+        }
+        if (mx)
+        {
+            int bytes = (int)(mx * DRP_ENT_SZ);
+            if (Z_LargestAllocatable() > bytes + 256*1024)
+            {
+                drp_entries     = (unsigned char *)Z_Malloc(bytes, PU_STATIC, NULL);
+                drp_max_entries = (int)mx;
+            }
+        }
+    }
     /* R3.1: sanity the sprite-header section before trusting it (a corrupt count
        could else over-read).  n_lumps is a safe upper bound on sprite lumps. */
     if (sprh_n > 0 && sprh_n <= n_lumps && sprh_ofs >= DRP_HDR_SZ)
@@ -384,10 +420,22 @@ extern "C" int sat_drp_preload_kb;  int sat_drp_preload_kb = 0;   /* row-21 tele
 #define SAT_DRP_PRELOAD_KEEP_FREE (192*1024)   /* leave this much allocatable for gameplay */
 #endif
 
+/* SATURN 2026-08-07: DEFAULT OFF.  The R5.1 preload is the ONE part of the .DRP path that touches
+   the Doom zone -- it caches lumps until Z_LargestAllocatable falls to a 192 KB keep-free guard.
+   TNT MAP11 played for dozens of capture rounds with no Zmalloc failure, and the halt appeared on
+   the FIRST build with a valid .DRP; this is the only mechanism in that change that can plausibly
+   cost contiguity, so it goes off first.  The two parts that earned their keep stay ON: the R3.1
+   sprite-header index (the ~4 minute boot -> fast) and per-map blob serving.
+   Flip to 1 to A/B it once the zone is understood.  ⚠ Judge it on `LIM lg`, not on fps. */
+#ifndef SAT_DRP_PRELOAD_ON
+#define SAT_DRP_PRELOAD_ON 0
+#endif
+
 extern "C" void sat_drp_preload(void)
 {
     int done = 0;
     sat_drp_preload_kb = 0;
+    if (!SAT_DRP_PRELOAD_ON) return;
     if (sat_drp_state != 1 || !drp_entries || drp_n_entries <= 0) return;
 
     /* Breadth-first fill (the entry table is in WAD order = whole monster type after
@@ -503,8 +551,9 @@ extern "C" void sat_drp_select_map(const char *lumpname)
 {
     if (sat_drp_state == 0) drp_probe();
 
-    /* release the previous map's entry table + cart staging */
-    if (drp_entries) { Z_Free(drp_entries); drp_entries = nullptr; }
+    /* release the previous map's entry table + cart staging.  With the shared boot buffer there is
+       nothing to release -- just invalidate the contents (drp_n_entries = 0). */
+    if (drp_entries && !drp_max_entries) { Z_Free(drp_entries); drp_entries = nullptr; }
     drp_n_entries = 0;
     drp_blob_ofs  = 0;
     drp_cart_staged = 0; drp_cart_blob = nullptr; sat_drp_cart = 0; sat_drp_cart_kb = 0;
@@ -538,10 +587,18 @@ extern "C" void sat_drp_select_map(const char *lumpname)
         if (n_entries == 0 || n_entries > numlumps) return;   /* corrupt -> raw for this map */
 
         int bytes = (int)(n_entries * DRP_ENT_SZ);
-        drp_entries = (unsigned char *)Z_Malloc(bytes, PU_STATIC, NULL);
+        if (drp_max_entries)
+        {
+            /* shared boot buffer: refill in place, never re-allocate (see drp_probe) */
+            if ((int)n_entries > drp_max_entries) return;   /* can't happen -- probe took the max */
+        }
+        else
+            drp_entries = (unsigned char *)Z_Malloc(bytes, PU_STATIC, NULL);
         if (drp_read(entries_ofs, drp_entries, bytes) < bytes)
         {
-            Z_Free(drp_entries); drp_entries = nullptr;   /* read failed -> raw for this map */
+            /* read failed -> raw WAD for this map.  Only free what WE allocated; the shared
+               buffer stays (drp_n_entries is left 0, which is what makes it inert). */
+            if (!drp_max_entries) { Z_Free(drp_entries); drp_entries = nullptr; }
             return;
         }
         drp_n_entries = (int)n_entries;

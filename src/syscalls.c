@@ -52,7 +52,15 @@ char **environ = __env;
    ~6 KB peak), so the heap is trimmed 88 -> 32 KB, returning ~56 KB to the TLSF pool.
    Watch row-22 `hp` (dg_heap_peak) stays < HEAP_SIZE on a full E1 run; trim further toward
    the measured peak if you want even more pool, or raise back if a hidden libc alloc appears. */
-#define HEAP_SIZE (16 * 1024)   /* 32->24->20->18->16KB (16KB 2026-07-24): +2KB more to the TLSF pool for
+#define HEAP_SIZE (12 * 1024)   /* SATURN 2026-08-07: 16 -> 12 KB, +4 KB straight to the TLSF pool.
+                                    Taken because a whole afternoon was spent DELETING FEATURES to buy
+                                    back 70 bytes of pool -- and worse, deleting code kept making the
+                                    pool go DOWN (4.98 -> 4.80, 4.73 -> 4.11: `_end` moves with section
+                                    layout, not byte count).  This is the honest lever: measured peak
+                                    `hp` is ~6 KB, so 12 KB is still 2x peak.  ⚠ ALWAYS reach for this
+                                    (or another slack reserve) BEFORE cutting a diagnostic or a feature.
+                                    Watch row-22 `hp`; raise back if it approaches 12 KB.
+                                    Previously: 32->24->20->18->16KB (16KB 2026-07-24): +2KB for
                                     the CPROBE cart-CRC diag .text (pool was 6.55KB < the 7KB comfort
                                     target; the boot-loop floor DRIFTS, 4KB is optimistic).  Peak is ~6KB
                                     (lumpinfo is in LWRAM, no big-IWAD spike) so 16KB still holds 2.6x

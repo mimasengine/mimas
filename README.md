@@ -75,10 +75,23 @@ Outputs `build/Mimas.iso` + `build/Mimas.cue` (and a MODE1/2352 `.bin`).
 | `-Cdda` | multi-file CDDA disc: a small data `.bin` + WAV tracks referenced separately (fast build/mount) |
 | `-WarpMap "1 8"` | boot straight into a map (E1M8); Doom II: `-WarpMap 15` |
 | `-WarpSkill 4` | skill 1–5 (default `4` = Ultra-Violence) |
+| `-Name <n>` | force the disc name (default: derived from `-Wad`, see below) |
+| `-OutDir <p>` | put the finished disc in `<p>` instead of the per-WAD stash (a CD-DA disc is a folder) |
+| `-MusicSrc <p>` | (with `-Cdda`) WAV library to take `track_NN.wav` from (default `./music`) |
+| `-Tracks "2-10,29-33"` | (with `-Cdda`) which tracks go on the disc — a CD holds ~80 min |
+| `-Renumber` | (with `-Cdda`) renumber the selected tracks contiguously from 02 (a Red Book TOC has no holes) |
+
+**Disc naming.** With `-Wad`, every output is named after the IWAD it carries —
+`-Wad Doom2` → `build/Mimas-Doom2.bin/.cue`, `-Wad Doom1s -Cdda` →
+`build/Mimas-Doom1s-CDDA.bin/.cue` — and the same descriptive pair is stashed in
+`build/wads/<wad>/`, so a loose `.bin` on an SD card still says which game it is.
+Without `-Wad` the name stays plain `Mimas`. `run_ymir.ps1` resolves the `.cue` by
+search (newest wins), so it follows the naming automatically.
 
 Build configuration lives at the top of [`Makefile`](Makefile): `CD_NAME = Mimas`
-(disc / artifact name), the SRL/SGL work-area sizes, and the Doom compile flags
-(`MAXVISPLANES`, visplane pool, command-buffer size, repack, …).
+(the disc / artifact base name, overridden per-IWAD by `build.ps1`), the SRL/SGL
+work-area sizes, and the Doom compile flags (`MAXVISPLANES`, visplane pool,
+command-buffer size, repack, …).
 
 ### Run
 ```powershell

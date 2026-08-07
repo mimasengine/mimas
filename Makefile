@@ -3,7 +3,10 @@
 # Based on the SRL sample Makefile pattern.
 # Run via build.ps1 (MSYS2 MINGW64), or directly: make build
 #
-# Output: build/Mimas.bin + build/Mimas.cue
+# Output: build/$(CD_NAME).bin + build/$(CD_NAME).cue (IP.BIN identity stays Mimas-Eng).
+# CD_NAME is overridable on the make command line -- build.ps1 derives a per-IWAD disc
+# name from -Wad (e.g. CD_NAME=Mimas-Doom2, Mimas-Doom1s-CDDA) so every image on disk
+# says which WAD it carries.
 
 # -----------------------------------------------------------------------
 # SRL configuration
@@ -71,6 +74,7 @@ DOOM_CORE_C = \
 	p_map.c p_maputl.c p_mobj.c p_plats.c p_pspr.c \
 	p_saveg.c p_setup.c p_sight.c p_spec.c p_switch.c \
 	p_telept.c p_tick.c p_user.c r_bsp.c r_cache.c r_data.c \
+	r_flatcache.c \
 	r_draw.c r_main.c r_plane.c r_segs.c r_sky.c \
 	r_things.c sha1.c sounds.c statdump.c st_lib.c \
 	st_stuff.c s_sound.c tables.c v_video.c wi_stuff.c \
@@ -144,6 +148,15 @@ endif
 # Put the compiler's real newlib headers first so Doom's uses of FILE* work.
 # -Isrc: Doom sources include each other with relative paths.
 # -DNDEBUG: silence assert() (no abort() on Saturn anyway).
+# -DVP_POOL_PLANES=64: was 96 (2026-08-07).  R_InitPlanes' span pool is ~640 B per plane = 60 KB of
+#   PU_STATIC, and the SAT_ZONE_RA dump on a Zmalloc-fail named it as the one big STATIC block
+#   sitting mid-zone (@318K) with only ~50 KB free anywhere.  MEASURED headroom: the LIM row's
+#   per-frame visplane peak `vp` never exceeded 45 over 14 TNT MAP11 captures
+#   (8/29/30/30/31/32/33/34/36/38/39/41/43/45), so 64 keeps ~40 % margin over the worst case seen.
+#   Overflow is graceful (r_visplane_pool_ovf: that surface is not drawn -- one plane, one frame,
+#   HOM, no freeze).  ⚠ Watch `vp` on the LIM row: if it ever reaches 64 on a real map, put it back.
+# ⚠ NEVER put a `#` comment INSIDE the backslash-continued flag list below -- make truncates the
+#   variable at that line and half the -D flags silently vanish.  Comments go here, above it.
 # -DRP_CMD_BUF_SIZE=0x2000: L2-RECLAIM (2026-07-10).  The legacy parity column-renderer cmd ring
 #   (top of LWRAM) is INERT in shipping (rp_disabled forced =1 via sat_plane_parallel, r_main.c:1291;
 #   the draw funcs r_parallel.c:1715+ render direct + return, never recording).  Shrunk 0x14000->0x2000
@@ -152,7 +165,7 @@ endif
 SRL_CUSTOM_CCFLAGS = -w -fsigned-char \
     -DCMAP256 -DDOOMGENERIC_RESX=320 -DDOOMGENERIC_RESY=200 -DNDEBUG \
     -DMAXVISPLANES=256 \
-    -DSAT_VISPLANE_POOL=1 -DVP_POOL_PLANES=96 \
+    -DSAT_VISPLANE_POOL=1 -DVP_POOL_PLANES=64 \
     -DRP_CMD_BUF_SIZE=0x2000 \
     -DTEXCACHE_MARGIN=0x20000 \
     -DSAT_REPACK \

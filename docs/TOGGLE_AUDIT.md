@@ -6,6 +6,14 @@ This file is the authoritative **consignation** — when a debate is closed, rec
 
 **Counts (unique):** BAKE_REMOVE 16 · REMOVE 20 · KEEP_LIVE 19 · KEEP_PARKED 28 · RECORD_ONLY 111
 
+> ⚠️ **Rows superseded by the 2026-08-02 Tier-4 execution (below).** Every entry naming
+> `M5_CONVEX`, `SAT_FLOOR_TEX`, `SAT_VDP1_FLOOR`, `VDP1_FLOOR_TEST`, `SAT_FLOOR_PERFSIM`,
+> `sat_ftex_mode`, `sat_ftex_slave`, `sat_ftex_blit_overlap`, `sat_vdp1_floor{,_claim}`,
+> `sat_vdp1_ceil_claim` or `floor_perfsim_mode` describes code that **no longer exists** — read
+> them as history, not as state. In particular the two `KEEP_PARKED` verdicts for `M5_CONVEX`
+> and `SAT_FLOOR_TEX` are **overturned**: they were parked pending an owner decision, and the
+> owner took it. `sat_wpn_soft`'s L+X chord is likewise gone (the core flag stays, pinned at 0).
+
 ## Execution progress (2026-07-16, all build-verified EXIT=0)
 
 - ✅ **Plane-split → TAS-only** (`RP_DrawPlanesSplit` collapsed; removed `sat_plane_rowsplit`,
@@ -19,10 +27,25 @@ This file is the authoritative **consignation** — when a debate is closed, rec
   `rbg0_win_*` dead vars, `rbg0_tex_*`/`rbg0_pitch_adj` identity terms, dead macros); wallprep-slave
   harness removal. NOTE: `WALL_ACC_MAX` deliberately NOT bumped 144→160 (144 ≫ peak 57; keep the pool
   headroom the plane-split freed).
-- ⏳ **Tier 4 (reserved — own validated pass)**: M1/M2/M3/M5 + `SAT_FLOOR_TEX` ftex removal — this one
-  touches the LIVE render path (`sat_apply_mode` governs M4/M7) and shared `core/r_segs.c`, so it needs
-  its own careful pass + HW validation, NOT a rushed bulk delete. `SAT_WALL_RMUL` bake has an open
-  "validate seams on Ymir" TODO.
+- ✅ **Tier 4 EXECUTED 2026-08-02** — M5_CONVEX + the whole `SAT_FLOOR_TEX` / `SAT_VDP1_FLOOR` /
+  `VDP1_FLOOR_TEST` / `SAT_FLOOR_PERFSIM` machinery removed, **−1455 lines**, build green.
+  **TLSF pool 4 976 → 19 568 bytes (×3.93, +14 592 B)**; **16 KB of VDP1 VRAM freed** (the two F
+  command banks `0x25C7C000..0x25C80000`, now unclaimed).
+  What decided it: `sat_vdp1_floor` was **0 in every reachable mode** (`hook_consult = (M==M5)`,
+  ring = `{M7}`), so the whole path was compiled and never executed — the code said so itself
+  (*"THIS IS THE PATH M7 TAKES EVERY FRAME … the textured-floor branch below is dead here"*).
+  The pad **R+X** deport-preview was its ONLY live consumer, and four staircase HW captures had
+  already settled M5 negative. Pad **L+X** (weapon-off-VDP1) went in the same pass: glitched when
+  ON (HW-confirmed), measured inert, and silently re-zeroed by `sat_apply_iso` on every SQ chord.
+  Freed: pad **R+X**, pad **L+X**, overlay **row 19**, overlay row-8 field `fbf`, and pad **Y**'s
+  compile-time contention (`#elif SAT_FLOOR_PERFSIM` / `#elif SAT_DIAG_SLAVE_TOGGLES` chain gone).
+  Verification: **zero new compiler warnings** vs the pre-cut file at `-Wall` (two disappeared).
+  ⚠️ **NOT yet HW-validated** — the VDP1 present path was restructured (see below).
+  `SAT_WALL_RMUL` bake still has its open "validate seams on Ymir" TODO.
+- ⚠️ **Follow-up left in `core/` (shared with DoomJo, so a separate submodule commit)**: `sat_plane_border`
+  is still recomputed every frame in `r_main.c:1042-1051` from `sat_plane_border_max`, but it is read
+  ONLY under `fclaim` (`r_plane.c:1531`), which now can never be true — cost paid, benefit nil. Same for
+  the `sat_vdp1_floor && sat_wall_cross_hi(...)` above-ceiling mirror branches in `r_segs.c`.
 
 ## BAKE_REMOVE — winner known, bake the value & delete the toggle
 

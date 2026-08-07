@@ -45,19 +45,28 @@ if ($Build) {
 # -Build): -Build just populated it, and for -Cdda the audio WAVs live ONLY next to the
 # stashed .cue (Ymir loads referenced files from the .cue's own directory).  No -Wad ->
 # the fresh build/ output.
+# Discs are named after the IWAD they carry (build.ps1 CD_NAME: Mimas-Doom2.cue,
+# Mimas-Doom1s-CDDA.cue, ...), so resolve the .cue by SEARCH, not by a fixed name --
+# newest wins if several are present.
+function Find-Cue([string]$dir) {
+    if (-not (Test-Path $dir)) { return $null }
+    Get-ChildItem $dir -File -Filter *.cue -EA SilentlyContinue |
+        Sort-Object LastWriteTime -Descending | Select-Object -First 1 -ExpandProperty FullName
+}
+
 if ($Wad) {
     $wadName = [System.IO.Path]::GetFileNameWithoutExtension($Wad)
-    $cue = Join-Path $root "build\wads\$wadName\Mimas.cue"
-    if (-not (Test-Path $cue)) {
+    $cue = Find-Cue (Join-Path $root "build\wads\$wadName")
+    if (-not $cue) {
         Write-Error "No stashed build for '$Wad' (build/wads/$wadName/) -- build it once: run_ymir.ps1 -Build -Wad $Wad"
         exit 1
     }
-    Write-Host "Using stashed build: build/wads/$wadName/"
+    Write-Host "Using stashed build: build/wads/$wadName/$(Split-Path $cue -Leaf)"
 }
 else {
-    $cue = Join-Path $root "build\Mimas.cue"
-    if (-not (Test-Path $cue)) {
-        Write-Error "build/Mimas.cue not found -- build first: powershell -File build.ps1"
+    $cue = Find-Cue (Join-Path $root "build")
+    if (-not $cue) {
+        Write-Error "no .cue in build/ -- build first: powershell -File build.ps1"
         exit 1
     }
 }

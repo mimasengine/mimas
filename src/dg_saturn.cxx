@@ -1806,6 +1806,11 @@ static int sat_field_n    = 0;    /* fields the last locked frame occupied -- ro
                                      be STEADY: a value flipping N/N+1 means the frame sits on a
                                      field boundary and the beat is back, coarser (judder). */
 static void sat_field_fence(void);   /* defined next to the long note in DG_DrawFrame */
+/* SATURN 2026-08-08: VDP1 flat quads that had to use the NEUTRAL GREY index because the dominant
+   colour was neither primed nor affordable.  Cumulative; printed as `gy` on row 12.  It should be
+   ~0 now that the flat path computes the colour when looking costs no disc -- a climbing `gy` is
+   the owner's grey walls coming back, and means the budget is genuinely out on those frames. */
+int vdp1_wall_nocol = 0;
 static int vdp1_wall_drop = 0;   /* walls the core handed to VDP1 that the emit silently dropped --
                                     row 13 `N<orphan>/<drop>/<flip>`, summed over the window.  Watched
                                     at the command pointer, so it catches every early return in
@@ -2422,9 +2427,17 @@ static void fps_update(void)
                    this build would have HALTED at `Zmalloc fail 35104` before 2026-08-07** --
                    it is the crash, converted into a flat wall and a counter.  Room for it here
                    because the CD row gave up `k`, `L`, `S`, `p`, `e` and `lf` as they settled. */
-                extern int r_patch_ovf;
-                snprintf(ovbuf, sizeof ovbuf, "CD t%us px%d ",
-                         w_cd_ms10 / 10000, r_patch_ovf);
+                /* `ob` = composite offsets caught OUTSIDE texturecompositesize (core r_data.c,
+                   2026-08-08).  **It must stay 0.** Non-zero is the owner's "wrong texture for one
+                   frame": R_GenerateLookup's two early returns leave every column pre-seeded to
+                   "composite, offset 0" while the composite is sized ZERO, so the column read ran
+                   off the end into the neighbouring zone block -- another texture's composite,
+                   which is why the wrong texture was a REAL one and not noise. */
+                /* `gy` = VDP1 flat quads forced to the NEUTRAL GREY index -- the owner's grey
+                   walls, whose trigger is a wall-dense view exhausting the wtex slots. */
+                extern int r_patch_ovf, r_composite_oob;
+                snprintf(ovbuf, sizeof ovbuf, "CD t%us px%d ob%d gy%d ",
+                         w_cd_ms10 / 10000, r_patch_ovf, r_composite_oob, vdp1_wall_nocol);
                 (void)sat_cd_persistent; (void)sat_texcache_evicts;
                 (void)sat_texcache_carve_lf; (void)sat_texcache_poolkb;
                 if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 12, ovbuf);
@@ -4884,14 +4897,25 @@ static void wall_emit_flat(int wi)
        the neutral index; the colour is PRIMED in wall_tex_resolve on the frame the budget decides to
        PAY, so it self-heals.  Same defect, same fix as the software wall path (r_segs.c
        sat_wall_flat_color).  Budget OFF -> unchanged, so lb0 stays a clean A/B reference. */
-    int pot;
-    if (sat_tex_load_budget)
+    /* SATURN 2026-08-08 -- THE GREY WALLS, and THIS is the site the owner was seeing: his trigger
+       is *"quand l'écran est surchargé de murs"*, i.e. the wtex slots run out, `wall_tex_resolve`
+       returns -1 and the wall degrades to a flat quad HERE.  Until today this branch only PEEKED
+       whenever the budget was armed -- and the budget became armed BY DEFAULT on 2026-08-07 -- so
+       every capacity-driven flat quad came out mid-grey instead of the wall's own colour.  The
+       peek-only rule guarded against a ~42 ms disc fault; on this trigger the texture is RESIDENT
+       and the walk is pure CPU, memoised for the level.  Same predicate as the software side
+       (core r_segs.c sat_wall_flat_color): look if looking is free, grey only if it truly is not. */
+    int pot = R_WallPotatoColorPeek(wall_acc[wi].texnum);
+    if (pot < 0)
     {
-        pot = R_WallPotatoColorPeek(wall_acc[wi].texnum);
-        if (pot < 0) pot = SAT_WALL_FLAT_UNKNOWN;
+        if (R_TextureIOFree(wall_acc[wi].texnum) || R_LoadBudgetLeft())
+            pot = R_WallPotatoColor(wall_acc[wi].texnum);
+        else
+        {
+            pot = SAT_WALL_FLAT_UNKNOWN;
+            vdp1_wall_nocol++;   /* the VDP1 flat path had NO counter at all until now */
+        }
     }
-    else
-        pot = R_WallPotatoColor(wall_acc[wi].texnum);
     unsigned short col  = (unsigned short)(colr | ((unsigned int)pot & 0xFF));
     /* DEBUG PAINT bit0 (core r_data.c sat_wall_paint, pad L+X): flat GREEN, and through CRAM BANK 1
        (= NBG1's own palette) rather than the wall's light bank, so it stays the SAME green in a dark
@@ -6916,6 +6940,27 @@ extern "C" void DG_DrawFrame(void)
            ds=1.4e9 -> HARD FREEZE on real HW, Ymir-clean; toggling sat_clear_slave OFF via R+C launched
            the level).  Clear on the MASTER in lowres (M4/M6 keep the slave-clear win); the ~2-3ms cost
            is on the packed M7 frame only.  [[clear-slave-nearsprites-aimd-shipped]] listed this risk. */
+        /* SATURN 2026-08-08 -- `!sat_lowres` RESTORED.  It was removed on 2026-07-30 on the premise
+           quoted below ("the plane-split now runs in M7, which restores exactly the TAS-sync
+           coverage").  That premise is FALSE IN PRACTICE: row 5 reads **Pb0%** in every capture of
+           2026-08-08, i.e. the plane-split contributes nothing to the plane phase, so the sync it
+           was supposed to provide is not there -- and the exact failure the July guard was written
+           for came back.  Owner-observed: after a few seconds of a heavy scene the picture stops
+           being cleared, with a visible left/right boundary, and the game is unplayable.
+           Measured on his captures: R245 against Bw2.7+Bp20.5+P62.1+M48.7 = 134, so **111 ms per
+           frame in NO render phase at all**, with `to9` (>=9 slave-dispatch timeouts per second)
+           and `T40`/`dg32` -- the GAME TIC, which renders nothing, inflated too.  A uniform stall,
+           not a rendering cost.  Confirmed by the owner toggling R+C: `cs0` makes it disappear.
+           Cost of clearing on the master here is ~2-3 ms against a 111 ms stall.
+           ⚠ Do not lift this again on the strength of "the plane-split covers it" without reading
+           `Pb` on row 5 first -- that is the number that decides whether the coverage is real.
+           2026-08-08, SAME DAY: RE-LIFTED, because the guard was a MASK, not the fix.  Turning the
+           clear off only removed one more consumer that was waiting on an ALREADY-DEAD slave; the
+           owner found the real cause -- only the LEFT half of the CPU sprites drawn (the slave owns
+           [half, viewwidth), r_things.c ~1952) with `SLV id100%` FROZEN instead of oscillating at
+           98%.  The kill is the masked-phase allocation race, closed in r_things.c by
+           sat_masked_inflight.  Kept as a live comment, not as code: if the stall ever comes back,
+           `!sat_lowres` here is a one-line workaround that buys a playable build while you look. */
         if (sat_clear_slave && gamestate == GS_LEVEL && sat_local_players <= 1) {
             /* SATURN M7 2026-07-30: the `!sat_lowres` hard-off is GONE -- the plane-split now runs in M7
                (r_plane.c), which restores exactly the TAS-sync coverage whose ABSENCE (slave-idle M7, no

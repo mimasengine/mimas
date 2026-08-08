@@ -649,6 +649,7 @@ extern "C" unsigned int sat_p_kick10;  /* VDP1 wall kick + R_DrawPlayerSprites (
 extern "C" int R_TextureIOFree(int tex);  /* core r_data.c: 1 = resolving this texture hits no disc */
 extern "C" int sat_tex_load_spent;     /* core r_segs.c: tenths of a ms of disc spent this frame    */
 extern "C" int R_LoadBudgetLeft(void); /* core r_segs.c: 1 = the frame can still afford a fault     */
+extern "C" int sat_budget_refused;     /* core r_segs.c: 1 once the budget has refused something    */
 extern "C" int R_WallPotatoColorPeek(int tex);  /* core r_data.c: cached dominant colour, -1 = none,
                                                    NEVER loads (R_WallPotatoColor faults the texture
                                                    in through R_GetColumn -- see wall_emit_flat)    */
@@ -4431,8 +4432,11 @@ static int wall_tex_resolve(int texnum, const unsigned char *cmap)
                empty in normal play (the potato mode is off) and every LATER refusal of this same
                texture would fall back to the neutral index -- measured `nocol` = 100 % of flattened
                tiers when the software half shipped without priming.  No `spent++`: the budget is
-               a CLOCK now (core r_segs.c), and this call's own disc read is already on it. */
-            R_WallPotatoColor(texnum);
+               a CLOCK now (core r_segs.c), and this call's own disc read is already on it.
+               LAZY since 2026-08-08 (sat_budget_refused): the walk is every other column of the
+               whole texture through R_GetColumn, and nothing reads its product until the budget
+               has actually refused something. */
+            if (sat_budget_refused) R_WallPotatoColor(texnum);
         }
         else return -1;                                 /* flat quad this frame, textured later */
     }

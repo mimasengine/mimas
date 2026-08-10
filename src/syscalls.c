@@ -49,24 +49,26 @@ char **environ = __env;
    was MOVED to the roomy ~1MB LWRAM Doom zone (ExtendLumpInfo in core/w_wad.c, the move
    anticipated by the old note here), so the libc heap no longer scales with the IWAD and
    ALL IWADs are still supported.  What remains here is incidental (printf/stdio buffers,
-   ~6 KB peak), so the heap is trimmed 88 -> 32 KB, returning ~56 KB to the TLSF pool.
-   Watch row-22 `hp` (dg_heap_peak) stays < HEAP_SIZE on a full E1 run; trim further toward
+   ~1-2 KB MEASURED peak, see below), so the heap is trimmed 88 -> 32 KB, returning ~56 KB to the TLSF pool.
+   Watch row-10 `hp` (dg_heap_peak) stays < HEAP_SIZE on a full E1 run; trim further toward
    the measured peak if you want even more pool, or raise back if a hidden libc alloc appears. */
 #define HEAP_SIZE (12 * 1024)   /* SATURN 2026-08-07: 16 -> 12 KB, +4 KB straight to the TLSF pool.
                                     Taken because a whole afternoon was spent DELETING FEATURES to buy
                                     back 70 bytes of pool -- and worse, deleting code kept making the
                                     pool go DOWN (4.98 -> 4.80, 4.73 -> 4.11: `_end` moves with section
                                     layout, not byte count).  This is the honest lever: measured peak
-                                    `hp` is ~6 KB, so 12 KB is still 2x peak.  ⚠ ALWAYS reach for this
+                                    `hp` reads 1 (i.e. 1024-2047 B, the field truncates >>10) on TNT MAP11 at
+                                    t4s-t20s, boot included -- NOT the ~6 KB asserted here and below, which was
+                                    an estimate never checked once the field existed.  12 KB is ~6x peak.  ⚠ ALWAYS reach for this
                                     (or another slack reserve) BEFORE cutting a diagnostic or a feature.
-                                    Watch row-22 `hp`; raise back if it approaches 12 KB.
+                                    Watch row-10 `hp`; raise back if it approaches 12 KB.
                                     Previously: 32->24->20->18->16KB (16KB 2026-07-24): +2KB for
                                     the CPROBE cart-CRC diag .text (pool was 6.55KB < the 7KB comfort
                                     target; the boot-loop floor DRIFTS, 4KB is optimistic).  Peak is ~6KB
                                     (lumpinfo is in LWRAM, no big-IWAD spike) so 16KB still holds 2.6x
                                     peak -- acceptable for the SAROO diag image which only runs shareware
                                     DOOM1; RESTORE >=18KB before any big-WAD (TNT/Plutonia) campaign or
-                                    when the WPROBE/CPROBE diag retires (watch row-22 hp).
+                                    when the WPROBE/CPROBE diag retires (watch row-10 hp).
                                     WALL_ACC_MAX stays 128 -- never rob the wall budget for the pool. */
 static char heap[HEAP_SIZE] __attribute__((aligned(8)));
 static char *heap_end = heap;

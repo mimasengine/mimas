@@ -167,6 +167,9 @@ extern "C" int sat_plane_border_v;    /* live vertical fill-border px this frame
 extern "C" int   r_visplane_coverage_peak;  /* #1: peak sum of live-plane spans (top-bytes) */
 extern "C" int   r_visplane_pool_peak;      /* #1: peak bytes used in the span pool (0 if off) */
 extern "C" int   r_visplane_pool_ovf;       /* #1: planes that overflowed VP_POOL_PLANES (0 = ok) */
+extern "C" int   r_visplane_pool_ovf_pk;    /* ...and its ~1 s HIGH-WATER: the per-view reset made the
+                                               raw counter read 0 on the overlay almost always.
+                                               Printed as the 2nd digit of row 11 `vp<peak>.<ovf>` */
 extern "C" int   sat_texcache_active, sat_texcache_poolkb, sat_texcache_entries,
                  sat_texcache_builds, sat_texcache_evicts;  /* streaming texture cache (core/r_cache.c) */
 extern "C" int   sat_texcache_carve_lf;     /* largest free block (KB) at the last carve attempt */
@@ -184,13 +187,16 @@ extern "C" void  P_BspStageApply(int on);          /* core/p_setup.c: swap LWRAM
 /* VDP1 wall-texture bakes (cache misses) THIS flush -- diagnoses the `k` cost: if the split
    views thrash the 19 shared slots, bk stays high every frame => re-bake is the kick cost. */
 static int wtex_bakes = 0;
-/* SATURN VRAM-PRESSURE ROW (row 18 `VRM`, 2026-08-05).  Until now wtex_bakes was incremented and
-   reset every flush and printed NOWHERE, and every thing decline was folded into one `sat_things_decl`
-   -- so neither "is the wall cache thrashing" nor "WHY was that sprite refused" could be read at all.
+/* SATURN VRAM-PRESSURE ROW (row 18 `VRM`, 2026-08-05).  BEFORE that row existed, wtex_bakes was
+   incremented and reset every flush and printed NOWHERE, and every thing decline was folded into one
+   `sat_things_decl` -- so neither "is the wall cache thrashing" nor "WHY was that sprite refused"
+   could be read at all.  (Both are fixed: `bk`/`q` print on row 18 and `td` on row 15 since
+   2026-08-09.  The past tense matters -- as written in the present it read as an open defect.)
    Both are the prerequisites for re-cutting the VDP1 VRAM map (cede WTEX slots -> bigger command
    banks; top 16KB -> more thing slots): without them a cut is measured only by a fps drop with no
    cause attached.  All four are ~1 s WINDOW sums, reset at print. */
 static int wtex_bakes_win = 0;    /* wall-texture re-bakes / window  = WTEX thrash                 */
+static int wtex_qrefuse   = 0;    /* evictions REFUSED / window: victim still on screen (3-state lock) */
 static int thd_size   = 0;        /* thing declined: patch > THINGS_TEX_SLOTSZ -> slot SIZE limit  */
 static int thd_slot   = 0;        /* thing declined: every slot already feeds this frame's list    */
 static int thd_budget = 0;        /* thing declined: command bank / split queue full               */
@@ -617,8 +623,11 @@ extern int sat_wall_cpu_v1;            /* core r_segs.c: VDP1-exit span (kept = 
    sat_clear_slave (R+C): dispatch the end-of-frame fb clear to the idle slave SH-2 (docs/BLIT_DMA_PLAN
      Inc3).  It writes HWRAM, not the B-bus, so the SCU-DMA hang law does not apply; the core joins it
      (RP_AuxWait) at the top of R_RenderPlayerView.  Watch dg/MST (rows 1/0).
-   sat_near_sprites (R+X): FastDoom nearSprites cull of far decorations (defined in core/r_things.c).
-     Watch SPR n<projected> (row 15) fall + MST.
+   sat_near_sprites: FastDoom nearSprites cull of far decorations (defined in core/r_things.c).
+     ⚠ NOT A TOGGLE and NOT OBSERVABLE.  It is baked ON, its R+X chord was reclaimed for the texture
+     load budget (verified 2026-08-06), and row 7's `ns` -- a constant printed as if it were a knob --
+     was cut 2026-08-09.  Listed here only so it is not re-discovered as a live A/B: there is no way
+     to turn it off in a shipping build and no field that shows its effect.
    (things-AIMD is no longer a toggle: wbudget is baked for 1p -- see the emit-budget block.) */
 extern "C" int sat_clear_slave = 1;    /* default ON: HW-validated -2..-3ms dg (R+C to A/B off) */
 extern int     sat_near_sprites;       /* defined in core/r_things.c; default ON there.  (Its old R+X
@@ -672,10 +681,14 @@ static unsigned int sat_p_thg10 = 0;   /* ...in the WORLD-THINGS emit (R_EmitWor
    REMOVED 2026-08-07 once it had answered (L270s/4704 -> the BOOT, not P_SetupLevel).  To revive:
    four statics (cd_prev_ms10/cd_prev_n/lvl_load_ms10/lvl_load_n), a delta+latch in the per-frame
    fold below, and the L%us/%u pair on the CD row. */
-/* AIMD-damp state (read by fps_update row 15 + the two back-off sites): learned floor never lets ec
-   collapse to 0, overrun-run gives 2-frame hysteresis against the noisy HW EDSR-CEF. */
-static int     thing_emit_floor  = 0;
-static int     thing_overrun_run = 0;
+/* 🔴 AIMD-DAMP STATE CUT 2026-08-09 -- thing_emit_floor / thing_overrun_run / thing_cap_clean.
+   The comment that stood here promised "a learned floor never lets ec collapse to 0" and "2-frame
+   hysteresis against the noisy HW EDSR-CEF".  NEITHER EXISTED: all three were only ever ASSIGNED
+   ZERO (five statements between them, two of which run every frame in each WBUDGET branch) and READ
+   nowhere except the row-15 `ef` field, which therefore printed a constant 0.
+   That is worse than dead code: the reader -- me, this morning -- believes a damper is protecting
+   `ec` and looks elsewhere for why it snapped to 0. The policy is, and always was, pure
+   feed-forward: see the ramp at the two `budget_cap` sites. If a damper is wanted, write one. */
 extern int sat_things_hw;              /* core: 1 = world sprites -> VDP1 (M4); 0 = software (M0/M6) */
 extern int sat_split_active;           /* core r_main.c: split emits per view PRE-kick -> queue path */
 int  sat_vdp1_thing_draw(patch_t *patch, int lump, const unsigned char *cmap,
@@ -1535,11 +1548,16 @@ volatile int game_phase = 0;
    FINISH before this kick?  'D'one = VDP1 had headroom, 'B'usy = it overran the frame.
    2026-06-24: the old "always B" note was PRE-8bpp -- since the 8bpp wall pack (half the
    VDP1 writes) the list CAN finish within a frame, so D/B is a live, meaningful headroom
-   signal again.  Row 2 shows D/B + Dr = the % of frames Done over the measurement window
-   (vd1_win_done/vd1_win_tot, reset with the REC window) -- the go/no-go input for the
-   VDP1-floor offload (high Dr => spare VDP1 budget for floor strips). */
+   signal again.
+   ⚠ 2026-08-10, comment corrected: this narration described a row that no longer exists.  The VD1
+   row was deleted 2026-08-06 and row 2 is now r_parallel's Bw/Bp/P/M line; `Dr` and its two
+   accumulators went with the 08-09 cleanup (see the note below).  `vdp1_prev_done` itself is still
+   live -- but the trustworthy VDP1 headroom signal to read on a photo is row 17 `LP%`, not any
+   done-rate: EDSR.CEF latches 30-60% on real hardware ([[vdp1-cef-latches-on-hw]]). */
 static int vdp1_prev_done = 1;
-static unsigned int vd1_win_done = 0, vd1_win_tot = 0;   /* VDP1 done-rate over the window */
+/* (vd1_win_done / vd1_win_tot CUT 2026-08-09: their only consumer computed `dr` and then
+   `(void)`-discarded it, with a note saying the number is discredited -- CEF/vblank aliasing.
+   Same defect as the row-10 `D%` cut in the same pass.  See [[vdp1-cef-latches-on-hw]].) */
 #if VDP1_MANUAL_CHANGE
 /* Corrected draw-gated present (docs/VDP1_PRESENT_SYNC_PLAN.md, brick A).  Declared up here (not by
    the driver below) so the row-2 overlay can show the mode.  Runtime A/B via pad L+Z:
@@ -1582,9 +1600,21 @@ static int vdp1_tx_used = 0;                          /* wtex cache slots occupi
    overrun it IS the exact reach; on a clean frame it drifts up +1 / THING_LP_CLEAN to re-probe
    headroom.  The things AIMD and the wall-span LOD both allocate against THIS number instead of the
    static slot cap -- so the "default" cap is the real measured per-frame budget, not a guess. */
-#define THING_LP_CLEAN 24                             /* clean (LP=100) frames before the budget drifts up +1 */
+/* 🔴 RECOVERY RE-TUNED 2026-08-09 -- the controller's clock was the FRAME, and our frame is 10-25x
+   longer than whatever rate 24 was chosen for.  Decrease is one-shot multiplicative (`/4`), increase
+   was +1 every 24 frames: from a latched 45 back to 248 is 203 steps x 24 frames = 487 SECONDS at
+   10 fps, twenty minutes at 4.  So a single transient overrun removed VDP1 sprites for the rest of
+   the session -- observed live as `B45` with `ec0` while the SAME spot seconds later read `B0 ec16`.
+   "Never reset on level load" was the symptom; this is the defect.
+   Now: gate 4 clean frames, and the step is 1/16 of the REMAINING GAP (min 1, cap 8).  Recovery
+   stops scaling with how deep the crash was -- ~10 s from 45 at 10 fps -- while the step shrinks to
+   +1 near the ceiling, so the fine probing where it matters is unchanged.  The sawtooth this
+   produces IS the intended AIMD behaviour; what was broken was only the length of the climb. */
+#define THING_LP_CLEAN     4                          /* clean (LP=100) frames between drift-up probes */
+#define THING_BUDGET_STEP  8                          /* max commands per probe (gap>>4, floored at 1) */
 static int vdp1_budget_cmds  = 0;                     /* measured budget in commands (0 until first sample; WALL_CMD_CAP-bounded) */
 static int vdp1_budget_clean = 0;                     /* consecutive clean frames (drift-up counter) */
+static int vdp1_budget_map   = -1;                    /* gamemap the current measurement belongs to */
 /* WEAPON-ALWAYS-VISIBLE reserve (2026-07-31, replaces the double-emit hedge).  The gun is the LAST
    world command (it must be: VDP1 is a painter, so "above the walls AND above the monsters" = drawn
    after both), which makes "was it displayed?" DIRECTLY observable instead of inferred -- LOPR >=
@@ -1618,8 +1648,10 @@ static int vdp1_wpn_safe      = 0;                    /* consecutive reached-fra
    SQ), NOT on a level change (user 2026-07-05: "par session, tant que je ne change pas le mode")
    -> the numbers describe the whole run at the CURRENT mode.  A/B = capture M4, switch to M0
    (pad Z), capture again.  Histograms give p50/p90/p99 with no sort: frame time (8ms buckets),
-   world-things emitted/frame and declined/frame (direct 0..63).  Plus the VDP1 plot done-rate (the
-   headroom / flicker-inverse: the OnVblank Dr sampler feeds mh_vbl_*) and occluded-skip avg.
+   world-things emitted/frame and declined/frame (direct 0..63).  Plus the occluded-skip avg.
+   (The VDP1 plot done-rate that used to be described here went with row 10 `D%` on 2026-08-09 and
+   its vblank sampler on 08-10 -- CEF latches 30-60% on real HW, so the rate was never trustworthy.
+   Read row 17 `LP%` instead.)
    ============================================================================ */
 #define MH_MS_BUCKETS  40          /* 8ms buckets -> 0..320ms frame time */
 #define MH_MS_SHIFT    3
@@ -1629,8 +1661,13 @@ static unsigned int mh_things[MH_N_BUCKETS];
 static unsigned int mh_decl[MH_N_BUCKETS];
 static unsigned int mh_frames;
 static unsigned int mh_ms_mx, mh_things_mx, mh_decl_mx, mh_occ_sum;
-static unsigned int mh_vbl_done, mh_vbl_tot;   /* VDP1 plot done-rate over the session */
-static unsigned int mh_bake_sum, mh_emit_sum;  /* session totals: fresh bakes vs sprites emitted (cache reuse) */
+/* (mh_bake_sum / mh_emit_sum CUT 2026-08-09: two accumulators, two adds per frame and a divide per
+   second, whose only consumer computed `sbpc` and then `(void)`-discarded it.  Row 15 `fb` answers
+   the same question live.)
+   (mh_vbl_done / mh_vbl_tot CUT 2026-08-10: the 08-09 pass cut their ONLY consumer -- row 10 `D%` --
+   and left the pair being incremented once per vblank for nobody, i.e. it created exactly the class
+   of dead symbol it was cutting.  The trustworthy VDP1 done signal is row 17 `LP%`; EDSR.CEF latches
+   30-60% on real hardware, which is why `D%` went.) */
 
 static void mh_reset(void)
 {
@@ -1638,8 +1675,6 @@ static void mh_reset(void)
     memset(mh_things, 0, sizeof mh_things);
     memset(mh_decl, 0, sizeof mh_decl);
     mh_frames = mh_ms_mx = mh_things_mx = mh_decl_mx = mh_occ_sum = 0;
-    mh_vbl_done = mh_vbl_tot = 0;
-    mh_bake_sum = mh_emit_sum = 0;
 }
 static void mh_add(int ms, int things, int decl, int occ, int bake)
 {
@@ -1651,8 +1686,7 @@ static void mh_add(int ms, int things, int decl, int occ, int bake)
     if ((unsigned)things > mh_things_mx) mh_things_mx = (unsigned)things;
     if ((unsigned)decl   > mh_decl_mx)   mh_decl_mx   = (unsigned)decl;
     mh_occ_sum  += (unsigned)occ;
-    mh_bake_sum += (unsigned)bake;
-    mh_emit_sum += (unsigned)things;
+    (void)bake;                      /* consumer cut 2026-08-09; param kept to spare the call sites */
     mh_frames++;
 }
 /* percentile p(0..100): first bucket whose cumulative count reaches p% of mh_frames.  For the ms
@@ -1670,7 +1704,6 @@ static int mh_pct(const unsigned int *h, int nb, int p)
    bank, computed where WALL_CMD_CAP is in scope (#defined below fps_update) and read by the
    overlay.  fb_pk_starve (walls dumped when the bank fills) is the definitive "over budget"
    signal.  The floor-bank twin (vd1_fpct / ftexd_trunc) went with the ftex F-build 2026-08-02. */
-static int vd1_wpct = 0;
 /* RBG0 floor view (pad Y): 0 = HW floor (sector-dimmed baked flat), 1 = software floor.  The HW floor
    ships BAKE-ONLY (no distance gradient) for now. */
 static int rbg0_floor_view = 0;
@@ -1928,7 +1961,6 @@ static void fps_update(void)
 #endif
                ) {
                 RP_ProfReset();
-                vd1_win_done = vd1_win_tot = 0;
                 fb_pk_clamp = fb_pk_mag = fb_pk_starve = fb_pk_px = 0;   /* Phase-0: clean fallback A/B window */
                 blit10_sum = blit10_cnt = 0;   /* row-1 'b' precise window: fresh sample on the L+A toggle */
                 l_map=gamemap; l_m=sat_m; l_sq=(sq_wall<<6|sq_sprite<<4|sq_floor<<2|sq_ceil); l_blit=blit_mode; l_ms=sat_mark_suppress;
@@ -2061,7 +2093,6 @@ static void fps_update(void)
                Post-8bpp the VDP1 CAN finish within a frame, so Dr is a live VDP1-floor
                headroom signal (high Dr => spare budget for floor strips).  b:__TIME__ =
                build stamp (build.ps1 touches this file so it refreshes). */
-            unsigned int dr = vd1_win_tot ? (vd1_win_done * 100u / vd1_win_tot) : 0;
             /* (VD1 row DELETED 2026-08-06 -- cut long ago but still formatting cmds + D/B + Dr% +
                a __TIME__ build stamp into a dead 52-byte buffer every frame.  `Dr%` itself is
                DISCREDITED (CEF/vblank aliasing -- see the (void)dr note below).) */
@@ -2073,9 +2104,6 @@ static void fps_update(void)
             snprintf(ovbuf, sizeof ovbuf, "REC 50:%d.%d 95:%d.%d mx%d.%d d%d      ",
                     p50/10, p50%10, p95/10, p95%10,
                     sat_prof_rec_max/10, sat_prof_rec_max%10, sat_prof_dropped);
-            (void)dr;   /* Dr% dropped from the overlay: CEF/vblank-sampling aliasing makes it
-                           unreliable (owner: "Dr% biaisé"); the Dr0-but-floor-complete captures
-                           confirm it does NOT signal VDP1 saturation. */
             if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 3, ovbuf);   /* row 3: REC percentiles + VDP1 Dr% */
             /* (PVfill row DELETED 2026-08-06 -- its R+Up/Down knob was cut 2026-07-07 and the values
                baked (sat_plane_vscale=4, sat_plane_border_max=10), yet it still formatted them.) */
@@ -2139,16 +2167,26 @@ static void fps_update(void)
                Walls untouched (wall LD is what DRIVES detailshift). */
             { extern int detailshift;
               if (detailshift) { if (sqf==SQ_LD) sqf=SQ_FULL; if (sqc==SQ_LD) sqc=SQ_FULL; if (sqs==SQ_LD) sqs=SQ_FULL; } }
-            snprintf(ovbuf, sizeof ovbuf, "M%d %s ms%d pm%d SQ:%c%c%c%c cs%dns%d lr%d/o%d",
+            /* `ns` CUT 2026-08-09: sat_near_sprites has no chord (the R+X it was documented for was
+               never bound -- see the note at the R+X budget chord) and no other writer, so it read
+               a constant 1 forever while occupying a column and reading as a live knob. */
+            snprintf(ovbuf, sizeof ovbuf, "M%d %s ms%d pm%d SQ:%c%c%c%c cs%d lr%d/o%d",
                      sat_m, sat_m_name[sat_m], sat_mark_suppress,
                      sat_plane_tas,
                      sqch[sqw & 3], sqch[sqf & 3], sqch[sqc & 3], sqch[sqs & 3],
-                     sat_clear_slave, sat_near_sprites, sat_lowres, sat_opt);   /* /o = perf-lever level 0-4 (pad L+C) */
+                     sat_clear_slave, sat_lowres, sat_opt);   /* /o = perf-lever level 0-4 (pad L+C) */
             if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 7, ovbuf);
-            /* row 8: RELIABLE VDP1 load (replaces the CEF-aliased Dr%).  w%/f% = wall/floor
-               command-budget FILL % (100% = bank full, further surfaces spill to CPU); fbw = walls
-               dumped to CPU because the bank filled (windowed peak); fbf = floor tiles dropped
-               (trunc).  fbw|fbf > 0 = VDP1 genuinely over budget this window (the master pays).
+            /* row 8: RELIABLE VDP1 load (replaces the CEF-aliased Dr%).
+               ⚠ 2026-08-10, legend corrected: THE FORMAT PRINTS ONLY `fbw` AND `fbm`.  Everything
+               else described below -- `w%`, `f%`, `fbf`, `e<got>/<want>`, `m`, `b<L><M><T><R>` -- is
+               either CUT (w%, 08-09; fbf, 08-02) or was NEVER in the snprintf (the whole L5 edge
+               block: ATLAS U8, and r_segs.c:362's own rule says never judge a lever through an
+               instrument that cannot show why it did nothing).  The text is kept because it is the
+               only surviving specification of those counters, which ARE still maintained -- but do
+               not go looking for them on a photo.  fbw = walls dumped to CPU because the command
+               bank filled (windowed peak); fbm = tiers refused for the VDP1 +/-1024 coordinate
+               limit.  fbw|fbm > 0 = VDP1 genuinely over budget this window (the master pays).
+               ---- SPECIFICATION OF THE UNPRINTED FIELDS (do not read these off a capture) ----
                L5 near-wall split as PER-FRAME RATES (one decimal), not peaks: e<got>/<want> = tiers
                split / tiers that ASKED, m = tiers the subdiv squish guard dumped to SOFTWARE (the
                OTHER, much larger population -- what L5 does NOT reach).  Rates because a peak only
@@ -2161,8 +2199,11 @@ static void fps_update(void)
                narrower BAKED sub-texture), T interior thinner than SAT_WALL_EDGE_MIN, R refused
                (floor-clearance proof / bank full).  The rate window resets with the profiler, so
                changing /o (pad L+C) starts a clean count for the A/B. */
-            snprintf(ovbuf, sizeof ovbuf, "VD1 w%d%% fbw%d fbm%d ",
-                     vd1_wpct, fb_pk_starve, fb_pk_mag);
+            /* `w%` CUT 2026-08-09: it was EXACTLY vdp1_last_cmds*100/WALL_CMD_CAP, i.e. row 17 `c`
+               expressed as a percentage -- a pure duplicate, and one whose letter (`w` for wall)
+               actively misled: the numerator is the WHOLE command list, not the walls. */
+            snprintf(ovbuf, sizeof ovbuf, "VD1 fbw%d fbm%d ",
+                     fb_pk_starve, fb_pk_mag);
             /* (fbf -- floor tiles truncated -- dropped 2026-08-02 with the VDP1 floor deport: it
                was structurally 0 in every reachable mode.  fbw is now the sole over-budget bit.) */
             if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 8, ovbuf);
@@ -2254,14 +2295,29 @@ static void fps_update(void)
                pointless.  Tenths-ms; FRT-quantised (~0.02ms/tick) so pj jitters +-0.1ms. */
             int sp_pj = 0, sp_fl = 0, sp_np = 0, sp_nd = 0;
             RP_SprStats(&sp_pj, &sp_fl, &sp_np, &sp_nd);
-            /* th e/d = world-things emitted on VDP1 / declined; fb = baked THIS frame (instant);
-               sb = SESSION bake% (mh_bake_sum/mh_emit_sum) = the cache read -- low = high reuse.
-               On row 15 (bottom, clear of centre-screen monsters that hide the THp row). */
-            unsigned int sbpc = mh_emit_sum ? (mh_bake_sum * 100u / mh_emit_sum) : 0;
-            (void)sbpc;   /* session bake% folded out with the ad-toggle; ef (split floor) shown instead */
-            snprintf(ovbuf, sizeof ovbuf, "SPR fl%d.%d n%d/%d th%d/%d ec%d ef%d fb%d ",
+            /* th e/d = world-things emitted on VDP1 / declined; fb = baked THIS frame (instant).
+               On row 15 (bottom, clear of centre-screen monsters that hide the THp row).
+               (`sb` = SESSION bake% was described here until 2026-08-10; mh_bake_sum/mh_emit_sum
+               were deleted on 08-09 and the field had never been in the format string.)
+               ⚠ `th` and `td` on this row RUN ON DIFFERENT CLOCKS: th<e>/<d> is PER FRAME (zeroed at
+               the bank build, :5374/:5688), td is a ~1 s WINDOW sum (zeroed at the row-18 block).
+               So `th0/0 td12/3/40` is CONSISTENT, not a contradiction -- do not read it as a bug.
+               ⚠ And `td0/0/0` next to `th0/0` does NOT mean "VDP1 declined nothing": every exit path
+               INSIDE the platform hook bumps one of the three, so all-zero means the hook was never
+               CALLED -- the sprites were rejected upstream by core's compiled area floor
+               (core/r_things.c:1649-1656), which counts nothing.  See
+               [[thing-area-floor-kills-vdp1-sprites]]. */
+            /* 2026-08-09: `ec` was an EXACT duplicate of row 17's, and `ef` (thing_emit_floor) was
+               only ever assigned 0 in two places and read nowhere -- a constant presented as
+               controller state, which is the most expensive kind of field there is.  Both cut, and
+               the columns go to `td`, which was already being accumulated AND reset every window
+               and simply never printed: the worst of both worlds.  `td` says WHY a world sprite was
+               refused by VDP1 -- size / no free slot / command budget -- so it belongs exactly here,
+               next to the th<emitted>/<declined> it explains. */
+            snprintf(ovbuf, sizeof ovbuf, "SPR fl%d.%d n%d/%d th%d/%d td%d/%d/%d fb%d ",
                      sp_fl/10, sp_fl%10, sp_np, sp_nd,
-                     sat_things_n, sat_things_decl, sat_thing_emit_cap, thing_emit_floor, thing_bake_n);
+                     sat_things_n, sat_things_decl,
+                     thd_size, thd_slot, thd_budget, thing_bake_n);
             if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 15, ovbuf);
             /* row 18: VDP1 VRAM PRESSURE -- the two things the map re-cut needs and that nothing
                reported before (2026-08-05).  Everything here is a ~1 s window sum, reset on print.
@@ -2272,26 +2328,46 @@ static void fps_update(void)
                    bk 0 => the wall cache is idle and slots can be ceded to the command banks; bk
                    staying high => the level already thrashes and ceding would cost real ms.
                    THIS IS THE GATE on cutting WTEX -- do not cede a slot without reading it first.
-                 td<size>/<slot>/<budget> = why a world sprite was REFUSED by VDP1 (it then falls
-                   back to the software masked fill).  All three used to be one opaque `th` decline:
+                 q  = resolves REFUSED this window because the only candidate slot was still being
+                   re-plotted by VDP1 from the DISPLAYED command list (3-state lock, 2026-08-09).
+                   Each one is a wall drawn as a flat coloured quad for ONE frame INSTEAD of showing
+                   somebody else's texture -- i.e. `q` counts the "inversions de textures" that used
+                   to happen.  q 0 with bk high = plain LRU churn, the guard is not the limiter;
+                   q rising = the pool is genuinely too small for the view and the honest fix is
+                   fewer distinct textures on screen, not a bigger risk window.
+                 td<size>/<slot>/<budget> -- ⚠ PRINTED ON ROW 15, not here (2026-08-09); this legend
+                   stayed behind in the row-18 block and a reader decoding a photo would hunt for it
+                   on the VRM line.  Why a world sprite was REFUSED by VDP1 (it then falls back to
+                   the software masked fill).  All three used to be one opaque `th` decline:
                    size   = patch bigger than THINGS_TEX_SLOTSZ (3584 B).  The refused sprites are
                             the NEAR ones = the most expensive software fills => this is the counter
                             that says whether 1p wants FEWER, BIGGER slots.
                    slot   = every slot already feeds this frame's list => raise THINGS_TEX_SLOTS
                             (the MP case: 4 views + up to 3 other-player colours share 4 slots).
                    budget = command bank / split queue full => raise VDP1_BANK_CMDS.
-                 lb<budget>:<flat>.<nocol> = the per-frame TEXTURE LOAD BUDGET, in MILLISECONDS OF
-                   DISC (pad R+X cycles 10/20/40/0; 0 = off = the old ungated behaviour; DEFAULT 20
-                   since 2026-08-07 -- it used to be a count of reads AND default-off, i.e. armed
-                   only by the chord).  <flat> = wall tiers drawn FLAT this window because
-                   texturing them would have hit the disc and the budget was spent -- the number to
-                   trade against `Bp` on row 2.  <nocol> = of those, how many had NO cached dominant
+                 lb<budget>:<wall>/<plane>/<sprite>.<nocol> = the per-frame TEXTURE LOAD BUDGET, in
+                   MILLISECONDS OF DISC (pad R+X cycles 10/20/40/0; 0 = off = the old ungated
+                   behaviour; DEFAULT 20 since 2026-08-07 -- it used to be a count of reads AND
+                   default-off, i.e. armed only by the chord).  ⚠ 2026-08-10: this legend said
+                   `<flat>`, ONE counter; the format has printed THREE since the plane and sprite
+                   gates landed.  <wall>/<plane>/<sprite> = tiers drawn flat / planes drawn potato /
+                   sprites skipped this window because texturing them would have hit the disc and the
+                   budget was spent -- <wall> is the number to trade against `Bp` on row 2.
+                   ⚠ <sprite> is NOT purely a budget refusal: r_things.c:1505 is the SLAVE path and
+                   is unconditional, and it produces the half-sprite artefact (left half drawn, right
+                   half missing).  <nocol> = of the wall+plane flats, how many had NO cached dominant
                    colour and fell back to the neutral index (a texture never yet seen at all; it
-                   self-heals the first time the texture is drawn textured). */
+                   self-heals the first time the texture is drawn textured).
+                   ⚠ ANY non-zero here arms sat_budget_refused (core/r_segs.c:259), which is STICKY
+                   and has NO CLEAR SITE: from that instant sat_wall_io_flat primes R_WallPotatoColor
+                   for every non-IO-free tier, walking every other column of a whole texture through
+                   R_GetColumn -- INSIDE the Bp bracket.  Memoised per texture per level, so it
+                   cannot sustain a spike, but it can produce a single 150 ms outlier frame. */
             {
-                snprintf(ovbuf, sizeof ovbuf, "VRM tx%d/%d bk%d cb%d lb%d:%d/%d/%d.%d          ",
+                snprintf(ovbuf, sizeof ovbuf, "VRM tx%d/%d bk%d q%d cb%d lb%d:%d/%d/%d.%d      ",
                          vdp1_tx_used, vdp1_tx_total,
                          (wtex_bakes_win > 9999 ? 9999 : wtex_bakes_win),
+                         (wtex_qrefuse > 999 ? 999 : wtex_qrefuse),
                          (r_composite_builds > 999 ? 999 : r_composite_builds),
                          sat_tex_load_budget,
                          (sat_wall_flat_io  > 999 ? 999 : sat_wall_flat_io),
@@ -2300,7 +2376,7 @@ static void fps_update(void)
                          (sat_wall_flat_nocol + sat_plane_flat_nocol > 999
                           ? 999 : sat_wall_flat_nocol + sat_plane_flat_nocol));
                 if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 18, ovbuf);
-                wtex_bakes_win = thd_size = thd_slot = thd_budget = 0;
+                wtex_bakes_win = thd_size = thd_slot = thd_budget = wtex_qrefuse = 0;
                 r_composite_builds = 0;
                 sat_wall_flat_io = sat_wall_flat_nocol = 0;
                 sat_plane_flat_io = sat_plane_flat_nocol = sat_spr_flat_io = 0;
@@ -2346,7 +2422,6 @@ static void fps_update(void)
             int t_p99 = mh_pct(mh_things, MH_N_BUCKETS, 99);
             int d_p99 = mh_pct(mh_decl, MH_N_BUCKETS, 99);
             unsigned int occ10 = mh_frames ? (mh_occ_sum * 10u / mh_frames) : 0;
-            unsigned int don    = mh_vbl_tot ? (mh_vbl_done * 100u / mh_vbl_tot) : 0;
             /* ⚠ 2026-08-07: cutting this row to buy pool for the level-load probe made the pool go
                DOWN, 4.98 -> 4.80 KB (pre-flight FAIL).  The pool is `__heap_end - _end` and `_end`
                moves with SECTION LAYOUT, so it is NOT a monotone function of code size -- the same
@@ -2355,8 +2430,19 @@ static void fps_update(void)
             snprintf(ovbuf, sizeof ovbuf, "THp n%d/%d d%d o%u.%u f%u    ",
                      t_p50, t_p99, d_p99, occ10 / 10, occ10 % 10, mh_frames);
             if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 9, ovbuf);
-            snprintf(ovbuf, sizeof ovbuf, "FMp %d/%d/%d mx%u D%u%%    ",
-                     f_p50, f_p90, f_p99, mh_ms_mx, don);
+            /* `D%` CUT 2026-08-09 and REPLACED by `hp`.  D was the VDP1 plot done-rate sampled from
+               EDSR.CEF -- and CEF is known to LATCH 30-60% of the time on real hardware
+               ([[vdp1-cef-latches-on-hw]]), which the row-3 `Dr%` note had already concluded
+               independently before discarding its own copy of the same number.  Two findings, one
+               discredited field, and a trustworthy replacement already on screen: row 17 `LP%`.
+               `hp<peak>/<cap>k` = newlib sbrk high-water vs HEAP_SIZE.  RESTORED, not added:
+               syscalls.c:53 tells the reader to "watch row-22 hp" and row 22 does not exist, while
+               syscalls.c:61 names this heap as the project's designated FIRST pool lever.  Trimming
+               it blind risks W_AddFile's lumpinfo calloc failing on a big WAD -- a LOAD-gate
+               failure, the worst class we have. */
+            snprintf(ovbuf, sizeof ovbuf, "FMp %d/%d/%d mx%u hp%d/%dk  ",
+                     f_p50, f_p90, f_p99, mh_ms_mx,
+                     dg_heap_peak >> 10, dg_heap_size >> 10);
             if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 10, ovbuf);
             /* row 11 (ENDGAME limits high-water): how close this ~1s window got to the render
                HARD-HALT caps that I_Error-freeze a big WAD (docs/ENDGAME_ROADMAP.md Axis 2).
@@ -2364,12 +2450,44 @@ static void fps_update(void)
                zf = zone free (KB); lg = largest contiguous purgeable run (KB) = the fragmentation-
                vs-exhaustion signal.  vp/ds are core running-maxes zeroed here each window; when
                either climbs toward 256 on Doom II MAP13/15 that is the cap that crashes next.
-               (VP_POOL_PLANES=96 span-pool overflow -> r_visplane_pool_ovf is a GRACEFUL flat
-               glitch, not a freeze -- tracked separately, not shown here.) */
-            snprintf(ovbuf, sizeof ovbuf, "LIM vp%d ds%d ss%d%s zf%dk lg%dk op%d tc%d rl%d",   /* SATURN: ss = solidsegs peak vs MAXSEGS 32, '!' = overflow guard fired (M7 freeze root-cause) */
-                     r_visplane_peak, r_drawseg_peak, r_solidseg_peak, r_solidseg_ovf ? "!" : "",
-                     Z_FreeMemory() >> 10, Z_LargestAllocatable() >> 10, r_opening_ovf, r_composite_ovf, r_readlump_short);
+               🔴 vp IS NOW `vp<peak>.<poolovf>` (2026-08-09).  The second digit is the one that was
+               missing for months: `vp` alone is measured against MAXVISPLANES 256, but the SPAN POOL
+               holds only VP_POOL_PLANES = 64 plane-pairs.  Past 64, every overflower shares ONE
+               fallback slice pair and each new one's memset wipes the previous one's spans -- so at
+               `vp120.0` you are fine and at `vp120.28` you are looking at a graceful-but-real span
+               glitch that the old row could not distinguish.  It is a window HIGH-WATER (core keeps
+               it across the per-view reset), NOT a freeze: raise VP_POOL_PLANES if it is ever hot.
+               ⚠ THE SECOND DIGIT COUNTS SLICES, NOT PLANES.  r_visplane_pool_ovf++ lives inside
+               R_PoolSlice (core/r_plane.c:117) and R_PoolSlice is called TWICE per plane (:580-581
+               in R_FindPlane, :692-693 in the R_CheckPlane split), so the printed value is 2x the
+               number of glitched planes: `.28` = 14 planes.  HALVE IT before you reason about it.
+               🔴 SPLIT 2026-08-10: `op`/`tc`/`rl` MOVED TO ROW 22.  SRL::Debug::Print gives EXACTLY
+               40 visible cells (320px / 8px font) and this row rendered up to 59 -- so `rl` was off
+               the right edge in EVERY capture ever taken, and `tc` in most of them.  That is not
+               cosmetic: ATLAS says `rl>0` invalidates every LOOK finding of a session, i.e. the row
+               was silently voiding the captures it was supposed to validate.  The row cannot be made
+               to fit by shortening labels (10 conversions, 29 worst-case digit columns), so it is
+               split by READ CADENCE: continuous high-waters stay here, guard latches that read 0 in
+               every healthy frame go to row 22.  The trailing pad is REQUIRED -- nothing clears the
+               text rows per frame, and this row no longer always exceeds 40 (it used to hide its own
+               ghosting off-screen).  Worst case now 39 + pad; the old 59 also overran ovbuf[56]. */
+            snprintf(ovbuf, sizeof ovbuf, "LIM vp%d.%d ds%d ss%d%s zf%dk lg%dk       ",   /* SATURN: ss = solidsegs peak vs MAXSEGS 32, '!' = overflow guard fired (M7 freeze root-cause) */
+                     r_visplane_peak, r_visplane_pool_ovf_pk,
+                     r_drawseg_peak, r_solidseg_peak, r_solidseg_ovf ? "!" : "",
+                     Z_FreeMemory() >> 10, Z_LargestAllocatable() >> 10);
             if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 11, ovbuf);
+            /* row 22 (GUARD LATCHES): the three "a crash was prevented" counters evicted from row 11.
+               op = openings sink (PER VIEW, zeroed in R_ClearPlanes -- in 3/4p this shows the LAST
+               view only); tc = CONDEMNED TEXTURES (composite OOM sentinel, sticky per texture for the
+               whole level -- a non-zero tc means those walls are flat for good, so it changes how you
+               read `gy` and `st`); rl = short CD reads zero-filled and then CACHED.  All three are
+               cumulative since boot except op.  `rl>0` VOIDS THE LOOK GATE for the session -- that is
+               why it may never again share a row with anything that can push it off the edge.
+               Row 21 is deliberately left free: it is claimed by the LOD governor row. */
+            snprintf(ovbuf, sizeof ovbuf, "GRD op%d tc%d rl%d              ",
+                     r_opening_ovf, r_composite_ovf, r_readlump_short);
+            if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 22, ovbuf);
+            r_visplane_pool_ovf_pk = 0;
             r_visplane_peak = 0;   /* zero the core running-maxes -> next window re-accumulates its own peak */
             r_drawseg_peak  = 0;
             r_solidseg_peak = 0;   /* r_solidseg_ovf stays latched (sticky) so a single overflow event stays visible */
@@ -2435,9 +2553,17 @@ static void fps_update(void)
                    which is why the wrong texture was a REAL one and not noise. */
                 /* `gy` = VDP1 flat quads forced to the NEUTRAL GREY index -- the owner's grey
                    walls, whose trigger is a wall-dense view exhausting the wtex slots. */
-                extern int r_patch_ovf, r_composite_oob;
-                snprintf(ovbuf, sizeof ovbuf, "CD t%us px%d ob%d gy%d ",
-                         w_cd_ms10 / 10000, r_patch_ovf, r_composite_oob, vdp1_wall_nocol);
+                /* `st` = LEAD-FILL spans whose source had been PURGED by drain time (core
+                   r_segs.c, 2026-08-09).  It belongs on this row because it is a garde of exactly
+                   the same kind as px/ob: each one used to be a WRONG TEXTURE -- the slave drew a
+                   stale `dc_source` that the master's R_DrawPlanes had already freed and another
+                   texture had reused.  Now the span draws flat for one frame and says so here.
+                   Cumulative like its neighbours; it must TEND TO 0 in a calm scene, and a steady
+                   climb means the zone is purging under the render, not that the fix is failing. */
+                extern int r_patch_ovf, r_composite_oob, sat_lead_stale;
+                snprintf(ovbuf, sizeof ovbuf, "CD t%us px%d ob%d gy%d st%d ",
+                         w_cd_ms10 / 10000, r_patch_ovf, r_composite_oob, vdp1_wall_nocol,
+                         (sat_lead_stale > 9999 ? 9999 : sat_lead_stale));
                 (void)sat_cd_persistent; (void)sat_texcache_evicts;
                 (void)sat_texcache_carve_lf; (void)sat_texcache_poolkb;
                 if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 12, ovbuf);
@@ -2477,13 +2603,17 @@ static void fps_update(void)
         }
 #endif
         /* fps-only mode: SRL::Debug tiles persist, so a row we stop writing would GHOST.  Blank
-           rows 1-19 (every per-frame row: 1-8 the core B/P/M/REC/PK/SLV block, 11 LIM, 12 V1 probe,
-           13 LOS, 15 SPR, 17 SPL, 18 SLV, 19 DEP -- all gated on mode==0 for both writers, so nothing
-           re-fills them here) so only row 0 (fps + MST) remains -> the mode0<->mode1 fps delta is
-           clean.  Mode 2 hides the whole NBG3 layer (nbg3_show=0), so no blanking is needed there. */
+           rows 1-22 (every per-frame row: 1-8 the core B/P/M/REC/PK/SLV block, 11 LIM, 12 V1 probe,
+           13 LOS, 15 SPR, 17 SPL, 18 SLV, 19 DEP, 20 BP, 22 GRD -- all gated on mode==0 for both
+           writers, so nothing re-fills them here) so only row 0 (fps + MST) remains -> the
+           mode0<->mode1 fps delta is clean.  Mode 2 hides the whole NBG3 layer (nbg3_show=0), so no
+           blanking is needed there.
+           🔴 2026-08-10: the bound was 19, which GHOSTED row 20 (core/r_parallel.c's BP line) in
+           every fps-only run and would have ghosted the new row 22.  Raised to 22; row 21 is inside
+           the range in advance, for the LOD governor row. */
         if (sat_dbg_overlay_mode == 1) {
             static const char bl[] = "                                        ";
-            for (int rr = 1; rr <= 19; ++rr) SRL::Debug::Print(0, rr, (char *)bl);
+            for (int rr = 1; rr <= 22; ++rr) SRL::Debug::Print(0, rr, (char *)bl);
         }
         t0     = now;
         frames = 0;
@@ -3927,7 +4057,7 @@ static unsigned char wpn_rr_spl[2][4];     /* split: per-(parity,view) cursor wi
 static int           wpn_cache_split = -1; /* addressing mode the cache holds (1p/split); a flip
                                               relocates+rescales every slot -> invalidate all */
 
-static volatile int vd1_dr_live;   /* 1 = a world list is linked -> the vblank Dr sampler counts */
+/* (vd1_dr_live CUT 2026-08-10 with vdp1_vblank_dr -- see the mh_vbl note.) */
 static int          vdp1_bank;     /* weapon bank VDP1 is currently displaying */
 static int          vdp1_wbank;    /* bank being written this frame */
 static int          vdp1_wnext;    /* next command slot in the write bank */
@@ -4000,9 +4130,8 @@ static unsigned int thing_lru_tick;        /* monotonic use counter -> evict the
    fast on an overrun.  THING_ADAPT_MAX must match core THING_EMIT_MAX (the scratch-array bound). */
 #define THING_CAP_GROW  8                  /* clean frames before +1 (slow additive increase) */
 #define THING_ADAPT_MAX 16                 /* outdoor ceiling == core THING_EMIT_MAX */
-static int          thing_cap_clean;       /* consecutive finished-plot frames */
-/* thing_emit_floor / thing_overrun_run (AIMD damp state) are defined near the top toggles (before
-   fps_update, which reads thing_emit_floor for the row-15 ef field). */
+/* (thing_cap_clean / thing_emit_floor / thing_overrun_run CUT 2026-08-09 -- see the note at the
+   top toggles: all three were write-only, and the row-15 `ef` they fed printed a constant 0.) */
 /* (sat_things_n / sat_things_decl / thing_bake_n are defined earlier, before the overlay block) */
 /* SPLIT-SCREEN QUEUE: split renders its views BEFORE the kick and the walls only flush AT the
    kick, so a per-view thing emitted straight into the command bank would land BEFORE the walls
@@ -4127,9 +4256,25 @@ static int vdp1_wall_cap = WALL_CMD_CAP;
    H-1.  They exist so a quad grown for the seam can grow its CHARACTER by the matching number of
    texels and keep the mapping EXACT -- see wall_emit.  0 when the padded bake would not fit the
    slot (a texture that exactly fills its 16KB/32KB slot); such a texture simply never grows. */
+/* `locked` is a THREE-state cross-frame guard (SATURN 2026-08-09), not a boolean:
+     0 = free to evict
+     1 = referenced by the list being BUILT this frame  (evicting it corrupts the frame we are writing)
+     2 = referenced by the list VDP1 is still DISPLAYING (evicting it corrupts the frame on screen)
+   State 2 is the half of the 2026-07 corruption fix that was never posted.  The comment on
+   VDP1_DBLBANK (top of file) names the hazard exactly -- "the VDP1 reads a bank we're already
+   overwriting (AND A TEXTURE WE'RE RE-BAKING) the next frame" -- and it was closed for the command
+   banks (double-banked) and for the things pool (thing_cache[parity][]) but NOT here: the wall
+   texture pool is 364 KB of the 512 KB VDP1 VRAM (12 KB spare, dg_saturn:4106), so it cannot be
+   duplicated.  In 1-cycle auto VDP1 re-plots the displayed list EVERY vblank with CMDSRCA pointing
+   into these slots, so a slot re-baked while that list is live shows ANOTHER REAL TEXTURE -- the
+   owner's "inversions de textures sous grosse charge".  Refusing the eviction degrades to a flat
+   coloured quad for ONE frame instead, and self-heals (the slot drops to 0 next flush).
+   Same invariant, same reasoning as the flat pool: core/r_flatcache.c:136-138. */
 static struct { int texnum; unsigned int addr, cap; short padW, H, vpad;
                 unsigned int lru; unsigned char locked; }
                 wtex_cache[WTEX_SLOTS];
+static int wtex_saw_stale = 0;     /* wtex_find_victim skipped a state-2 slot during this resolve
+                                      (wtex_qrefuse itself is declared up at the row-18 counters) */
 #define WTEX_VPAD 2   /* rows each side; also the largest sat_wall_grow that can stay exact */
 static unsigned int wtex_tick;     /* per-frame monotonic clock for LRU */
 
@@ -4356,13 +4501,20 @@ extern "C" int sat_wall_vdp1(int x1, int yl1, int yh1, int x2, int yl2, int yh2,
     return 0;                            /* queued for VDP1 */
 }
 
-/* best victim in [lo,hi): an empty slot, else the least-recently-used UNLOCKED slot */
+/* best victim in [lo,hi): an empty slot, else the least-recently-used slot in state 0.
+   States 1 AND 2 are both untouchable -- see the wtex_cache declaration.  A skipped state-2
+   slot is recorded so the caller can tell "the pool is genuinely full this frame" (state 1)
+   apart from "the pool is full only because the screen still needs it" (state 2, overlay `q`). */
 static int wtex_find_victim(int lo, int hi)
 {
     int victim = -1; unsigned int oldest = 0xFFFFFFFFu;
     for (int i = lo; i < hi; ++i)
     {
-        if (wtex_cache[i].locked) continue;
+        if (wtex_cache[i].locked)
+        {
+            if (wtex_cache[i].locked == 2) wtex_saw_stale = 1;
+            continue;
+        }
         if (wtex_cache[i].texnum < 0) return i;
         if (wtex_cache[i].lru < oldest) { oldest = wtex_cache[i].lru; victim = i; }
     }
@@ -4407,6 +4559,7 @@ static int wall_tex_resolve(int texnum, const unsigned char *cmap)
        texture may always take a bigger slot, never a smaller one.  A scene wanting only 16 KB
        textures therefore degrades to exactly the pre-2026-08-06 two-pool behaviour, never worse. */
     int victim;
+    wtex_saw_stale = 0;                                 /* set by wtex_find_victim on a state-2 skip */
     if (size <= WTEX_SMALL_SZ)
     {
         victim = wtex_find_victim(0, WTEX_SMALL_N);
@@ -4420,7 +4573,11 @@ static int wall_tex_resolve(int texnum, const unsigned char *cmap)
     }
     else                                                /* wide: only the wide pool fits */
         victim = wtex_find_victim(WTEX_SMALL_N + WTEX_NARROW_N, WTEX_SLOTS);
-    if (victim < 0) return -1;                          /* all fitting slots used -> flat in flush */
+    if (victim < 0)                                     /* all fitting slots used -> flat in flush */
+    {
+        if (wtex_saw_stale) wtex_qrefuse++;             /* refused to overwrite what is ON SCREEN */
+        return -1;
+    }
 
     /* SATURN LOAD BUDGET, VDP1 HALF (2026-08-06) -- THE HOLE THE ROW-20 SPLIT EXPOSED.
        The bake loop below calls R_GetColumn per column, which in the CD-streaming build FAULTS THE
@@ -4521,7 +4678,10 @@ static int wall_ext = 768; /* how far a tile's extrapolated extent may run past 
 
 static int wall_vbands(int wi)   /* number of vertical texture-height bands this wall needs */
 {
-    int H = (wall_acc[wi].slot >= 0) ? wtex_cache[wall_acc[wi].slot].H : 128;
+    /* H from the TEXTURE, not from the cache slot: this is now called BEFORE the slot exists
+       (lazy resolve, vdp1_walls_flush) -- and it is the same number either way, because
+       wall_tex_resolve bakes wtex_cache[].H = textureheight>>16.  The old `: 128` guess is gone. */
+    int H = textureheight[wall_acc[wi].texnum] >> 16;
     int v0 = wall_acc[wi].v0, vspan = wall_acc[wi].v1 - v0;
     /* EXACT count matching wall_emit's band loop (starts at vmod0 = v0%H, then H-aligned steps).
        The old (vspan+H-1)/H + 1 over-counted ~2x for normal walls -> the budget estimate saturated
@@ -5001,12 +5161,20 @@ static void vdp1_walls_flush(void)
                              then rejected EVERY wall forever (VD1=1, all walls CPU, 10fps --
                              owner overlay capture 2026-07-03) */
     wtex_tick++;
-    for (int i = 0; i < WTEX_SLOTS; ++i) wtex_cache[i].locked = 0;
+    /* AGE THE LOCKS, don't clear them (SATURN 2026-08-09).  1 -> 2: the slots this frame's list
+       used are exactly the slots VDP1 will be re-plotting from while we build the next one, so
+       they stay untouchable for one more flush.  2 -> 0: that list is off the bank now (commands
+       are double-banked and the kick flipped), so the slot is genuinely free. */
+    for (int i = 0; i < WTEX_SLOTS; ++i)
+        wtex_cache[i].locked = (unsigned char)((wtex_cache[i].locked == 1) ? 2 : 0);
 
     /* (the `t` RESOLVE bracket is gone -- it measured a flat 0.0 ms with 0 refusals on every
-       capture, i.e. THE TEXTURE BAKE IS NOT THE COST, and carrying it cost HWRAM.) */
-    for (int i = 0; i < wall_acc_n; ++i)                 /* resolve textures (near-first) */
-        wall_acc[i].slot = (short)wall_tex_resolve(wall_acc[i].texnum, wall_acc[i].cmap);
+       capture, i.e. THE TEXTURE BAKE IS NOT THE COST, and carrying it cost HWRAM.)
+       The eager "resolve EVERY accumulated wall" pass that used to sit here is gone too: it baked a
+       texture, paid the disc, and locked a slot for walls the loop below then drew FLAT anyway
+       (surplus exhausted, potato mode, iso mode).  That waste is what drove `tx` to 26/26 and
+       MANUFACTURED the evictions.  Resolution now happens inside the decision loop, only for a wall
+       that has already won a textured slot in the budget -- see the wall_tex_resolve call below. */
     unsigned short em0 = frt_read();   /* SATURN: everything below is the EMIT loop -> row 20 `f` */
 
     /* mode: 1 = textured, 2 = flat, 0 = skip.  Every wall gets at least a 1-cmd FLAT (never sky
@@ -5028,13 +5196,15 @@ static void vdp1_walls_flush(void)
     int extra_used[4] = { 0, 0, 0, 0 };
     for (int i = 0; i < wall_acc_n; ++i)
     {
+        wall_acc[i].slot = -1;                                /* no slot until one is actually won */
         if (i >= budget) { wall_acc[i].mode = 0; continue; }   /* n > budget (cap makes this unreachable) */
         int v = (nviews > 1) ? (int)wall_acc[i].view : 0;     /* per-view surplus bin (0..nviews-1) */
         if (v >= nviews) v = nviews - 1;
-        /* 3-way: 0=textured 1=banded 2=flat; a wall with no texture slot must be flat.  A SPECIAL
-           wall (door/switch, wall_acc[i].special) is forced TEXTURED for readability even in pot2. */
-        int wmode = (wall_acc[i].slot < 0) ? 2
-                  : sat_iso_flat            ? 2   /* iso mode 4: force every VDP1 wall FLAT (overdraw-vs-fill probe) */
+        /* 3-way: 0=textured 1=banded 2=flat.  A SPECIAL wall (door/switch, wall_acc[i].special) is
+           forced TEXTURED for readability even in pot2.  The "no texture slot -> flat" arm has moved
+           DOWN, past the budget test: asking for a slot is the expensive part (a bake, and in the
+           streaming build a synchronous disc read), so it is now the LAST question, not the first. */
+        int wmode = sat_iso_flat            ? 2   /* iso mode 4: force every VDP1 wall FLAT (overdraw-vs-fill probe) */
                   : (wall_acc[i].special)  ? 0
                   : wall_potato(i);
         if (wmode != 2)                                        /* textured/banded: charge extra to surplus */
@@ -5043,9 +5213,18 @@ static void vdp1_walls_flush(void)
             if (extra < 0) extra = 0;
             if (extra_used[v] + extra <= surplus_per_view)
             {
-                extra_used[v] += extra;
-                wall_acc[i].mode = (wmode == 1) ? 3 : 1;       /* banded=3, textured=1 */
-                continue;
+                /* THE ONLY resolve site.  Near-first, same order as the old eager pass, so the LRU
+                   still favours the nearest walls -- but a wall that lost the surplus race never
+                   gets here, so it costs no bake, no disc and no slot lock.  A refusal (pool full,
+                   or the victim is still on screen -- see the 3-state lock) falls through to flat. */
+                int slot = wall_tex_resolve(wall_acc[i].texnum, wall_acc[i].cmap);
+                if (slot >= 0)
+                {
+                    wall_acc[i].slot = (short)slot;
+                    extra_used[v] += extra;
+                    wall_acc[i].mode = (wmode == 1) ? 3 : 1;   /* banded=3, textured=1 */
+                    continue;
+                }
             }
         }
         wall_acc[i].mode = 2;                                  /* flat baseline (guaranteed to fit) */
@@ -5173,20 +5352,12 @@ static void sat_field_fence(void)
     fv_prev = vbl_count;
 }
 
-#if SHOW_FPS
-/* TRUE VDP1 done-rate: sample EDSR.CEF at EVERY VBLANK -- 1-cycle-auto restarts a plot pass
-   per vblank, so the old per-KICK sample (once per ~5-10 vblank game frame) aliased with the
-   frame rate and misread the rate at random phases (owner: "Dr% est biaisé, pb de fréquence").
-   CEF at vblank = "did the pass started at the previous vblank finish in time" -- exactly the
-   per-pass completion the budget work needs.  Gated on a linked world list (vd1_dr_live). */
-static void vdp1_vblank_dr(void)
-{
-    if (!vd1_dr_live) return;
-    int done = (VDP1_EDSR & 0x0002) ? 1 : 0;
-    vd1_win_tot++;   if (done) vd1_win_done++;   /* ~1s window (row 2 Dr%) */
-    mh_vbl_tot++;    if (done) mh_vbl_done++;     /* session (mode-scoped) done-rate -> metrics row */
-}
-#endif
+/* (vdp1_vblank_dr CUT 2026-08-10.  It sampled EDSR.CEF at every vblank into mh_vbl_done/tot, whose
+   only consumer -- row 10 `D%` -- was cut on 08-09.  Its own comment said "cut it or print it, do not
+   leave it here a second time", so: cut, along with its OnVblank registration and vd1_dr_live.  It
+   was an ISR running 60x/s to feed nobody.  If a done-rate is ever wanted again, note that the
+   number is discredited on real hardware anyway ([[vdp1-cef-latches-on-hw]]) -- row 17 `LP%` is the
+   signal that survived HW validation. */
 
 /* One-time: build the fixed root (sysclip + JUMP, link -> empty bank) and the empty
    bank, then put VDP1 in 1-cycle auto (or manual-change) mode. */
@@ -5232,7 +5403,7 @@ static void vdp1_wpn_init(void)
     VDP1_FBCR = 0x0000;                              /* BOOT in 1-cycle auto (known-good, Ymir-safe, == ship) */
     VDP1_PTMR = 0x0002;
 #if SHOW_FPS
-    SRL::Core::OnVblank += vdp1_vblank_dr;           /* per-vblank Dr sampler (the honest done-rate) */
+    /* (OnVblank += vdp1_vblank_dr REMOVED 2026-08-10 -- consumer-less ISR, see the cut note.) */
 #endif
 #if VDP1_MANUAL_CHANGE
     /* Register the gated-present handler; it is a NO-OP until pad L+Z sets vdp1_present_manual=1.
@@ -5749,8 +5920,6 @@ static void vdp1_things_flush(void)
         { extern int sat_local_players; int nv = sat_local_players; if (nv < 1) nv = 1;
           int fit = i / nv; if (fit < sat_thing_emit_cap) sat_thing_emit_cap = fit;
           if (sat_thing_emit_cap < 0) sat_thing_emit_cap = 0; }
-        thing_emit_floor = 0;
-        thing_cap_clean = 0;
     }
     thing_acc_n = 0; thing_acc_open = 0;
 }
@@ -5905,9 +6074,19 @@ static void vdp1_wpn_kick(void)
                from the hardware.  Snap to it.  On a clean frame the budget is >= the list and we can't
                see the surplus, so drift up +1 / THING_LP_CLEAN to re-probe headroom when a scene eases.
                vdp1_budget_cmds==0 means "not yet measured" -> the AIMD treats it as unlimited (slot cap). */
+            /* A NEW MAP IS A NEW SCENE: a measurement taken in the previous level's worst corridor
+               is not a budget for this one, and nothing else in the loop ever clears it. */
+            { extern int gamemap;
+              if (gamemap != vdp1_budget_map)
+              { vdp1_budget_map = gamemap; vdp1_budget_cmds = 0; vdp1_budget_clean = 0; } }
             if (overran) { vdp1_budget_cmds = got / 4; vdp1_budget_clean = 0; }
             else if (vdp1_budget_cmds > 0 && ++vdp1_budget_clean >= THING_LP_CLEAN) {
-                if (vdp1_budget_cmds < WALL_CMD_CAP) vdp1_budget_cmds++;
+                int gap = WALL_CMD_CAP - vdp1_budget_cmds;    /* geometric climb, additive near the top */
+                int step = gap >> 4;
+                if (step < 1) step = 1;
+                if (step > THING_BUDGET_STEP) step = THING_BUDGET_STEP;
+                vdp1_budget_cmds += step;
+                if (vdp1_budget_cmds > WALL_CMD_CAP) vdp1_budget_cmds = WALL_CMD_CAP;
                 vdp1_budget_clean = 0; }
             /* WEAPON GUARANTEE (closed loop).  The gun is the last world command, so the plot
                reached it iff the list completed OR LOPR passed its slot.  This is the ONLY place
@@ -5935,12 +6114,9 @@ static void vdp1_wpn_kick(void)
     }
     vdp1_last_cmds = vdp1_wactive ? vdp1_wnext : 0;
     vdp1_wpn_slot_disp = vdp1_wactive ? vdp1_wpn_slot_end : 0;   /* the list LOPR will report on next kick */
-    vd1_wpct = WALL_CMD_CAP ? (vdp1_last_cmds * 100 / WALL_CMD_CAP) : 0;   /* wall command-budget fill % */
-    /* Dr accumulation moved to the OnVblank sampler (vdp1_vblank_dr): per-KICK sampling ran
-       once per GAME frame while 1-cycle-auto replots every VBLANK -> the rate aliased with
-       the frame rate and under/over-read at random phases (owner: "Dr% est biaisé").  Here
-       we only gate WHICH frames count (a world list is linked). */
-    vd1_dr_live = vdp1_wactive ? 1 : 0;
+    /* (vd1_wpct CUT 2026-08-09 with the row-8 `w%` it fed -- a division per frame to restate row 17
+       `c` as a percentage of a constant.) */
+    /* (the vd1_dr_live gate went with vdp1_vblank_dr, 2026-08-10.) */
     /* Phase-0 fallback profiler: snapshot the just-rendered frame's tally into cur + windowed peaks
        (r_segs.c accumulated the counters across this frame's segs), then reset below. */
     fb_cur_clamp = sat_fb_clamp_t; fb_cur_mag = sat_fb_mag_t; fb_cur_px = sat_fb_px;
@@ -6148,7 +6324,6 @@ extern "C" void sat_walls_kick(void)
             if (sat_thing_emit_cap < budget_cap)      sat_thing_emit_cap += 2;         /* smooth ramp up */
             else if (sat_thing_emit_cap > budget_cap) sat_thing_emit_cap = budget_cap; /* snap down to fit */
             if (sat_thing_emit_cap < 0) sat_thing_emit_cap = 0;
-            thing_overrun_run = 0; thing_cap_clean = 0;
 #if SHOW_FPS
             /* (2) WALL LOD: engage only when things are already shed and the walls STILL overrun the
                VDP1 budget (room for things <= trigger), AND the master (software) has room to take them.
@@ -6182,7 +6357,6 @@ extern "C" void sat_walls_kick(void)
             if (sat_thing_emit_cap < budget_cap)      sat_thing_emit_cap += 2;         /* smooth ramp up */
             else if (sat_thing_emit_cap > budget_cap) sat_thing_emit_cap = budget_cap; /* snap down to fit */
             if (sat_thing_emit_cap < 0) sat_thing_emit_cap = 0;
-            thing_overrun_run = 0; thing_cap_clean = 0;
         }
         /* (VDP1 thing FILL budget removed 2026-07-25: fill is not the limiter -- sat_thing_fill_budget
            stays 0 (core default = off).  The count budget above (WBUDGET, command-slot-driven) is what
@@ -7275,10 +7449,14 @@ static void poll_pad(void)
     /* SATURN 2026-07-09 -- three perf-lever live A/B toggles, one HW session.  Letter+modifier chords
        (the established pattern; the incidental Doom tap is harmless).  The d-pad is deliberately NOT
        used (L/R + d-pad would eat movement in normal play).  R+C = clear-on-slave (R+C was the freed M5
-       staging slot); R+X = nearSprites cull; L+X = AIMD damp.  X's TAB (automap) is suppressed below
-       whenever L or R is held, and the mp split-VDP1 X toggle is gated to X-alone, so these never
-       collide.  Row 7 shows cs/ns/ad; row 15 SPR shows the AIMD ec/ef effect.  L+X now CYCLES the
-       AIMD mode ad0/1/2 (2 = wbudget: 1p command-budget-driven emit cap -> monsters to VDP1). */
+       staging slot); R+X = the texture LOAD BUDGET; L+X = paint every VDP1 wall a flat quad.  X's TAB
+       (automap) is suppressed below whenever L or R is held, and the mp split-VDP1 X toggle is gated
+       to X-alone, so these never collide.
+       ⚠ 2026-08-10, four dead field names removed from this sentence: it used to say "R+X =
+       nearSprites cull ... Row 7 shows cs/ns/ad; row 15 SPR shows the AIMD ec/ef effect.  L+X now
+       CYCLES the AIMD mode ad0/1/2".  `ns` was cut from row 7 (08-09) and its chord had already been
+       reclaimed; `ad` was never in the row-7 format; `ec`/`ef` were cut from row 15 (08-09); and the
+       L+X AIMD cycle was cut on 2026-07-16 (see :7488).  Read instead: row 7 `cs`, row 17 `ec`. */
     if (!(cur & PER_DGT_TR) && (cur & PER_DGT_TL)                 /* R held, L released */
         && (changed & PER_DGT_TC) && !(cur & PER_DGT_TC))
         sat_clear_slave ^= 1;
@@ -7326,7 +7504,7 @@ static void poll_pad(void)
        walls by construction.  0 = off = every texture faults on sight (the old behaviour).
        The chord cycles 10 -> 20 -> 40 -> 0 -> 10 MILLISECONDS of disc per frame (it was a count
        of reads, 0/1/2/4, until 2026-08-07); the DEFAULT is 20, so the gate is armed at boot.
-       Read `lb<budget>:<flat>.<nocol>` on row 18.  (R+X was documented for sat_near_sprites but
+       Read `lb<budget>:<wall>/<plane>/<sprite>.<nocol>` on row 18.  (R+X was documented for sat_near_sprites but
        NEVER bound -- verified on PER_DGT_TX, the only sites are L+X and split-X.) */
     if (sat_local_players <= 1 && !(cur & PER_DGT_TR) && (cur & PER_DGT_TL)
         && (changed & PER_DGT_TX) && !(cur & PER_DGT_TX))

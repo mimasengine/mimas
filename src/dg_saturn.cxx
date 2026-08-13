@@ -3744,7 +3744,9 @@ extern "C" void DG_Init(void)
     /* LAYER INVERSION: software (NBG1) ON TOP with Doom's correct occlusion; the VDP1
        walls render BELOW NBG1, filling the index-0 (transparent) wall gaps NBG1 leaves
        where the software wall draw is skipped.  NBG3 debug = 7 (top).
-       NBG1 game = 6  >  every sprite priority = 5  >  NBG0 sky = 4 (3 with RBG0). */
+       NBG1 game = 6  >  every sprite priority = 5  >  NBG0 sky = 4 (3 with RBG0).
+       (Since 2026-08-12 the HIGH sprite registers are 6, not 7, so NBG3's 7 is strictly on top --
+       see the SAT_SPR_HI_PRIO note below.) */
 #if VDP2_RBG0_TEST
     slPriorityNbg0(VDP2_SKY_OCCL_DIAG ? 4 : 3); slPriorityNbg1(6);   /* sky 3 below floor(4); DIAG: sky 4 above floor(3) */
 #else
@@ -3779,11 +3781,37 @@ extern "C" void DG_Init(void)
 #if SAT_WPN_VDP1
     /* PER-COMMAND SPLIT: register 0 = 5 (below NBG1) is what walls/floors select -- their
        framebuffer values are CRAM addresses <=2047, so the priority-select bits are CLEAR ->
-       register 0.  registers 1..7 = 7 (above NBG1) -- anything that SETS a priority bit lands
+       register 0.  registers 1..7 = SPR_HI (above NBG1) -- anything that SETS a priority bit lands
        here.  So a command that ORs a priority bit into its CMDCOLR jumps above NBG1 while the
-       walls/floors stay below.  This is the sprite-vs-world layer split. */
-    slPrioritySpr0(5); slPrioritySpr1(7); slPrioritySpr2(7); slPrioritySpr3(7);
-    slPrioritySpr4(7); slPrioritySpr5(7); slPrioritySpr6(7); slPrioritySpr7(7);
+       walls/floors stay below.  This is the sprite-vs-world layer split.
+
+       🔴 2026-08-12 -- SPR_HI 7 -> 6 SO THE DEBUG TEXT SITS ABOVE THE WEAPON.
+       Owner: "zb est caché par l'arme vdp1 ... idéalement, la couche debug devrait au dessus de
+       vdp1".  He is right, and the reason it was not is exact.  NBG3 (the SRL debug text) is at
+       priority 7 and so was every sprite register 1..7 -- and on a TIE, VDP2 Table 11.1 of the
+       KRONOS-CORRECTED manual (../saturn-refs/manuals/text/VDP2-ST-058-R2.txt, PDF p.244) gives the
+       order Sprite > RBG0 > NBG0 > NBG1 > NBG2 > NBG3.  **NBG3 is dead last of every layer**, so at
+       7-vs-7 the weapon wins every pixel.  Raising the text is impossible: 7 is the 3-bit maximum.
+       So the sprites come down one instead.
+
+       ⚠ THE TIE IS STRUCTURALLY UNAVOIDABLE, and this is where it now sits.  Constraints:
+       wall commands (reg 0 = 5) must stay STRICTLY below NBG1, so NBG1 >= 6; the weapon must be
+       above NBG1; NBG3 <= 7.  There is no assignment in 0..7 that makes all three strict.  With
+       SPR_HI = 6 the surviving tie is sprite-vs-NBG1 at 6, and Table 11.1 resolves it in the
+       SPRITE's favour -- i.e. the weapon still composites over the software framebuffer exactly as
+       before.  Everything else is untouched: walls 5 < NBG1 6, RBG0 4 < 6.  The ONLY intended
+       behavioural change is that the debug text now draws over sprites.
+       ⚠ REVERT = set SPR_HI back to 7 (one token).  If a capture shows the weapon vanishing behind
+       the game framebuffer, the tie rule is not holding as documented on this path: revert and pad
+       the row-22 print rightward instead (the owner's own fallback: start `zb` at column 28, clear
+       of the weapon's columns 14-27). */
+#ifndef SAT_SPR_HI_PRIO
+#define SAT_SPR_HI_PRIO 6
+#endif
+    slPrioritySpr0(5);
+    slPrioritySpr1(SAT_SPR_HI_PRIO); slPrioritySpr2(SAT_SPR_HI_PRIO); slPrioritySpr3(SAT_SPR_HI_PRIO);
+    slPrioritySpr4(SAT_SPR_HI_PRIO); slPrioritySpr5(SAT_SPR_HI_PRIO); slPrioritySpr6(SAT_SPR_HI_PRIO);
+    slPrioritySpr7(SAT_SPR_HI_PRIO);
 #elif SAT_SPR_PRIO7_TEST
     slPrioritySpr0(7); slPrioritySpr1(7); slPrioritySpr2(7); slPrioritySpr3(7);
     slPrioritySpr4(7); slPrioritySpr5(7); slPrioritySpr6(7); slPrioritySpr7(7);

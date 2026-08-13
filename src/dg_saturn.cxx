@@ -179,6 +179,7 @@ extern "C" int   Z_FreeMemory(void);          /* total reclaimable (free + purge
 extern "C" int   Z_LargestAllocatable(void);  /* largest contiguous run after purging */
 extern "C" int   dg_heap_peak;              /* #4: peak newlib sbrk usage (bytes)             */
 extern "C" int   dg_heap_size;              /* #4: newlib heap cap (bytes)                    */
+extern "C" int   dg_heap_fail;              /* #4: sbrk REFUSALS -- any non-zero = raise HEAP_SIZE */
 /* split-screen perf breakdown (ms per piece of the 2p render block) -- diagnose the slowdown */
 extern "C" unsigned int sat_spl_sw, sat_spl_v0, sat_spl_v1, sat_spl_v2, sat_spl_v3, sat_spl_kick;
 extern "C" int   sat_bsp_stage_used, sat_bsp_stage_want;  /* M5 BSP staging, row 1 st readout */
@@ -2435,14 +2436,22 @@ static void fps_update(void)
                ([[vdp1-cef-latches-on-hw]]), which the row-3 `Dr%` note had already concluded
                independently before discarding its own copy of the same number.  Two findings, one
                discredited field, and a trustworthy replacement already on screen: row 17 `LP%`.
-               `hp<peak>/<cap>k` = newlib sbrk high-water vs HEAP_SIZE.  RESTORED, not added:
-               syscalls.c:53 tells the reader to "watch row-22 hp" and row 22 does not exist, while
-               syscalls.c:61 names this heap as the project's designated FIRST pool lever.  Trimming
-               it blind risks W_AddFile's lumpinfo calloc failing on a big WAD -- a LOAD-gate
-               failure, the worst class we have. */
-            snprintf(ovbuf, sizeof ovbuf, "FMp %d/%d/%d mx%u hp%d/%dk  ",
+               `hp<peak>/<cap>!<fail>` = newlib sbrk high-water vs HEAP_SIZE, IN BYTES, plus the
+               refusal count.  RESTORED, not added: syscalls.c told the reader three times to "watch
+               row-22 hp" and row 22 did not exist, while the same file names this heap as the
+               project's designated FIRST pool lever.
+               🔴 2026-08-12: BYTES, not KB.  The `>>10` is what made this field ambiguous exactly when
+               it mattered -- `hp1` covers [1024, 2047], a 2x uncertainty, and the whole P0 decision
+               (HEAP_SIZE 12 KB -> 4 KB, +8192 B of pool) had to be sized on the pessimistic end of it.
+               At a 4 KB cap a KB-resolution field would read `hp1/4k` right up to the failure.
+               🔴 And `!<fail>` = dg_heap_fail, _sbrk's ENOMEM branch, which was MUTE.  ANY non-zero
+               means RAISE HEAP_SIZE: the failure mode is a LOAD-gate halt in M_StringJoin /
+               M_StringDuplicate BEFORE the first frame, not a perf regression.  (The lumpinfo calloc
+               this comment used to fear is NOT the risk -- that array is a Z_Malloc in the LWRAM zone,
+               and `calloc` is referenced by no project object.  The late allocator is m_menu's fopen.) */
+            snprintf(ovbuf, sizeof ovbuf, "FMp %d/%d/%d mx%u hp%d/%d!%d ",
                      f_p50, f_p90, f_p99, mh_ms_mx,
-                     dg_heap_peak >> 10, dg_heap_size >> 10);
+                     dg_heap_peak, dg_heap_size, dg_heap_fail);
             if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 10, ovbuf);
             /* row 11 (ENDGAME limits high-water): how close this ~1s window got to the render
                HARD-HALT caps that I_Error-freeze a big WAD (docs/ENDGAME_ROADMAP.md Axis 2).

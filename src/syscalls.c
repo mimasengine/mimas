@@ -52,23 +52,35 @@ char **environ = __env;
    ~1-2 KB MEASURED peak, see below), so the heap is trimmed 88 -> 32 KB, returning ~56 KB to the TLSF pool.
    Watch row-10 `hp` (dg_heap_peak) stays < HEAP_SIZE on a full E1 run; trim further toward
    the measured peak if you want even more pool, or raise back if a hidden libc alloc appears. */
-#define HEAP_SIZE (12 * 1024)   /* SATURN 2026-08-07: 16 -> 12 KB, +4 KB straight to the TLSF pool.
-                                    Taken because a whole afternoon was spent DELETING FEATURES to buy
-                                    back 70 bytes of pool -- and worse, deleting code kept making the
-                                    pool go DOWN (4.98 -> 4.80, 4.73 -> 4.11: `_end` moves with section
-                                    layout, not byte count).  This is the honest lever: measured peak
-                                    `hp` reads 1 (i.e. 1024-2047 B, the field truncates >>10) on TNT MAP11 at
-                                    t4s-t20s, boot included -- NOT the ~6 KB asserted here and below, which was
-                                    an estimate never checked once the field existed.  12 KB is ~6x peak.  ⚠ ALWAYS reach for this
-                                    (or another slack reserve) BEFORE cutting a diagnostic or a feature.
-                                    Watch row-10 `hp`; raise back if it approaches 12 KB.
-                                    Previously: 32->24->20->18->16KB (16KB 2026-07-24): +2KB for
-                                    the CPROBE cart-CRC diag .text (pool was 6.55KB < the 7KB comfort
-                                    target; the boot-loop floor DRIFTS, 4KB is optimistic).  Peak is ~6KB
-                                    (lumpinfo is in LWRAM, no big-IWAD spike) so 16KB still holds 2.6x
-                                    peak -- acceptable for the SAROO diag image which only runs shareware
-                                    DOOM1; RESTORE >=18KB before any big-WAD (TNT/Plutonia) campaign or
-                                    when the WPROBE/CPROBE diag retires (watch row-10 hp).
+#define HEAP_SIZE (4 * 1024)    /* SATURN 2026-08-12 (macro plan P0): 12 -> 4 KB = +8192 B of TLSF
+                                    pool, EXACTLY.  This is the one pool change whose gain is
+                                    arithmetic instead of section-layout luck: __heap_end is a
+                                    link-time constant (0x060fa000 in all ten build/*.map) and the
+                                    .bss downstream of syscalls.o aligns to at most 0x10, so a
+                                    multiple-of-16 cut lands 1:1.  Contrast the usual trap -- deleting
+                                    CODE kept moving the pool DOWN (4.98->4.80, 4.73->4.11, and again
+                                    8.41->7.97 on 2026-08-09) because `_end` follows section layout,
+                                    not byte count.
+                                      TAKEN ON A MEASUREMENT, not an estimate.  The overlay `hp` field
+                                    was restored on 2026-08-09 and immediately read hp1/12k across
+                                    three TNT MAP11 captures at level time t4s-t20s, boot included:
+                                    the peak is in [1024, 2047] B (the old field truncated >>10).  The
+                                    ~6 KB figure asserted here for a year was never checked once the
+                                    instrument existed.  4096 B is ~2x the measured ceiling and ~2.5x
+                                    the ENUMERATED one (1028 B stdout BUFSIZ + 416 B FILE glue + ~204 B
+                                    of M_StringJoin/strdup/I_AtExit = ~1648 B).
+                                      THE RISK IS THE **LOAD** GATE, NOT PERF: an sbrk failure halts in
+                                    M_StringJoin / M_StringDuplicate (core/m_misc.c) BEFORE the first
+                                    frame.  So `hp` now prints BYTES, and _sbrk's ENOMEM branch -- mute
+                                    until today -- increments dg_heap_fail, shown as `hp<peak>/<cap>!<n>`.
+                                    ANY `!` on row 10 means raise HEAP_SIZE, and it is the ONLY warning
+                                    you get.  The old note here claimed W_AddFile's lumpinfo calloc was
+                                    the thing to fear: it is NOT -- that array is a Z_Malloc in the
+                                    LWRAM zone (core/w_wad.c:124-129) and `calloc` is referenced by no
+                                    project object at all (build/Mimas-Tnt.map pulls it only via
+                                    libc_a-mprec.o).  The late allocator to watch instead is the save
+                                    menu's fopen (core/m_menu.c:513).
+                                      History: 88->32->24->20->18->16->12->4 KB.
                                     WALL_ACC_MAX stays 128 -- never rob the wall budget for the pool. */
 static char heap[HEAP_SIZE] __attribute__((aligned(8)));
 static char *heap_end = heap;
@@ -83,6 +95,7 @@ static char *heap_end = heap;
    failing would brick the WAD load -- failure is graceful NULL, not corruption). */
 int dg_heap_peak = 0;            /* bytes ever sbrk'd (high-water)        */
 int dg_heap_size = HEAP_SIZE;    /* the cap, for the overlay denominator  */
+int dg_heap_fail = 0;            /* sbrk refusals -- see the ENOMEM branch */
 
 void *_sbrk(int incr)
 {
@@ -90,6 +103,13 @@ void *_sbrk(int incr)
     int  used;
     if (heap_end + incr > heap + HEAP_SIZE)
     {
+        /* SATURN 2026-08-12: this branch was MUTE.  With HEAP_SIZE cut to 2x the measured peak it is
+           the only thing standing between a hidden libc alloc and a LOAD-gate halt with no cause
+           attached, so it is now counted and surfaced as row-10 `hp<peak>/<cap>!<n>`.  It does NOT
+           make the failure survivable -- malloc returns NULL and the caller usually I_Errors -- it
+           makes it ATTRIBUTABLE, which is the difference between "raise HEAP_SIZE by 4 KB" and a
+           week of bisecting a boot loop. */
+        dg_heap_fail++;
         errno = ENOMEM;
         return (void *)-1;
     }

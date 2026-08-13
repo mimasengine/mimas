@@ -180,6 +180,7 @@ extern "C" int   Z_LargestAllocatable(void);  /* largest contiguous run after pu
 extern "C" int   dg_heap_peak;              /* #4: peak newlib sbrk usage (bytes)             */
 extern "C" int   dg_heap_size;              /* #4: newlib heap cap (bytes)                    */
 extern "C" int   dg_heap_fail;              /* #4: sbrk REFUSALS -- any non-zero = raise HEAP_SIZE */
+extern "C" int   z_block_count;             /* core z_zone.c: zone blocks walked by Z_LargestAllocatable */
 /* split-screen perf breakdown (ms per piece of the 2p render block) -- diagnose the slowdown */
 extern "C" unsigned int sat_spl_sw, sat_spl_v0, sat_spl_v1, sat_spl_v2, sat_spl_v3, sat_spl_kick;
 extern "C" int   sat_bsp_stage_used, sat_bsp_stage_want;  /* M5 BSP staging, row 1 st readout */
@@ -1944,6 +1945,7 @@ static void fps_update(void)
            (the pad is already saturated: Y=SQ X=split Z=mode-M L+A=blit). */
         {
             static int l_map=-1, l_m=-1, l_sq=-1, l_blit=-1, l_ms=-1, l_cls=-1, l_ns=-1, l_opt=-1, l_wen=-1, l_wb=-1;
+            static int l_lx=-1, l_lm=-1;   /* lead-fill chord (pad R+Right): depth + mode */
 #if SAT_DIAG_SLAVE_TOGGLES
             static int l_steal=-1, l_wp=-1;
 #endif
@@ -1957,6 +1959,16 @@ static void fps_update(void)
                                                 so En0 vs En1 must be read on a clean Bp window too */
                 || sat_wall_grow != l_wb    /* pad L+Up: the grow adds VDP1 fill -> read its cost on
                                                a clean window as well */
+                || sat_wall_lead_x != l_lx || sat_lead_mode != l_lm
+                                            /* 🔴 2026-08-12: pad R+Right was MISSING from this key,
+                                               and it is an A/B like every other entry.  Consequence
+                                               caught on a real capture: PK/MXd and the row-20 g/b latch
+                                               are cleared only here, so after a chord press the latched
+                                               frame could have been drawn under a DIFFERENT lead-fill
+                                               configuration than the one row 13 prints on the same
+                                               photo -- a 275-second window spanning up to four
+                                               configurations.  The A/B was unattributable and nothing
+                                               said so. */
 #if SAT_DIAG_SLAVE_TOGGLES
                 || sat_plane_steal != l_steal || sat_wallprep_slave != l_wp
 #endif
@@ -1966,6 +1978,7 @@ static void fps_update(void)
                 blit10_sum = blit10_cnt = 0;   /* row-1 'b' precise window: fresh sample on the L+A toggle */
                 l_map=gamemap; l_m=sat_m; l_sq=(sq_wall<<6|sq_sprite<<4|sq_floor<<2|sq_ceil); l_blit=blit_mode; l_ms=sat_mark_suppress;
                 l_cls=sat_clear_slave; l_ns=sat_near_sprites; l_opt=sat_opt; l_wen=sat_wall_entry; l_wb=sat_wall_grow;
+                l_lx=sat_wall_lead_x; l_lm=sat_lead_mode;
 #if SAT_DIAG_SLAVE_TOGGLES
                 l_steal=sat_plane_steal; l_wp=sat_wallprep_slave;
 #endif
@@ -2492,9 +2505,16 @@ static void fps_update(void)
                read `gy` and `st`); rl = short CD reads zero-filled and then CACHED.  All three are
                cumulative since boot except op.  `rl>0` VOIDS THE LOOK GATE for the session -- that is
                why it may never again share a row with anything that can push it off the edge.
+               zb = the ZONE BLOCK COUNT, a free by-product of Z_LargestAllocatable's walk (2026-08-12).
+               It sits here because it is a zone-health number, and because it is the missing factor in
+               the 214 ms R_GetColumn hole: R_GenerateComposite calls Z_LargestAllocatable TWICE per
+               build on the 1p path, that function is O(blocks), and nobody knew whether "blocks" meant
+               600 or 1500 -- 0.4 ms vs 1.6 ms per walk, i.e. whether the allocator is the subject or a
+               footnote.  It is a LAST-CALL value, not a peak: whatever the most recent
+               Z_LargestAllocatable saw.
                Row 21 is deliberately left free: it is claimed by the LOD governor row. */
-            snprintf(ovbuf, sizeof ovbuf, "GRD op%d tc%d rl%d              ",
-                     r_opening_ovf, r_composite_ovf, r_readlump_short);
+            snprintf(ovbuf, sizeof ovbuf, "GRD op%d tc%d rl%d zb%d        ",
+                     r_opening_ovf, r_composite_ovf, r_readlump_short, z_block_count);
             if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 22, ovbuf);
             r_visplane_pool_ovf_pk = 0;
             r_visplane_peak = 0;   /* zero the core running-maxes -> next window re-accumulates its own peak */

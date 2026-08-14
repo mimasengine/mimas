@@ -171,6 +171,7 @@ extern "C" int   r_visplane_pool_ovf;       /* #1: planes that overflowed VP_POO
 extern "C" int   r_visplane_pool_ovf_pk;    /* ...and its ~1 s HIGH-WATER: the per-view reset made the
                                                raw counter read 0 on the overlay almost always.
                                                Printed as the 2nd digit of row 11 `vp<peak>.<ovf>` */
+extern "C" int   sat_texcache_use;  /* SATURN 2026-08-14: 1p composite-cache A/B, pad L+Right, row 22 `xc` */
 extern "C" int   sat_texcache_active, sat_texcache_poolkb, sat_texcache_entries,
                  sat_texcache_builds, sat_texcache_evicts;  /* streaming texture cache (core/r_cache.c) */
 extern "C" int   sat_texcache_carve_lf;     /* largest free block (KB) at the last carve attempt */
@@ -2536,10 +2537,15 @@ static void fps_update(void)
                call in R_GenerateLookup's vanilla `printf`, which on Saturn blits a 26-row console.
                `np` below counts the textures that reach that site (see core/r_data.c).
                Row 21 is deliberately left free: it is claimed by the LOD governor row. */
-            snprintf(ovbuf, sizeof ovbuf, "GRD op%d tc%d rl%d zb%d zw%u np%d  ",
+            /* `xc<use>/<poolKB>` = the 1p composite-cache A/B (pad L+Right).  `xc0/32` = the slab is
+               CARVED but inert (today's shipping behaviour); `xc1/32` = composites live in it.  The
+               pool KB must be identical on both sides -- if it differs, the two photos are not the
+               same experiment. */
+            snprintf(ovbuf, sizeof ovbuf, "GRD op%d tc%d rl%d zb%d zw%u np%d xc%d/%d ",
                      r_opening_ovf, r_composite_ovf, r_readlump_short,
                      z_block_count, (sat_bp_zw > 999999u ? 999999u : sat_bp_zw),
-                     (r_nopatch_col > 9999 ? 9999 : r_nopatch_col));
+                     (r_nopatch_col > 9999 ? 9999 : r_nopatch_col),
+                     sat_texcache_use, sat_texcache_poolkb);
             if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 22, ovbuf);
             r_visplane_pool_ovf_pk = 0;
             r_visplane_peak = 0;   /* zero the core running-maxes -> next window re-accumulates its own peak */
@@ -7711,7 +7717,24 @@ static void poll_pad(void)
         sat_lead_mode   = (lead_sel == 3) ? 0 : 1;
     }
     /* (Pad L+Left/Right WALL_PX_BUDGET wall-offload A/B CUT 2026-07-07 -- settled-negative on HW
-       (net loss); WALL_PX_BUDGET baked to 200k.  L+Left/Right are free.) */
+       (net loss); WALL_PX_BUDGET baked to 200k.  L+Left is still free.) */
+
+    /* Pad L+Right (L held, R released, 1p): live A/B of the 1p COMPOSITE CACHE (core/r_cache.c).
+       ON = R_GenerateComposite's output lands in the contiguous LRU slab and survives the frame;
+       OFF = the classic main-zone PU_CACHE composite, purged and REBUILT -- row-20 `k` measured that
+       rebuild at 31 ms, ~5 a frame, i.e. the whole residual after the LZSS fix.
+       The slab is CARVED IN BOTH STATES (r_cache.c defaults sat_texcache_use to 0 in 1p), so the two
+       sides have a byte-identical memory layout -- the same discipline as the R+Z flat-pool A/B and
+       the only way this measurement is honest ([[interbuild-perf-noise]]).
+       ⚠ This re-opens a MEASURED-NEGATIVE verdict (fps 9.7-21 -> 0.9-6.8, 2026-08-06/07) whose
+       stated mechanism -- "every Z_Malloc walks the whole block list" -- row-20 `z0` now refutes.
+       JUDGE IT ON FPS, exactly as that comment demands, not on the cache counters.  If it is still
+       3-4x slower, set sat_texcache_use back to 0 unconditionally and close it for good.
+       Watch: fps (row 0), `k` (row 20), `cb` (row 18), `xc` (row 22). */
+    if (!(cur & PER_DGT_TL) && (cur & PER_DGT_TR)
+        && (changed & PER_DGT_KR) && !(cur & PER_DGT_KR)
+        && sat_local_players <= 1)
+        sat_texcache_use = !sat_texcache_use;
 
     /* (R+C M5 BSP-staging A/B cut -- settled-negative; the staging mechanism stays inert in core.
        R+C is now the CEILING SQ knob below; C alone still cycles the plane-split pmode.) */

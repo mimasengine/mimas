@@ -611,7 +611,23 @@ extern "C" void sat_drp_select_map(const char *lumpname)
 
 /* W_ReadLump: if `lump` is in the current map's blob, fill `dest` (size bytes) from
 ** the .DRP and return 1; otherwise return 0 so the caller reads the full WAD. */
-extern "C" int sat_drp_read_lump(unsigned int lump, void *dest, int size)
+/* SATURN 2026-08-14 -- PREFIX DECODE.  Measured: R_GenerateLookup LZSS-decodes a whole 35 080-byte
+** TNT patch (12 ms, `k12` on overlay row 20) purely to read `width` and `columnofs[]`, i.e. the
+** first 8 + 4*width ~= 1 KB.  It never touches a texel.  Four such patches per directory rebuild and
+** ~4 rebuilds per frame made the entire 46 ms `e`.
+**
+** A truncated decode is BIT-EXACT here, not an approximation: drp_lzss_decode's compression window
+** IS the output buffer, so a back-reference can only ever read bytes already written.  Stopping at
+** `want` therefore produces exactly the first `want` bytes of the full decode.
+**
+** `want` = 0 means "the whole lump" (the classic behaviour).  The CD path still READS the full
+** compressed stream -- a seek is a seek -- and only the DECODE is shortened; the live path here is
+** the cart-staged one, which does no read at all and is pure decode.
+**
+** CALLER CONTRACT: a prefix result is NOT a valid lump.  It must never be published into
+** lumpinfo[].cache -- see W_CacheLumpPrefix, which decodes into a scratch buffer for exactly this
+** reason. */
+extern "C" int sat_drp_read_lump_n(unsigned int lump, void *dest, int size, int want)
 {
     if (sat_drp_state != 1 || drp_n_entries <= 0) return 0;
 
@@ -634,13 +650,16 @@ extern "C" int sat_drp_read_lump(unsigned int lump, void *dest, int size)
     uint32_t usize    = rd32(e + 12);
     if ((int)usize != size) return 0;            /* defensive: directory mismatch -> fallback */
 
+    /* how many OUTPUT bytes the caller actually needs (0 / oversized => all of them) */
+    uint32_t need = (want > 0 && (uint32_t)want < usize) ? (uint32_t)want : usize;
+
     if (drp_cart_staged)                         /* Step 4b: decode straight from cart RAM, no CD */
     {
         const unsigned char *blob = drp_cart_blob + data_ofs;
         if (csize == usize)
-            memcpy(dest, blob, usize);           /* STORED */
+            memcpy(dest, blob, need);            /* STORED */
         else
-            drp_lzss_decode(blob, (unsigned char *)dest, (int)usize);   /* LZSS */
+            drp_lzss_decode(blob, (unsigned char *)dest, (int)need);    /* LZSS */
         sat_drp_served++;
         return 1;
     }
@@ -649,18 +668,25 @@ extern "C" int sat_drp_read_lump(unsigned int lump, void *dest, int size)
 
     if (csize == usize)                          /* STORED: read raw straight into dest */
     {
-        if (drp_read(at, dest, (int)usize) < (int)usize) return 0;
+        if (drp_read(at, dest, (int)need) < (int)need) return 0;
         sat_drp_served++;
         return 1;
     }
 
-    /* LZSS: read the compressed stream into a transient buffer, decode into dest */
+    /* LZSS: read the compressed stream into a transient buffer, decode into dest.  The READ stays
+    ** full -- we cannot know how much of the stream `need` output bytes consume without decoding it,
+    ** and a shorter read saves no seek.  Only the DECODE is shortened. */
     unsigned char *tmp = (unsigned char *)Z_Malloc((int)csize, PU_STATIC, NULL);
     if (drp_read(at, tmp, (int)csize) < (int)csize) { Z_Free(tmp); return 0; }
-    drp_lzss_decode(tmp, (unsigned char *)dest, (int)usize);
+    drp_lzss_decode(tmp, (unsigned char *)dest, (int)need);
     Z_Free(tmp);
     sat_drp_served++;
     return 1;
+}
+
+extern "C" int sat_drp_read_lump(unsigned int lump, void *dest, int size)
+{
+    return sat_drp_read_lump_n(lump, dest, size, 0);   /* 0 = whole lump, classic behaviour */
 }
 
 /* Step 4d (STREAMING_ANALYSIS §7.9): will the CD be idle during play?  True when the

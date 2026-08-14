@@ -148,6 +148,7 @@ extern "C" int   r_solidseg_ovf;   /* core r_bsp.c: latched '!' when a solidsegs
 extern "C" int   r_opening_ovf;    /* core r_plane.c: openings-pool overflow redirects THIS frame (0 = fine; >0 = garde-OPENINGS sinking) */
 extern "C" int   r_composite_ovf;  /* core r_data.c: # textures stubbed by garde-COMPOSITE (0 = fine; >0 = a composite OOM was crash-proofed) */
 extern "C" int   r_readlump_short; /* core w_wad.c: # streaming reads sunk by garde-W_ReadLump (0 = fine; >0 = a short CD read was zero-filled not I_Error-frozen) */
+extern "C" int   r_nopatch_col;    /* core r_data.c: textures with a patchless column -- the ex-printf site, row 22 `np` */
 extern "C" int   sat_lowres;       /* core r_main.c: 1 = half-h-res (160) packed software render + VDP2 x2 NBG1 zoom (docs/LOWRES_RENDER_STUDY.md) */
 extern "C" void  R_SetLowRes(int); /* core r_main.c: set sat_lowres + setsizeneeded (recompute viewwidth next D_Display) */
 extern "C" int   sightcounts[2];   /* core p_sight.c: [0]=REJECT trivial-rejects, [1]=full BSP LOS walks */
@@ -2530,13 +2531,15 @@ static void fps_update(void)
                so the subtraction against `g` is direct.  THE TEST: if walk_ms accounts for most of
                `g`, r_data.c:615's per-column zone walk is the R_GetColumn hole and the early-exit
                Z_CanAllocate must be made to bite harder (or the call hoisted out of the column loop).
-               If walk_ms is small while `g` stays large, the walk is exonerated -- and the residual is
-               a ~80 us/call BASELINE that the 7 us instruction-count model of the fast path cannot
-               explain, which would point at LWRAM miss latency on the directory arrays instead.
+               ANSWERED 2026-08-14: walk_ms was 0,59 ms of 183 -- the walk is exonerated, and the
+               residual was neither a baseline nor a miss: `e46` of `x46648` put 99 % of the worst
+               call in R_GenerateLookup's vanilla `printf`, which on Saturn blits a 26-row console.
+               `np` below counts the textures that reach that site (see core/r_data.c).
                Row 21 is deliberately left free: it is claimed by the LOD governor row. */
-            snprintf(ovbuf, sizeof ovbuf, "GRD op%d tc%d rl%d zb%d zw%u    ",
+            snprintf(ovbuf, sizeof ovbuf, "GRD op%d tc%d rl%d zb%d zw%u np%d  ",
                      r_opening_ovf, r_composite_ovf, r_readlump_short,
-                     z_block_count, (sat_bp_zw > 999999u ? 999999u : sat_bp_zw));
+                     z_block_count, (sat_bp_zw > 999999u ? 999999u : sat_bp_zw),
+                     (r_nopatch_col > 9999 ? 9999 : r_nopatch_col));
             if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 22, ovbuf);
             r_visplane_pool_ovf_pk = 0;
             r_visplane_peak = 0;   /* zero the core running-maxes -> next window re-accumulates its own peak */

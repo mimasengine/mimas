@@ -180,7 +180,8 @@ extern "C" int   Z_LargestAllocatable(void);  /* largest contiguous run after pu
 extern "C" int   dg_heap_peak;              /* #4: peak newlib sbrk usage (bytes)             */
 extern "C" int   dg_heap_size;              /* #4: newlib heap cap (bytes)                    */
 extern "C" int   dg_heap_fail;              /* #4: sbrk REFUSALS -- any non-zero = raise HEAP_SIZE */
-extern "C" int   z_block_count;             /* core z_zone.c: zone blocks walked by Z_LargestAllocatable */
+extern "C" int   z_block_count;             /* core z_zone.c: zone blocks walked by the last zone walk */
+extern "C" int   z_walk_calls;              /* core z_zone.c: zone walks this window (row 22 `zc`)   */
 /* split-screen perf breakdown (ms per piece of the 2p render block) -- diagnose the slowdown */
 extern "C" unsigned int sat_spl_sw, sat_spl_v0, sat_spl_v1, sat_spl_v2, sat_spl_v3, sat_spl_kick;
 extern "C" int   sat_bsp_stage_used, sat_bsp_stage_want;  /* M5 BSP staging, row 1 st readout */
@@ -2509,13 +2510,24 @@ static void fps_update(void)
                It sits here because it is a zone-health number, and because it is the missing factor in
                the 214 ms R_GetColumn hole: R_GenerateComposite calls Z_LargestAllocatable TWICE per
                build on the 1p path, that function is O(blocks), and nobody knew whether "blocks" meant
-               600 or 1500 -- 0.4 ms vs 1.6 ms per walk, i.e. whether the allocator is the subject or a
-               footnote.  It is a LAST-CALL value, not a peak: whatever the most recent
-               Z_LargestAllocatable saw.
+               600 or 1500 -- 0.4 ms vs 1.6 ms per walk.  MEASURED 2026-08-12: zb reads 762..802 over
+               five captures, so ONE walk is ~790 x 30 cyc = ~0.83 ms.  That settled it: the allocator
+               is the subject.
+               It is a LAST-CALL value, not a peak: whatever the most recent walk saw -- and since the
+               early-exit form Z_CanAllocate stops at the first sufficient run, zb now reads LOW on a
+               healthy zone and climbs toward the zone total as it tightens.
+               zc = zone WALKS this ~1 s window.  zb x zc is the real cost, and it is the leading
+               explanation of the R_GetColumn hole: r_data.c:615 tested Z_LargestAllocatable PER COLUMN
+               on the single-patch path.  392 calls x 54 % x 0.83 ms = 175 ms, which is EXACTLY the
+               row-20 `g` of the owner's slowest capture; the fast one needs 18 walks for its 15 ms.
+               One mechanism, one cost, both captures.  Read zc against row-20 `n`: zc/n is the
+               fraction of R_GetColumn calls paying for a zone walk.
                Row 21 is deliberately left free: it is claimed by the LOD governor row. */
-            snprintf(ovbuf, sizeof ovbuf, "GRD op%d tc%d rl%d zb%d        ",
-                     r_opening_ovf, r_composite_ovf, r_readlump_short, z_block_count);
+            snprintf(ovbuf, sizeof ovbuf, "GRD op%d tc%d rl%d zb%d zc%d   ",
+                     r_opening_ovf, r_composite_ovf, r_readlump_short,
+                     z_block_count, (z_walk_calls > 99999 ? 99999 : z_walk_calls));
             if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 22, ovbuf);
+            z_walk_calls = 0;   /* window counter: print then reset, like every row-22 neighbour */
             r_visplane_pool_ovf_pk = 0;
             r_visplane_peak = 0;   /* zero the core running-maxes -> next window re-accumulates its own peak */
             r_drawseg_peak  = 0;

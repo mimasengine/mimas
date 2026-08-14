@@ -181,7 +181,7 @@ extern "C" int   dg_heap_peak;              /* #4: peak newlib sbrk usage (bytes
 extern "C" int   dg_heap_size;              /* #4: newlib heap cap (bytes)                    */
 extern "C" int   dg_heap_fail;              /* #4: sbrk REFUSALS -- any non-zero = raise HEAP_SIZE */
 extern "C" int   z_block_count;             /* core z_zone.c: zone blocks walked by the last zone walk */
-extern "C" int   z_walk_calls;              /* core z_zone.c: zone walks this window (row 22 `zc`)   */
+extern "C" unsigned int sat_bp_zw;          /* core r_parallel.c: zone blocks walked on the PK-Bp frame */
 /* split-screen perf breakdown (ms per piece of the 2p render block) -- diagnose the slowdown */
 extern "C" unsigned int sat_spl_sw, sat_spl_v0, sat_spl_v1, sat_spl_v2, sat_spl_v3, sat_spl_kick;
 extern "C" int   sat_bsp_stage_used, sat_bsp_stage_want;  /* M5 BSP staging, row 1 st readout */
@@ -2516,18 +2516,28 @@ static void fps_update(void)
                It is a LAST-CALL value, not a peak: whatever the most recent walk saw -- and since the
                early-exit form Z_CanAllocate stops at the first sufficient run, zb now reads LOW on a
                healthy zone and climbs toward the zone total as it tightens.
-               zc = zone WALKS this ~1 s window.  zb x zc is the real cost, and it is the leading
-               explanation of the R_GetColumn hole: r_data.c:615 tested Z_LargestAllocatable PER COLUMN
-               on the single-patch path.  392 calls x 54 % x 0.83 ms = 175 ms, which is EXACTLY the
-               row-20 `g` of the owner's slowest capture; the fast one needs 18 walks for its 15 ms.
-               One mechanism, one cost, both captures.  Read zc against row-20 `n`: zc/n is the
-               fraction of R_GetColumn calls paying for a zone walk.
+               🔴 zw (2026-08-14) REPLACES the 08-12 `zc`, which was UNUSABLE FOR THE SAME REASON `cb`
+               was: it summed over the ~1 s overlay window while row-20 `g`/`n` are latched to ONE
+               frame (the PK-Bp frame), so `zc149` at 3.7 fps meant ~40 walks per frame, not 149, and
+               dividing g by it was the exact clock error already catalogued two days earlier.  And zb
+               could not stand in: the overlay's OWN Z_LargestAllocatable() call for row-11 `lg` runs
+               immediately before this print and clobbers z_block_count, which is why zb read 785..808
+               on every capture regardless of scene -- it was reporting the zone total, not the hot
+               path's walk depth.
+               zw = zone BLOCKS walked on the SAME FRAME as `g`, latched in core/r_parallel.c's PK-Bp
+               block.  It needs no division and no clock conversion:
+                    walk_ms = zw x ~30 cycles / 28600
+               so the subtraction against `g` is direct.  THE TEST: if walk_ms accounts for most of
+               `g`, r_data.c:615's per-column zone walk is the R_GetColumn hole and the early-exit
+               Z_CanAllocate must be made to bite harder (or the call hoisted out of the column loop).
+               If walk_ms is small while `g` stays large, the walk is exonerated -- and the residual is
+               a ~80 us/call BASELINE that the 7 us instruction-count model of the fast path cannot
+               explain, which would point at LWRAM miss latency on the directory arrays instead.
                Row 21 is deliberately left free: it is claimed by the LOD governor row. */
-            snprintf(ovbuf, sizeof ovbuf, "GRD op%d tc%d rl%d zb%d zc%d   ",
+            snprintf(ovbuf, sizeof ovbuf, "GRD op%d tc%d rl%d zb%d zw%u    ",
                      r_opening_ovf, r_composite_ovf, r_readlump_short,
-                     z_block_count, (z_walk_calls > 99999 ? 99999 : z_walk_calls));
+                     z_block_count, (sat_bp_zw > 999999u ? 999999u : sat_bp_zw));
             if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 22, ovbuf);
-            z_walk_calls = 0;   /* window counter: print then reset, like every row-22 neighbour */
             r_visplane_pool_ovf_pk = 0;
             r_visplane_peak = 0;   /* zero the core running-maxes -> next window re-accumulates its own peak */
             r_drawseg_peak  = 0;

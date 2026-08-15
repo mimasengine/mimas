@@ -646,7 +646,10 @@ extern "C" int sat_plane_flat_nocol;   /* core r_plane.c: ...with no cached flat
 extern "C" int sat_spr_flat_io;        /* core r_things.c: sprites skipped for want of residency       */
 extern "C" int r_composite_builds;     /* core r_data.c: composites REBUILT (CPU copy, no disc I/O)    */
 extern "C" int r_composite_distinct;   /* core r_data.c: DISTINCT textures behind them (thrash vs churn)*/
+extern "C" int r_composite_pf;         /* core r_data.c: worst useful fraction of a patch decode (%)   */
+extern "C" int sat_cpin_on, r_cpin_kb, r_cpin_yield;   /* composite pin: A/B, KB held, pressure yields */
 extern "C" void R_CompositeWindowReset (void);   /* one writer for both + the 16-slot distinct set     */
+extern "C" void R_CompositePinFlush (void);      /* release every pinned composite at once             */
 /* SATURN RESIDENT FLAT POOL (core/r_flatcache.c) -- the fix for the "flat treadmill": before it,
    W_ReleaseLumpNum demoted every visible plane's flat to PU_CACHE after EVERY plane of EVERY frame,
    so Z_Malloc's address-ordered rover purged the floor under the player's feet and it cost a fresh
@@ -2560,11 +2563,23 @@ static void fps_update(void)
                             arithmetic, not policy.
                ⚠ `zb` was DROPPED here: it is clobbered by row 11's own Z_LargestAllocatable() call
                for `lg`, so it never measured the renderer.  `zw` is the real one. */
-            snprintf(ovbuf, sizeof ovbuf, "GRD op%d tc%d rl%d zw%u np%d xc%d/%d/%d ",
+            /* `pn<KB>/<yields>` = the COMPOSITE PIN (core/r_data.c), pad L+Left.  KB currently held
+               non-purgeable; `yields` = times the whole ring was released because a 48 KB run could
+               no longer be found.  A CLIMBING yield count means the pin is fighting the zone and
+               buying nothing -- that is the signal to turn it off, and it is why the pin can never
+               cause the contiguous-OOM that killed the 1p slab.
+               `pf<pct>` = the worst useful fraction of a patch decode this window: how far into the
+               patch R_GenerateComposite's copy actually reached.  Low = bounding the decode (the
+               R_GenerateLookup trick) would take the rest back for free.
+               ⚠ `xc` DROPPED: the 1p composite pool is closed by arithmetic (`lf60` < the 96 KB the
+               floor rung needs), so it printed a constant.  `zb` was dropped earlier -- it was
+               clobbered by row 11's own Z_LargestAllocatable() call for `lg`.  `zw` is the real one. */
+            snprintf(ovbuf, sizeof ovbuf, "GRD op%d tc%d rl%d zw%u np%d pn%d/%d pf%d ",
                      r_opening_ovf, r_composite_ovf, r_readlump_short,
                      (sat_bp_zw > 999999u ? 999999u : sat_bp_zw),
                      (r_nopatch_col > 9999 ? 9999 : r_nopatch_col),
-                     sat_texcache_use, sat_texcache_poolkb, sat_texcache_carve_lf);
+                     r_cpin_kb, (r_cpin_yield > 999 ? 999 : r_cpin_yield),
+                     r_composite_pf);
             if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 22, ovbuf);
             r_visplane_pool_ovf_pk = 0;
             r_visplane_peak = 0;   /* zero the core running-maxes -> next window re-accumulates its own peak */
@@ -7735,8 +7750,19 @@ static void poll_pad(void)
         sat_wall_lead_x = (lead_sel == 4) ? 0 : (lead_sel == 3) ? 1 : lead_sel + 1;
         sat_lead_mode   = (lead_sel == 3) ? 0 : 1;
     }
-    /* (Pad L+Left/Right WALL_PX_BUDGET wall-offload A/B CUT 2026-07-07 -- settled-negative on HW
-       (net loss); WALL_PX_BUDGET baked to 200k.  L+Left is still free.) */
+    /* Pad L+Left (L held, R released, 1p): live A/B of the COMPOSITE PIN (core/r_data.c).
+       ON = the last composites stay non-purgeable under a 64 KB budget; OFF = the classic PU_CACHE
+       demote, i.e. the treadmill `cb20/6` measured (SIX textures rebuilt 20x a second, `k33` each).
+       No slab and no contiguous run is involved, so unlike the 1p pool A/B both sides have an
+       identical layout by construction.  Watch fps, `k` (row 20), `cb` (row 18) and `pn` (row 22):
+       a CLIMBING yield count means the pin is fighting the zone and buying nothing. */
+    if (!(cur & PER_DGT_TL) && (cur & PER_DGT_TR)
+        && (changed & PER_DGT_KL) && !(cur & PER_DGT_KL)
+        && sat_local_players <= 1)
+    {
+        sat_cpin_on = !sat_cpin_on;
+        if (!sat_cpin_on) R_CompositePinFlush();   /* release immediately, so the A/B is honest */
+    }
 
     /* Pad L+Right (L held, R released, 1p): live A/B of the 1p COMPOSITE CACHE (core/r_cache.c).
        ON = R_GenerateComposite's output lands in the contiguous LRU slab and survives the frame;

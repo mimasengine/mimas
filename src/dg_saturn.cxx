@@ -2585,9 +2585,13 @@ static void fps_update(void)
                48 KB floor); the chord and its counters still exist, see the legend. */
             {
                 int lo_step = sat_wall_lod_scale == 0 ? 0
-                            : sat_wall_lod_scale <= 65536/16 ? 1
-                            : sat_wall_lod_scale <= 65536/8  ? 2 : 3;
-                snprintf(ovbuf, sizeof ovbuf, "GRD op%d tc%d rl%d zw%u np%d Lo%d/%d pf%d ",
+                            : sat_wall_lod_scale <= 65536/8 ? 1
+                            : sat_wall_lod_scale <= 65536/6 ? 2 : 3;
+                /* Trailing spaces sized for the WIDEST this row ever prints: `Lo3/9999 pf100` is
+                   4 chars longer than `Lo0/0 pf10`, and SRL::Debug::Print does not clear the tail --
+                   which is why the owner's capture read `pf100 0`, a leftover digit from the
+                   previous, longer line. */
+                snprintf(ovbuf, sizeof ovbuf, "GRD op%d tc%d rl%d zw%u np%d Lo%d/%d pf%d       ",
                          r_opening_ovf, r_composite_ovf, r_readlump_short,
                          (sat_bp_zw > 999999u ? 999999u : sat_bp_zw),
                          (r_nopatch_col > 9999 ? 9999 : r_nopatch_col),
@@ -7791,7 +7795,11 @@ static void poll_pad(void)
         && (changed & PER_DGT_TB) && !(cur & PER_DGT_TB)
         && sat_local_players <= 1)
     {
-        static const int lod_ring[4] = { 0, 65536/16, 65536/8, 65536/4 };
+        /* SATURN 2026-08-15, RECALIBRATED on the owner's four-step capture: /16 scored **0 hits** --
+           a wasted rung, and exactly the "threshold does not bite" case the field was built to
+           expose.  /8 = 145 hits (3.8 -> 4.7 fps), /4 = 244 hits (-> 5.9 fps, g146 -> g2).  So drop
+           /16 and put a real middle at /6 between the two that work. */
+        static const int lod_ring[4] = { 0, 65536/8, 65536/6, 65536/4 };
         int li = 0, k;
         for (k = 0; k < 4; ++k) if (lod_ring[k] == sat_wall_lod_scale) { li = k; break; }
         sat_wall_lod_scale = lod_ring[(li + 1) & 3];

@@ -2581,6 +2581,8 @@ static void fps_update(void)
                      r_cpin_kb, (r_cpin_yield > 999 ? 999 : r_cpin_yield),
                      r_composite_pf);
             if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 22, ovbuf);
+            r_composite_pf = 0;   /* own the reset HERE: row 18's R_CompositeWindowReset runs before
+                                     this print, so clearing it there zeroed `pf` unseen */
             r_visplane_pool_ovf_pk = 0;
             r_visplane_peak = 0;   /* zero the core running-maxes -> next window re-accumulates its own peak */
             r_drawseg_peak  = 0;

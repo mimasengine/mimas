@@ -2541,11 +2541,20 @@ static void fps_update(void)
                CARVED but inert (today's shipping behaviour); `xc1/32` = composites live in it.  The
                pool KB must be identical on both sides -- if it differs, the two photos are not the
                same experiment. */
-            snprintf(ovbuf, sizeof ovbuf, "GRD op%d tc%d rl%d zb%d zw%u np%d xc%d/%d ",
+            /* `xc<use>/<poolKB>/<lf>` -- `lf` = Z_LargestAllocatable (KB) AT THE CARVE ATTEMPT, which
+               is the only field that can explain a pool of 0.  The ladder's floor rung needs
+               32 KB slab + 64 KB margin = 96 KB CONTIGUOUS at level load, and the margin is what
+               serves the ~35 KB sky/face patches during play -- it must not shrink.
+                 lf 0    => R_SetupTextureCaches returned BEFORE the carve (streaming off)
+                 lf < 96 => the ladder correctly REFUSED; the pool does not fit, and that is
+                            arithmetic, not policy.
+               ⚠ `zb` was DROPPED here: it is clobbered by row 11's own Z_LargestAllocatable() call
+               for `lg`, so it never measured the renderer.  `zw` is the real one. */
+            snprintf(ovbuf, sizeof ovbuf, "GRD op%d tc%d rl%d zw%u np%d xc%d/%d/%d ",
                      r_opening_ovf, r_composite_ovf, r_readlump_short,
-                     z_block_count, (sat_bp_zw > 999999u ? 999999u : sat_bp_zw),
+                     (sat_bp_zw > 999999u ? 999999u : sat_bp_zw),
                      (r_nopatch_col > 9999 ? 9999 : r_nopatch_col),
-                     sat_texcache_use, sat_texcache_poolkb);
+                     sat_texcache_use, sat_texcache_poolkb, sat_texcache_carve_lf);
             if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 22, ovbuf);
             r_visplane_pool_ovf_pk = 0;
             r_visplane_peak = 0;   /* zero the core running-maxes -> next window re-accumulates its own peak */
@@ -2625,7 +2634,7 @@ static void fps_update(void)
                          w_cd_ms10 / 10000, r_patch_ovf, r_composite_oob, vdp1_wall_nocol,
                          (sat_lead_stale > 9999 ? 9999 : sat_lead_stale));
                 (void)sat_cd_persistent; (void)sat_texcache_evicts;
-                (void)sat_texcache_carve_lf; (void)sat_texcache_poolkb;
+                /* sat_texcache_carve_lf / _poolkb are LIVE again on row 22 as `xc` (2026-08-14). */
                 if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 12, ovbuf);
             }
             /* row 18: memory-latency calibration (one-shot cold 32 KB read per bank, FRT

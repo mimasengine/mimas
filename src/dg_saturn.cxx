@@ -648,6 +648,7 @@ extern "C" int r_composite_builds;     /* core r_data.c: composites REBUILT (CPU
 extern "C" int r_composite_distinct;   /* core r_data.c: DISTINCT textures behind them (thrash vs churn)*/
 extern "C" int r_composite_pf;         /* core r_data.c: worst useful fraction of a patch decode (%)   */
 extern "C" int sat_cpin_on, r_cpin_kb, r_cpin_yield;   /* composite pin: A/B, KB held, pressure yields */
+extern "C" int sat_wall_lod_scale, sat_wall_lod_hits;  /* core r_segs.c: distance LOD (pad L+B, row 22)*/
 extern "C" void R_CompositeWindowReset (void);   /* one writer for both + the 16-slot distinct set     */
 extern "C" void R_CompositePinFlush (void);      /* release every pinned composite at once             */
 /* SATURN RESIDENT FLAT POOL (core/r_flatcache.c) -- the fix for the "flat treadmill": before it,
@@ -2574,15 +2575,29 @@ static void fps_update(void)
                ⚠ `xc` DROPPED: the 1p composite pool is closed by arithmetic (`lf60` < the 96 KB the
                floor rung needs), so it printed a constant.  `zb` was dropped earlier -- it was
                clobbered by row 11's own Z_LargestAllocatable() call for `lg`.  `zw` is the real one. */
-            snprintf(ovbuf, sizeof ovbuf, "GRD op%d tc%d rl%d zw%u np%d pn%d/%d pf%d ",
-                     r_opening_ovf, r_composite_ovf, r_readlump_short,
-                     (sat_bp_zw > 999999u ? 999999u : sat_bp_zw),
-                     (r_nopatch_col > 9999 ? 9999 : r_nopatch_col),
-                     r_cpin_kb, (r_cpin_yield > 999 ? 999 : r_cpin_yield),
-                     r_composite_pf);
+            /* `Lo<step>/<hits>` = the DISTANCE LOD (pad L+B).  step 0 = off, 1..3 = rw_scale under
+               FRACUNIT/16, /8, /4 -- progressively nearer tiers flattened to their dominant colour
+               instead of paying R_GenerateComposite.  `hits` = tiers flattened this ~1 s window.
+                 hits 0 while step > 0  => the threshold does not bite, go up a step
+                 hits climbs but `k` (row 20) does not fall => the composites being built are NOT
+                 the distant ones, and the LOD is aiming at the wrong walls
+               ⚠ `pn` dropped: the composite pin is default-OFF and inert (`lg` 24-38 KB vs its
+               48 KB floor); the chord and its counters still exist, see the legend. */
+            {
+                int lo_step = sat_wall_lod_scale == 0 ? 0
+                            : sat_wall_lod_scale <= 65536/16 ? 1
+                            : sat_wall_lod_scale <= 65536/8  ? 2 : 3;
+                snprintf(ovbuf, sizeof ovbuf, "GRD op%d tc%d rl%d zw%u np%d Lo%d/%d pf%d ",
+                         r_opening_ovf, r_composite_ovf, r_readlump_short,
+                         (sat_bp_zw > 999999u ? 999999u : sat_bp_zw),
+                         (r_nopatch_col > 9999 ? 9999 : r_nopatch_col),
+                         lo_step, (sat_wall_lod_hits > 9999 ? 9999 : sat_wall_lod_hits),
+                         r_composite_pf);
+            }
             if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 22, ovbuf);
             r_composite_pf = 0;   /* own the reset HERE: row 18's R_CompositeWindowReset runs before
                                      this print, so clearing it there zeroed `pf` unseen */
+            sat_wall_lod_hits = 0;   /* same rule: the field's own row clears it, right after printing */
             r_visplane_pool_ovf_pk = 0;
             r_visplane_peak = 0;   /* zero the core running-maxes -> next window re-accumulates its own peak */
             r_drawseg_peak  = 0;
@@ -7764,6 +7779,22 @@ static void poll_pad(void)
     {
         sat_cpin_on = !sat_cpin_on;
         if (!sat_cpin_on) R_CompositePinFlush();   /* release immediately, so the A/B is honest */
+    }
+
+    /* Pad L+B (L held, R released, 1p): DISTANCE LOD threshold, 0 -> /16 -> /8 -> /4 -> 0.
+       A tier whose rw_scale falls under it draws flat in its dominant colour instead of paying
+       R_GenerateComposite (31 ms, row-20 `k`).  Higher threshold = nearer walls flattened = faster
+       and uglier.  Row 13 `Lo<n>/<hits>`: `hits` is tiers flattened per ~1 s window -- if it stays
+       0 the threshold is too low to bite, if `k` does not fall while it climbs the composites being
+       built are NOT the distant ones and the LOD is aiming at the wrong walls. */
+    if (!(cur & PER_DGT_TL) && (cur & PER_DGT_TR)
+        && (changed & PER_DGT_TB) && !(cur & PER_DGT_TB)
+        && sat_local_players <= 1)
+    {
+        static const int lod_ring[4] = { 0, 65536/16, 65536/8, 65536/4 };
+        int li = 0, k;
+        for (k = 0; k < 4; ++k) if (lod_ring[k] == sat_wall_lod_scale) { li = k; break; }
+        sat_wall_lod_scale = lod_ring[(li + 1) & 3];
     }
 
     /* Pad L+Right (L held, R released, 1p): live A/B of the 1p COMPOSITE CACHE (core/r_cache.c).

@@ -2585,8 +2585,8 @@ static void fps_update(void)
                48 KB floor); the chord and its counters still exist, see the legend. */
             {
                 int lo_step = sat_wall_lod_scale == 0 ? 0
-                            : sat_wall_lod_scale <= 65536/8 ? 1
-                            : sat_wall_lod_scale <= 65536/6 ? 2 : 3;
+                            : sat_wall_lod_scale <= 800  ? 1
+                            : sat_wall_lod_scale <= 1600 ? 2 : 3;
                 /* Trailing spaces sized for the WIDEST this row ever prints: `Lo3/9999 pf100` is
                    4 chars longer than `Lo0/0 pf10`, and SRL::Debug::Print does not clear the tail --
                    which is why the owner's capture read `pf100 0`, a leftover digit from the
@@ -7795,11 +7795,12 @@ static void poll_pad(void)
         && (changed & PER_DGT_TB) && !(cur & PER_DGT_TB)
         && sat_local_players <= 1)
     {
-        /* SATURN 2026-08-15, RECALIBRATED on the owner's four-step capture: /16 scored **0 hits** --
-           a wasted rung, and exactly the "threshold does not bite" case the field was built to
-           expose.  /8 = 145 hits (3.8 -> 4.7 fps), /4 = 244 hits (-> 5.9 fps, g146 -> g2).  So drop
-           /16 and put a real middle at /6 between the two that work. */
-        static const int lod_ring[4] = { 0, 65536/8, 65536/6, 65536/4 };
+        /* SATURN 2026-08-15: the threshold is now a SCREEN AREA IN PIXELS, not an rw_scale -- the
+           scale version flattened a big mid-distance wall because rw_scale is only 1/distance.
+           Anchor for the ladder: at scale FRACUNIT/4 (which scored 244 hits) a 128-unit tier is
+           ~32 px tall, so a 20-column sliver = 640 px and a 100-column facade = 3200 px.  The rungs
+           straddle that so the facade survives every step and the slivers go first. */
+        static const int lod_ring[4] = { 0, 800, 1600, 3200 };
         int li = 0, k;
         for (k = 0; k < 4; ++k) if (lod_ring[k] == sat_wall_lod_scale) { li = k; break; }
         sat_wall_lod_scale = lod_ring[(li + 1) & 3];

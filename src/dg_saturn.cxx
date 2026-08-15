@@ -650,6 +650,7 @@ extern "C" int r_composite_pf;         /* core r_data.c: worst useful fraction o
 extern "C" int sat_cpin_on, r_cpin_kb, r_cpin_yield;   /* composite pin: A/B, KB held, pressure yields */
 extern "C" int sat_wall_lod_scale, sat_wall_lod_hits;  /* core r_segs.c: size LOD (pad L+B, row 22)   */
 extern "C" int sat_lod_eff, sat_lod_auto_step, sat_lod_gov_up, sat_lod_gov_dn;  /* governor, row 21   */
+extern "C" int sat_gov_axis, sat_gov_p_step, sat_gov_p_dirty;   /* multi-axis governor: which knob    */
 extern "C" void R_CompositeWindowReset (void);   /* one writer for both + the 16-slot distinct set     */
 extern "C" void R_CompositePinFlush (void);      /* release every pinned composite at once             */
 /* SATURN RESIDENT FLAT POOL (core/r_flatcache.c) -- the fix for the "flat treadmill": before it,
@@ -914,10 +915,21 @@ static void sat_apply_mode(void)
     wall_potato_mode = (sq_wall == SQ_BAND) ? 1 : (sq_wall == SQ_FLAT) ? 2 : 0;  /* VDP1 wall style */
     sat_potato_walls = (sq_wall == SQ_FLAT);                     /* flat-shaded software walls */
     sat_wall_nocpu   = (sq_wall == SQ_BAND || sq_wall == SQ_FLAT);/* banded/flat -> skip close-wall CPU */
-    sat_potato_floors = (sq_floor == SQ_FLAT);                   /* solid-colour software floors */
-    sat_floor_ld      = (sq_floor == SQ_LD);                     /* half-rate floor texel fetch */
-    sat_ceil_potato   = (sq_ceil == SQ_FLAT);                    /* solid-colour software ceilings */
-    sat_ceil_ld       = (sq_ceil == SQ_LD);                      /* half-rate ceiling texel fetch */
+    /* SATURN 2026-08-15: the LOD governor's PLANE axis rides ON TOP of the owner's own SQ setting,
+       as a FLOOR -- max(), never assignment.  It can degrade what he chose and never silently
+       improve past it, and when it releases (`sat_gov_p_step` back to 0) his setting is exactly
+       what it was.  Steps skip BAND: band is documented meaningless for a plane (the potato span is
+       already distance-shaded per row), so the useful ladder is FULL -> LD -> FLAT. */
+    {
+        static const int gov_sq[3] = { SQ_FULL, SQ_LD, SQ_FLAT };
+        int gp = gov_sq[(sat_gov_p_step < 0 ? 0 : sat_gov_p_step > 2 ? 2 : sat_gov_p_step)];
+        int ef = sq_floor > gp ? sq_floor : gp;
+        int ec = sq_ceil  > gp ? sq_ceil  : gp;
+        sat_potato_floors = (ef == SQ_FLAT);                     /* solid-colour software floors */
+        sat_floor_ld      = (ef == SQ_LD);                       /* half-rate floor texel fetch */
+        sat_ceil_potato   = (ec == SQ_FLAT);                     /* solid-colour software ceilings */
+        sat_ceil_ld       = (ec == SQ_LD);                       /* half-rate ceiling texel fetch */
+    }
     /* SATURN M/SQ: detailshift is a GLOBAL half-viewwidth lever -- it hits walls' software
        fallback AND sprites AND spans alike, so it must NOT be driven by the floor/ceil SQ.
        Floor/ceil LD already have their OWN per-plane mechanism (sat_floor_ld / sat_ceil_ld =
@@ -2609,8 +2621,9 @@ static void fps_update(void)
                dead band, which is the healthy state.  `s` moving every second = the thresholds
                straddle this scene badly and it is pumping -- that is the failure to look for. */
             {
-                snprintf(ovbuf, sizeof ovbuf, "GOV A%d s%d u%d d%d px%d          ",
-                         sat_wall_lod_scale == -1 ? 1 : 0, sat_lod_auto_step,
+                snprintf(ovbuf, sizeof ovbuf, "GOV A%d d%c w%d p%d u%d d%d px%d      ",
+                         sat_wall_lod_scale == -1 ? 1 : 0,
+                         (char)sat_gov_axis, sat_lod_auto_step, sat_gov_p_step,
                          (sat_lod_gov_up > 99 ? 99 : sat_lod_gov_up),
                          (sat_lod_gov_dn > 99 ? 99 : sat_lod_gov_dn),
                          sat_lod_eff);
@@ -7801,6 +7814,13 @@ static void poll_pad(void)
         sat_cpin_on = !sat_cpin_on;
         if (!sat_cpin_on) R_CompositePinFlush();   /* release immediately, so the A/B is honest */
     }
+
+    /* SATURN 2026-08-15: the governor's PLANE axis is decided in core (r_parallel.c) but applied
+       here, because sat_apply_mode() and the SQ knobs live on this side.  One re-apply per actual
+       change, never per frame: sat_apply_mode touches the whole quality block and calling it 60x a
+       second to write the same values would be exactly the kind of pointless work this session has
+       been removing. */
+    if (sat_gov_p_dirty) { sat_gov_p_dirty = 0; sat_apply_mode(); }
 
     /* Pad L+B (L held, R released, 1p): DISTANCE LOD threshold, 0 -> /16 -> /8 -> /4 -> 0.
        A tier whose rw_scale falls under it draws flat in its dominant colour instead of paying

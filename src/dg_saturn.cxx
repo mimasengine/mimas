@@ -648,7 +648,8 @@ extern "C" int r_composite_builds;     /* core r_data.c: composites REBUILT (CPU
 extern "C" int r_composite_distinct;   /* core r_data.c: DISTINCT textures behind them (thrash vs churn)*/
 extern "C" int r_composite_pf;         /* core r_data.c: worst useful fraction of a patch decode (%)   */
 extern "C" int sat_cpin_on, r_cpin_kb, r_cpin_yield;   /* composite pin: A/B, KB held, pressure yields */
-extern "C" int sat_wall_lod_scale, sat_wall_lod_hits;  /* core r_segs.c: distance LOD (pad L+B, row 22)*/
+extern "C" int sat_wall_lod_scale, sat_wall_lod_hits;  /* core r_segs.c: size LOD (pad L+B, row 22)   */
+extern "C" int sat_lod_eff, sat_lod_auto_step, sat_lod_gov_up, sat_lod_gov_dn;  /* governor, row 21   */
 extern "C" void R_CompositeWindowReset (void);   /* one writer for both + the 16-slot distinct set     */
 extern "C" void R_CompositePinFlush (void);      /* release every pinned composite at once             */
 /* SATURN RESIDENT FLAT POOL (core/r_flatcache.c) -- the fix for the "flat treadmill": before it,
@@ -2584,9 +2585,9 @@ static void fps_update(void)
                ⚠ `pn` dropped: the composite pin is default-OFF and inert (`lg` 24-38 KB vs its
                48 KB floor); the chord and its counters still exist, see the legend. */
             {
-                int lo_step = sat_wall_lod_scale == 0 ? 0
-                            : sat_wall_lod_scale <= 800  ? 1
-                            : sat_wall_lod_scale <= 1600 ? 2 : 3;
+                int lo_step = sat_lod_eff <= 0  ? 0
+                            : sat_lod_eff <= 200 ? 1
+                            : sat_lod_eff <= 400 ? 2 : 3;
                 /* Trailing spaces sized for the WIDEST this row ever prints: `Lo3/9999 pf100` is
                    4 chars longer than `Lo0/0 pf10`, and SRL::Debug::Print does not clear the tail --
                    which is why the owner's capture read `pf100 0`, a leftover digit from the
@@ -2599,6 +2600,22 @@ static void fps_update(void)
                          r_composite_pf);
             }
             if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 22, ovbuf);
+            /* ROW 21 -- THE LOD GOVERNOR, the row that was reserved for it all along.
+                 A<0/1>  0 = manual rung (or off), 1 = the governor is steering
+                 s<0..3> the rung it has chosen: 0 = full quality, 3 = 800 px
+                 u/d     consecutive frames over the 100 ms ceiling / under the 40 ms floor
+                 px<n>   the threshold actually in force, whoever set it (sat_lod_eff)
+               Read `u`/`d` to see it think: both near 0 with a stable `s` = it has settled in the
+               dead band, which is the healthy state.  `s` moving every second = the thresholds
+               straddle this scene badly and it is pumping -- that is the failure to look for. */
+            {
+                snprintf(ovbuf, sizeof ovbuf, "GOV A%d s%d u%d d%d px%d          ",
+                         sat_wall_lod_scale == -1 ? 1 : 0, sat_lod_auto_step,
+                         (sat_lod_gov_up > 99 ? 99 : sat_lod_gov_up),
+                         (sat_lod_gov_dn > 99 ? 99 : sat_lod_gov_dn),
+                         sat_lod_eff);
+                if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 21, ovbuf);
+            }
             r_composite_pf = 0;   /* own the reset HERE: row 18's R_CompositeWindowReset runs before
                                      this print, so clearing it there zeroed `pf` unseen */
             sat_wall_lod_hits = 0;   /* same rule: the field's own row clears it, right after printing */
@@ -7800,10 +7817,16 @@ static void poll_pad(void)
            Anchor for the ladder: at scale FRACUNIT/4 (which scored 244 hits) a 128-unit tier is
            ~32 px tall, so a 20-column sliver = 640 px and a 100-column facade = 3200 px.  The rungs
            straddle that so the facade survives every step and the slivers go first. */
-        static const int lod_ring[4] = { 0, 800, 1600, 3200 };
+        /* RECALIBRATED DOWNWARD 2026-08-15: with the area predicate fixed, rung 800 already took
+           95 % of the win -- `cb0/0`, `k34 -> 0`, 4.4 -> 13.3 fps -- and 1600/3200 only cost more
+           pixels for +0.7 fps.  The whole prize is "no composite gets built", and the smallest rung
+           already wins it, so the ladder must extend DOWN to find the least destructive setting
+           that still does.  Last slot is AUTO: the governor drives the threshold itself. */
+        static const int lod_ring[5] = { 0, 200, 400, 800, -1 };   /* -1 = AUTO */
         int li = 0, k;
-        for (k = 0; k < 4; ++k) if (lod_ring[k] == sat_wall_lod_scale) { li = k; break; }
-        sat_wall_lod_scale = lod_ring[(li + 1) & 3];
+        for (k = 0; k < 5; ++k) if (lod_ring[k] == sat_wall_lod_scale) { li = k; break; }
+        sat_wall_lod_scale = lod_ring[(li + 1) % 5];
+        if (sat_wall_lod_scale != -1) sat_lod_auto_step = 0;   /* leaving AUTO resets its state */
     }
 
     /* Pad L+Right (L held, R released, 1p): live A/B of the 1p COMPOSITE CACHE (core/r_cache.c).

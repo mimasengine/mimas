@@ -645,6 +645,8 @@ extern "C" int sat_plane_flat_io;      /* core r_plane.c: visplanes drawn potato
 extern "C" int sat_plane_flat_nocol;   /* core r_plane.c: ...with no cached flat colour either         */
 extern "C" int sat_spr_flat_io;        /* core r_things.c: sprites skipped for want of residency       */
 extern "C" int r_composite_builds;     /* core r_data.c: composites REBUILT (CPU copy, no disc I/O)    */
+extern "C" int r_composite_distinct;   /* core r_data.c: DISTINCT textures behind them (thrash vs churn)*/
+extern "C" void R_CompositeWindowReset (void);   /* one writer for both + the 16-slot distinct set     */
 /* SATURN RESIDENT FLAT POOL (core/r_flatcache.c) -- the fix for the "flat treadmill": before it,
    W_ReleaseLumpNum demoted every visible plane's flat to PU_CACHE after EVERY plane of EVERY frame,
    so Z_Malloc's address-ordered rover purged the floor under the player's feet and it cost a fresh
@@ -2381,11 +2383,19 @@ static void fps_update(void)
                    R_GetColumn -- INSIDE the Bp bracket.  Memoised per texture per level, so it
                    cannot sustain a spike, but it can produce a single 150 ms outlier frame. */
             {
-                snprintf(ovbuf, sizeof ovbuf, "VRM tx%d/%d bk%d q%d cb%d lb%d:%d/%d/%d.%d      ",
+                /* SATURN 2026-08-14: `cb<builds>/<distinct>` -- the two numbers that separate the
+                   only worlds left for the R_GenerateComposite residual (row-20 `k33`), now that the
+                   1p composite pool is dead by arithmetic (`xc0/0/60`: floor rung wants 96 KB
+                   contiguous, the level had 60).  distinct << builds = THRASH (the same few
+                   textures rebuilt in a loop -> something to win by keeping them alive);
+                   distinct ~= builds = CHURN (new multi-patch textures constantly -> no cache can
+                   help and the only lever is a cheaper BUILD). */
+                snprintf(ovbuf, sizeof ovbuf, "VRM tx%d/%d bk%d q%d cb%d/%d lb%d:%d/%d/%d.%d   ",
                          vdp1_tx_used, vdp1_tx_total,
                          (wtex_bakes_win > 9999 ? 9999 : wtex_bakes_win),
                          (wtex_qrefuse > 999 ? 999 : wtex_qrefuse),
                          (r_composite_builds > 999 ? 999 : r_composite_builds),
+                         (r_composite_distinct > 999 ? 999 : r_composite_distinct),
                          sat_tex_load_budget,
                          (sat_wall_flat_io  > 999 ? 999 : sat_wall_flat_io),
                          (sat_plane_flat_io > 999 ? 999 : sat_plane_flat_io),
@@ -2394,7 +2404,7 @@ static void fps_update(void)
                           ? 999 : sat_wall_flat_nocol + sat_plane_flat_nocol));
                 if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 18, ovbuf);
                 wtex_bakes_win = thd_size = thd_slot = thd_budget = wtex_qrefuse = 0;
-                r_composite_builds = 0;
+                R_CompositeWindowReset();   /* builds + distinct + the 16-slot set, one writer */
                 sat_wall_flat_io = sat_wall_flat_nocol = 0;
                 sat_plane_flat_io = sat_plane_flat_nocol = sat_spr_flat_io = 0;
             }

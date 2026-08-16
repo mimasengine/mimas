@@ -152,6 +152,7 @@ extern "C" int   r_nopatch_col;    /* core r_data.c: textures with a patchless c
 extern "C" int   sat_lowres;       /* core r_main.c: 1 = half-h-res (160) packed software render + VDP2 x2 NBG1 zoom (docs/LOWRES_RENDER_STUDY.md) */
 extern "C" void  R_SetLowRes(int); /* core r_main.c: set sat_lowres + setsizeneeded (recompute viewwidth next D_Display) */
 extern "C" int   sightcounts[2];   /* core p_sight.c: [0]=REJECT trivial-rejects, [1]=full BSP LOS walks */
+extern "C" int   sat_sight_cachehit;  /* core p_sight.c: temporal sight-cache hits (row 24 `hc`)      */
 extern "C" int   sat_floor_vq_cur, sat_floor_vq_peak;  /* VDP1-floor inc-0 estimate, shown on row 2 */
 extern "C" unsigned int sat_sky_px, sat_floor_px;  /* sky-vs-floor coverage classifier (row 13) */
 extern "C" int sat_plane_vscale;      /* deported-plane VERTICAL decrochage fill scale (baked at 4; live pad knob cut 2026-07-07) */
@@ -648,9 +649,11 @@ extern "C" int r_composite_builds;     /* core r_data.c: composites REBUILT (CPU
 extern "C" int r_composite_distinct;   /* core r_data.c: DISTINCT textures behind them (thrash vs churn)*/
 extern "C" int r_composite_pf;         /* core r_data.c: worst useful fraction of a patch decode (%)   */
 extern "C" int sat_cpin_on, r_cpin_kb, r_cpin_yield;   /* composite pin: A/B, KB held, pressure yields */
-extern "C" int sat_wall_lod_scale, sat_wall_lod_hits;  /* core r_segs.c: size LOD (pad L+B, row 22)   */
-extern "C" int sat_lod_eff, sat_lod_auto_step, sat_lod_gov_up, sat_lod_gov_dn;  /* governor, row 21   */
+extern "C" int sat_wall_lod_hits;                      /* core r_segs.c: size LOD, row 22 `Lo`        */
+extern "C" int sat_lod_mindist, sat_wall_lod_near;     /* core r_segs.c: LOD distance floor + rescues */
+extern "C" int sat_lod_eff, sat_lod_auto_step, sat_gov_debt;   /* governor, row 21                    */
 extern "C" int sat_gov_axis, sat_gov_p_step, sat_gov_p_dirty;   /* multi-axis governor: which knob    */
+extern "C" int sat_thing_role_cull, sat_thing_cull_dist, sat_thing_role_cut;   /* role cull, row 21   */
 extern "C" void R_CompositeWindowReset (void);   /* one writer for both + the 16-slot distinct set     */
 extern "C" void R_CompositePinFlush (void);      /* release every pinned composite at once             */
 /* SATURN RESIDENT FLAT POOL (core/r_flatcache.c) -- the fix for the "flat treadmill": before it,
@@ -1740,6 +1743,12 @@ static int rbg0_linecol_mode  = 0;   /* gradient OFF by default -- WIP, see belo
    room light band (band 15/outdoor -> NONE), gated by a VDP2 color-calc window so the near stays clean.
    It still didn't read right across rooms (black tint / coverage tuning), so it's parked -- flip
    rbg0_linecol_mode + re-add the pad toggles to resume.  See memory [[rbg0-floor-distance-light]]. */
+/* SATURN 2026-08-16 -- THE VEIL WAS EXTENDED TO THE SOFTWARE VIEW AND REJECTED ON SIGHT.  The
+   line-colour insert CAN be routed to NBG1 (`N1LCEN`, VDP2 manual 1800E8H bit 1) with a mirrored
+   ramp above the horizon, at 0 VRAM banks / 0 CRAM / 0 cycles.  It was built, and the owner's
+   verdict was *"L1 c'est très moche et inutile. Je n'en veux pas."*  Removed entirely -- the floor-
+   only veil below is untouched and still parked at rbg0_linecol_mode = 0.
+   Keep the fact, not the code: routing to NBG1 is possible and cheap; it just does not look good. */
 static int rbg0_lc_far   = 7;        /* = the computed boundary bd (display only) */
 static int rbg0_lc_trans = 24;       /* TRANSITION length in rows: base->black, then pure black (R+L/R) */
 static int rbg0_zonek    = 7;        /* zone slope: bd = hz + (15-band)*zonek + zoneoff (C+L/R); b15 -> none */
@@ -2243,17 +2252,13 @@ static void fps_update(void)
             /* (fbf -- floor tiles truncated -- dropped 2026-08-02 with the VDP1 floor deport: it
                was structurally 0 in every reachable mode.  fbw is now the sole over-budget bit.) */
             if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 8, ovbuf);
-            /* row 5 (free): LINE-OF-SIGHT volume this ~1s window -- the game-tic (T, row 1) cost
-               driver.  rej = P_CheckSight calls the REJECT table trivially rejected in O(1); walk =
-               full BSP LOS traversals (P_CrossBSPNode, the expensive division-heavy path).  In the
-               streaming-mode DEFAULT rejectmatrix is NULL so rej stays 0 and EVERY check full-walks
-               -- a high walk with rej0 quantifies the REJECT lever (build -DSAT_KEEP_REJECT=1 to
-               convert walks -> rej and read the T delta).  First window shows cumulative-since-boot,
-               then per-window deltas. */
-            static int l_sc0 = 0, l_sc1 = 0;
-            int d_sc0 = sightcounts[0] - l_sc0;
-            int d_sc1 = sightcounts[1] - l_sc1;
-            l_sc0 = sightcounts[0]; l_sc1 = sightcounts[1];
+            /* (The sight-volume deltas that lived here are GONE 2026-08-16.  Their consumers -- `r`
+               and `w` on the LOS row -- were dropped for column space in August 2026 and the two
+               subtractions kept running every window for nobody, which is exactly the discarded work
+               this session has been removing ([[cut-all-useless-work-always]]).  Row 24 `sc` now
+               OWNS sightcounts[] and resets it; keeping a cumulative-delta reader alongside a row
+               that zeroes the source would have gone negative anyway -- one owner per counter
+               ([[debug-overlay-legend]]).) */
             /* C<+/-> = the PHASE-1 WALL CLAMP (core sat_wall_clamp, pad R+A): + = a wall crossing
                the floor line is SPLIT, the occluded part going to the software, the rest staying on
                VDP1; - = no split.  It used to print on the (now cut) FBK row, i.e. NOWHERE -- and
@@ -2614,20 +2619,65 @@ static void fps_update(void)
             if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 22, ovbuf);
             /* ROW 21 -- THE LOD GOVERNOR, the row that was reserved for it all along.
                  A<0/1>  0 = manual rung (or off), 1 = the governor is steering
-                 s<0..3> the rung it has chosen: 0 = full quality, 3 = 800 px
-                 u/d     consecutive frames over the 100 ms ceiling / under the 40 ms floor
-                 px<n>   the threshold actually in force, whoever set it (sat_lod_eff)
-               Read `u`/`d` to see it think: both near 0 with a stable `s` = it has settled in the
-               dead band, which is the healthy state.  `s` moving every second = the thresholds
-               straddle this scene badly and it is pumping -- that is the failure to look for. */
+                 d<B/P/M/-> the phase it elected last time it fired; `-` = held (Bw dominated, and
+                         Bw has no quality knob at all, so electing it would degrade the innocent)
+                 w<0..3> wall-LOD rung: 0 = full quality, 3 = 800 px
+                 p<0..2> plane rung applied as a FLOOR over the owner's SQ (0 none / 1 LD / 2 FLAT)
+                 e<±n>   ⚠ **SIGNED WHOLE MILLISECONDS OF INTEGRATED ERROR** -- one accumulator, not
+                         two.  >0 = behind the 70 ms render target, <0 = ahead.  Fires a degrade at
+                         +300, gives quality back at -900.
+                         🔴 The two-counter version (08-15/16) NEVER FIRED: each branch reset the
+                         other, and with `REC 50:36.0 95:86.0` the median frame took the low branch
+                         and wiped the debt every time.  If `e` sits pinned at one value while the
+                         rungs never move, that failure is back.
+                 px<n>   the wall threshold in force (sat_lod_eff)
+                 nr<n>   tiers the DISTANCE FLOOR rescued: small on screen but inside
+                         sat_lod_mindist, i.e. foreground the LOD is forbidden to flatten.  0 means
+                         the floor is inert and the area rung is doing all the work.
+                 rc<n>   sprites dropped by the ROLE CULL (~1 s).  Independent of everything else
+                         here; it is on this row because there is room, not because it is governed.
+               ⚠ The target is on `rend` = Bw+Bp+P+M, which is NOT the frame: MST runs ~20-25 ms
+               higher.  70 ms of render defends roughly 10-11 fps. */
             {
-                snprintf(ovbuf, sizeof ovbuf, "GOV A%d d%c w%d p%d u%d d%d px%d      ",
-                         sat_wall_lod_scale == -1 ? 1 : 0,
+                int gov_e = sat_gov_debt / 10;
+                if (gov_e >  999) gov_e =  999;
+                if (gov_e < -999) gov_e = -999;
+                snprintf(ovbuf, sizeof ovbuf, "GOV d%c w%d p%d e%d px%d nr%d rc%d     ",
                          (char)sat_gov_axis, sat_lod_auto_step, sat_gov_p_step,
-                         (sat_lod_gov_up > 99 ? 99 : sat_lod_gov_up),
-                         (sat_lod_gov_dn > 99 ? 99 : sat_lod_gov_dn),
-                         sat_lod_eff);
+                         gov_e, sat_lod_eff,
+                         (sat_wall_lod_near  > 999 ? 999 : sat_wall_lod_near),
+                         (sat_thing_role_cut > 999 ? 999 : sat_thing_role_cut));
                 if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 21, ovbuf);
+                /* the field's own row owns its reset ([[debug-overlay-legend]]) */
+                sat_wall_lod_near = 0; sat_thing_role_cut = 0;
+            }
+            /* ROW 24 -- THE GAME TIC, BROKEN DOWN.  Row 1 `T` is 69-83 ms on HARDWARE (~40 % of a
+               181-222 ms frame) against 8-14 ms for the same build on Ymir, and until now NOTHING
+               inside it was timed -- the renderer hunt was optimising `R` with the largest single
+               cost invisible.  This row exists to size it before anything is built.
+                 th<ms>  P_RunThinkers, MEAN MS PER FRAME (same clock as row-1 `T`, so `T - th` is
+                         the honest "everything else in the tic": player move, specials, LOS from
+                         outside the thinkers, the tic loop itself)
+                 s<ms>   the full BSP walk inside P_CheckSight, same clock.  A SUBSET of `th`.
+                 sc<r>/<w> sight REJECT trivial-rejects / full walks, ~1 s window.  `r0` means the
+                         REJECT lump was dropped for zone RAM (streaming) so EVERY check walks --
+                         the known streaming trade whose price has never been read.
+                 hc<n>   temporal sight-cache hits (~1 s).  Large `hc` with large `s` means the
+                         cache is working and the survivors are still expensive.
+               DECISION RULE: if `s` is most of `th`, the lever is the sight oracle. If `th - s` is,
+               the thinkers themselves are memory-bound and the lever is data layout, not
+               algorithms.  Either way MEASURE FIRST ([[budget-before-mechanism]]). */
+            {
+                unsigned int th10 = _f ? (sat_tic_think_frt * 10u / 224u) / _f : 0u;
+                unsigned int sg10 = _f ? (sat_tic_sight_frt * 10u / 224u) / _f : 0u;
+                snprintf(ovbuf, sizeof ovbuf, "TIC th%u.%u s%u.%u sc%d/%d hc%d      ",
+                         th10 / 10u, th10 % 10u, sg10 / 10u, sg10 % 10u,
+                         (sightcounts[0] > 9999 ? 9999 : sightcounts[0]),
+                         (sightcounts[1] > 9999 ? 9999 : sightcounts[1]),
+                         (sat_sight_cachehit > 9999 ? 9999 : sat_sight_cachehit));
+                if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 24, ovbuf);
+                sat_tic_think_frt = 0; sat_tic_sight_frt = 0;
+                sightcounts[0] = sightcounts[1] = 0; sat_sight_cachehit = 0;
             }
             r_composite_pf = 0;   /* own the reset HERE: row 18's R_CompositeWindowReset runs before
                                      this print, so clearing it there zeroed `pf` unseen */
@@ -3125,6 +3175,10 @@ static void rbg0_linecol_rebuild(void)
     if (onset < 1) onset = 1; else if (onset > 7) onset = 7;
     int T = rbg0_lc_trans; if (T < 1) T = 1;
     (void)span;
+    /* ⚠ Rows ABOVE hz stay at entry 0x0000, which is NOT "no insert" -- it inserts CRAM index 0 =
+       BLACK.  That is harmless ONLY because the insert is routed to RBG0, which has no pixels up
+       there.  Any future attempt to route it to NBG1 as well must first give those rows a real ramp
+       or the whole upper view blends to black (learned the hard way, 2026-08-16). */
     for (int y = 0; y < 256; ++y)
     {
         unsigned short entry = 0x0000;                  /* clean zone (windowed) + off-floor */
@@ -3190,6 +3244,11 @@ static void rbg0_linecol_apply(void)
     rbg0_linecol_ccrr();
 }
 #endif
+
+/* SATURN 2026-08-16 -- the FAR-DEGRADATION LADDER (veil / relaxed punch / adaptive view distance)
+   lived here for one session and is gone.  Rung 1 was rejected on sight; rungs 2 and 3 were killed
+   by their own counters (`pe0` on six captures of eight, `fc0` on the three heaviest).  The
+   post-mortems are at the removal sites in core/r_plane.c and core/r_bsp.c. */
 
 static void rbg0_proto_init(void)
 {
@@ -7822,49 +7881,12 @@ static void poll_pad(void)
        been removing. */
     if (sat_gov_p_dirty) { sat_gov_p_dirty = 0; sat_apply_mode(); }
 
-    /* Pad L+B (L held, R released, 1p): DISTANCE LOD threshold, 0 -> /16 -> /8 -> /4 -> 0.
-       A tier whose rw_scale falls under it draws flat in its dominant colour instead of paying
-       R_GenerateComposite (31 ms, row-20 `k`).  Higher threshold = nearer walls flattened = faster
-       and uglier.  Row 13 `Lo<n>/<hits>`: `hits` is tiers flattened per ~1 s window -- if it stays
-       0 the threshold is too low to bite, if `k` does not fall while it climbs the composites being
-       built are NOT the distant ones and the LOD is aiming at the wrong walls. */
-    if (!(cur & PER_DGT_TL) && (cur & PER_DGT_TR)
-        && (changed & PER_DGT_TB) && !(cur & PER_DGT_TB)
-        && sat_local_players <= 1)
-    {
-        /* SATURN 2026-08-15: the threshold is now a SCREEN AREA IN PIXELS, not an rw_scale -- the
-           scale version flattened a big mid-distance wall because rw_scale is only 1/distance.
-           Anchor for the ladder: at scale FRACUNIT/4 (which scored 244 hits) a 128-unit tier is
-           ~32 px tall, so a 20-column sliver = 640 px and a 100-column facade = 3200 px.  The rungs
-           straddle that so the facade survives every step and the slivers go first. */
-        /* RECALIBRATED DOWNWARD 2026-08-15: with the area predicate fixed, rung 800 already took
-           95 % of the win -- `cb0/0`, `k34 -> 0`, 4.4 -> 13.3 fps -- and 1600/3200 only cost more
-           pixels for +0.7 fps.  The whole prize is "no composite gets built", and the smallest rung
-           already wins it, so the ladder must extend DOWN to find the least destructive setting
-           that still does.  Last slot is AUTO: the governor drives the threshold itself. */
-        static const int lod_ring[5] = { 0, 200, 400, 800, -1 };   /* -1 = AUTO */
-        int li = 0, k;
-        for (k = 0; k < 5; ++k) if (lod_ring[k] == sat_wall_lod_scale) { li = k; break; }
-        sat_wall_lod_scale = lod_ring[(li + 1) % 5];
-        if (sat_wall_lod_scale != -1) sat_lod_auto_step = 0;   /* leaving AUTO resets its state */
-    }
-
-    /* Pad L+Right (L held, R released, 1p): live A/B of the 1p COMPOSITE CACHE (core/r_cache.c).
-       ON = R_GenerateComposite's output lands in the contiguous LRU slab and survives the frame;
-       OFF = the classic main-zone PU_CACHE composite, purged and REBUILT -- row-20 `k` measured that
-       rebuild at 31 ms, ~5 a frame, i.e. the whole residual after the LZSS fix.
-       The slab is CARVED IN BOTH STATES (r_cache.c defaults sat_texcache_use to 0 in 1p), so the two
-       sides have a byte-identical memory layout -- the same discipline as the R+Z flat-pool A/B and
-       the only way this measurement is honest ([[interbuild-perf-noise]]).
-       ⚠ This re-opens a MEASURED-NEGATIVE verdict (fps 9.7-21 -> 0.9-6.8, 2026-08-06/07) whose
-       stated mechanism -- "every Z_Malloc walks the whole block list" -- row-20 `z0` now refutes.
-       JUDGE IT ON FPS, exactly as that comment demands, not on the cache counters.  If it is still
-       3-4x slower, set sat_texcache_use back to 0 unconditionally and close it for good.
-       Watch: fps (row 0), `k` (row 20), `cb` (row 18), `xc` (row 22). */
-    if (!(cur & PER_DGT_TL) && (cur & PER_DGT_TR)
-        && (changed & PER_DGT_KR) && !(cur & PER_DGT_KR)
-        && sat_local_players <= 1)
-        sat_texcache_use = !sat_texcache_use;
+    /* (Pad L+B — the SIZE-LOD ladder — REMOVED 2026-08-16 on the owner's *"active le gouverneur par
+       défaut, enlève le toggle"*.  The governor is now unconditional: there is no manual rung and no
+       `sat_wall_lod_scale`.  L+B is free, and freeing it also retires the collision documented at the
+       old sat_mark_suppress site.
+       Pad L+Right — the FAR-DEGRADATION LADDER — REMOVED the same day, one session after it was
+       added: rung 1 rejected on sight, rungs 2 and 3 killed by their own counters. */
 
     /* (R+C M5 BSP-staging A/B cut -- settled-negative; the staging mechanism stays inert in core.
        R+C is now the CEILING SQ knob below; C alone still cycles the plane-split pmode.) */
@@ -8011,12 +8033,17 @@ static void poll_pad(void)
        (mirrors the R+A wall-clamp chord).  Row 7 SQ 4th char. */
     if (!(cur & PER_DGT_TR) && (changed & PER_DGT_TB) && !(cur & PER_DGT_TB))
     { sq_sprite = (sq_sprite == SQ_FULL) ? SQ_LD : SQ_FULL; sat_apply_mode(); }
-    /* Pad L+B (R released): live A/B of RBG0 mark-suppress (core R_CheckPlane no-split of the
-       dominant floor).  L held, R released, B pressed -> no clash with the R+B sprite chord; the
-       incidental USE tap to Doom is harmless.  Watch Bp (rows 2/4) and vp (row 11) fall when on. */
-    if (!(cur & PER_DGT_TL) && (cur & PER_DGT_TR)
-        && (changed & PER_DGT_TB) && !(cur & PER_DGT_TB))
-        sat_mark_suppress ^= 1;
+    /* 🔴 CHORD COLLISION, found + removed 2026-08-16.  This block used to toggle sat_mark_suppress
+       on **exactly** the chord the LOD ladder above uses (L held, R released, B edge -- byte-for-byte
+       the same predicate), so every single L+B press cycled the LOD rung AND flipped RBG0
+       mark-suppress underneath it.  The two are not independent -- mark-suppress changes how the
+       dominant floor SPLITS, i.e. it moves Bp and the visplane count, the very numbers the LOD rung
+       was being judged on.  Every LOD capture taken since the ladder shipped carries that
+       contamination, alternating on each press.
+       The pad is saturated, so rather than invent a chord for it, sat_mark_suppress keeps its
+       DEFAULT (0) and loses its binding: it has never actually had a clean A/B, so nothing measured
+       is being given up.  ([[interbuild-perf-noise]] is about builds; this was the same disease
+       inside one build.) */
     /* (The pad-Y floor PERF-SIM cycle and the visplane work-steal A/B that used to contend for Y
        behind #elif went with SAT_FLOOR_PERFSIM / the ftex cut on 2026-08-02.  Y is now
        unconditionally the SQ block above -- no compile-time contention left on this button.) */

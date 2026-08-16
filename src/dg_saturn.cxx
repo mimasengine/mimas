@@ -149,6 +149,11 @@ extern "C" int   r_opening_ovf;    /* core r_plane.c: openings-pool overflow red
 extern "C" int   r_composite_ovf;  /* core r_data.c: # textures stubbed by garde-COMPOSITE (0 = fine; >0 = a composite OOM was crash-proofed) */
 extern "C" int   r_readlump_short; /* core w_wad.c: # streaming reads sunk by garde-W_ReadLump (0 = fine; >0 = a short CD read was zero-filled not I_Error-frozen) */
 extern "C" int   r_nopatch_col;    /* core r_data.c: textures with a patchless column -- the ex-printf site, row 22 `np` */
+/* SATURN 2026-08-16 -- the shared placeholder column every garde in r_data.c returns when the zone
+   cannot serve a texture (zero-init, 256 B).  The sky uploader MUST compare against it: a sky built
+   from stub columns is uniformly near-black, and `sky_loaded_tex` used to latch anyway -> a single
+   tight moment at level load painted the sky black FOR THE WHOLE LEVEL.  See sky_cell_upload. */
+extern "C" unsigned char r_column_stub[256];
 extern "C" int   sat_lowres;       /* core r_main.c: 1 = half-h-res (160) packed software render + VDP2 x2 NBG1 zoom (docs/LOWRES_RENDER_STUDY.md) */
 extern "C" void  R_SetLowRes(int); /* core r_main.c: set sat_lowres + setsizeneeded (recompute viewwidth next D_Display) */
 extern "C" int   sightcounts[2];   /* core p_sight.c: [0]=REJECT trivial-rejects, [1]=full BSP LOS walks */
@@ -312,6 +317,8 @@ extern "C" int W_SaturnCDInit(void);
 #define SKY_HORIZON_ROW 96
 #if VDP2_CELL_SKY
 static void sky_cell_init(void);        /* forward decl: defined below, called from DG_Init */
+extern "C" void sat_sky_precache(void);              /* level-load sky upload (defined below)   */
+extern "C" void (*sat_sky_precache_hook)(void);      /* core p_setup.c: fired inside P_SetupLevel */
 static void sky_cell_build_map(void);   /* forward decl: rebuilds the sky map (live horizon tune) */
 static void sky_cell_write_map(void);   /* forward decl: the VRAM half alone, deferred past the fence */
 static int  sky_map_pending = 0;        /* a horizon change owes a deferred map write (sky_mode >= 1) */
@@ -2655,28 +2662,39 @@ static void fps_update(void)
                181-222 ms frame) against 8-14 ms for the same build on Ymir, and until now NOTHING
                inside it was timed -- the renderer hunt was optimising `R` with the largest single
                cost invisible.  This row exists to size it before anything is built.
-                 th<ms>  P_RunThinkers, MEAN MS PER FRAME (same clock as row-1 `T`, so `T - th` is
-                         the honest "everything else in the tic": player move, specials, LOS from
-                         outside the thinkers, the tic loop itself)
+                 T<ms>   TryRunTics on the SAME FRT clock as `th`/`s`.  ⚠ NOT row-1 `T`, which is
+                         d_ms-based and was seen SATURATING at 72-73 ms on hardware across three
+                         different frame rates while the thinkers alone measured 106-110 -- a
+                         quantity that stops moving while the work grows is a clock artefact.  When
+                         the two disagree believe THIS one; agreement means both clocks are healthy.
+                 th<ms>  P_RunThinkers, MEAN MS PER FRAME (same clock, so `T - th` is the honest
+                         "everything else in the tic": player move, specials, the tic loop itself)
                  s<ms>   the full BSP walk inside P_CheckSight, same clock.  A SUBSET of `th`.
-                 sc<r>/<w> sight REJECT trivial-rejects / full walks, ~1 s window.  `r0` means the
-                         REJECT lump was dropped for zone RAM (streaming) so EVERY check walks --
-                         the known streaming trade whose price has never been read.
+                 sc<r>/<w> sight REJECT trivial-rejects / full walks, ~1 s window.  `r0` means NO
+                         REJECT matrix, so EVERY check walks the tree.  MEASURED at 13-21 ms/frame
+                         on console, which is what size-gated the skip in p_setup.c P_LoadReject.
                  hc<n>   temporal sight-cache hits (~1 s).  Large `hc` with large `s` means the
                          cache is working and the survivors are still expensive.
                DECISION RULE: if `s` is most of `th`, the lever is the sight oracle. If `th - s` is,
                the thinkers themselves are memory-bound and the lever is data layout, not
                algorithms.  Either way MEASURE FIRST ([[budget-before-mechanism]]). */
             {
+                unsigned int tt10 = _f ? (sat_tic_total_frt * 10u / 224u) / _f : 0u;
                 unsigned int th10 = _f ? (sat_tic_think_frt * 10u / 224u) / _f : 0u;
                 unsigned int sg10 = _f ? (sat_tic_sight_frt * 10u / 224u) / _f : 0u;
-                snprintf(ovbuf, sizeof ovbuf, "TIC th%u.%u s%u.%u sc%d/%d hc%d      ",
+                /* 40 VISIBLE COLUMNS is the hard budget ([[debug-overlay-line-width]]), so `x` had to
+                   buy its place: `hc` is retired here.  It existed to judge the temporal sight cache
+                   while sight was 13-21 ms/frame; with the REJECT matrix back, `s` reads 1,2-4,9 ms
+                   and `sc<rejects>/<walks>` already tells that story on its own. */
+                unsigned int xt10 = _f ? (sat_tic_runs * 10u) / _f : 0u;   /* tics per frame, x10 */
+                snprintf(ovbuf, sizeof ovbuf, "TIC T%u th%u.%u s%u.%u x%u.%u sc%d/%d    ",
+                         tt10 / 10u,
                          th10 / 10u, th10 % 10u, sg10 / 10u, sg10 % 10u,
-                         (sightcounts[0] > 9999 ? 9999 : sightcounts[0]),
-                         (sightcounts[1] > 9999 ? 9999 : sightcounts[1]),
-                         (sat_sight_cachehit > 9999 ? 9999 : sat_sight_cachehit));
+                         xt10 / 10u, xt10 % 10u,
+                         (sightcounts[0] > 999 ? 999 : sightcounts[0]),
+                         (sightcounts[1] > 999 ? 999 : sightcounts[1]));
                 if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 24, ovbuf);
-                sat_tic_think_frt = 0; sat_tic_sight_frt = 0;
+                sat_tic_total_frt = 0; sat_tic_think_frt = 0; sat_tic_sight_frt = 0; sat_tic_runs = 0;
                 sightcounts[0] = sightcounts[1] = 0; sat_sight_cachehit = 0;
             }
             r_composite_pf = 0;   /* own the reset HERE: row 18's R_CompositeWindowReset runs before
@@ -3912,6 +3930,9 @@ extern "C" void DG_Init(void)
 #endif
 #if VDP2_CELL_SKY
     sky_cell_init();   /* NBG0 = 256-color cell sky in B1 (coexists with the RBG0 bitmap floor) */
+    /* Arm the level-load sky upload: P_SetupLevel calls this BEFORE P_LoadReject, so the sky wins
+       the 35 KB contiguous run it needs and the REJECT matrix takes what is left. */
+    sat_sky_precache_hook = &sat_sky_precache;
 #endif
 #if SKY_DEBUG_SHOW
     slPriorityNbg0(6); slPriorityNbg1(5);   /* sky ON TOP to verify Stage A */
@@ -4105,13 +4126,32 @@ static int sat_near_black(void)
 }
 
 static int sky_loaded_tex = -1;
+/* SATURN 2026-08-16 -- SKY UPLOAD RETRY BACKOFF.  Both uploaders below source their pixels from
+   R_GetColumn, which returns the zero-init `r_column_stub` whenever the zone cannot find one
+   contiguous run for the sky patch (a 256x128 TNT sky -- RSKY1/2/3 -- is 35080 B, and r_data.c's
+   garde-PATCH documents runs as short as 32 KB on this map).  Every zero then becomes near-black,
+   so a stubbed upload paints a UNIFORMLY BLACK SKY.  That was survivable; latching `sky_loaded_tex`
+   afterwards was not -- it made one tight moment at level load permanent for the entire level.
+   The uploaders now refuse to latch on a stubbed read and re-arm this counter instead; the sky
+   heals by itself the moment a run opens up, exactly the contract every garde in r_data.c has.
+   Backoff so a persistently tight zone does not pay 256 Z_LargestAllocatable scans per frame. */
+static int sky_retry_wait = 0;
+#define SKY_RETRY_FRAMES 8
+
 static void sky_upload(void)
 {
     unsigned char *vram = SKY_VRAM;
     unsigned char  nb   = (unsigned char)sat_near_black();
+    int stubbed = 0;
+
+    /* One cheap probe before committing to 256 column fetches (see SKY_RETRY_FRAMES above). */
+    if (R_GetColumn(skytexture, 0) == (const unsigned char *)r_column_stub)
+        { sky_retry_wait = SKY_RETRY_FRAMES; return; }
+
     for (int col = 0; col < 256; ++col)
     {
         const unsigned char *src = R_GetColumn(skytexture, col);  /* 128-tall */
+        if (src == (const unsigned char *)r_column_stub) stubbed = 1;
         for (int y = 0; y < 128; ++y)
         {
             unsigned char p = src[y];
@@ -4120,6 +4160,7 @@ static void sky_upload(void)
             vram[y * SKY_VRAM_STRIDE + col + 256] = p;   /* 2nd tile */
         }
     }
+    if (stubbed) { sky_retry_wait = SKY_RETRY_FRAMES; return; }   /* do NOT latch: retry, do not go black for good */
     sky_loaded_tex = skytexture;
 }
 
@@ -4136,10 +4177,17 @@ static void sky_cell_upload(void)
 {
     unsigned char *cells = (unsigned char *)SKY_CEL_VRAM;
     unsigned char  nb    = (unsigned char)sat_near_black();
+    int stubbed = 0;
+
+    /* One cheap probe before committing to 256 column fetches (see SKY_RETRY_FRAMES above). */
+    if (R_GetColumn(skytexture, 0) == (const unsigned char *)r_column_stub)
+        { sky_retry_wait = SKY_RETRY_FRAMES; return; }
+
     for (int ccol = 0; ccol < 32; ++ccol)
         for (int rx = 0; rx < 8; ++rx)
         {
             const unsigned char *src = R_GetColumn(skytexture, ccol * 8 + rx);  /* 128-tall column */
+            if (src == (const unsigned char *)r_column_stub) stubbed = 1;
             for (int crow = 0; crow < 16; ++crow)
                 for (int ry = 0; ry < 8; ++ry)
                 {
@@ -4149,6 +4197,7 @@ static void sky_cell_upload(void)
                 }
         }
     memset(cells + SKY_NB_CELL * 64, 0, 64);        /* TRANSPARENT filler (index 0): floor shows below the horizon */
+    if (stubbed) { sky_retry_wait = SKY_RETRY_FRAMES; return; }   /* do NOT latch: retry, do not go black for good */
     sky_loaded_tex = skytexture;
 }
 
@@ -4193,6 +4242,25 @@ static void sky_cell_init(void)
     slScrPosNbg0(toFIXED(0.0), toFIXED(0.0));
 }
 #endif
+
+/* SATURN 2026-08-16 -- LEVEL-LOAD SKY UPLOAD.  Installed into the core's `sat_sky_precache_hook`
+   (p_setup.c), which fires inside P_SetupLevel right BEFORE P_LoadReject.  That is the emptiest
+   the zone ever gets for a level -- geometry loaded, things/composites/flats not yet -- so the
+   35080-byte one-run sky patch is served while the run still exists, instead of at the first
+   displayed frame where it now loses to the REJECT matrix.  Hardware proved the per-frame retry
+   alone cannot rescue it: `px` climbed 37->40 against `lg22k`->`lg20k`, i.e. the run never
+   reappears mid-level.  The retry stays as the backstop for the case this one still misses. */
+extern "C" void sat_sky_precache(void)
+{
+    if (skytexture <= 0 || skytexture == sky_loaded_tex)
+        return;
+    sky_retry_wait = 0;
+#if VDP2_CELL_SKY
+    sky_cell_upload();
+#elif VDP2_HW_SKY
+    sky_upload();
+#endif
+}
 
 /* ------------------------------------------------------------------ */
 /* VDP1 weapon sprite -- player gun on the hardware sprite layer        */
@@ -6668,7 +6736,10 @@ extern "C" void DG_DrawFrame(void)
        px via SKY_ANGLESHIFT, slowed by SKY_PARALLAX_SHIFT; VDP2 wraps the plane). */
 #if VDP2_HW_SKY
     if (skytexture > 0 && skytexture != sky_loaded_tex)
-        sky_upload();
+    {
+        if (sky_retry_wait > 0) sky_retry_wait--;   /* stubbed last time: back off, then re-attempt */
+        else                    sky_upload();
+    }
 #if SKY_FIXED
     slScrPosNbg0(toFIXED(0.0), toFIXED(-(double)VIEW_Y_OFFSET));   /* centred like NBG1/VDP1 */
 #else
@@ -6682,7 +6753,10 @@ extern "C" void DG_DrawFrame(void)
 #endif
 #if VDP2_CELL_SKY
     if (skytexture > 0 && skytexture != sky_loaded_tex)
-        sky_cell_upload();   /* re-pack the sky into B1 cells on level/episode change */
+    {
+        if (sky_retry_wait > 0) sky_retry_wait--;   /* stubbed last time: back off, then re-attempt */
+        else                    sky_cell_upload();  /* re-pack the sky into B1 cells on level/episode change */
+    }
 #if VDP2_SPLIT_HW_SKY
     /* Part 5 (docs/RBG0_SKY_SPLIT_ANALYSIS.md §5): in a co-op split, elect ONE view to receive the HW
        NBG0 sky (windowed to its band); the other views keep their software sky.  Static election = P1

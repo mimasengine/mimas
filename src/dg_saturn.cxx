@@ -692,7 +692,8 @@ extern "C" int sat_spr_flat_io;        /* core r_things.c: sprites skipped for w
 extern "C" int r_composite_builds;     /* core r_data.c: composites REBUILT (CPU copy, no disc I/O)    */
 extern "C" int r_composite_distinct;   /* core r_data.c: DISTINCT textures behind them (thrash vs churn)*/
 extern "C" int r_composite_pf;         /* core r_data.c: worst useful fraction of a patch decode (%)   */
-extern "C" int sat_cpin_on, r_cpin_kb, r_cpin_yield;   /* composite pin: A/B, KB held, pressure yields */
+/* (the composite-pin externs went with the pin, 2026-08-17 -- it was gated on a flag no code could
+   set, and its `pn` field had already been dropped from row 22 for printing a constant zero.) */
 extern "C" int sat_lpin_on, r_lpin_kb, r_lpin_yield;   /* PATCH-LUMP pin (2026-08-17): row 16 `P`      */
 extern "C" int r_lpin_evict;                           /* ...ring-full evictions, PER WINDOW           */
 extern "C" void R_LumpPinFlush(void);                  /* release the ring on the pad L+Left A/B       */
@@ -702,7 +703,6 @@ extern "C" int sat_lod_eff, sat_lod_auto_step, sat_gov_debt;   /* governor, row 
 extern "C" int sat_gov_axis, sat_gov_p_step, sat_gov_p_dirty;   /* multi-axis governor: which knob    */
 extern "C" int sat_thing_role_cull, sat_thing_cull_dist, sat_thing_role_cut;   /* role cull, row 21   */
 extern "C" void R_CompositeWindowReset (void);   /* one writer for both + the 16-slot distinct set     */
-extern "C" void R_CompositePinFlush (void);      /* release every pinned composite at once             */
 /* SATURN RESIDENT FLAT POOL (core/r_flatcache.c) -- the fix for the "flat treadmill": before it,
    W_ReleaseLumpNum demoted every visible plane's flat to PU_CACHE after EVERY plane of EVERY frame,
    so Z_Malloc's address-ordered rover purged the floor under the player's feet and it cost a fresh

@@ -2874,35 +2874,40 @@ static void fps_update(void)
                    ~69 ms of `mo` had no name.  Two more terms, both SUBSETS of mo:
                      pt = P_PathTraverse, the traversal behind hitscan shots.  Disjoint from `mv`:
                           shots never call P_CheckPosition.
-                     sp = P_SpawnMobj <ms>/<calls> -- the Z_Malloc for every puff and blood splat.
-                          The count is half the measurement: 300 cheap spawns and 30 catastrophic
-                          ones need opposite fixes (a mobj_t free list only helps the second).
-                   ⚠ `sp` is a SUBSET of `pt` when the spawn happens in a shot's callback.  NEVER
-                   add pt + sp; read each against mo.
-                   `n` lost its decimal here to buy the columns -- it is a COUNT, the tenth said
-                   nothing, and the line is exactly at the 40-column wall ([[debug-overlay-line-width]]). */
+                   🔴 ROUND 3 -- `sp` RETIRED (it ANSWERED: `sp0,5/3`..`sp0,8/4`, three spawns a
+                   frame under a millisecond, hypothesis dead) and its columns spent SPLITTING `mv`,
+                   which the same run showed to be the biggest single item in the whole frame --
+                   `R66` against `T148` with `mv66,0`, i.e. the blockmap check alone costing as much
+                   as the entire renderer.  Both new fields are SUBSETS of `mv`:
+                     sb = `R_PointInSubsector` -- the BSP DESCENT, paid once per call before any
+                          collision work.  Never timed until now.
+                     bt = the THINGS blockmap loop, which walks every corpse still linked in.
+                   **`mv - sb - bt` is the LINES loop**, by subtraction: three terms for two probes.
+                   All tenths dropped: these terms run 3-70 ms and the FRT tick is already 4,5 us,
+                   so the decimal was precision the measurement does not have -- and six fields at
+                   40 columns leave no room for it ([[debug-overlay-line-width]]). */
                 {
-                    unsigned int mo10 = _f ? (sat_thk_mobj_frt  * 10u / 224u) / _f : 0u;
-                    unsigned int mv10 = _f ? (sat_thk_move_frt  * 10u / 224u) / _f : 0u;
-                    unsigned int pt10 = _f ? (sat_thk_path_frt  * 10u / 224u) / _f : 0u;
-                    unsigned int sp10 = _f ? (sat_thk_spawn_frt * 10u / 224u) / _f : 0u;
-                    unsigned int spn  = _f ? sat_thk_spawn_n / _f : 0u;
-                    unsigned int thn  = _f ? sat_thk_n / _f : 0u;
+                    unsigned int mo_ms = _f ? (sat_thk_mobj_frt * 10u / 224u) / _f / 10u : 0u;
+                    unsigned int mv_ms = _f ? (sat_thk_move_frt * 10u / 224u) / _f / 10u : 0u;
+                    unsigned int pt_ms = _f ? (sat_thk_path_frt * 10u / 224u) / _f / 10u : 0u;
+                    unsigned int sb_ms = _f ? (sat_thk_sub_frt  * 10u / 224u) / _f / 10u : 0u;
+                    unsigned int bt_ms = _f ? (sat_thk_blk_frt  * 10u / 224u) / _f / 10u : 0u;
+                    unsigned int thn   = _f ? sat_thk_n / _f : 0u;
                     snprintf(ovbuf, sizeof ovbuf,
-                             "THK n%u mo%u mv%u.%u pt%u.%u sp%u.%u/%u            ",
-                             thn > 9999u ? 9999u : thn, mo10 / 10,
-                             mv10/10, mv10%10, pt10/10, pt10%10,
-                             sp10/10, sp10%10, spn > 999u ? 999u : spn);
+                             "THK n%u mo%u mv%u pt%u sb%u bt%u            ",
+                             thn > 9999u ? 9999u : thn,
+                             mo_ms > 999u ? 999u : mo_ms, mv_ms > 999u ? 999u : mv_ms,
+                             pt_ms > 999u ? 999u : pt_ms, sb_ms > 999u ? 999u : sb_ms,
+                             bt_ms > 999u ? 999u : bt_ms);
                     /* Six fields is one more than the trailing-space trick can cover: the widest
-                       form (`n9999 mo999 mv99.9 pt99.9 sp99.9/999`) is EXACTLY the 40 visible
-                       columns, so any padding that clears a short line would overflow a long one.
-                       Pad generously, then cut at 40 -- the tail is always blanked and the line can
-                       never wrap ([[debug-overlay-line-width]]).  This is the `pf100 0` artefact
+                       form is EXACTLY the 40 visible columns, so any padding that clears a short
+                       line would overflow a long one.  Pad generously, then cut at 40 -- the tail is
+                       always blanked and the line can never wrap.  This is the `pf100 0` artefact
                        fixed at the source instead of guessed at. */
                     ovbuf[40] = '\0';
                     if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 23, ovbuf);
                     sat_thk_mobj_frt = sat_thk_move_frt = sat_thk_n = 0;
-                    sat_thk_path_frt = sat_thk_spawn_frt = sat_thk_spawn_n = 0;
+                    sat_thk_path_frt = sat_thk_sub_frt = sat_thk_blk_frt = 0;
                 }
                 snprintf(ovbuf, sizeof ovbuf, "TIC th%u.%u s%u.%u x%u.%u a%u.%u b%u.%u v%u.%u mk%d  ",
                          th10 / 10u, th10 % 10u, sg10 / 10u, sg10 % 10u,

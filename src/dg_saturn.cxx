@@ -153,6 +153,21 @@ extern "C" int   r_nopatch_col;    /* core r_data.c: textures with a patchless c
    cannot serve a texture (zero-init, 256 B).  The sky uploader MUST compare against it: a sky built
    from stub columns is uniformly near-black, and `sky_loaded_tex` used to latch anyway -> a single
    tight moment at level load painted the sky black FOR THE WHOLE LEVEL.  See sky_cell_upload. */
+/* 🔴 OVERLAY HOUSEKEEPING 2026-08-17, at the owner's request ("on en a tellement, on peut faire le
+   ménage").  Criterion, the one already applied to `T`, `hc`, `nr` and `sc`: A PROBE WHOSE QUESTION
+   IS ANSWERED GOES.  These three read IDENTICAL values on all four of the 2026-08-16 captures --
+   they are latched historical peaks that stopped moving, so they cost three lines of a 25-line
+   screen and tell nothing.  Flip to 1 to get them back; the accumulators behind them still run.
+     row 4  PK   per-phase peaks    (frozen at Bw9.1 Bp206.2 P77.9 M33.5)
+     row 14 MXd  worst-frame decomp (frozen at Bw6.4 Bp202.4 P31.0 M2.0)
+     row 16 W72  SGL work-pointer   (frozen at c808 d+0)
+   EXPLICITLY KEPT, per the owner: the whole VDP1<->CPU synchronisation train -- row 13 `N`/`L`,
+   `Fl` the field lock, row 19 `V1 c/B/LP/ec/ws/tx`.  Those are the ones a sync bug will need. */
+#define OVL_RETIRED 0
+
+extern "C" unsigned int prof_seg_cols, prof_seg_fill, prof_seg_px, prof_lead_px;  /* row 14 `SEG` */
+extern "C" unsigned int prof_gc_st[4], prof_gc_sn[4];                             /* row 16 `GCS` */
+extern "C" unsigned int prof_wallprep, prof_segloop, prof_segrout;  /* core: the Bp split, FRT ticks */
 extern "C" unsigned char r_column_stub[256];
 extern "C" int  *texturewidthmask;   /* core r_data.c: width-1 per texture -- the sky uploader's only
                                         way to learn the sky is 1024 wide, not the 256 it assumed */
@@ -179,10 +194,10 @@ extern "C" int   r_visplane_pool_ovf;       /* #1: planes that overflowed VP_POO
 extern "C" int   r_visplane_pool_ovf_pk;    /* ...and its ~1 s HIGH-WATER: the per-view reset made the
                                                raw counter read 0 on the overlay almost always.
                                                Printed as the 2nd digit of row 11 `vp<peak>.<ovf>` */
-extern "C" int   sat_texcache_use;  /* SATURN 2026-08-14: 1p composite-cache A/B, pad L+Right, row 22 `xc` */
-extern "C" int   sat_texcache_active, sat_texcache_poolkb, sat_texcache_entries,
-                 sat_texcache_builds, sat_texcache_evicts;  /* streaming texture cache (core/r_cache.c) */
-extern "C" int   sat_texcache_carve_lf;     /* largest free block (KB) at the last carve attempt */
+/* (the seven sat_texcache_* externs went with core/r_cache.c on 2026-08-17.  Their `xc` field had
+   already been dropped from row 22 -- it printed the constant `xc0/0/60`, i.e. "the 96 KB contiguous
+   slab was never carved", every capture of the summer.  Deleting the file is what paid for the two
+   THK probes on this build: dead code costs the TLSF pool 1:1.) */
 extern "C" int   sat_tex_numtex, sat_tex_sumwidth, sat_tex_dirbytes,
                  sat_tex_mptex, sat_tex_mpwidth;  /* Phase-0 texture-floor measurement (r_data.c) */
 extern "C" int   Z_FreeMemory(void);          /* total reclaimable (free + purgeable) bytes */
@@ -678,6 +693,9 @@ extern "C" int r_composite_builds;     /* core r_data.c: composites REBUILT (CPU
 extern "C" int r_composite_distinct;   /* core r_data.c: DISTINCT textures behind them (thrash vs churn)*/
 extern "C" int r_composite_pf;         /* core r_data.c: worst useful fraction of a patch decode (%)   */
 extern "C" int sat_cpin_on, r_cpin_kb, r_cpin_yield;   /* composite pin: A/B, KB held, pressure yields */
+extern "C" int sat_lpin_on, r_lpin_kb, r_lpin_yield;   /* PATCH-LUMP pin (2026-08-17): row 16 `P`      */
+extern "C" int r_lpin_evict;                           /* ...ring-full evictions, PER WINDOW           */
+extern "C" void R_LumpPinFlush(void);                  /* release the ring on the pad L+Left A/B       */
 extern "C" int sat_wall_lod_hits;                      /* core r_segs.c: size LOD, row 22 `Lo`        */
 extern "C" int sat_lod_mindist, sat_wall_lod_near;     /* core r_segs.c: LOD distance floor + rescues */
 extern "C" int sat_lod_eff, sat_lod_auto_step, sat_gov_debt;   /* governor, row 21                    */
@@ -1931,6 +1949,8 @@ static int vdp1_wall_drop = 0;   /* walls the core handed to VDP1 that the emit 
                                     at the command pointer, so it catches every early return in
                                     wall_emit/_flat/_banded without auditing them one by one. */
 extern "C" int sat_wall_lead_x;    /* core r_segs.c: LEAD-FILL depth in frames, 0 = off (pad R+Right) */
+extern "C" int sat_gov_inert;      /* governor: bitmask of axes PROVEN not to buy time (w/p/lead) */
+extern "C" int sat_gov_lead_step;  /* governor rung: 0 full / 1 flat spans / 2 lead-fill off */
 extern "C" int sat_lead_mode;      /* core r_segs.c: 0 master-tex / 1 SLAVE-tex / 2 master-flat (R+Right) */
 extern "C" int sat_wall_dwell;     /* core r_segs.c: frames a flipped seg stays CPU-covered (pad R+Up) */
 extern "C" int sat_lead_span_drop; /* core r_segs.c: spans the slave list could not hold             */
@@ -2026,6 +2046,7 @@ static void fps_update(void)
         {
             static int l_map=-1, l_m=-1, l_sq=-1, l_blit=-1, l_ms=-1, l_cls=-1, l_ns=-1, l_opt=-1, l_wen=-1, l_wb=-1;
             static int l_lx=-1, l_lm=-1;   /* lead-fill chord (pad R+Right): depth + mode */
+            static int l_lp=-1;            /* PATCH-LUMP pin (pad L+Left) -- see below */
 #if SAT_DIAG_SLAVE_TOGGLES
             static int l_steal=-1, l_wp=-1;
 #endif
@@ -2049,6 +2070,13 @@ static void fps_update(void)
                                                photo -- a 275-second window spanning up to four
                                                configurations.  The A/B was unattributable and nothing
                                                said so. */
+                || sat_lpin_on != l_lp      /* 🔴 2026-08-17: pad L+Left was missing here for exactly
+                                               the same reason R+Right was, and it is THE toggle of
+                                               this build.  Row-20 `c` and row-4 `w` are WINDOW peaks:
+                                               without this flush, turning the lump pin off keeps the
+                                               fat `c` latched from the pin-ON frames (and vice
+                                               versa), so the one measurement the hardware run exists
+                                               to make would have read the wrong side of its own A/B. */
 #if SAT_DIAG_SLAVE_TOGGLES
                 || sat_plane_steal != l_steal || sat_wallprep_slave != l_wp
 #endif
@@ -2058,7 +2086,7 @@ static void fps_update(void)
                 blit10_sum = blit10_cnt = 0;   /* row-1 'b' precise window: fresh sample on the L+A toggle */
                 l_map=gamemap; l_m=sat_m; l_sq=(sq_wall<<6|sq_sprite<<4|sq_floor<<2|sq_ceil); l_blit=blit_mode; l_ms=sat_mark_suppress;
                 l_cls=sat_clear_slave; l_ns=sat_near_sprites; l_opt=sat_opt; l_wen=sat_wall_entry; l_wb=sat_wall_grow;
-                l_lx=sat_wall_lead_x; l_lm=sat_lead_mode;
+                l_lx=sat_wall_lead_x; l_lm=sat_lead_mode; l_lp=sat_lpin_on;
 #if SAT_DIAG_SLAVE_TOGGLES
                 l_steal=sat_plane_steal; l_wp=sat_wallprep_slave;
 #endif
@@ -2204,10 +2232,28 @@ static void fps_update(void)
             /* row 10: per-PHASE INDEPENDENT peaks (each phase's own worst across the
                window, possibly different frames) -- the basis to size each offload
                (Bp -> slave wall-prep, P -> VDP1/RBG0 floor).  ~31 cols worst case. */
-            snprintf(ovbuf, sizeof ovbuf, "PK Bw%d.%d Bp%d.%d P%d.%d M%d.%d        ",
-                    sat_prof_pk_bw/10, sat_prof_pk_bw%10, sat_prof_pk_bp/10, sat_prof_pk_bp%10,
-                    sat_prof_pk_p/10,  sat_prof_pk_p%10,  sat_prof_pk_m/10,  sat_prof_pk_m%10);
-            if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 4, ovbuf);   /* row 4: per-phase peaks */
+            /* 🔴 ROW 4 REBORN 2026-08-17 -- THE Bp SPLIT.  The owner's open-scene captures killed the
+               premise the whole `B` axis was built on: most of the picture was VDP1 walls, the HW
+               floor and the HW sky, and `Bp` was still 106 ms.  It cannot be fill.  `Bp` is
+               R_StoreWallRange IN FULL, and that runs for EVERY visible seg whatever draws it --
+               clipping, visplane marking, silhouettes.  So the question is no longer "how much
+               fill" but WHICH HALF:
+                 pr = per-seg SETUP  (R_StoreWallRange minus the column loop: trig, scale, texture
+                      resolution, the VDP1 routing + lead-fill history search)
+                 lp = the PER-COLUMN loop (R_RenderSegLoop proper)
+                 wp = prof_wallprep, the whole of it -- `Bw` - wp is the pure BSP traversal
+               DECISION RULE, and it is an arithmetic one: a 320-wide screen has ~320-600 wall
+               columns TOTAL, so if `lp` carried 100 ms that would be ~200 us PER COLUMN, which no
+               handful of adds can cost.  Expect `pr` to dominate => the lever is PER-SEG work, and
+               the seg COUNT (ds104) is the multiplier -- not the pixels. */
+            {
+                unsigned int pr10 = prof_segrout  * 10u / 224u;
+                unsigned int lp10 = prof_segloop  * 10u / 224u;
+                unsigned int wp10 = prof_wallprep * 10u / 224u;
+                snprintf(ovbuf, sizeof ovbuf, "BPS pr%u.%u lp%u.%u wp%u.%u        ",
+                         pr10 / 10u, pr10 % 10u, lp10 / 10u, lp10 % 10u, wp10 / 10u, wp10 % 10u);
+                if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 4, ovbuf);
+            }
             /* row 16 (moved off row 5 -- row 5 belongs to r_parallel's per-frame SLVi%/w slave-
                occupancy readout, the WORK-DISTRIBUTION meter; the 1/s W72 stamp was stomping it
                once a second): SGL slave work-pointer creep watch (the idle menu/intermission freeze).
@@ -2221,10 +2267,49 @@ static void fps_update(void)
                 unsigned int _gbr; __asm__ volatile ("stc gbr,%0" : "=r"(_gbr));
                 unsigned int _w72 = *(volatile unsigned int *)(_gbr + 72);
                 static unsigned int _w72_prev = 0;
+#if OVL_RETIRED   /* SATURN 2026-08-17: the FORMATTING goes too.  Gating only the Print
+                   reclaimed almost nothing, and the TLSF pool is now the binding
+                   constraint on this branch (10,19 -> 7,61 KB across the day). */
                 snprintf(ovbuf, sizeof ovbuf, "W72 %04x d%+d      ",
                          _w72 & 0xffff, (int)(_w72 - _w72_prev));
                 _w72_prev = _w72;
-                if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 16, ovbuf);
+                if (OVL_RETIRED && sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 16, ovbuf);
+#endif
+                /* 🔴 ROW 16 REBORN 2026-08-17 -- WHO CALLS R_GetColumn.  A capture read `SEG c320 f0`
+                   beside `BP g98 n402`: 402 resolutions for zero fills, 98 ms, and every bracketed
+                   sub-site of the worst call at ~0.  The owner authorised cutting the useless
+                   resolutions; this says WHICH ones they are before anything is cut.
+                     w = the seg loop's own tier resolution -- the calls a VDP1-routed wall should
+                         not need, i.e. exactly what "option B" would remove
+                     p = R_StoreWallRange's routing preamble (R_WallPotatoColor walks a texture)
+                     m = R_RenderMaskedSegRange (grates).  ⚠ INVISIBLE in row 20 `g`, which is gated
+                         on prof_in_wp -- this is the first time that path is on screen at all
+                     o = everything else (r_plane.c's sky column, ...)
+                   ms/calls each, per frame, same window as rows 4 and 14. */
+                {
+                    unsigned int w10 = prof_gc_st[1] * 10u / 224u, p10g = prof_gc_st[2] * 10u / 224u;
+                    unsigned int m10 = prof_gc_st[3] * 10u / 224u, o10 = prof_gc_st[0] * 10u / 224u;
+                    /* `o` gave up its columns to the LUMP PIN readout (2026-08-17): it read 0 on
+                       every capture but one, and `P` is the witness of the fix `c8..c12` called
+                       for -- `P0/n` means the pin is yielding and holding nothing, exactly the
+                       `pn0/25` failure the composite pin lived through all summer.
+                       🔴 AND NOW `p` GOES THE SAME WAY (2026-08-17, 5th HW run).  It has printed
+                       `p0.0/0` on every capture it ever appeared on -- the routing preamble makes no
+                       R_GetColumn call, `R_WallPotatoColor` is memoised.  Its columns buy the field
+                       that would have decided the previous build: `P<rung><kb>/<yields>.<EVICTIONS>`.
+                       `yields` only ever counted the floor guard, so `P2122/0` was read as "no
+                       pressure" when the ring may have been shedding an entry on every add. */
+                    snprintf(ovbuf, sizeof ovbuf, "GCS w%u.%u/%u m%u.%u/%u P%c%d/%d.%d      ",
+                             w10/10, w10%10, prof_gc_sn[1] > 9999u ? 9999u : prof_gc_sn[1],
+                             m10/10, m10%10, prof_gc_sn[3] > 9999u ? 9999u : prof_gc_sn[3],
+                             "-12"[sat_lpin_on % 3], r_lpin_kb,   /* rung: - off / 1 64K / 2 128K */
+                             r_lpin_yield > 999 ? 999 : r_lpin_yield,
+                             r_lpin_evict > 999 ? 999 : r_lpin_evict);
+                    (void)o10; (void)p10g;
+                    ovbuf[40] = '\0';   /* five fields: pad, then cut, like row 23 */
+                    if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 16, ovbuf);
+                    r_lpin_evict = 0;   /* a RATE: evictions per window, unlike the cumulative yields */
+                }
             }
             /* row 9: WHERE/WHEN the REC-max frame was (the locator), so the worst frame is
                reproducible.  m=map, x,y=player render pos (map units), a=angle 0-255,
@@ -2238,10 +2323,36 @@ static void fps_update(void)
                until beaten or a config change) -> a fresh peak is a capture opportunity.  Bw/Bp/P/M =
                that frame's phase split (which phase spiked); b/Pb = the slave's busy%/plane-share AT
                that frame (was the idle slave able to help, or was it a master-serial Bp spike?). */
+#if OVL_RETIRED   /* SATURN 2026-08-17: the FORMATTING goes too.  Gating only the Print
+                   reclaimed almost nothing, and the TLSF pool is now the binding
+                   constraint on this branch (10,19 -> 7,61 KB across the day). */
             snprintf(ovbuf, sizeof ovbuf, "MXd Bw%d.%d Bp%d.%d P%d.%d M%d.%d b%d Pb%d ",
                      sat_prof_mx_bw/10, sat_prof_mx_bw%10, sat_prof_mx_bp/10, sat_prof_mx_bp%10,
                      sat_prof_mx_p/10,  sat_prof_mx_p%10,  sat_prof_mx_m/10,  sat_prof_mx_m%10,
                      sat_prof_mx_b, sat_prof_mx_pb);
+            if (OVL_RETIRED && sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 14, ovbuf);
+#endif
+            /* 🔴 ROW 14 REBORN 2026-08-17 -- SIZE `lp` INSTEAD OF ARGUING ABOUT IT.  Row 4's own
+               decision rule said "expect pr to dominate"; four hardware captures said the opposite
+               (`pr` 9,9-12,4 against `lp` 85,1-105,0), and the same arithmetic that predicted `pr`
+               now says `lp` is impossible: a few hundred wall columns cannot spend 100 ms on adds.
+               So count what the loop actually does, with increments only -- no timer, so the probe
+               cannot inflate what it measures:
+                 c  = column iterations of R_RenderSegLoop
+                 f  = colfunc() calls made from inside it (3 wall tiers + the lead-fill's own)
+                 k  = pixels those calls wrote, in THOUSANDS
+                 lk = the LEAD-FILL's share of those pixels, in thousands (counted on both the
+                      master and the slave path, so `L1s` and `L1-` stay comparable)
+               THE SUBTRACTION TO READ: R_DrawColumn is ~7 cycles/pixel = ~0,25 us at 28,6 MHz, so
+               a fill-bound `lp` of 100 ms needs ~400 k pixels = `k400` -- twelve whole 160x200 M7
+               screens.  `k` far below that PROVES `lp` is not fill, and kills the `w` axis on
+               arithmetic rather than on a 24-frame probe.  `lk` vs `k` prices the lead-fill in the
+               one unit that decides whether the governor needs a finer rung than on/off. */
+            snprintf(ovbuf, sizeof ovbuf, "SEG c%u f%u k%u lk%u        ",
+                     prof_seg_cols > 99999u ? 99999u : prof_seg_cols,
+                     prof_seg_fill > 99999u ? 99999u : prof_seg_fill,
+                     prof_seg_px / 1000u > 9999u ? 9999u : prof_seg_px / 1000u,
+                     prof_lead_px / 1000u > 9999u ? 9999u : prof_lead_px / 1000u);
             if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 14, ovbuf);
             /* row 7: ACTIVE A/B state -- so a photo is never read against the wrong config.  Kept
                SHORT (<=~40 visible cols; see the debug-overlay-line-width memory): the changing
@@ -2697,10 +2808,11 @@ static void fps_update(void)
                    flattened this ~1 s window.  `sb0/0` while `w>0` means the budget is inert and
                    the AREA rung is carrying the axis alone -- which is exactly the state that let
                    `Bp110,8` survive three governor fires on `ds118`. */
-                snprintf(ovbuf, sizeof ovbuf, "GOV d%c w%d p%d e%d px%d sb%d/%d rc%d    ",
+                snprintf(ovbuf, sizeof ovbuf, "GOV d%c w%d p%d e%d sb%d/%d L%d i%d rc%d ",
                          (char)sat_gov_axis, sat_lod_auto_step, sat_gov_p_step,
-                         gov_e, sat_lod_eff, sat_seg_budget,
+                         gov_e, sat_seg_budget,
                          (sat_seg_budget_cut > 999 ? 999 : sat_seg_budget_cut),
+                         sat_gov_lead_step, sat_gov_inert,
                          (sat_thing_role_cut > 999 ? 999 : sat_thing_role_cut));
                 if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 21, ovbuf);
                 /* the field's own row owns its reset ([[debug-overlay-legend]]) */
@@ -2727,7 +2839,6 @@ static void fps_update(void)
                the thinkers themselves are memory-bound and the lever is data layout, not
                algorithms.  Either way MEASURE FIRST ([[budget-before-mechanism]]). */
             {
-                unsigned int tt10 = _f ? (sat_tic_total_frt * 10u / 224u) / _f : 0u;
                 unsigned int th10 = _f ? (sat_tic_think_frt * 10u / 224u) / _f : 0u;
                 unsigned int sg10 = _f ? (sat_tic_sight_frt * 10u / 224u) / _f : 0u;
                 /* 40 VISIBLE COLUMNS is the hard budget ([[debug-overlay-line-width]]), so `x` had to
@@ -2748,14 +2859,58 @@ static void fps_update(void)
                 unsigned int xt10 = _f ? (sat_tic_runs  * 10u) / _f : 0u;  /* tics RUN per frame  */
                 unsigned int av10 = _f ? (sat_tic_avail * 10u) / _f : 0u;  /* tics TryRunTics elected */
                 unsigned int bl10 = _f ? (sat_tic_built * 10u) / _f : 0u;  /* tics NetUpdate WANTED     */
-                (void)tt10;
+                /* 🔴 ROW 23 (was blank) 2026-08-17 -- THE INSIDE OF `th`.  Hardware reads `th` at
+                   24-38 ms on 178-200 ms frames: a fifth of the frame that is not rendering, and
+                   the only number describing it was `th` itself.  `s` already carves out
+                   P_CheckSight's BSP walk; this carves the rest so a console session comes home
+                   with the whole picture:
+                     n  = thinkers RUN this frame -- separates "many" from "expensive"
+                     mo = P_MobjThinker, the actor world
+                     mv = P_CheckPosition/P_TryMove inside it -- the BLOCKMAP walk, Doom's classic
+                          hot spot, a SUBSET of mo (so mo - mv is state/animation)
+                   `th - mo` is what is left: the sector thinkers (doors, platforms, lights).
+                   🔴 ROUND 2, after the 64 s console run: at 63 s the frame read `T165` against
+                   `R141` -- the game tic OVERTOOK the whole renderer -- with mo146,4 mv75,1 s2,4, so
+                   ~69 ms of `mo` had no name.  Two more terms, both SUBSETS of mo:
+                     pt = P_PathTraverse, the traversal behind hitscan shots.  Disjoint from `mv`:
+                          shots never call P_CheckPosition.
+                     sp = P_SpawnMobj <ms>/<calls> -- the Z_Malloc for every puff and blood splat.
+                          The count is half the measurement: 300 cheap spawns and 30 catastrophic
+                          ones need opposite fixes (a mobj_t free list only helps the second).
+                   ⚠ `sp` is a SUBSET of `pt` when the spawn happens in a shot's callback.  NEVER
+                   add pt + sp; read each against mo.
+                   `n` lost its decimal here to buy the columns -- it is a COUNT, the tenth said
+                   nothing, and the line is exactly at the 40-column wall ([[debug-overlay-line-width]]). */
+                {
+                    unsigned int mo10 = _f ? (sat_thk_mobj_frt  * 10u / 224u) / _f : 0u;
+                    unsigned int mv10 = _f ? (sat_thk_move_frt  * 10u / 224u) / _f : 0u;
+                    unsigned int pt10 = _f ? (sat_thk_path_frt  * 10u / 224u) / _f : 0u;
+                    unsigned int sp10 = _f ? (sat_thk_spawn_frt * 10u / 224u) / _f : 0u;
+                    unsigned int spn  = _f ? sat_thk_spawn_n / _f : 0u;
+                    unsigned int thn  = _f ? sat_thk_n / _f : 0u;
+                    snprintf(ovbuf, sizeof ovbuf,
+                             "THK n%u mo%u mv%u.%u pt%u.%u sp%u.%u/%u            ",
+                             thn > 9999u ? 9999u : thn, mo10 / 10,
+                             mv10/10, mv10%10, pt10/10, pt10%10,
+                             sp10/10, sp10%10, spn > 999u ? 999u : spn);
+                    /* Six fields is one more than the trailing-space trick can cover: the widest
+                       form (`n9999 mo999 mv99.9 pt99.9 sp99.9/999`) is EXACTLY the 40 visible
+                       columns, so any padding that clears a short line would overflow a long one.
+                       Pad generously, then cut at 40 -- the tail is always blanked and the line can
+                       never wrap ([[debug-overlay-line-width]]).  This is the `pf100 0` artefact
+                       fixed at the source instead of guessed at. */
+                    ovbuf[40] = '\0';
+                    if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 23, ovbuf);
+                    sat_thk_mobj_frt = sat_thk_move_frt = sat_thk_n = 0;
+                    sat_thk_path_frt = sat_thk_spawn_frt = sat_thk_spawn_n = 0;
+                }
                 snprintf(ovbuf, sizeof ovbuf, "TIC th%u.%u s%u.%u x%u.%u a%u.%u b%u.%u v%u.%u mk%d  ",
                          th10 / 10u, th10 % 10u, sg10 / 10u, sg10 % 10u,
                          xt10 / 10u, xt10 % 10u, av10 / 10u, av10 % 10u,
                          bl10 / 10u, bl10 % 10u, vb10 / 10u, vb10 % 10u,
                          (sat_thing_masked_cut > 99 ? 99 : sat_thing_masked_cut));
                 if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 24, ovbuf);
-                sat_tic_total_frt = 0; sat_tic_think_frt = 0; sat_tic_sight_frt = 0;
+                sat_tic_think_frt = 0; sat_tic_sight_frt = 0;
                 sat_tic_runs = 0; sat_tic_avail = 0; sat_tic_built = 0; sat_thing_masked_cut = 0;
                 sightcounts[0] = sightcounts[1] = 0; sat_sight_cachehit = 0;
             }
@@ -2839,8 +2994,7 @@ static void fps_update(void)
                 snprintf(ovbuf, sizeof ovbuf, "CD t%us px%d ob%d gy%d st%d ",
                          w_cd_ms10 / 10000, r_patch_ovf, r_composite_oob, vdp1_wall_nocol,
                          (sat_lead_stale > 9999 ? 9999 : sat_lead_stale));
-                (void)sat_cd_persistent; (void)sat_texcache_evicts;
-                /* sat_texcache_carve_lf / _poolkb are LIVE again on row 22 as `xc` (2026-08-14). */
+                (void)sat_cd_persistent;
                 if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 12, ovbuf);
             }
             /* row 18: memory-latency calibration (one-shot cold 32 KB read per bank, FRT
@@ -5118,6 +5272,8 @@ static inline int wrmul_(long long num, int recip)   /* ~= num/den, rounded, sig
    This is the cheap patch, not the fix: the fix is to derive both edges from ONE number.  Kept as
    a live int so it can be A/B'd to zero if the overlap ever reads worse than the gap. */
 static int sat_wall_xgrow = 1;
+
+
 
 static void wall_emit_band(int x1, int x2, int yl1, int yh1, int yl2, int yh2,
                            int u1, int u2, int texw,
@@ -7590,40 +7746,51 @@ extern "C" uint32_t DG_GetTicksMs(void)
                  by exactly A = us_per_frame/1000 ms per real vblank detected
                  via frt_at_vbl change â€” preventing both the prev_ms+17-per-call
                  runaway and the single-spike-then-reset failure mode. */
-    static uint32_t       safe_ms  = 0;
-    static unsigned short last_fv  = 0;
+    /* 🔴 SATURN 2026-08-17 -- THE SLOW-MOTION WAS HERE, AND IT WAS A LATCH.
+       The old guard read `if (result > safe_ms + 5000) return safe_ms + (one field per new fv)`.
+       That is a one-way trap: the first time anything makes the true clock jump more than 5 s --
+       a level load, a long CD read, one stomped us_acc -- safe_ms falls 5 s behind and the test
+       `result > safe_ms + 5000` is then TRUE FOREVER, because nothing ever resynchronises it.
+       From that moment the clock advances only ~one field per CALL that happens to see a new
+       frt_at_vbl, i.e. ~3 fields per frame however long the frame really was.
+       That is exactly what the overlay says.  `b` (tics NetUpdate wanted) is pinned at 1,1-1,6
+       whatever the frame costs -- 82 % of correct at 26 fps (v2,3) but 23 % at 5 fps (v12,0) --
+       i.e. a CONSTANT ~31-46 ms of clock per frame, which is 2-3 fields.  The game world ran at a
+       fifth of real time and no counter downstream could see why, because `v` proved the vblank
+       handler itself was healthy.
+       THE REAL GUARD IS A RATE LIMIT, NOT A COMPARISON.  vbl_count says exactly how many fields
+       have really elapsed since the last call, so the clock can be bounded by that -- a rogue
+       us_acc is still clamped, but the clock KEEPS TRUE TIME instead of freezing, and it converges
+       the moment the corruption stops.  Monotonic too, so it can never run backwards. */
+    static uint32_t     safe_ms   = 0;
+    static unsigned int last_vbl  = 0;
+    static int          primed    = 0;
     unsigned long long us_snap;
     unsigned short fv, f;
-    unsigned int sr, sr_masked;
-    uint32_t result;
+    unsigned int sr, sr_masked, vc;
+    uint32_t result, maxstep, A;
 
     __asm__ volatile ("stc sr, %0" : "=r"(sr));
     sr_masked = sr | 0xF0;
     __asm__ volatile ("ldc %0, sr" :: "r"(sr_masked) : "memory");
     us_snap = us_acc;
     fv      = frt_at_vbl;
+    vc      = vbl_count;
     f       = (unsigned short)(((unsigned short)FRT_FRCH << 8) | (unsigned short)FRT_FRCL);
     __asm__ volatile ("ldc %0, sr" :: "r"(sr) : "memory");
 
     result = (uint32_t)((us_snap + ((unsigned short)(f - fv) * ns_per_frt) / 1000) / 1000);
 
-    if (result > 7200000U ||
-        (safe_ms > 0U && result > safe_ms + 5000U))
-    {
-        /* Corruption detected: advance safe_ms by A ms only if a real vblank
-           occurred (frt_at_vbl changed).  All calls within the same vblank
-           see the same fv â†’ same safe_ms, unlike prev_ms+17 per call. */
-        uint32_t A = us_per_frame / 1000U;
-        if (fv != last_fv)
-        {
-            safe_ms += A;
-            last_fv  = fv;
-        }
-        return safe_ms;
-    }
+    if (!primed) { primed = 1; safe_ms = result; last_vbl = vc; return result; }
 
-    safe_ms = result;
-    last_fv = fv;
+    /* Fields really elapsed since the last call, +1 for the partial field the FRT delta adds. */
+    A       = us_per_frame / 1000U;
+    maxstep = ((uint32_t)(vc - last_vbl) + 1u) * A + 1u;
+    if (result > safe_ms + maxstep) result = safe_ms + maxstep;   /* clamp, never freeze */
+    if (result < safe_ms)           result = safe_ms;             /* monotonic */
+
+    safe_ms  = result;
+    last_vbl = vc;
     return result;
 }
 
@@ -8031,8 +8198,18 @@ static void poll_pad(void)
         && (changed & PER_DGT_KL) && !(cur & PER_DGT_KL)
         && sat_local_players <= 1)
     {
-        sat_cpin_on = !sat_cpin_on;
-        if (!sat_cpin_on) R_CompositePinFlush();   /* release immediately, so the A/B is honest */
+        /* 🔴 RETARGETED 2026-08-17 -- this chord now A/Bs the PATCH-LUMP pin, which is the one that
+           can hold: the composite pin it used to toggle is defaulted OFF and has never held a byte
+           (`pn0/1`..`pn0/25`, its 48 KB floor against a 24-38 KB `lg`), while the lump pin's floor
+           clears the flatten's 13 KB worst lump with headroom.  Row 16 `P<kb>/<yields>` is the
+           readout; row 20 `c` is what must collapse.  The composite pin keeps its variable and its
+           flush so reviving it stays a one-line change. */
+        /* 2026-08-17 (4th HW run): a THREE-way cycle now -- 2 = 128 KB (default), 1 = 64 KB, 0 = off.
+           The console proved 64 KB never yields (`P57..61/0` for 64 s) AND never covers the ~12 fat
+           calls a frame, so the open question is the BUDGET, not on-vs-off.  Flush on every step, not
+           just on 0: keeping a 128 KB ring while claiming the 64 KB rung would make the A/B lie. */
+        sat_lpin_on = (sat_lpin_on + 2) % 3;   /* 2 -> 1 -> 0 -> 2 */
+        R_LumpPinFlush();
     }
 
     /* SATURN 2026-08-15: the governor's PLANE axis is decided in core (r_parallel.c) but applied

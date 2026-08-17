@@ -71,7 +71,8 @@ param(
                               # silently overwritten by it.
     [string]$Tracks = "",
     [string]$OutDir = "",
-    [switch]$Renumber
+    [switch]$Renumber,
+    [switch]$NoFlatten          # ship the IWAD untouched (A/B against the composite-free one)
 )
 
 $ErrorActionPreference = "Stop"
@@ -125,6 +126,42 @@ if ($Wad) {
     $dst = Join-Path $root "cd\data\DOOM1.WAD"
     Copy-Item $src $dst -Force
     Write-Host "IWAD: $([System.IO.Path]::GetFileName($src)) -> cd/data/DOOM1.WAD ($('{0:N0}' -f (Get-Item $dst).Length) bytes)"
+
+    # SATURN 2026-08-17 -- KILL THE WALL-COMPOSITE TREADMILL IN THE WAD, not at runtime.
+    # A texture whose columns are covered by more than one patch makes R_GenerateComposite
+    # allocate width*height in ONE contiguous run and rebuild it every time the zone purges it:
+    # measured `cb46/8` (the same 8 textures rebuilt 46 times a window) at 13-17 ms each, against
+    # `lg` = 21-34 KB of longest run.  On TNT the worst composite wants 131072 B -- it can never
+    # fit.  Re-rendering those textures as NON-OVERLAPPING strips makes every column single-patch,
+    # so no composite is ever built and the largest lump drops to ~13 KB.  See tools/flatten_textures.py.
+    # -NoFlatten builds the untouched IWAD, which is the A/B (and the escape hatch).
+    if (-not $NoFlatten) {
+        $tmpWad = Join-Path $root "build\_flat.wad"
+        New-Item -ItemType Directory -Force (Join-Path $root "build") | Out-Null
+        # 96 -> 128 px (2026-08-17): at 96 the strips were small but NUMEROUS, and hardware said the
+        # binding cost is the NUMBER of lump faults (~12/frame at ~11 ms each, row 20 `c`), not the
+        # contiguous run.  128 px = ~17,5 KB lumps -- still under the tightest measured `lg` (22 KB)
+        # -- for ~40 % fewer lumps.  Watch row 20 `c` and row 16 `P`; if `lg` dips under 20 KB on
+        # hardware this has to come back down.
+        & python (Join-Path $root "tools\flatten_textures.py") $dst $tmpWad --max-width 128
+        if ($LASTEXITCODE -ne 0) { throw "flatten_textures.py failed" }
+        if (Test-Path $tmpWad) {
+            Move-Item $tmpWad $dst -Force
+            Write-Host "Flatten: cd/data/DOOM1.WAD is now composite-free ($('{0:N0}' -f (Get-Item $dst).Length) bytes)"
+        }
+        # Then CUT whatever is still oversized.  Flattening only rewrites textures whose columns
+        # overlap; a texture that is already single-patch-per-column keeps its patches verbatim, and
+        # TNT still had a 35 083 B one (RWDMON3) -- the exact 35 KB-vs-`lg21k` cliff that ate the sky.
+        # split_patches.py copies raw post streams, so it is safe on the masked textures flatten
+        # deliberately left alone.  Order matters: flatten first, cut second.
+        $tmpWad2 = Join-Path $root "build\_split.wad"
+        & python (Join-Path $root "tools\split_patches.py") $dst $tmpWad2 --max-width 128
+        if ($LASTEXITCODE -ne 0) { throw "split_patches.py failed" }
+        if (Test-Path $tmpWad2) {
+            Move-Item $tmpWad2 $dst -Force
+            Write-Host "Split:   cd/data/DOOM1.WAD oversized patches cut ($('{0:N0}' -f (Get-Item $dst).Length) bytes)"
+        }
+    }
     # remember which IWAD this is so the finished disc can be stashed per-WAD below
     $wadName = [System.IO.Path]::GetFileNameWithoutExtension($src)
     # ...and so the disc itself is NAMED after it (unless -Name forced one).

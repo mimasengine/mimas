@@ -73,7 +73,7 @@ DOOM_CORE_C = \
 	p_doors.c p_enemy.c p_floor.c p_inter.c p_lights.c \
 	p_map.c p_maputl.c p_mobj.c p_plats.c p_pspr.c \
 	p_saveg.c p_setup.c p_sight.c p_spec.c p_switch.c \
-	p_telept.c p_tick.c p_user.c r_bsp.c r_cache.c r_data.c \
+	p_telept.c p_tick.c p_user.c r_bsp.c r_data.c \
 	r_flatcache.c \
 	r_draw.c r_main.c r_plane.c r_segs.c r_sky.c \
 	r_things.c sha1.c sounds.c statdump.c st_lib.c \

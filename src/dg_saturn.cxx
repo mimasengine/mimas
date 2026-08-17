@@ -154,6 +154,8 @@ extern "C" int   r_nopatch_col;    /* core r_data.c: textures with a patchless c
    from stub columns is uniformly near-black, and `sky_loaded_tex` used to latch anyway -> a single
    tight moment at level load painted the sky black FOR THE WHOLE LEVEL.  See sky_cell_upload. */
 extern "C" unsigned char r_column_stub[256];
+extern "C" int  *texturewidthmask;   /* core r_data.c: width-1 per texture -- the sky uploader's only
+                                        way to learn the sky is 1024 wide, not the 256 it assumed */
 extern "C" int   sat_lowres;       /* core r_main.c: 1 = half-h-res (160) packed software render + VDP2 x2 NBG1 zoom (docs/LOWRES_RENDER_STUDY.md) */
 extern "C" void  R_SetLowRes(int); /* core r_main.c: set sat_lowres + setsizeneeded (recompute viewwidth next D_Display) */
 extern "C" int   sightcounts[2];   /* core p_sight.c: [0]=REJECT trivial-rejects, [1]=full BSP LOS walks */
@@ -296,9 +298,29 @@ extern "C" int W_SaturnCDInit(void);
    table starves the 2nd 8bpp read = sky snow on HW only, invisible in Ymir).  Gated like the floor:
    potato-0 + 1-player.  See memory rbg0-hw-sky-feasible. */
 #define VDP2_CELL_SKY    1
-#define SKY_CEL_VRAM     ((void *)0x25E60000)  /* B1 low half: NBG0 sky 256-color cells (~32KB+filler) */
-#define SKY_MAP_VRAM     ((void *)0x25E6A000)  /* B1: NBG0 sky pattern-name map (64x64 1-word = 8KB)    */
-#define SKY_NB_CELL      512                    /* 32 cols x 16 rows of 8x8 cells (256x128 Doom sky)     */
+/* 🔴 2026-08-16: the layer is now the FULL PAGE WIDTH, 64x16 cells.  It used to be 32x16 = the
+   first 256 columns of the sky, tiled twice -- and a Doom sky is 1024 wide (TNT SKY1/2/3 and even
+   DOOM1's are 1024x128, four 256-wide patches), so we showed ONE QUARTER of it and wrapped in the
+   MIDDLE of the image: the owner's "ciel non continu".  Now the whole 1024 is sampled 2:1 into 512
+   unique columns, so the wrap falls on the sky's own seam, which Doom art is drawn to hide.
+   VRAM: 1025 cells x 64 B = 64,06 KB at B1+0, map moved to B1+64 KB.  B1 is 128 KB -> 56 KB still
+   free.  A full-resolution 1024-wide layer would need 128 KB of cells + 16 KB of map and does NOT
+   fit; A0/A1/B0 are the K-table, the floor bitmap and the framebuffer. */
+/* 🔴 B1 BUDGET, WRITTEN OUT SO IT CANNOT ROT AGAIN.  B1 spans 0x25E60000..0x25E7FFFF (128 KB), and
+   it is SHARED: **0x25E70000 is RBG0_MAP_VRAM** (the floor's pattern-name table, handed to the chip
+   by sl1MapRA) and 0x25E7FF00 is the live RPT.  The sky therefore owns exactly the low 64 KB --
+   CELLS **AND** MAP.  Writing the sky map at 0x25E70000 overwrote the floor's map and painted the
+   whole floor in regular vertical stripes (owner's capture, 2026-08-16).  Arithmetic, checked:
+       cells  64 cols x 13 rows + 1 filler = 833 cells x 64 B = 53312 B  [0x00000..0x0D03F]
+       map    64x64 1-word                                    =  8192 B  [0x0E000..0x0FFFF]  (8 KB aligned)
+       total                                                    61504 B  <= 65536  ✔ 0x25E70000 untouched
+   13 rows = 104 px of sky, against a horizon of 96 (thresh = 12) -- one spare row, and
+   sky_cell_write_map CLAMPS thresh to the row count so a live horizon tune can never index past
+   the last stored row.  16 rows would need 65600 B and overflow into the floor by 64 bytes. */
+#define SKY_CEL_VRAM     ((void *)0x25E60000)  /* B1+0:     NBG0 sky 256-color cells                  */
+#define SKY_MAP_VRAM     ((void *)0x25E6E000)  /* B1+56K:   NBG0 sky pattern-name map (64x64 = 8KB)   */
+#define SKY_CELL_ROWS    13                     /* 104 px of sky kept; horizon 96 needs 12            */
+#define SKY_NB_CELL      (64 * SKY_CELL_ROWS)   /* 832 = index of the transparent filler cell         */
 /* VDP2_SKY_FORCE_CYC: experimental per-frame cycle override forcing NBG0's char read into B1 when
    RBG0 is on (sky_cell_force_cyc).  Did NOT change the "sky shows floor" HW bug -> gated OFF. */
 #define VDP2_SKY_FORCE_CYC 0
@@ -1548,11 +1570,31 @@ extern "C" unsigned int sat_vbl(void)
     return vbl_count;
 }
 
+/* 🔴 SATURN 2026-08-16 -- THE MILLISECOND CLOCK MEASURES VBLANKS IT ACTUALLY SAW.
+   `us_acc += us_per_frame` asserted that this handler runs on EVERY field.  Nothing guaranteed
+   that, and row 24 `x` (tics per frame) says it does not: 2,1 tics/frame at 5,5 fps where 35 Hz
+   over a 181 ms frame owes 6,4.  A handler that misses fields makes DG_GetTicksMs run slow by
+   exactly the miss ratio, `GetAdjustedTime` hands `NetUpdate` too few tics, and NetUpdate has
+   already advanced `lasttime` past them -- so they are LOST, not deferred.  That is the whole
+   slow-motion mechanism, and it is the same clock caught saturating at 72-73 ms on hardware
+   while the FRT read 106-110.
+   Fix: add the MEASURED FRT delta since the previous handler run instead of a constant.  If the
+   handler is healthy every delta is one field and the result is byte-identical to before; if it
+   misses fields the delta covers the gap and the clock stays true.  Self-correcting either way,
+   and it needs no knowledge of WHY a field was missed.  (The delta can only wrap past 293 ms,
+   which would mean the handler is dead, not late.)  Row 24 `v` = fields seen per frame reports
+   the miss rate directly: it must read 60/fps. */
 static void vblank_handler(void)
 {
+    static int vbl_primed = 0;
+    unsigned char  h = FRT_FRCH, l = FRT_FRCL;          /* read H then L: latches the pair */
+    unsigned short f = (unsigned short)((h << 8) | l);
     vbl_count++;
-    frt_at_vbl = frt_read();
-    us_acc += us_per_frame;
+    if (vbl_primed)
+        us_acc += ((unsigned int)(unsigned short)(f - frt_at_vbl) * ns_per_frt) / 1000u;
+    else
+        vbl_primed = 1;
+    frt_at_vbl = f;
     if (palette_dirty)
     {
         for (int i = 0; i < 256; i++)
@@ -2649,14 +2691,20 @@ static void fps_update(void)
                 int gov_e = sat_gov_debt / 10;
                 if (gov_e >  999) gov_e =  999;
                 if (gov_e < -999) gov_e = -999;
-                snprintf(ovbuf, sizeof ovbuf, "GOV d%c w%d p%d e%d px%d nr%d rc%d     ",
+                /* `nr` (near-rescues) RETIRED 2026-08-16 for `sb`: it validated the distance floor,
+                   which is settled, and the budget is the half of the `B` axis now doing the work.
+                   `sb<budget>/<cut>` = the rung's seg allowance, and how many segs it actually
+                   flattened this ~1 s window.  `sb0/0` while `w>0` means the budget is inert and
+                   the AREA rung is carrying the axis alone -- which is exactly the state that let
+                   `Bp110,8` survive three governor fires on `ds118`. */
+                snprintf(ovbuf, sizeof ovbuf, "GOV d%c w%d p%d e%d px%d sb%d/%d rc%d    ",
                          (char)sat_gov_axis, sat_lod_auto_step, sat_gov_p_step,
-                         gov_e, sat_lod_eff,
-                         (sat_wall_lod_near  > 999 ? 999 : sat_wall_lod_near),
+                         gov_e, sat_lod_eff, sat_seg_budget,
+                         (sat_seg_budget_cut > 999 ? 999 : sat_seg_budget_cut),
                          (sat_thing_role_cut > 999 ? 999 : sat_thing_role_cut));
                 if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 21, ovbuf);
                 /* the field's own row owns its reset ([[debug-overlay-legend]]) */
-                sat_wall_lod_near = 0; sat_thing_role_cut = 0;
+                sat_wall_lod_near = 0; sat_thing_role_cut = 0; sat_seg_budget_cut = 0;
             }
             /* ROW 24 -- THE GAME TIC, BROKEN DOWN.  Row 1 `T` is 69-83 ms on HARDWARE (~40 % of a
                181-222 ms frame) against 8-14 ms for the same build on Ymir, and until now NOTHING
@@ -2686,15 +2734,29 @@ static void fps_update(void)
                    buy its place: `hc` is retired here.  It existed to judge the temporal sight cache
                    while sight was 13-21 ms/frame; with the REJECT matrix back, `s` reads 1,2-4,9 ms
                    and `sc<rejects>/<walks>` already tells that story on its own. */
-                unsigned int xt10 = _f ? (sat_tic_runs * 10u) / _f : 0u;   /* tics per frame, x10 */
-                snprintf(ovbuf, sizeof ovbuf, "TIC T%u th%u.%u s%u.%u x%u.%u sc%d/%d    ",
-                         tt10 / 10u,
+                /* `T` RETIRED 2026-08-16 to seat `v` inside the 40 columns.  It answered its
+                   question: across six hardware captures `T - th` was 2-4 ms every time, i.e. the
+                   game tic IS the thinkers and nothing else. (RP_TicBegin/End still run and
+                   sat_tic_total_frt is still reset below -- print it again in one line if needed.)
+                   `v` = VBLANK FIELDS SEEN PER FRAME. It must read 60/fps: 10,9 at 5,5 fps. Lower
+                   means the vblank handler is missing fields, which made the millisecond clock run
+                   slow and silently DROPPED game tics -- read it beside `x`, they are one story. */
+                static unsigned int vbl_prev = 0;
+                unsigned int vbl_now  = sat_vbl();
+                unsigned int vb10     = _f ? ((vbl_now - vbl_prev) * 10u) / _f : 0u;
+                vbl_prev = vbl_now;
+                unsigned int xt10 = _f ? (sat_tic_runs  * 10u) / _f : 0u;  /* tics RUN per frame  */
+                unsigned int av10 = _f ? (sat_tic_avail * 10u) / _f : 0u;  /* tics TryRunTics elected */
+                unsigned int bl10 = _f ? (sat_tic_built * 10u) / _f : 0u;  /* tics NetUpdate WANTED     */
+                (void)tt10;
+                snprintf(ovbuf, sizeof ovbuf, "TIC th%u.%u s%u.%u x%u.%u a%u.%u b%u.%u v%u.%u mk%d  ",
                          th10 / 10u, th10 % 10u, sg10 / 10u, sg10 % 10u,
-                         xt10 / 10u, xt10 % 10u,
-                         (sightcounts[0] > 999 ? 999 : sightcounts[0]),
-                         (sightcounts[1] > 999 ? 999 : sightcounts[1]));
+                         xt10 / 10u, xt10 % 10u, av10 / 10u, av10 % 10u,
+                         bl10 / 10u, bl10 % 10u, vb10 / 10u, vb10 % 10u,
+                         (sat_thing_masked_cut > 99 ? 99 : sat_thing_masked_cut));
                 if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 24, ovbuf);
-                sat_tic_total_frt = 0; sat_tic_think_frt = 0; sat_tic_sight_frt = 0; sat_tic_runs = 0;
+                sat_tic_total_frt = 0; sat_tic_think_frt = 0; sat_tic_sight_frt = 0;
+                sat_tic_runs = 0; sat_tic_avail = 0; sat_tic_built = 0; sat_thing_masked_cut = 0;
                 sightcounts[0] = sightcounts[1] = 0; sat_sight_cachehit = 0;
             }
             r_composite_pf = 0;   /* own the reset HERE: row 18's R_CompositeWindowReset runs before
@@ -4179,21 +4241,29 @@ static void sky_cell_upload(void)
     unsigned char  nb    = (unsigned char)sat_near_black();
     int stubbed = 0;
 
-    /* One cheap probe before committing to 256 column fetches (see SKY_RETRY_FRAMES above). */
+    /* One cheap probe before committing to 512 column fetches (see SKY_RETRY_FRAMES above). */
     if (R_GetColumn(skytexture, 0) == (const unsigned char *)r_column_stub)
         { sky_retry_wait = SKY_RETRY_FRAMES; return; }
 
-    for (int ccol = 0; ccol < 32; ++ccol)
+    /* Sample the sky's FULL width down to the 512-column layer.  Doom skies are 1024 wide (sh=1,
+       every other column); a 512- or 256-wide sky gives sh=0 and R_GetColumn's own width mask
+       repeats it, exactly as the renderer would.  NEAREST-NEIGHBOUR on purpose: these are PALETTE
+       INDICES, and averaging index 5 with index 200 yields index 102 -- an unrelated colour. */
+    int skyw = texturewidthmask[skytexture] + 1;
+    int sh   = 0;
+    while ((512 << sh) < skyw) sh++;
+
+    for (int ccol = 0; ccol < 64; ++ccol)
         for (int rx = 0; rx < 8; ++rx)
         {
-            const unsigned char *src = R_GetColumn(skytexture, ccol * 8 + rx);  /* 128-tall column */
+            const unsigned char *src = R_GetColumn(skytexture, (ccol * 8 + rx) << sh);  /* 128-tall */
             if (src == (const unsigned char *)r_column_stub) stubbed = 1;
-            for (int crow = 0; crow < 16; ++crow)
+            for (int crow = 0; crow < SKY_CELL_ROWS; ++crow)
                 for (int ry = 0; ry < 8; ++ry)
                 {
                     unsigned char p = src[crow * 8 + ry];
                     if (!p) p = nb;                /* keep the sky OPAQUE (0 = VDP2 transparent code) */
-                    cells[(ccol * 16 + crow) * 64 + ry * 8 + rx] = p;
+                    cells[(ccol * SKY_CELL_ROWS + crow) * 64 + ry * 8 + rx] = p;
                 }
         }
     memset(cells + SKY_NB_CELL * 64, 0, 64);        /* TRANSPARENT filler (index 0): floor shows below the horizon */
@@ -4213,10 +4283,14 @@ static void sky_cell_write_map(void)
     int thresh = sky_horizon_row >> 3;   /* cell-row boundary (8px cells) */
     if (sky_mode == 2) thresh--;
     if (thresh < 0) thresh = 0;
+    /* CLAMP to what is actually stored: only SKY_CELL_ROWS rows exist in VRAM (the B1 budget note
+       above), and the horizon is re-derived live by the auto-track -- an un-clamped thresh would
+       index cells past the last row, i.e. into the map. */
+    if (thresh > SKY_CELL_ROWS) thresh = SKY_CELL_ROWS;
     for (int my = 0; my < 64; ++my)
         for (int mx = 0; mx < 64; ++mx)
         {
-            int cellidx = (my < thresh) ? ((mx & 31) * 16 + my) : SKY_NB_CELL;  /* sky above the horizon; transparent filler at/below it */
+            int cellidx = (my < thresh) ? ((mx & 63) * SKY_CELL_ROWS + my) : SKY_NB_CELL;  /* sky above the horizon; transparent filler at/below it */
             map[my * 64 + mx] = (unsigned short)((cellidx * 2) | 0x1000);       /* char#=idx*2, palette bank 1 */
         }
 }
@@ -5033,12 +5107,25 @@ static inline int wrmul_(long long num, int recip)   /* ~= num/den, rounded, sig
 #define WDIV(numP, denP, recip)  ((int)((long long)(numP) / (denP)))
 #endif
 
+/* 🔴 SATURN 2026-08-16 -- THE 1 px SEAM, owner-localised: *"les bandes verticales manquantes se
+   produisent aux jonctions entre deux murs vdp1"*.  The software path cannot have this defect --
+   it walks COLUMNS, so column n belongs to exactly one seg by construction.  A quad rasteriser
+   has to be TOLD where the shared edge is, and it is not: wall A's right edge and wall B's left
+   edge are two independent roundings of the same world point, so one column can fall inside
+   neither.  Widening the RIGHT edge by one pixel makes the overlap explicit -- the neighbour
+   repaints it with its own first column, so the only visible cost is one column of overdraw, and
+   at the far end the spill lands where the wall itself would have been.
+   This is the cheap patch, not the fix: the fix is to derive both edges from ONE number.  Kept as
+   a live int so it can be A/B'd to zero if the overlap ever reads worse than the gap. */
+static int sat_wall_xgrow = 1;
+
 static void wall_emit_band(int x1, int x2, int yl1, int yh1, int yl2, int yh2,
                            int u1, int u2, int texw,
                            unsigned short charAddr, unsigned short charSize, unsigned short colr,
                            int vx, int vxr, int vyt, int vyb)
 {
     int xspan = x2 - x1, du = u2 - u1;
+    int xg = sat_wall_xgrow;          /* seam closer: widen the right edge, never the mapping */
     unsigned short cmd[16];
 
     if (xspan <= 0 || du == 0 || texw <= 0)            /* degenerate -> single quad */
@@ -5048,10 +5135,10 @@ static void wall_emit_band(int x1, int x2, int yl1, int yh1, int yl2, int yh2,
         cmd[0] = 0x0002; cmd[2] = 0x00E0;                 /* DISTORSP | COLOR_4 8bpp | SPD | ECD-off */
         cmd[3] = colr;                                    /* CMDCOLR = CRAM light-bank base */
         cmd[4] = charAddr; cmd[5] = charSize;
-        cmd[6]  = (short)x1; cmd[7]  = (short)yl1;
-        cmd[8]  = (short)x2; cmd[9]  = (short)yl2;
-        cmd[10] = (short)x2; cmd[11] = (short)yh2;
-        cmd[12] = (short)x1; cmd[13] = (short)yh1;
+        cmd[6]  = (short)x1;        cmd[7]  = (short)yl1;
+        cmd[8]  = (short)(x2 + xg); cmd[9]  = (short)yl2;
+        cmd[10] = (short)(x2 + xg); cmd[11] = (short)yh2;
+        cmd[12] = (short)x1;        cmd[13] = (short)yh1;
         vdp1_cmd_at(VDP1_BANK[vdp1_wbank], vdp1_wnext++, cmd);
         return;
     }
@@ -5133,8 +5220,8 @@ static void wall_emit_band(int x1, int x2, int yl1, int yh1, int yl2, int yh2,
             cmd[3] = colr;                                 /* CMDCOLR = CRAM light-bank base */
             cmd[4] = charAddr; cmd[5] = charSize;
             cmd[6]  = (short)xs; cmd[7]  = (short)yls;     /* A col0  top */
-            cmd[8]  = (short)xe; cmd[9]  = (short)yle;     /* B colW  top */
-            cmd[10] = (short)xe; cmd[11] = (short)yhe;     /* C colW  bot */
+            cmd[8]  = (short)(xe + xg); cmd[9]  = (short)yle;     /* B colW  top */
+            cmd[10] = (short)(xe + xg); cmd[11] = (short)yhe;     /* C colW  bot */
             cmd[12] = (short)xs; cmd[13] = (short)yhs;     /* D col0  bot */
             vdp1_cmd_at(VDP1_BANK[vdp1_wbank], vdp1_wnext++, cmd);
         }
@@ -5158,8 +5245,8 @@ static void wall_emit_band(int x1, int x2, int yl1, int yh1, int yl2, int yh2,
             cmd[3] = colr;                                    /* CMDCOLR = CRAM light-bank base */
             cmd[4] = charAddr; cmd[5] = charSize;
             cmd[6]  = (short)cxs; cmd[7]  = (short)cyls;
-            cmd[8]  = (short)cxe; cmd[9]  = (short)cyle;
-            cmd[10] = (short)cxe; cmd[11] = (short)chye;
+            cmd[8]  = (short)(cxe + xg); cmd[9]  = (short)cyle;
+            cmd[10] = (short)(cxe + xg); cmd[11] = (short)chye;
             cmd[12] = (short)cxs; cmd[13] = (short)chys;
             vdp1_cmd_at(VDP1_BANK[vdp1_wbank], vdp1_wnext++, cmd);
         }

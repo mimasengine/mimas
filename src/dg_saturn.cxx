@@ -2144,8 +2144,17 @@ static void fps_update(void)
            toggle) -> resolves the ~1.5ms W5/DMA deltas the old integer rounded away.  Folded into
            THIS field (no new overlay row -- rows are saturated across dg_saturn + r_parallel). */
         unsigned int bmt = blit10_cnt ? (blit10_sum / blit10_cnt) : 0u;   /* tenths-ms */
-        sprintf(ovbuf, "R%u T%u S%u b%u.%u%c%c dg%u pr%u.%u    ",
-                _rec, _tic, _snd, bmt / 10, bmt % 10, blit_c, blit_w, _dg, _pr10 / 10, _pr10 % 10);
+        /* 🔴 `rs` (2026-08-18) = R_RenderPlayerView's PRE-BSP setup -- the slave-clear join,
+           R_SetupFrame, R_PostFlatCacheFrame.  `R` here is DERIVED (MST - T - S - b - dg) while
+           row 2's Bw/Bp/P/M are MEASURED, and the two differ by ~11,6 ms.  `rs` is the only
+           candidate phase in that gap: if it reads ~11 the frame is fully accounted for, if it
+           reads ~0 the gap is the slop of a derived number and should be treated as noise. */
+        unsigned int rs10 = _f ? (sat_r_setup_frt * 10u / 224u) / _f : 0u;
+        sat_r_setup_frt = 0;
+        sprintf(ovbuf, "R%u T%u S%u b%u.%u%c%c dg%u pr%u.%u rs%u.%u  ",
+                _rec, _tic, _snd, bmt / 10, bmt % 10, blit_c, blit_w, _dg, _pr10 / 10, _pr10 % 10,
+                rs10 / 10, rs10 % 10);
+        ovbuf[40] = ' ';
         if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 1, ovbuf);
         /* row 17: SPLIT per-view render times, ms (the CLEAN probe for "does M7 lowres actually
            save time in 3/4p?").  v0..v3 = each R_RenderPlayerView (d_ms-bracketed in d_main's split
@@ -2887,36 +2896,48 @@ static void fps_update(void)
                    so the decimal was precision the measurement does not have -- and six fields at
                    40 columns leave no room for it ([[debug-overlay-line-width]]). */
                 {
-                    unsigned int mo_ms = _f ? (sat_thk_mobj_frt * 10u / 224u) / _f / 10u : 0u;
-                    unsigned int mv_ms = _f ? (sat_thk_move_frt * 10u / 224u) / _f / 10u : 0u;
-                    unsigned int pt_ms = _f ? (sat_thk_path_frt * 10u / 224u) / _f / 10u : 0u;
-                    unsigned int sb_ms = _f ? (sat_thk_sub_frt  * 10u / 224u) / _f / 10u : 0u;
-                    unsigned int bt_ms = _f ? (sat_thk_blk_frt  * 10u / 224u) / _f / 10u : 0u;
+                    unsigned int mo_ms = _f ? (sat_thk_mobj_frt  * 10u/224u)/_f/10u : 0u;
+                    unsigned int ph_ms = _f ? (sat_thk_phys_frt  * 10u/224u)/_f/10u : 0u;
+                    unsigned int sm_ms = _f ? (sat_thk_state_frt * 10u/224u)/_f/10u : 0u;
+                    unsigned int mv_ms = _f ? (sat_thk_move_frt  * 10u/224u)/_f/10u : 0u;
+                    unsigned int sb_ms = _f ? (sat_thk_sub_frt   * 10u/224u)/_f/10u : 0u;
+                    unsigned int bt_ms = _f ? (sat_thk_blk_frt   * 10u/224u)/_f/10u : 0u;
                     unsigned int thn   = _f ? sat_thk_n / _f : 0u;
                     snprintf(ovbuf, sizeof ovbuf,
-                             "THK n%u mo%u mv%u pt%u sb%u bt%u            ",
+                             "THK n%u mo%u ph%u sm%u mv%u sb%u bt%u        ",
                              thn > 9999u ? 9999u : thn,
-                             mo_ms > 999u ? 999u : mo_ms, mv_ms > 999u ? 999u : mv_ms,
-                             pt_ms > 999u ? 999u : pt_ms, sb_ms > 999u ? 999u : sb_ms,
-                             bt_ms > 999u ? 999u : bt_ms);
-                    /* Six fields is one more than the trailing-space trick can cover: the widest
-                       form is EXACTLY the 40 visible columns, so any padding that clears a short
-                       line would overflow a long one.  Pad generously, then cut at 40 -- the tail is
-                       always blanked and the line can never wrap.  This is the `pf100 0` artefact
-                       fixed at the source instead of guessed at. */
-                    ovbuf[40] = '\0';
+                             mo_ms > 999u ? 999u : mo_ms, ph_ms > 999u ? 999u : ph_ms,
+                             sm_ms > 999u ? 999u : sm_ms, mv_ms > 999u ? 999u : mv_ms,
+                             sb_ms > 999u ? 999u : sb_ms, bt_ms > 999u ? 999u : bt_ms);
+                    ovbuf[40] = ' ';
                     if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 23, ovbuf);
                     sat_thk_mobj_frt = sat_thk_move_frt = sat_thk_n = 0;
-                    sat_thk_path_frt = sat_thk_sub_frt = sat_thk_blk_frt = 0;
+                    sat_thk_phys_frt = sat_thk_state_frt = 0;
+                    sat_thk_sub_frt  = sat_thk_blk_frt   = 0;
                 }
-                snprintf(ovbuf, sizeof ovbuf, "TIC th%u.%u s%u.%u x%u.%u a%u.%u b%u.%u v%u.%u mk%d  ",
-                         th10 / 10u, th10 % 10u, sg10 / 10u, sg10 % 10u,
-                         xt10 / 10u, xt10 % 10u, av10 / 10u, av10 % 10u,
-                         bl10 / 10u, bl10 % 10u, vb10 / 10u, vb10 % 10u,
-                         (sat_thing_masked_cut > 99 ? 99 : sat_thing_masked_cut));
+                /* 🔴 2026-08-18 -- `sp` EXISTS BECAUSE I MISREAD THIS ROW, TWICE.  I compared `b`
+                   (what NetUpdate WANTED) against `v` and reported the clock healthy at 94-95 %.
+                   `x` is what actually RAN, and an independent cross-check settles it: TNT MAP11
+                   has 422 THINGS and row 23 reads n~1921 P_MobjThinker calls a frame -- 1921/422 =
+                   4,55 tics, which matches `x` and NOT `b`.  The game runs at a THIRD to two thirds
+                   of real time and the fps counter cannot see it.
+                   `sp` = 100 * x / (0,583 * v) = the game speed in percent, so nobody has to do that
+                   division on a photograph again.  `a` RETIRED: the code's own decision rule needed
+                   `a` only to separate "elected but not run" from "never built", and a == x on every
+                   capture ever taken answers it.  `mk` RETIRED with the grate feature.
+                   `sc` = the SECTOR thinkers, so `th - mo - sc` is the bare list walk + Z_Free. */
+                unsigned int sc_ms = _f ? (sat_thk_sect_frt * 10u/224u)/_f/10u : 0u;
+                unsigned int owed10 = (vb10 * 583u) / 1000u;          /* 35 Hz / 60 Hz = 0,583 */
+                unsigned int sp     = owed10 ? (xt10 * 100u) / owed10 : 0u;
+                snprintf(ovbuf, sizeof ovbuf, "TIC th%u s%u x%u.%u v%u.%u sp%u%% sc%u        ",
+                         th10 / 10u, sg10 / 10u,
+                         xt10 / 10u, xt10 % 10u, vb10 / 10u, vb10 % 10u,
+                         sp > 999u ? 999u : sp, sc_ms > 999u ? 999u : sc_ms);
+                ovbuf[40] = ' ';
                 if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 24, ovbuf);
                 sat_tic_think_frt = 0; sat_tic_sight_frt = 0;
                 sat_tic_runs = 0; sat_tic_avail = 0; sat_tic_built = 0; sat_thing_masked_cut = 0;
+                sat_thk_sect_frt = 0;
                 sightcounts[0] = sightcounts[1] = 0; sat_sight_cachehit = 0;
             }
             r_composite_pf = 0;   /* own the reset HERE: row 18's R_CompositeWindowReset runs before

@@ -157,6 +157,26 @@ is **not** a failure — see §D.
 > split-screen runs the same per-frame present but was never A/B'd under it; step-1 emission fixes
 > (sprite floors, LOPR budget un-gating) still not built.
 
+> **STEP 1 AS-BUILT 2026-08-19 (same evening; split validated by the owner, default build validated
+> on Ymir).** (a) The measured-budget state (LOPR meter, `vdp1_budget_cmds`, weapon reserve,
+> wall-span LOD knobs) and its application moved **out of `#if SHOW_FPS`** — it drives emission, so
+> a release build must keep it; only the tx count and fb profiler stay overlay-gated. (b) **New
+> overrun signal**: under the gated swap the LOPR guillotine can never fire (LP≡100), so the budget
+> now backs off on the fence's **COPR-gate spin** (`sat_mp_gate_ms`, row 8 `g`): every spin ms is a
+> frame ms lost 1:1 → `vdp1_budget_cmds` snaps multiplicatively below the list that spun (floor 32);
+> the clean-frame drift-up re-probes as before; the LOPR branch stays (inert, revives if the present
+> ever reverts). (c) Core floors raised (flag DoomJo, constants only): decorations 2%→1%, actors
+> 5‰→2‰, `THING_EMIT_MAX` 16→32 lockstep with `THING_ADAPT_MAX`, boot cap 4→8. (d)
+> `THINGS_TEX_SLOTS` 4→6 was tried for ONE build and **REVERTED** (owner captures: monsters in the
+> HUD, HUD texels on monsters): the things pool truly ends at 0x25C78000 — `VDP1_HUD_TEX` sits at
+> 0x25C78000..0x25C7BC00 (bar + double-buffered message slots) and the 2p HUD stack reaches
+> 0x25C7D000 into the "free" F banks; raising the distinct-texture grant needs a relocated region
+> + split addressing, not a constant bump. (e) The `ec`→0 snap softened: `budget_cap` floor 2 (1p
+> and per-view split) — the two nearest actors always ride; the flush guard still hard-bounds the
+> bank. Pool 19.48 KB. Judge on
+> `th`/`ec` in hordes, `g` (should stay ~0), fps; the CPU may be the binder on console (T165>R141) —
+> final verdict there.
+
 ## D. The motion holes ("ils ont toujours existé" — owner correction 2026-08-18)
 
 **History**: the artifact is coeval with the first VDP1 wall — core `84f3130` (06-17, one day after

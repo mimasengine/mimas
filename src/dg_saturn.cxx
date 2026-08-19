@@ -1714,6 +1714,9 @@ static int sat_mp_active       = 0;   /* FCM entered (first change pulse issued 
 static int sat_mp_pending      = 0;   /* a kick armed this frame; present due at the fence */
 static int sat_mp_wd           = 0;   /* cumulative timed-out plots (force-swapped, may tear) */
 static int sat_mp_wait_ms      = 0;   /* fence wait last frame, ms = the measured cap cost */
+static int sat_mp_gate_ms      = 0;   /* of which: COPR-gate spin = the plot outlived the frame
+                                         (0 when the plot was done first).  THE live overrun
+                                         signal for the emission budget (row 8 `g`). */
 static unsigned short sat_mp_copr_kick = 0;  /* COPR sampled right after PTMR=1 (Ymir clause) */
 static unsigned short sat_mp_end_ca    = 0;  /* staged end-command addr of the list just kicked
                                                 (>>3 units): wall path = the empty-bank END; the
@@ -1727,17 +1730,13 @@ static unsigned short sat_mp_end_ca    = 0;  /* staged end-command addr of the l
    increments them always links) -- the pool struct itself is defined later with the weapon cache. */
 static int sat_things_n = 0, sat_things_decl = 0, thing_bake_n = 0;   /* 'th' emitted/declined, 'fb' baked (cache misses) */
 
-#if SHOW_FPS
-extern "C" int rp_timeout_count;
-extern "C" int rp_to_site[4];            /* core r_parallel.c: per-wait-site timeout split A/P/M/W */
-/* SATURN L5 near-wall edge split: the core-side hook pointer + this file's implementation of it. */
-extern "C" int (*sat_wall_edge_hook)(int, int, int, int, int, int, int, int, int,
-                                     int *, int *, int *, int *, int *);
-extern "C" int sat_wall_edge_split(int, int, int, int, int, int, int, int, int,
-                                   int *, int *, int *, int *, int *);
-extern "C" unsigned int rp_master_ms;   /* master frame ms -> prefixes r_parallel.c's row-18 SLV line */
-extern "C" int sat_opt;                  /* core r_segs.c: cumulative perf-lever level L1..L4 (pad L+C) */
-static unsigned int dg_frame_count = 0;
+/* ============================================================================
+   MEASURED VDP1 BUDGET STATE -- moved OUT of the #if SHOW_FPS overlay block 2026-08-19 (step 1
+   of the manual-present plan): this state drives EMISSION (things AIMD, wall-span LOD, weapon
+   reserve), not just the overlay -- a SHOW_FPS=0 release build must keep it.  Latent until then
+   (SHOW_FPS is hardcoded 1) but the gating was a release trap.  Overlay-only state (fb_ profiler,
+   tx counts, percentiles) stays behind SHOW_FPS. */
+extern "C" unsigned int rp_master_ms;   /* master frame ms -- gates the wall-span LOD (software side saturated?) */
 static int vdp1_last_cmds = 0;
 /* VDP1 transfer-over meter (SEGA VDP1 UM p.52-53).  The real flicker signal: did the plot finish the
    command list in the frame?  LOPR/COPR are cmd addrs in (VRAM byte offset)>>3 units. */
@@ -1749,7 +1748,11 @@ static int vdp1_tx_used = 0;                          /* wtex cache slots occupi
    many VDP1 commands the frame's plot TIME actually paid for, READ from LOPR (not guessed): on an
    overrun it IS the exact reach; on a clean frame it drifts up +1 / THING_LP_CLEAN to re-probe
    headroom.  The things AIMD and the wall-span LOD both allocate against THIS number instead of the
-   static slot cap -- so the "default" cap is the real measured per-frame budget, not a guess. */
+   static slot cap -- so the "default" cap is the real measured per-frame budget, not a guess.
+   ⚠ 2026-08-19: under the MANUAL PRESENT the LOPR guillotine cannot fire (the fence WAITS for
+   completion -> LP is always 100); the live back-off signal is now the fence's COPR-gate spin
+   (sat_mp_gate_ms) -- every ms the gate spins is a frame ms lost 1:1.  The LOPR branch is kept:
+   it costs nothing and would resume service if the present ever reverted to 1-cycle. */
 /* 🔴 RECOVERY RE-TUNED 2026-08-09 -- the controller's clock was the FRAME, and our frame is 10-25x
    longer than whatever rate 24 was chosen for.  Decrease is one-shot multiplicative (`/4`), increase
    was +1 every 24 frames: from a latched 45 back to 248 is 203 steps x 24 frames = 487 SECONDS at
@@ -1771,7 +1774,9 @@ static int vdp1_budget_map   = -1;                    /* gamemap the current mea
    its slot.  The reserve is in COMMAND-EQUIVALENTS, not slots: the gun occupies ~3 command slots but
    costs many slots' worth of plot TIME (large sprite), and that ratio is scene- and weapon-dependent,
    so it is LEARNED by AIMD on the direct observation rather than guessed.  Grows fast on a cut (the
-   gun must not blink twice for the same cause), decays slowly when the plot keeps reaching it. */
+   gun must not blink twice for the same cause), decays slowly when the plot keeps reaching it.
+   (Under the manual present a cut can no longer happen -- the fence waits -- so the reserve decays
+   to its floor and stays there: correct, the guarantee is structural now.) */
 #define WPN_RESERVE_MIN   6                           /* floor = the weapon's own slot cost (clip+gun+flash+slack) */
 #define WPN_RESERVE_MAX  64                           /* ceiling: past this we would starve the world to save the gun */
 #define WPN_RESERVE_UP    8                           /* AIMD grow step on a cut                                     */
@@ -1791,6 +1796,19 @@ static int vdp1_wpn_safe      = 0;                    /* consecutive reached-fra
 #define WALL_SPAN_MIN         200                     /* floor: cap how many near walls we push to software */
 #define WALL_SPAN_STEP         40                     /* per-frame span adjust (AIMD ramp; < BAND so a wall crosses over >=2 frames) */
 #define WALL_PREWARM_BAND      96                     /* = core (V1 576 - span 480); kept constant so the CPU/VDP1 handoff band survives the shift */
+
+#if SHOW_FPS
+extern "C" int rp_timeout_count;
+extern "C" int rp_to_site[4];            /* core r_parallel.c: per-wait-site timeout split A/P/M/W */
+/* SATURN L5 near-wall edge split: the core-side hook pointer + this file's implementation of it. */
+extern "C" int (*sat_wall_edge_hook)(int, int, int, int, int, int, int, int, int,
+                                     int *, int *, int *, int *, int *);
+extern "C" int sat_wall_edge_split(int, int, int, int, int, int, int, int, int,
+                                   int *, int *, int *, int *, int *);
+extern "C" int sat_opt;                  /* core r_segs.c: cumulative perf-lever level L1..L4 (pad L+C) */
+static unsigned int dg_frame_count = 0;
+/* (the measured-budget / weapon-reserve / wall-LOD state that lived here moved ABOVE this #if on
+   2026-08-19 -- it drives emission, not just the overlay.  vdp1_tx_total stays here: overlay-only.) */
 
 /* ============================================================================
    SATURN world-things-on-VDP1: SESSION percentile metrics -- so ONE end-of-level capture tells
@@ -2483,10 +2501,14 @@ static void fps_update(void)
                of the cap: align-to-vblank + the vblank itself, expect ~2-18 avg ~10, owner
                captures 13-15 (a reading of 14-26+ sustained = a missed change sample -- the
                v1 armed-field cost). */
-            snprintf(ovbuf, sizeof ovbuf, "VD1 fbw%d fbm%d MP%d w%d %dms ",
+            /* g<ms> (2026-08-19, step 1) = the fence's COPR-gate spin alone: 0 = the plot was
+               done before the frame ended (free); >0 = the plot made the frame WAIT that many
+               ms = the live overrun signal the emission budget backs off on.  <ms> includes it. */
+            snprintf(ovbuf, sizeof ovbuf, "VD1 fbw%d fbm%d MP%d w%d %dms g%d ",
                      fb_pk_starve, fb_pk_mag,
                      sat_mp_active, (sat_mp_wd > 999 ? 999 : sat_mp_wd),
-                     (sat_mp_wait_ms > 99 ? 99 : sat_mp_wait_ms));
+                     (sat_mp_wait_ms > 99 ? 99 : sat_mp_wait_ms),
+                     (sat_mp_gate_ms > 99 ? 99 : sat_mp_gate_ms));
             /* (fbf -- floor tiles truncated -- dropped 2026-08-02 with the VDP1 floor deport: it
                was structurally 0 in every reachable mode.  fbw is now the sole over-budget bit.) */
             if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 8, ovbuf);
@@ -4728,7 +4750,11 @@ static int vdp1_hud_force_recopy = 0;   /* palette change (level load / flash) -
    texture, so a same-type horde shares slots and offloads wholesale; the rest stay software.  4 x
    3584 x 2 parity = 28KB (the whole gap).  More distinct textures => cede wall-pool VRAM to raise
    THINGS_TEX_SLOTS.  'th' counts emitted/declined; 'fb' baked (misses), 'sb' session bake%. */
-/* VRAM UNION DISSOLVED 2026-08-02.  This pool 0x25C71000..0x25C78000 (28KB) used to ALIAS the ftex
+/* VRAM UNION DISSOLVED 2026-08-02.  ⚠ "THINGS owns the tail outright" below means the 28KB pool
+   0x25C71000..0x25C78000 ONLY: the rest of the old ftex tail (0x25C78000..0x25C7B800) is the HUD's
+   (VDP1_HUD_TEX + message slots, see ~line 4723) -- growing THINGS_TEX_SLOTS past 4 overwrites it
+   (proven by the 2026-08-19 one-build regression).
+   This pool 0x25C71000..0x25C78000 (28KB) used to ALIAS the ftex
    flat-cache tail 0x25C71000..0x25C7B800 (42KB) -- the 44KB tail could not hold both, so they were
    kept mutually exclusive by render mode and sat_apply_mode enforced an interlock.  The ftex floor
    deport is gone with M5, so THINGS owns the tail outright and the interlock is deleted.
@@ -4736,6 +4762,12 @@ static int vdp1_hud_force_recopy = 0;   /* palette change (level load / flash) -
    16KB, the top of VDP1 VRAM).  Natural claimants, in order: more THINGS_TEX_SLOTS (a same-type
    horde already shares slots, so extra slots buy DISTINCT textures), or wall-texture slots. */
 #define THINGS_TEX_BASE   0x25C71000u
+/* ⚠ 2026-08-19: 4 -> 6 slots was tried for ONE build and REVERTED the same evening -- the owner's
+   captures showed monsters in the HUD and HUD texels on monsters.  The things pool truly ends at
+   0x25C78000: VDP1_HUD_TEX sits at 0x25C78000 (bar 320x32) with the double-buffered HUD message
+   slots behind it up to 0x25C7BC00, and the 2p HUD stack can reach 0x25C7D000 INTO the "free" F
+   banks.  Parity-1 slots 3..6 of the 6-slot layout landed exactly on the HUD region.  Raising the
+   distinct-texture grant needs a RELOCATED extra region + split addressing, not a constant bump. */
 #define THINGS_TEX_SLOTS  4                /* slots PER parity == max distinct things offloaded/frame (VRAM cap) */
 #define THINGS_TEX_SLOTSZ 0x0E00u          /* 3584 B -> fits any shareware monster frame @ 8bpp */
 /* KEY = (lump, xlat, cmap) where `cmap` is NULL for every standard light level.  Until 2026-08-06
@@ -4752,7 +4784,11 @@ static unsigned int thing_lru_tick;        /* monotonic use counter -> evict the
 /* AIMD adaptive things-per-frame budget (sat_walls_kick): grow slowly on a finished plot, back off
    fast on an overrun.  THING_ADAPT_MAX must match core THING_EMIT_MAX (the scratch-array bound). */
 #define THING_CAP_GROW  8                  /* clean frames before +1 (slow additive increase) */
-#define THING_ADAPT_MAX 16                 /* outdoor ceiling == core THING_EMIT_MAX */
+/* 2026-08-19 (step 1): 16 -> 32 in lockstep with core THING_EMIT_MAX.  The manual present
+   removed the one-field plot guillotine (the fence waits; overrun shows as gate spin `g`,
+   which the budget backs off on), so the ceiling is no longer the field -- let the AIMD
+   find the real one.  THING_ACC_MAX scales with it (split queue, ~24 B/entry of .bss). */
+#define THING_ADAPT_MAX 32                 /* ceiling == core THING_EMIT_MAX */
 /* (thing_cap_clean / thing_emit_floor / thing_overrun_run CUT 2026-08-09 -- see the note at the
    top toggles: all three were write-only, and the row-15 `ef` they fed printed a constant 0.) */
 /* (sat_things_n / sat_things_decl / thing_bake_n are defined earlier, before the overlay block) */
@@ -6021,12 +6057,16 @@ static void sat_mp_fence(void)
            by ~10+ ms, the plot is long done -- and on the menu path the ~2.5 ms mini-plot
            finishes inside the align-to-vblank wait below.) */
         unsigned int t0 = vbl_count;
+        uint32_t g0 = DG_GetTicksMs();
         for (;;)
         {
             unsigned short c = VDP1_COPR;
             if (c == sat_mp_end_ca || c == sat_mp_copr_kick) break;
             if ((vbl_count - t0) >= SAT_MP_WD_VBL) { sat_mp_wd++; break; }
         }
+        sat_mp_gate_ms = (int)(DG_GetTicksMs() - g0);   /* >0 = the plot made the frame WAIT;
+                                                           feeds the emission budget back-off
+                                                           at the next kick (row 8 `g`). */
     }
     /* 2: VBE erase & change at a fresh vblank-IN edge (p.40 window; SlaveDriver 0xfffe). */
     while ( (TVSTAT & 8)) { }                  /* arrived inside a vblank: wait it out    */
@@ -6760,7 +6800,8 @@ static void vdp1_wpn_kick(void)
 {
     unsigned int link;
     vdp1_prev_done = (VDP1_EDSR & 0x0002) ? 1 : 0;   /* did the previous frame's plot finish? */
-#if SHOW_FPS
+    /* (the meter below ran under #if SHOW_FPS until 2026-08-19 -- it feeds the EMISSION budget,
+       so it must survive a release build; only the tx count + fb profiler stay overlay-gated.) */
     {   /* VDP1 transfer-over meter (SEGA VDP1 UM p.52-53 LOPR/COPR/BEF; docs/VDP1_LIMITS_SOURCED.md).
            The list VDP1 is displaying used bank vdp1_bank with vdp1_last_cmds cmds -- BOTH still hold the
            PREVIOUS frame's values HERE (updated just below).  LOPR = the cmd addr where that plot ENDED;
@@ -6825,14 +6866,30 @@ static void vdp1_wpn_kick(void)
                     if (vdp1_wpn_reserve > WPN_RESERVE_MAX) vdp1_wpn_reserve = WPN_RESERVE_MAX;
                 }
             } }
+        /* MANUAL-PRESENT OVERRUN -- the live back-off (2026-08-19).  Under the gated swap the
+           LOPR guillotine above cannot fire (the fence waits for completion -> LP always 100):
+           a plot-time overrun now shows as the fence's COPR-gate SPIN, measured at the previous
+           frame's fence -- which gated exactly the list vdp1_last_cmds still describes here.
+           Every spin ms is a frame ms lost 1:1 -> back off multiplicatively below the list that
+           spun; the clean-frame drift above re-probes upward as before. */
+        if (sat_mp_gate_ms > 1 && vdp1_last_cmds > 0)
+        {
+            int b = vdp1_last_cmds - (vdp1_last_cmds >> 3);
+            if (b < 32) b = 32;                      /* working floor: gun + the nearest things */
+            if (vdp1_budget_cmds == 0 || b < vdp1_budget_cmds) vdp1_budget_cmds = b;
+            vdp1_budget_clean = 0;
+        }
+#if SHOW_FPS
         {   int u = 0; for (int i = 0; i < WTEX_SLOTS; ++i) if (wtex_cache[i].texnum >= 0) u++;
             vdp1_tx_used = u; vdp1_tx_total = WTEX_SLOTS; }
+#endif
     }
     vdp1_last_cmds = vdp1_wactive ? vdp1_wnext : 0;
     vdp1_wpn_slot_disp = vdp1_wactive ? vdp1_wpn_slot_end : 0;   /* the list LOPR will report on next kick */
     /* (vd1_wpct CUT 2026-08-09 with the row-8 `w%` it fed -- a division per frame to restate row 17
        `c` as a percentage of a constant.) */
     /* (the vd1_dr_live gate went with vdp1_vblank_dr, 2026-08-10.) */
+#if SHOW_FPS
     /* Phase-0 fallback profiler: snapshot the just-rendered frame's tally into cur + windowed peaks
        (r_segs.c accumulated the counters across this frame's segs), then reset below. */
     fb_cur_clamp = sat_fb_clamp_t; fb_cur_mag = sat_fb_mag_t; fb_cur_px = sat_fb_px;
@@ -7056,20 +7113,23 @@ extern "C" void sat_walls_kick(void)
                      headroom -> push near walls to software (lower sat_wall_cpu_span) to free VDP1.
                      Gated on rp_master_ms so we NEVER trade a blink for decrochage (two-engine balance). */
             int cap_cmds = vdp1_wall_cap;                       /* hard SLOT ceiling (248) */
-#if SHOW_FPS
             if (vdp1_budget_cmds > 0 && vdp1_budget_cmds < cap_cmds)
                 cap_cmds = vdp1_budget_cmds;                    /* measured TIME budget (usually tighter) */
-#endif
             /* vdp1_wpn_reserve is withheld FIRST: the gun is emitted after the things, so anything
                the things allocate here is spent ahead of it in the plot.  THING_FLUSH_MARGIN keeps
                its SLOTS free; the reserve keeps its plot TIME free (the resource that actually cuts). */
             int room = cap_cmds - vdp1_wnext - THING_FLUSH_MARGIN - vdp1_wpn_reserve;
             int budget_cap = (room > 0) ? (room >> 1) : 0;      /* ~2 VDP1 cmds per emitted thing */
             if (budget_cap > THING_ADAPT_MAX) budget_cap = THING_ADAPT_MAX;
+            /* SOFTENED SNAP (2026-08-19, step 1): room<=0 used to zero the cap -- every monster
+               fell to the software fill at once, in exactly the dense scenes where the CPU is
+               busiest (the `ec`->0 mid-map collapse).  Floor of 2: the two nearest actors (the
+               rank is nearest-first) always ride VDP1; the flush guard still hard-bounds the
+               bank, so a mispredict declines (thd_budget) instead of overflowing. */
+            if (budget_cap < 2) budget_cap = 2;
             if (sat_thing_emit_cap < budget_cap)      sat_thing_emit_cap += 2;         /* smooth ramp up */
             else if (sat_thing_emit_cap > budget_cap) sat_thing_emit_cap = budget_cap; /* snap down to fit */
             if (sat_thing_emit_cap < 0) sat_thing_emit_cap = 0;
-#if SHOW_FPS
             /* (2) WALL LOD: engage only when things are already shed and the walls STILL overrun the
                VDP1 budget (room for things <= trigger), AND the master (software) has room to take them.
                Lower the span -> more near walls -> software (CPU), freeing VDP1; relax back to the core
@@ -7084,7 +7144,6 @@ extern "C" void sat_walls_kick(void)
                 }
                 sat_wall_cpu_v1 = sat_wall_cpu_span + WALL_PREWARM_BAND;   /* keep the pre-warm band width -> V1 is the real VDP1-exit */
             }
-#endif
         } else {
             /* SPLIT WBUDGET (2026-07-20): identical command-budget policy to the 1p branch above, but
                sat_thing_emit_cap is PER-VIEW and nv views each emit up to it into the shared queue, so
@@ -7099,6 +7158,7 @@ extern "C" void sat_walls_kick(void)
             int room = vdp1_wall_cap - vdp1_wnext - THING_FLUSH_MARGIN - vdp1_wpn_reserve;
             int budget_cap = (room > 0) ? (room / (2 * nv)) : 0;   /* per-view slots (~2 cmds/thing) */
             if (budget_cap > THING_ADAPT_MAX) budget_cap = THING_ADAPT_MAX;
+            if (budget_cap < 2) budget_cap = 2;   /* softened snap, same as 1p: 2 nearest per view */
             if (sat_thing_emit_cap < budget_cap)      sat_thing_emit_cap += 2;         /* smooth ramp up */
             else if (sat_thing_emit_cap > budget_cap) sat_thing_emit_cap = budget_cap; /* snap down to fit */
             if (sat_thing_emit_cap < 0) sat_thing_emit_cap = 0;

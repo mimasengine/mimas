@@ -1666,6 +1666,62 @@ static volatile int vdp1_couple_nbg1     = 0;   /* brick B: defer the NBG1 blit 
 #define VDP1_COUPLE_MAX_VBL    4    /* couple: wait at most this many vblanks for CEF before blitting anyway */
 #endif
 
+/* ============================================================================
+   SATURN MANUAL PRESENT (2026-08-19) -- the owner's theory, rebuilt from the Kronos-corrected
+   ST-013 contract (docs/VDP1_MANUAL_PRESENT_VERDICT.md).  THE present since 2026-08-19: the
+   owner's Ymir A/B validated v2 (20-24 fps vs 18.4-19.4 auto+leadfill, `w0`, fence 13-15 ms,
+   motion holes GONE) -> default and unconditional, the L+B toggle removed, the AUTO 1-cycle
+   present retired, the lead-fill PARKED (core r_segs.c boot default 0).  Not yet re-validated
+   on console at that date; SlaveDriver precedent (same VBE sequence shipped) covers the HW
+   side on paper.  NOT the parked VDP1_MANUAL_CHANGE machinery above: that one gated on
+   EDSR.CEF (30-60% HW latch, never on Ymir) with an unfenced blit -- the two poisons every
+   past attempt carried.
+
+   AUTO (retired): FBCR=0 1-cycle.  VDP1 erases+swaps EVERY field and replots the rooted list;
+   a list rooted at kick K is visible from K+2 while the blit lands wherever the free loop puts
+   it -> the screen pairs picture N with list N-1 for 0-1 field per frame, beating with the
+   fractional field count.  That stale-pair sliver is the motion hole the CPU lead-fill
+   repainted each frame -- both mechanisms now retired together (owner 2026-08-19: "corriger
+   le decalage pour desactiver le lead-fill").
+
+   MANUAL: the kick plots ONCE (PTMR=1) into the clean back buffer; the erase is the in-list
+   colour-0 polygon (first bank command), so the HW erase choreography is never RELIED on.
+   The frame-end fence grants the swap with the VBE erase & change sequence (ST-013 p.40;
+   the exact sequence SlaveDriver ships as SCL frame interval 0xfffe): TVMR.VBE=1 +
+   FBCR=0x0003 at a fresh vblank-IN, VBE cleared after the OUT edge (red step 7).  That is
+   the ONE mode both machines time identically -- swap at the END of that same vblank: Ymir
+   evaluates it at its LastLine-end (vdp.cpp BeginHPhaseLeftBorder), the manual says "at the
+   end of V-blank ... the frame is changed".  (v1 used the p.38 OUT-window 0x0003 pulse and
+   rode one field -- correct per Table 4.3(a), swap at the NEXT boundary, but Ymir executes
+   a write landing in its one-line OUT window ~63 us later, a FIELD EARLY: owner captures
+   2026-08-19 showed the walls one field AHEAD of the picture for one field per frame = the
+   residual holes + the double-door frame.  One hardcoded ordering cannot satisfy both
+   contracts; VBE mode sidesteps the divergence.)  The blit starts right after the fence's
+   OUT edge: walls and picture commit on the same field, every frame, no beat -> the
+   lead-fill (and with it the entry-cover class) becomes belt-and-braces.
+   Completion gate = COPR, never CEF: done = COPR parked at the empty-bank END (0xC) or COPR
+   unmoved since the kick (Ymir: register not modelled = frozen = pass-through; HW: a re-read
+   of a *parked* register).  A moving-but-stalled plot times out on SAT_MP_WD_VBL and is
+   force-swapped -- sat_mp_wd counts it and is THE overrun metric here (LP% is tautological
+   once the swap is gated on completion).  Revert to AUTO = the legal two-pulse sequence
+   (erase 0x0002 in the prior field, then 0x0000; Table 4.3(a) note 5).  SGL cannot clobber
+   the pulses: in the SRL_FRAMERATE=0 config _BlankOut's FBCR write is dead code (DMASetFlag's
+   single writer is the never-run slSynch pipeline -- LIBSGL.A disasm, 2026-08-18 audit).
+   Known transition artifact: the first manual frame runs PTM=1 under the still-auto swap, so
+   its plot straddles both buffers -> ~1 frame of wall garbage on toggle-ON.  Accepted for an
+   A/B knob; entering via a pre-change would cost more machinery than it removes. */
+static int sat_mp_active       = 0;   /* FCM entered (first change pulse issued since boot) */
+static int sat_mp_pending      = 0;   /* a kick armed this frame; present due at the fence */
+static int sat_mp_wd           = 0;   /* cumulative timed-out plots (force-swapped, may tear) */
+static int sat_mp_wait_ms      = 0;   /* fence wait last frame, ms = the measured cap cost */
+static unsigned short sat_mp_copr_kick = 0;  /* COPR sampled right after PTMR=1 (Ymir clause) */
+static unsigned short sat_mp_end_ca    = 0;  /* staged end-command addr of the list just kicked
+                                                (>>3 units): wall path = the empty-bank END; the
+                                                menu erase mini-list = its own END.  Staged per
+                                                kick, never hardcoded -- the one COPR trap the
+                                                2026-08-18 verify pass flagged. */
+#define SAT_MP_WD_VBL 4               /* fields before a running plot is force-swapped */
+
 /* SATURN world-things-on-VDP1: per-frame emitted / declined counters (overlay 'th').  Defined here
    (before the SHOW_FPS overlay block that prints them, and unconditionally so the emit path that
    increments them always links) -- the pool struct itself is defined later with the weapon cache. */
@@ -1905,13 +1961,12 @@ extern "C" int sat_fb_edge_b[4];  /* L5 bail causes: lateral / magnitude / too-t
    the VDP1 quad is not in the wrong place -- it is not on screen at all. */
 extern "C" int sat_wall_entry;    /* core r_segs.c: CPU frames covering a newly-visible VDP1 wall */
 extern "C" int sat_seg_frame;     /* core r_segs.c: per-seg visit tag, advanced once per frame here */
-/* FIELD LOCK -- PARKED 2026-08-03 (owner: *"supprime wm1, 2, et park wm3"*).  0 = free-running
-   loop = the SHIPPING default and the only reachable position; the pad chord that selected it is
-   gone.  1 = fence the blit to a vblank edge so the loop phase-locks to the field rate and the
-   VDP1-vs-software BEAT stops; 2 = 1 + hold the blit until the walls are actually on screen
-   (age 2).  Both cost fps, and neither closed the motion hole -- that job now belongs to the
-   LEAD-FILL (sat_wall_lead_x).  The fence code below is left intact and inert: flip this to 1 to
-   bring it back for an A/B, no other change needed. */
+/* FIELD LOCK -- PARKED 2026-08-03 (owner: *"supprime wm1, 2, et park wm3"*), SUPERSEDED
+   2026-08-19: the manual-present fence (sat_mp_fence) now edge-locks EVERY frame and its
+   call site no longer consults this flag -- the variable and sat_field_fence are dead code
+   the compiler elides.  Kept as documentation of the Fl1/Fl2 era (see the long note at
+   sat_field_fence); reviving it would mean disabling the manual present, which the 2026-08-19
+   validation (holes gone, +fps) argues against ever doing. */
 static int sat_field_lock = 0;
 static int rbg0_rpt_late  = 2;    /* RBG0 rotation-table copy timing, 0/1/2 -- pad R+Left, row-13
                                      `F<m><rp>` 2nd digit.  Declared up here only so the row-13
@@ -1948,10 +2003,13 @@ static int vdp1_wall_drop = 0;   /* walls the core handed to VDP1 that the emit 
                                     row 13 `N<orphan>/<drop>/<flip>`, summed over the window.  Watched
                                     at the command pointer, so it catches every early return in
                                     wall_emit/_flat/_banded without auditing them one by one. */
-extern "C" int sat_wall_lead_x;    /* core r_segs.c: LEAD-FILL depth in frames, 0 = off (pad R+Right) */
+extern "C" int sat_wall_lead_x;    /* core r_segs.c: LEAD-FILL depth in frames -- PARKED 2026-08-19,
+                                      boot 0, no chord: the manual present removed the stale-pair
+                                      offset it repainted.  Set > 0 to revive for an A/B. */
 extern "C" int sat_gov_inert;      /* governor: bitmask of axes PROVEN not to buy time (w/p/lead) */
 extern "C" int sat_gov_lead_step;  /* governor rung: 0 full / 1 flat spans / 2 lead-fill off */
-extern "C" int sat_lead_mode;      /* core r_segs.c: 0 master-tex / 1 SLAVE-tex / 2 master-flat (R+Right) */
+extern "C" int sat_lead_mode;      /* core r_segs.c: 0 master-tex / 1 SLAVE-tex / 2 master-flat
+                                      (only read when sat_wall_lead_x > 0 -- parked with it) */
 extern "C" int sat_wall_dwell;     /* core r_segs.c: frames a flipped seg stays CPU-covered (pad R+Up) */
 extern "C" int sat_lead_span_drop; /* core r_segs.c: spans the slave list could not hold             */
 extern "C" int sat_lead_cols;      /* core r_segs.c: extra software column-spans drawn by the fill    */
@@ -2416,8 +2474,19 @@ static void fps_update(void)
             /* `w%` CUT 2026-08-09: it was EXACTLY vdp1_last_cmds*100/WALL_CMD_CAP, i.e. row 17 `c`
                expressed as a percentage -- a pure duplicate, and one whose letter (`w` for wall)
                actively misled: the numerator is the WHOLE command list, not the walls. */
-            snprintf(ovbuf, sizeof ovbuf, "VD1 fbw%d fbm%d ",
-                     fb_pk_starve, fb_pk_mag);
+            /* MP<act> w<wd> <ms>ms = MANUAL PRESENT (sat_mp_*, THE present since 2026-08-19;
+               the L+B toggle and its `on` digit left with the validation).  act = FCM entered
+               (first change granted since boot; 0 only before the first fence).  w =
+               CUMULATIVE force-swapped plots (the overrun metric -- LP% is tautological once
+               the swap is gated on completion; a RISING w across two photos = plots not
+               finishing).  <ms>ms = last frame's fence wait = the measured quantisation cost
+               of the cap: align-to-vblank + the vblank itself, expect ~2-18 avg ~10, owner
+               captures 13-15 (a reading of 14-26+ sustained = a missed change sample -- the
+               v1 armed-field cost). */
+            snprintf(ovbuf, sizeof ovbuf, "VD1 fbw%d fbm%d MP%d w%d %dms ",
+                     fb_pk_starve, fb_pk_mag,
+                     sat_mp_active, (sat_mp_wd > 999 ? 999 : sat_mp_wd),
+                     (sat_mp_wait_ms > 99 ? 99 : sat_mp_wait_ms));
             /* (fbf -- floor tiles truncated -- dropped 2026-08-02 with the VDP1 floor deport: it
                was structurally 0 in every reachable mode.  fbw is now the sole over-budget bit.) */
             if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 8, ovbuf);
@@ -5921,6 +5990,65 @@ static void sat_field_fence(void)
     fv_prev = vbl_count;
 }
 
+/* SATURN MANUAL PRESENT fence + swap grant -- design at the sat_mp_* state block (~1670).
+   Sits at the field-lock call site so it doubles as the Fl1 blit fence: it returns right
+   after the vblank the swap executes at the end of, and the blit that follows starts on that
+   edge -> picture N and wall-list N go live on the same field, every frame.
+   TVSTAT bit 3 = VBLANK flag (1 inside vblank).  v2 (2026-08-19, after the owner's capture
+   session): VBE erase & change, because it is the one swap both Ymir and the ST-013 contract
+   time at the SAME instant (end of the vblank the write lands in) -- see the state block.
+   Edge discipline: always catch a FRESH IN edge (wait out a vblank we arrive inside of):
+   a write landing late in a vblank risks missing the hardware's change sample for that
+   boundary, and a missed one-field FCT pulse is VOID (red p.38 note), not deferred.  The
+   VBE erase this triggers on the retiring buffer is partial on NTSC (x10 deficit) and
+   harmless -- the in-list colour-0 polygon owns the real erase.  Wait = align-to-vblank
+   (avg ~half a field) + the vblank itself; measured into sat_mp_wait_ms (row 8). */
+static void sat_mp_fence(void)
+{
+    uint32_t w0 = DG_GetTicksMs();
+    /* (The legal two-pulse AUTO revert -- erase 0x0002 then 0x0000, Table 4.3(a) note 5 --
+       left with the L+B toggle on 2026-08-19.  Re-entering 1-cycle needs it back.) */
+    if (!sat_mp_pending)
+        return;                                /* no kick this frame -> nothing to present */
+    {   /* 1: plot done?  Parked at the empty-bank END (HW), or unmoved since the kick
+           (Ymir's unmodelled register / a plot that finished before we first sampled).  A
+           MOVING plot spins here -- normally already done, the kick was fields ago -- and a
+           stalled one exits on the vblank bound as a force-swap (may tear once, never
+           freezes).  sat_mp_wd counts those: it is the manual-mode overrun metric.
+           (Known alias, 2026-08-19 audit: on HW the COPR sampled at kick time can still
+           read the PREVIOUS plot's parked END == sat_mp_end_ca, so an unstarted plot
+           passes the gate.  Benign on the gameplay path -- the kick precedes this fence
+           by ~10+ ms, the plot is long done -- and on the menu path the ~2.5 ms mini-plot
+           finishes inside the align-to-vblank wait below.) */
+        unsigned int t0 = vbl_count;
+        for (;;)
+        {
+            unsigned short c = VDP1_COPR;
+            if (c == sat_mp_end_ca || c == sat_mp_copr_kick) break;
+            if ((vbl_count - t0) >= SAT_MP_WD_VBL) { sat_mp_wd++; break; }
+        }
+    }
+    /* 2: VBE erase & change at a fresh vblank-IN edge (p.40 window; SlaveDriver 0xfffe). */
+    while ( (TVSTAT & 8)) { }                  /* arrived inside a vblank: wait it out    */
+    while (!(TVSTAT & 8)) { }                  /* fresh IN edge                           */
+    VDP1_TVMR = 0x0008;                        /* VBE=1 (TVM=000 unchanged)               */
+    VDP1_FBCR = 0x0003;                        /* erase & change: swap at THIS vblank's END */
+#if VDP2_CELL_SKY
+    /* Deferred sky map, INSIDE the same vblank: the new sky boundary, the new wall list
+       and the picture blit that follows all land on the field starting at the OUT edge.
+       ~1 ms of halfwords against ~2.4 ms of vblank; an overrun only delays the blit start
+       by its tail (same tear class as writing it after the fence, which auto mode does). */
+    if (sky_map_pending) { sky_cell_write_map(); sky_map_pending = 0; }
+#endif
+    /* 3: ride to the OUT edge -- the swap has just executed (both machines).  The caller
+       blits right after, racing the beam from the top of the field (Fl1 phase, ~2.5x). */
+    while ( (TVSTAT & 8)) { }
+    VDP1_TVMR = 0x0000;                        /* red step 7: no auto V-blank erase next  */
+    sat_mp_active  = 1;
+    sat_mp_pending = 0;
+    sat_mp_wait_ms = (int)(DG_GetTicksMs() - w0);
+}
+
 /* (vdp1_vblank_dr CUT 2026-08-10.  It sampled EDSR.CEF at every vblank into mh_vbl_done/tot, whose
    only consumer -- row 10 `D%` -- was cut on 08-09.  Its own comment said "cut it or print it, do not
    leave it here a second time", so: cut, along with its OnVblank registration and vd1_dr_live.  It
@@ -6038,6 +6166,25 @@ extern "C" void sat_vdp1_wpn_begin(void)
     cmd[7] = VIEW_Y_OFFSET;                          /* local Y origin -> walls centred like NBG1 */
     vdp1_cmd_at(VDP1_BANK[vdp1_wbank], 0, cmd);
     vdp1_wnext   = 1;
+    /* SATURN MANUAL PRESENT: in-list full-screen colour-0 erase as the bank's first DRAWING
+       command.  Manual mode does not RELY on the HW erase: the VBE pulse in sat_mp_fence is
+       there for its end-of-vblank SWAP timing, and its vblank erase only part-covers the
+       retiring buffer on NTSC (~10x deficit) -- so each plot wipes its own back buffer here
+       (~2.5 ms of plot inside a multi-field window).  Index 0 = VDP2-transparent,
+       the same colour the retired AUTO per-field HW erase wrote (EWDR=0).  Costs one command
+       slot; every downstream count (vdp1_wnext, LOPR meter, weapon slots) is cursor-based, so
+       no special accounting. */
+    {
+        memset(cmd, 0, sizeof cmd);
+        cmd[0]  = 0x0004;                            /* FUNC_Polygon (flat)               */
+        cmd[2]  = 0x00C0;                            /* SPD (write all, incl 0) | ECD-off */
+        cmd[3]  = 0x0000;                            /* CMDCOLR 0 -> framebuffer index 0  */
+        cmd[6]  = 0;   cmd[7]  = 0;                  /* A (0,0)   (VIEW_Y_OFFSET = 0)     */
+        cmd[8]  = 319; cmd[9]  = 0;                  /* B (319,0)                         */
+        cmd[10] = 319; cmd[11] = 223;                /* C (319,223)                       */
+        cmd[12] = 0;   cmd[13] = 223;                /* D (0,223)                         */
+        vdp1_cmd_at(VDP1_BANK[vdp1_wbank], vdp1_wnext++, cmd);
+    }
 #if VDP1_MANUAL_CHANGE
     /* In-list full-screen colour-0 erase (manual-change only).  Without slSynch the VDP1 HW
        back-buffer erase (FBCR=0x0003 / EWLR-EWRR) does NOT fire reliably -> old walls accumulate
@@ -6729,7 +6876,11 @@ static void vdp1_wpn_kick(void)
         vdp1_bank = vdp1_wbank;
         *((volatile unsigned short *)VDP1_ROOT_ADDR + 1) =
             (unsigned short)((VDP1_BANK[vdp1_wbank] - VDP1_VRAM_BASE) >> 3);
-        VDP1_PTMR = 0x0002;
+        /* SATURN MANUAL PRESENT: PTM=1 plots ONCE, now, into the clean back buffer (the swap
+           is granted at the frame-end fence).  The wall chain terminates through the empty
+           bank's END -> stage that address for the fence's COPR completion compare. */
+        sat_mp_end_ca = (unsigned short)((VDP1_BANKE_ADDR + 0x20u - VDP1_VRAM_BASE) >> 3);
+        VDP1_PTMR = 0x0001; sat_mp_copr_kick = VDP1_COPR; sat_mp_pending = 1;
         vdp1_wactive = 0;
         return;
     }
@@ -6738,9 +6889,34 @@ static void vdp1_wpn_kick(void)
         if (sat_vdp1_switch_clear > 0) sat_vdp1_switch_clear--;   /* SATURN: consume a mode-switch erase frame */
         link = (VDP1_BANKE_ADDR - VDP1_VRAM_BASE) >> 3;
     }
+    /* SATURN MANUAL PRESENT: this (empty-bank) path runs on menu/intermission and mode-switch
+       frames.  Under manual mode the empty bank draws nothing AND no per-field HW erase runs,
+       so presenting it would leave the last level frame's pixels on screen; build a mini
+       ERASE list instead (local-coord + full-screen colour-0 polygon + END) in the other
+       bank and present that -- the manual-mode equivalent of the retired AUTO per-field wipe. */
+    {
+        int wb = vdp1_bank ^ 1;
+        unsigned short mc[16];
+        memset(mc, 0, sizeof mc);
+        mc[0] = 0x000A; mc[7] = VIEW_Y_OFFSET;           /* local coord (== the wall banks') */
+        vdp1_cmd_at(VDP1_BANK[wb], 0, mc);
+        memset(mc, 0, sizeof mc);
+        mc[0]  = 0x0004; mc[2] = 0x00C0; mc[3] = 0x0000; /* colour-0 SPD polygon, full screen */
+        mc[6]  = 0;   mc[7]  = 0;
+        mc[8]  = 319; mc[9]  = 0;
+        mc[10] = 319; mc[11] = 223;
+        mc[12] = 0;   mc[13] = 223;
+        vdp1_cmd_at(VDP1_BANK[wb], 1, mc);
+        memset(mc, 0, sizeof mc);
+        mc[0] = 0x8000;                                  /* END */
+        vdp1_cmd_at(VDP1_BANK[wb], 2, mc);
+        vdp1_bank = wb;
+        link = (VDP1_BANK[wb] - VDP1_VRAM_BASE) >> 3;
+        sat_mp_end_ca = (unsigned short)((VDP1_BANK[wb] + 2u * 32u - VDP1_VRAM_BASE) >> 3);
+    }
     /* atomic single-halfword flip of the root command's jump target */
     *((volatile unsigned short *)VDP1_ROOT_ADDR + 1) = (unsigned short)link;
-    VDP1_PTMR = 0x0002;              /* start the draw (clears EDSR CEF until it finishes) */
+    VDP1_PTMR = 0x0001; sat_mp_copr_kick = VDP1_COPR; sat_mp_pending = 1;
 #if VDP1_MANUAL_CHANGE
     if (vdp1_present_manual)
     {
@@ -7570,7 +7746,12 @@ extern "C" void DG_DrawFrame(void)
        further up let RP_AuxWait and the VDP2 setup run first, so the copy actually started several
        ms INTO the field and crossed the beam -- the owner's "j'ai l'impression de constater plus de
        déchirures".  The loop still phase-locks either way; only the tearing moved. */
-    if (sat_field_lock && gamestate == GS_LEVEL) sat_field_fence();
+    /* SATURN MANUAL PRESENT (unconditional since 2026-08-19): the swap-grant fence ends right
+       after the vblank the VDP1 swap executes at the end of, which IS the Fl1 edge for the
+       blit below.  Runs on menu/intermission frames too (the empty-bank kick arms pending
+       there; without a grant the last level frame's walls would stay displayed).  It subsumes
+       the parked field-lock fence (sat_field_fence): every frame is edge-locked by construction. */
+    sat_mp_fence();
 #if VDP2_CELL_SKY
     /* SKY MAP, deferred half (sky_mode >= 1).  HERE, at the top of the field the blit is about to
        paint: the map is VRAM and VDP2 reads it during display, so writing it any earlier would show
@@ -8199,21 +8380,12 @@ static void poll_pad(void)
     if (sat_local_players <= 1 && !(cur & PER_DGT_TR) && (cur & PER_DGT_TL)
         && (changed & PER_DGT_KU) && !(cur & PER_DGT_KU))
         sat_wall_dwell = (sat_wall_dwell == 0) ? 4 : (sat_wall_dwell == 4) ? 8 : 0;
-    /* Pad R+Right (R held, L released, 1p): the WHOLE LEAD-FILL state, one cycle (row 13
-       `L<X><m>/<spans>`): `1s` `2s` `3s` = depth X on the SLAVE, `1-` = X1 drawn by the MASTER
-       (the offload A/B), `0-` = OFF = the reference.
-       ⚠ X used to be on R+A -- WHICH IS ALREADY sat_wall_clamp'S CHORD (the Phase-1 wall clamp,
-       bound long before).  Every press toggled BOTH, so the owner's X sweeps were silently
-       flipping the floor-crossing wedge under him.  Chord audits must match on PER_DGT_T*, not on
-       the button letter. */
-    if (sat_local_players <= 1 && !(cur & PER_DGT_TR) && (cur & PER_DGT_TL)
-        && (changed & PER_DGT_KR) && !(cur & PER_DGT_KR))
-    {
-        static int lead_sel = 0;
-        lead_sel = (lead_sel + 1) % 5;
-        sat_wall_lead_x = (lead_sel == 4) ? 0 : (lead_sel == 3) ? 1 : lead_sel + 1;
-        sat_lead_mode   = (lead_sel == 3) ? 0 : 1;
-    }
+    /* (Pad R+Right -- the LEAD-FILL cycle -- REMOVED 2026-08-19 with the lead-fill PARK: the
+       manual present eliminated the stale-pair offset the lead-fill repainted, so its boot
+       default is now 0 (core r_segs.c) and no chord re-arms it.  Revive for an A/B by setting
+       sat_wall_lead_x > 0 -- the whole core mechanism is intact, only dormant.  Historical ⚠
+       kept: X once shared R+A with sat_wall_clamp's chord; chord audits must match on
+       PER_DGT_T*, not on the button letter.  The R+Right slot is FREE.) */
     /* Pad L+Left (L held, R released, 1p): live A/B of the COMPOSITE PIN (core/r_data.c).
        ON = the last composites stay non-purgeable under a 64 KB budget; OFF = the classic PU_CACHE
        demote, i.e. the treadmill `cb20/6` measured (SIX textures rebuilt 20x a second, `k33` each).
@@ -8245,11 +8417,13 @@ static void poll_pad(void)
        been removing. */
     if (sat_gov_p_dirty) { sat_gov_p_dirty = 0; sat_apply_mode(); }
 
-    /* (Pad L+B — the SIZE-LOD ladder — REMOVED 2026-08-16 on the owner's *"active le gouverneur par
-       défaut, enlève le toggle"*.  The governor is now unconditional: there is no manual rung and no
-       `sat_wall_lod_scale`.  L+B is free, and freeing it also retires the collision documented at the
-       old sat_mark_suppress site.
-       Pad L+Right — the FAR-DEGRADATION LADDER — REMOVED the same day, one session after it was
+    /* (Pad L+B -- the MANUAL PRESENT A/B -- REMOVED 2026-08-19, one day after it was added:
+       the owner's Ymir captures validated v2 (20-24 fps vs 18.4-19.4 auto+leadfill, `w0`,
+       fence 13-15 ms, holes gone), so the manual present is now unconditional (sat_mp_*),
+       the AUTO revert left with the toggle, and the lead-fill is parked.  The L+B slot is
+       FREE.) */
+
+    /* (Pad L+Right — the FAR-DEGRADATION LADDER — REMOVED 2026-08-16, one session after it was
        added: rung 1 rejected on sight, rungs 2 and 3 killed by their own counters. */
 
     /* (R+C M5 BSP-staging A/B cut -- settled-negative; the staging mechanism stays inert in core.

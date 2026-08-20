@@ -366,6 +366,24 @@ extern "C" void (*sat_sky_precache_hook)(void);      /* core p_setup.c: fired in
 static void sky_cell_build_map(void);   /* forward decl: rebuilds the sky map (live horizon tune) */
 static void sky_cell_write_map(void);   /* forward decl: the VRAM half alone, deferred past the fence */
 static int  sky_map_pending = 0;        /* a horizon change owes a deferred map write (sky_mode >= 1) */
+/* SATURN 2026-08-21 round 4 (owner: "le hardware affiche un miroir du ciel cpu" + "il s'étend
+   jusqu'en haut de la fenêtre").  Both observations are structural and both are fixed in VRAM,
+   not in the scroll registers:
+   -- sky_map_split: the PN map has TWO layouts.  1p (0) = the legacy thresh/transparent map (the
+      RBG0 floor needs NBG0 transparent below the horizon).  Split-elected (1) = CPU-cheat
+      replica: map rows ABOVE the stored texture tile the sky's own TOP cell row (the real 8px
+      top band, repeating -- the hardware twin of r_draw.c's R_SkyGrainTexel clamp), rows BELOW
+      it tile the BOTTOM cell row, and -- only when the elected view is ALSO the RBG0-floor view
+      (sat_split_p1hw) -- rows below the horizon go back to the transparent filler so the HW
+      floor still shows through (NBG0 prio 4 > RBG0 3 would otherwise cover it).  Costs ZERO
+      extra cells: the tiles reference the existing edge cell rows.
+   -- sky_map_hzrow: that transparent cut's LAYER cell row (-1 = no cut).
+   -- sky_layer_sh: the uploader's width shift (0 = 256/512-wide sky stored 1:1, 1 = 1024-wide
+      TNT sky stored half-res).  Scale and scroll must halve with it or wide skies turn/zoom 2x
+      too fast -- a latent day-1 nit made visible by the exact round-4 geometry. */
+static int  sky_map_split = 0;
+static int  sky_map_hzrow = -1;
+static int  sky_layer_sh  = 0;
 static int  sky_horizon_row = SKY_HORIZON_ROW;  /* HW-sky horizon row (baked at SKY_HORIZON_ROW=96; live pad knob cut 2026-07-07). Still re-derived live by the horizon auto-track (~5669). */
 #endif
 /* VDP2_SPLIT_HW_SKY (Part 5 -- docs/RBG0_SKY_SPLIT_ANALYSIS.md §5): 1 = in a co-op split give ONE
@@ -391,9 +409,10 @@ static int  sky_horizon_row = SKY_HORIZON_ROW;  /* HW-sky horizon row (baked at 
 #if VDP2_SPLIT_HW_SKY
 static int hwsky_split_on = 1;   /* Part 5 LIVE toggle (pad L+C): 1 = HW sky for the elected split view (DEFAULT ON), 0 = software split sky.  Toggle OFF with L+C if it snows/misaligns on HW (cosmetic size/anchor still WIP -- docs §10). */
 #endif
-/* Frames a challenger must out-cover the leader (by margin) before the elected HW-sky view switches
-   (dynamic election only; unused by the static default).  ~0.5s at 60fps avoids per-frame scroll jumps. */
-#define SKY_ELECT_HYST 30
+/* Frames a challenger must out-cover the leader (by margin) before the elected HW-sky view switches.
+   2026-08-21 owner: "30 frames c'est peut-être un peu long comme bascule" -- at split fps (10-15)
+   30 frames was 2-3 s; 15 lands ~1 s while the +25% margin still blocks border ping-pong. */
+#define SKY_ELECT_HYST 15
 /* SATURN (Romain 2026-06-30): RBG0 floor improvements -- candidate defaults, flip to 0 to A/B-test.
    RBG0_FLOOR_DOMINANT -> drives core sat_vdp2_floor_dominant: the HW floor follows the DOMINANT
      visible flat (re-picked ONLY when the player changes sector) instead of the floor under the eye.
@@ -618,6 +637,7 @@ extern "C" int            sat_frame_has_sky;/* core: a sky visplane was in view 
 extern "C" int            sat_sky_view;         /* core Part 5: elected split view for the HW sky (-1 = none => all software) */
 extern "C" unsigned int   sat_sky_px_view[4];   /* core Part 5: per-view SKY pixel coverage (election metric) */
 extern "C" unsigned int   sat_sky_view_angle;   /* core Part 5: elected view's viewangle (angle_t) for the NBG0 scroll */
+extern "C" int            sat_rbg0_view;        /* core: the split view whose floor is punched to RBG0 (round-4 sky map cut) */
 extern "C" int            sat_vdp2_floor;   /* core: skip software floor (=> VDP2 RBG0) */
 extern "C" int            sat_vdp2_floor_h; /* core: player's floor height (fixed_t) */
 extern "C" int            sat_vdp2_floor_pic;/* core: player's floor flat (picnum) */
@@ -3120,14 +3140,15 @@ static void fps_update(void)
                 unsigned int sc_ms = _f ? (sat_thk_sect_frt * 10u/224u)/_f/10u : 0u;
                 unsigned int owed10 = (vb10 * 583u) / 1000u;          /* 35 Hz / 60 Hz = 0,583 */
                 unsigned int sp     = owed10 ? (xt10 * 100u) / owed10 : 0u;
-                /* ca (2026-08-21) = sight-cache validity window in tics (pad L+A, 4/8/16);
+                /* ca (2026-08-21) = sight-cache validity window in tics (pad L+A cycles
+                   auto->4->8->16; `a` suffix = AUTO, the mobj-count ladder in p_tick.c decides);
                    judge it on `s` (sight ms) dropping while the AI still feels right. */
-                { extern int sat_sight_cache_tics;
-                snprintf(ovbuf, sizeof ovbuf, "TIC th%u s%u x%u.%u v%u.%u sp%u%% sc%u ca%d  ",
+                { extern int sat_sight_cache_tics, sat_sight_cache_auto;
+                snprintf(ovbuf, sizeof ovbuf, "TIC th%u s%u x%u.%u v%u.%u sp%u%% sc%u ca%d%s ",
                          th10 / 10u, sg10 / 10u,
                          xt10 / 10u, xt10 % 10u, vb10 / 10u, vb10 % 10u,
                          sp > 999u ? 999u : sp, sc_ms > 999u ? 999u : sc_ms,
-                         sat_sight_cache_tics); }
+                         sat_sight_cache_tics, sat_sight_cache_auto ? "a" : ""); }
                 ovbuf[40] = ' ';
                 if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 24, ovbuf);
                 sat_tic_think_frt = 0; sat_tic_sight_frt = 0;
@@ -4636,11 +4657,20 @@ static void sky_cell_upload(void)
     int skyw = texturewidthmask[skytexture] + 1;
     int sh   = 0;
     while ((512 << sh) < skyw) sh++;
+    sky_layer_sh = sh;                 /* scale + scroll must follow (wide skies live half-res) */
 
+    /* MIRRORED on purpose (2026-08-21 round 4, owner: "le hardware affiche un miroir du ciel
+       affiché en cpu" -- confirmed in r_plane.c: the software sky's texture column is
+       (viewangle + xtoviewangle[x]) >> 22 and xtoviewangle DECREASES with screen x, so the CPU
+       draws the texture right-to-left; a scroll plane reads it left-to-right.  Day-1 bug, in 1p
+       too -- never caught because 1p has no side-by-side and the scroll DIRECTION was correct).
+       Scroll can only translate, never mirror, so the flip happens here at upload: layer column
+       x stores texture column (511-x)<<sh.  The tiling seam stays the art's own hidden seam
+       (same two texture columns adjoin, in reverse order). */
     for (int ccol = 0; ccol < 64; ++ccol)
         for (int rx = 0; rx < 8; ++rx)
         {
-            const unsigned char *src = R_GetColumn(skytexture, (ccol * 8 + rx) << sh);  /* 128-tall */
+            const unsigned char *src = R_GetColumn(skytexture, (511 - (ccol * 8 + rx)) << sh);  /* 128-tall */
             if (src == (const unsigned char *)r_column_stub) stubbed = 1;
             for (int crow = 0; crow < SKY_CELL_ROWS; ++crow)
                 for (int ry = 0; ry < 8; ++ry)
@@ -4664,6 +4694,31 @@ static void sky_cell_upload(void)
 static void sky_cell_write_map(void)
 {
     unsigned short *map = (unsigned short *)SKY_MAP_VRAM;
+    if (sky_map_split)
+    {
+        /* SPLIT-ELECTED layout (round 4): replicate the CPU cheat in the map itself.
+           Layer rows 0..103 = the stored texture; rows 448..511 (reached by the NEGATIVE
+           scroll wrap above a 2p band's row-0 line) tile the TOP cell row -- the hardware
+           equivalent of R_SkyGrainTexel's "extend the top band" (tiled, not grained: the
+           1-word/12-bit-char PN format has no V-flip bit and no cells are left in the B1
+           budget for baked grain -- 8px-period repeat of real art, judged acceptable vs the
+           alternatives).  Rows between the texture and sky_map_hzrow tile the BOTTOM cell
+           row (the CPU clamps its bottom overflow the same way -- at row 127, where we only
+           store up to 103: a ~12-screen-px nit near the horizon, the B1 13-row budget).
+           At/below sky_map_hzrow (>= 0 only when the elected view is the RBG0-floor view):
+           transparent filler so the P1 HW floor shows through. */
+        for (int my = 0; my < 64; ++my)
+            for (int mx = 0; mx < 64; ++mx)
+            {
+                int cellidx;
+                if (my >= 56)                cellidx = mx * SKY_CELL_ROWS;                       /* top-band tile (negative wrap) */
+                else if (my < SKY_CELL_ROWS) cellidx = mx * SKY_CELL_ROWS + my;                  /* the texture */
+                else if (sky_map_hzrow >= 0 && my >= sky_map_hzrow) cellidx = SKY_NB_CELL;       /* RBG0 floor cut */
+                else                         cellidx = mx * SKY_CELL_ROWS + (SKY_CELL_ROWS - 1); /* bottom-band tile */
+                map[my * 64 + mx] = (unsigned short)((cellidx * 2) | 0x1000);
+            }
+        return;
+    }
     int thresh = sky_horizon_row >> 3;   /* cell-row boundary (8px cells) */
     if (sky_mode == 2) thresh--;
     if (thresh < 0) thresh = 0;
@@ -8178,13 +8233,11 @@ extern "C" void DG_DrawFrame(void)
        constant, so there is no phase skew.  Re-poke the W0 window only when the elected band changes. */
     /* SATURN 2026-08-21 (quick win, docs/RESOURCE_BUDGETS.md opp 4 + M7_FEATURE_AUDIT §1): the
        `&& !sat_lowres` cut (cb201c7, 2026-07-15, the eve of M7-default -- silent in its commit
-       message) is LIFTED with the compensation the audit prescribes: under M7 the NBG1 view is
-       x2-zoomed while NBG0 was not -> scale NBG0 x2 horizontally (SGL ratio convention: 2.0 =
-       2x source texels per screen px) and halve the scroll step below, so the sky turns at the
-       view's angular rate again.  1p M7 keeps scale 1.0 (its HW sky was never misaligned --
-       show_sky has no lowres gate).  ⚠ Audit reserve (c): the half-view FOV compression may
-       need this x2 EVEN outside M7 -- never HW-validated; L+C stays the live A/B either way,
-       and the chunky x2 sky is the accepted cost. */
+       message) is LIFTED.  Audit reserve (c) proved right: the compensation is the half-view
+       FOV compression itself, not M7 -- and rounds 2-4 replaced the guessed x2 with the EXACT
+       CPU-derived geometry (mirror at upload, 0.625/0.5 scale, one scroll law; see the round-4
+       comments at sky_cell_upload / the scale block / the scroll block below).  L+C stays the
+       live A/B. */
     int hwsky_split = (hwsky_split_on && sat_local_players >= 2 && gamestate == GS_LEVEL && !automapactive);
     /* SATURN 2026-08-21 (owner: "élection sur le(s) joueur(s) ayant le plus de ciel avec
        protection pour ne pas flick") -- DYNAMIC ELECTION, the documented Part 5 next step.
@@ -8216,14 +8269,43 @@ extern "C" void DG_DrawFrame(void)
         }
         sat_sky_view = sky_led;
     }
+    /* Round 4: keep the PN map's LAYOUT in step with the mode -- split tile-extend vs 1p
+       thresh/transparent (sky_cell_write_map) -- and with the RBG0-floor transparent cut
+       (only when the elected sky view IS the HW-floor view).  Deferred via sky_map_pending,
+       the same fence discipline as the horizon tune. */
     {
-        static int sky_zoomed = -1;     /* last NBG0 h-scale state: -1 uninit, 0 = 1.0, 1 = 2.0 */
-        int wantz = (hwsky_split && sat_lowres) ? 1 : 0;
+        int wsplit = hwsky_split ? 1 : 0;
+        int whz = -1;
+        if (wsplit && sat_split_p1hw && sat_sky_view == sat_rbg0_view && sat_local_players == 2)
+        {
+            whz = ((sky_horizon_row * 2) - 60) >> 3;   /* screen horizon -> layer cell row (2p SCY = -60, 2 rows/px) */
+            if (whz < SKY_CELL_ROWS) whz = SKY_CELL_ROWS;
+            if (whz > 56) whz = 56;
+        }
+        if (wsplit != sky_map_split || whz != sky_map_hzrow)
+        { sky_map_split = wsplit; sky_map_hzrow = whz; sky_map_pending = 1; }
+    }
+    {
+        static int sky_zoomed = -1;     /* last NBG0 scale state: (split<<4)|layer_sh, -1 uninit */
+        int wantz = ((hwsky_split ? 1 : 0) << 4) | sky_layer_sh;
         if (wantz != sky_zoomed)
         {
-            slScrScaleNbg0(wantz ? toFIXED(2.0) : toFIXED(1.0), toFIXED(1.0));   /* same proven
-                convention as NBG1's M7 zoom (Phase-0: 2.0 = x2 BIGGER) -> the sky magnifies
-                exactly like the packed view it sits behind */
+            /* Round 4 EXACT geometry (rounds 2/3 guessed 2.0 then 0.5 -- owner bracketed them:
+               "trop grand / écrasé").  CPU law: 256 texture columns per 90-deg FOV, so a 160-px
+               band shows 1.6 texels/px (scale 1/1.6 = 0.625) and the FULL 320-px 1p view shows
+               0.8 texels/px (scale 1.25 -- the old 1p 1.0 was a latent 25% zoom-out vs vanilla,
+               unifiable now that the mirror fix makes 1p judgeable too).  VERTICAL: every split
+               path steps 2 texture rows per screen px (pspriteiscale law, r_plane.c) => 0.5;
+               1p is 1:1.  <<sky_layer_sh: 1024-wide skies live half-res in the layer, so the
+               horizontal factor doubles (split then = 1.25, no reduction at all).
+               ⚠ CONSOLE RISK (Ymir-invisible): h-scale 0.625 is a REDUCTION; a 256-color cell
+               layer under reduction needs DOUBLE character-read slots in the B1 cycle pattern.
+               slZoomModeNbg0(ZOOM_HALF) declares that to SGL's allocator -- if the elected
+               band's sky snows (or NBG3 text breaks) on hardware, suspect THIS first; L+C is
+               the live kill. */
+            slZoomModeNbg0((hwsky_split && sky_layer_sh == 0) ? ZOOM_HALF : 0);
+            slScrScaleNbg0((FIXED)((hwsky_split ? 0x0000A000 : 0x00014000) << sky_layer_sh),
+                           (FIXED)(hwsky_split ? 0x00008000 : 0x00010000));
             sky_zoomed = wantz;
         }
         static int sky_win_view = -2;   /* last NBG0-window state: -2 uninit, -1 full screen, 0..3 band */
@@ -8247,13 +8329,29 @@ extern "C" void DG_DrawFrame(void)
 #if VDP2_SPLIT_HW_SKY
         if (hwsky_split) skyang = sat_sky_view_angle;
 #endif
-        int sx = -(int)(skyang >> (SKY_ANGLESHIFT + SKY_PARALLAX_SHIFT));
+        /* Round 4 -- ONE law for every view, now that the cells are MIRRORED (sky_cell_upload):
+           the texel at any view's LEFT edge is the view direction +45deg = texture column A+128
+           (A = viewangle>>22, CPU-exact).  On the mirrored plane that is
+           SCX = 511 - (128>>sh) - (A>>sh); the round-3 per-band centre term VANISHES, because
+           half a 90-deg FOV is always 128 texture columns and z*centre_x == 128 mod 256 for
+           every window (0.8*160 = 1.6*80 = 128; 1.6*240 = 384).  sh=0 collapses to 127 - A
+           modulo the 256-px content period -- the same value serves 1p, both 2p halves and all
+           four quadrants with no per-view branch. */
+        int A  = (int)(skyang >> (SKY_ANGLESHIFT + SKY_PARALLAX_SHIFT));
+        int sx = 511 - (128 >> sky_layer_sh) - (A >> sky_layer_sh);
+        int scy = -VIEW_Y_OFFSET;
 #if VDP2_SPLIT_HW_SKY
-        if (hwsky_split && sat_lowres) sx >>= 1;   /* x2 h-scale: a source px covers 2 screen px,
-                                                      so half the source scroll keeps the same
-                                                      screen-px-per-angle rate (audit §1 recipe) */
+        /* VERTICAL anchor (round 4, owner: "il s'étend jusqu'en haut de la fenêtre du joueur").
+           CPU law (r_plane.c): texture row = 100 + 2*(y_local - centery) in every split path
+           => SCY = 100 - 2*(band_top + centery).  2p (centery 80, top 0): -60 -- the band's
+           top 30 screen rows wrap NEGATIVE into the map's top-band tile rows, exactly where
+           the CPU grains its overflow.  Quadrants (centery 48): +4 top / -220 bottom -- row 0
+           lands at the band top (no cheat zone, like the CPU), and the bottom quadrant gets
+           its own anchor (the round-3 "quadrant vertical nit" dies here). */
+        if (hwsky_split)
+            scy = (sat_local_players == 2) ? -60 : (4 - 2 * ((sat_sky_view & 2) ? 112 : 0));
 #endif
-        slScrPosNbg0((FIXED)(sx << 16), toFIXED(-(double)VIEW_Y_OFFSET));
+        slScrPosNbg0((FIXED)(sx << 16), (FIXED)(scy << 16));
     }
 #endif
 #endif
@@ -9605,11 +9703,15 @@ static void poll_pad(void)
        thinker-heavy maps, monsters react up to N tics late).  Read TIC row: `ca<t>` = the
        current window, `s` = the sight ms it should shrink.  The incidental A tap (use/open)
        is the usual chord cost -- cycle it standing clear of doors. */
-    { extern int sat_sight_cache_tics;
+    { extern int sat_sight_cache_tics, sat_sight_cache_auto;
       if (!(cur & PER_DGT_TL) && (cur & PER_DGT_TR)
           && (changed & PER_DGT_TA) && !(cur & PER_DGT_TA))
-          sat_sight_cache_tics = (sat_sight_cache_tics == 4) ? 8
-                               : (sat_sight_cache_tics == 8) ? 16 : 4; }
+      {   /* AUTO (mobj-count ladder, boot default) -> 4 -> 8 -> 16 -> AUTO */
+          if      (sat_sight_cache_auto)          { sat_sight_cache_auto = 0; sat_sight_cache_tics = 4; }
+          else if (sat_sight_cache_tics == 4)     sat_sight_cache_tics = 8;
+          else if (sat_sight_cache_tics == 8)     sat_sight_cache_tics = 16;
+          else                                    { sat_sight_cache_auto = 1; sat_sight_cache_tics = 4; }
+      } }
     /* Pad R+A: live A/B of the Phase-1 WALL CLAMP (partially-occluded tiers kept on VDP1 via the
        world-anchored cut + software wedge, core sat_wall_cut_floor/_ceil).  Row 6 W<n><+/-> = tiers
        kept + state.  (MOVED off L+R+Y -- the L+R chord fires the overlay toggle, so L+R+Y was

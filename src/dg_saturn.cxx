@@ -204,6 +204,7 @@ extern "C" int   Z_FreeMemory(void);          /* total reclaimable (free + purge
 extern "C" int   Z_LargestAllocatable(void);  /* largest contiguous run after purging */
 extern "C" int   dg_heap_peak;              /* #4: peak newlib sbrk usage (bytes)             */
 extern "C" unsigned int doom_stack_free(void);  /* main.cxx: doom_stack virgin bytes (row 10 `sk`) */
+extern "C" int   sat_tic_decim;             /* core p_tick.c: TIC-governor decimation rung (row 23 `dc`) */
 extern "C" int   dg_heap_size;              /* #4: newlib heap cap (bytes)                    */
 extern "C" int   dg_heap_fail;              /* #4: sbrk REFUSALS -- any non-zero = raise HEAP_SIZE */
 extern "C" int   z_block_count;             /* core z_zone.c: zone blocks walked by the last zone walk */
@@ -344,6 +345,14 @@ extern "C" int W_SaturnCDInit(void);
 #define SKY_MAP_VRAM     ((void *)0x25E6E000)  /* B1+56K:   NBG0 sky pattern-name map (64x64 = 8KB)   */
 #define SKY_CELL_ROWS    13                     /* 104 px of sky kept; horizon 96 needs 12            */
 #define SKY_NB_CELL      (64 * SKY_CELL_ROWS)   /* 832 = index of the transparent filler cell         */
+/* SATURN 2026-08-21 (owner, console: the split sky's top extension "se répète visiblement, là où
+   le cpu bruite et mélange"): ONE ROW OF BAKED GRAIN -- the hardware twin of r_draw.c's
+   R_SkyGrainTexel, same hash, same top-band sampling -- for the map rows above the texture in
+   the split layout.  It fits in the FREE TAIL of the B1 cell block (896 cells budget - 832 sky
+   - 1 filler = 63 free): 32 cells suffice because the 2x-tiled 256-px content is periodic, so
+   the SPARE 13th texture row is NOT sacrificed and 31 cells stay free for a future need. */
+#define SKY_GRAIN_CELLS  32
+#define SKY_GRAIN_BASE   (SKY_NB_CELL + 1)      /* cells 833..864 of the 896-cell B1 budget            */
 /* VDP2_SKY_FORCE_CYC: experimental per-frame cycle override forcing NBG0's char read into B1 when
    RBG0 is on (sky_cell_force_cyc).  Did NOT change the "sky shows floor" HW bug -> gated OFF. */
 #define VDP2_SKY_FORCE_CYC 0
@@ -2566,23 +2575,19 @@ static void fps_update(void)
                reaches -- live setter now in rp_p3_prof_show (r_parallel.c).  The probe costs
                ~0.5-1 ms inside P (full overlay only) and leaves with the planes-VDP1 verdict;
                L+B now arms only the legacy FLR band estimate. */
-            /* md (2026-08-21, RESOURCE_BUDGETS mention): VDP1 SILICON REVISION, MODR bits 15-12
-               (read-only reg 0x25D00016).  Reading it is the 1-line probe that decides whether
-               the conditional features (Pclp/HSS/EOS -- pre-clipping = THE theoretical lever
-               against iteration overrun) exist on this chip.  Ymir will report its own value;
-               only the CONSOLE reading counts. */
-            static int vdp1_modr_ver = -1;
-            if (vdp1_modr_ver < 0)
-                vdp1_modr_ver = (int)((*(volatile unsigned short *)0x25D00016u >> 12) & 0xF);
-            snprintf(ovbuf, sizeof ovbuf, "VD1 fb%d/%d MP%d w%d %dms g%d Q%d E%d/%d md%d ",
+            /* (md -- VDP1 MODR silicon revision, bits 15-12 of 0x25D00016 -- READ AND REMOVED
+               2026-08-21: the owner's console read `md1`, same as Ymir.  The question the field
+               existed for is answered; per the owner's rule NO machine-specific paths get built,
+               so the revision is a fact for the notes, not a runtime input.  Re-read it with a
+               one-liner here if a future SGL/emulator question needs it.) */
+            snprintf(ovbuf, sizeof ovbuf, "VD1 fb%d/%d MP%d w%d %dms g%d Q%d E%d/%d ",
                      fb_pk_starve, fb_pk_mag,
                      sat_mp_active, (sat_mp_wd > 999 ? 999 : sat_mp_wd),
                      (sat_mp_wait_ms > 99 ? 99 : sat_mp_wait_ms),
                      (sat_mp_gate_ms > 99 ? 99 : sat_mp_gate_ms),
                      (sat_plane_quad_n > 999 ? 999 : sat_plane_quad_n),
                      (sat_plane_q4cmd > 999 ? 999 : sat_plane_q4cmd),
-                     (sat_plane_q4pct > 99 ? 99 : sat_plane_q4pct),
-                     vdp1_modr_ver);
+                     (sat_plane_q4pct > 99 ? 99 : sat_plane_q4pct));
             /* (fbf -- floor tiles truncated -- dropped 2026-08-02 with the VDP1 floor deport: it
                was structurally 0 in every reachable mode.  fbw is now the sole over-budget bit.) */
             if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 8, ovbuf);
@@ -3122,11 +3127,17 @@ static void fps_update(void)
                     unsigned int sb_ms = _f ? (sat_thk_sub_frt   * 10u/224u)/_f/10u : 0u;
                     unsigned int bt_ms = _f ? (sat_thk_blk_frt   * 10u/224u)/_f/10u : 0u;
                     unsigned int thn   = _f ? sat_thk_n / _f : 0u;
+                    /* dc (2026-08-21) = the TIC governor's decimation rung (core sat_tic_decim:
+                       0 full rate / 1 far monsters think 1:2 / 2 think 1:4).  `n` now EXCLUDES
+                       parked corpses/props (thinker -2, unlinked) -- a post-carnage n that stays
+                       low IS the parking working; dc>0 with `mo` NOT dropping = decimation dead,
+                       see the law's falsifier in p_tick.c. */
                     snprintf(ovbuf, sizeof ovbuf,
-                             "THK n%u mo%u ph%u sm%u mv%u sb%u bt%u        ",
+                             "THK n%u mo%u ph%u sm%u mv%u dc%d sb%u bt%u  ",
                              thn > 9999u ? 9999u : thn,
                              mo_ms > 999u ? 999u : mo_ms, ph_ms > 999u ? 999u : ph_ms,
                              sm_ms > 999u ? 999u : sm_ms, mv_ms > 999u ? 999u : mv_ms,
+                             sat_tic_decim,
                              sb_ms > 999u ? 999u : sb_ms, bt_ms > 999u ? 999u : bt_ms);
                     ovbuf[40] = ' ';
                     if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 23, ovbuf);
@@ -3835,13 +3846,13 @@ static void rbg0_commit_ramctl(void)
        CELL K_OFF (the CRKTE-bandwidth test): A0=NONE(0), A1=char(3), B1=pattern-name(2) -> 0x8C.  This is
        exactly what CRKTE gives (coeff out of VRAM -> 2 rotation banks char+map, A0 free).  If THIS still
        snows, CRKTE cannot help and the cell floor is definitively dead with the framebuffer. */
-    /* SATURN 2026-08-21 (RESOURCE_BUDGETS opp 5, HW-ONLY probe -- flip to 1 for ONE console boot):
-       bitmap RDBS declares A0 as coefficient bank, but the K table runs K_LINE (per-line, small)
-       -- likely an OVER-declaration inherited from the K_DOT-capable path.  0x0C (A0=NONE) frees
-       a WHOLE VDP2 bank (128 KB) if the floor stays clean; SNOW = A0 genuinely consumed, close
-       the question forever.  Falsifier is hardware-only (Ymir never snows -- no cycle model). */
-#define RBG0_A0_PROBE 0
-    uint16_t rdbs = (rbg0_kind == RBG0_KIND_BITMAP) ? (RBG0_A0_PROBE ? 0x000Cu : 0x000Du)
+    /* (A0 probe CLOSED 2026-08-21, console boot of the Mimas-A0probe disc: RDBS A0=00 under the
+       K_LINE bitmap floor does NOT snow -- it CORRUPTS the coefficient reads, the previous
+       dominant floor bleeding through the current one.  "Any VRAM bank" (VDP2 p.148) means no
+       DEDICATED bank, not no DECLARATION: an undeclared bank falls back to cycle-pattern access
+       and CYCA0 carries no coefficient slot.  Verdict + mechanism: saturn-refs/knowledge/
+       HW_VDP2.md §2.  The 128 KB A0-reclaim path is dead; do not re-propose.) */
+    uint16_t rdbs = (rbg0_kind == RBG0_KIND_BITMAP) ? 0x000Du
                   : (rbg0_cell_koff ? 0x008Cu : 0x008Du);
     uint16_t v = (uint16_t)((ramctl_before & 0xFC00u) | 0x0300u | rdbs);
     *RAMCTL = v;
@@ -4689,6 +4700,24 @@ static void sky_cell_upload(void)
                 }
         }
     memset(cells + SKY_NB_CELL * 64, 0, 64);        /* TRANSPARENT filler (index 0): floor shows below the horizon */
+    /* Bake the GRAIN row (split top extension): per grain cell = the top band [0..7] of the SAME
+       mirrored source columns as texture cell column gc, scrambled by R_SkyGrainTexel's exact
+       hash (x*73 + row*179, ^= >>5) so per-column brightness zones stay put, like the CPU.
+       (Wide skies, sh=1: map columns 32..63 reuse these 32 cells -> the grain's brightness can
+       sit up to half a panorama off there -- noise, judged acceptable.) */
+    for (int gc = 0; gc < SKY_GRAIN_CELLS; ++gc)
+        for (int rx = 0; rx < 8; ++rx)
+        {
+            const unsigned char *src = R_GetColumn(skytexture, (511 - (gc * 8 + rx)) << sh);
+            for (int ry = 0; ry < 8; ++ry)
+            {
+                unsigned h = (unsigned)((gc * 8 + rx) * 73 + ry * 179);
+                h ^= h >> 5;
+                unsigned char p = src[h & 7u];
+                if (!p) p = nb;
+                cells[(SKY_GRAIN_BASE + gc) * 64 + ry * 8 + rx] = p;
+            }
+        }
     if (stubbed) { sky_retry_wait = SKY_RETRY_FRAMES; return; }   /* do NOT latch: retry, do not go black for good */
     sky_loaded_tex = skytexture;
 }
@@ -4719,7 +4748,13 @@ static void sky_cell_write_map(void)
             for (int mx = 0; mx < 64; ++mx)
             {
                 int cellidx;
-                if (my >= 56)                cellidx = mx * SKY_CELL_ROWS;                       /* top-band tile (negative wrap) */
+                /* Top extension = the BAKED GRAIN row (owner, console: the tiled top band "se
+                   répète visiblement" vs the CPU's grain).  Small alternating phase per map row
+                   (0,+1,0,-1) breaks the 8px vertical period into 32 without moving any column's
+                   brightness by more than one cell. */
+                static const signed char sky_gr_ph[4] = { 0, 1, 0, -1 };
+                if (my >= 56)                cellidx = SKY_GRAIN_BASE
+                                                 + ((mx + sky_gr_ph[my & 3]) & (SKY_GRAIN_CELLS - 1));
                 else if (my < SKY_CELL_ROWS) cellidx = mx * SKY_CELL_ROWS + my;                  /* the texture */
                 else if (sky_map_hzrow >= 0 && my >= sky_map_hzrow) cellidx = SKY_NB_CELL;       /* RBG0 floor cut */
                 else                         cellidx = mx * SKY_CELL_ROWS + (SKY_CELL_ROWS - 1); /* bottom-band tile */
@@ -4753,7 +4788,7 @@ static void sky_cell_build_map(void)
 /* One-shot NBG0 cell config + PN map (cells change per level; map rebuilds on a live horizon tune). */
 static void sky_cell_init(void)
 {
-    memset((void *)SKY_CEL_VRAM, 0, (SKY_NB_CELL + 1) * 64);
+    memset((void *)SKY_CEL_VRAM, 0, (SKY_GRAIN_BASE + SKY_GRAIN_CELLS) * 64);   /* incl. filler + grain row */
     memset((void *)SKY_MAP_VRAM, 0, 64 * 64 * 2);
     slPlaneNbg0(PL_SIZE_1x1);
     slCharNbg0(COL_TYPE_256, CHAR_SIZE_1x1);

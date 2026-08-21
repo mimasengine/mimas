@@ -203,6 +203,7 @@ extern "C" int   sat_tex_numtex, sat_tex_sumwidth, sat_tex_dirbytes,
 extern "C" int   Z_FreeMemory(void);          /* total reclaimable (free + purgeable) bytes */
 extern "C" int   Z_LargestAllocatable(void);  /* largest contiguous run after purging */
 extern "C" int   dg_heap_peak;              /* #4: peak newlib sbrk usage (bytes)             */
+extern "C" unsigned int doom_stack_free(void);  /* main.cxx: doom_stack virgin bytes (row 10 `sk`) */
 extern "C" int   dg_heap_size;              /* #4: newlib heap cap (bytes)                    */
 extern "C" int   dg_heap_fail;              /* #4: sbrk REFUSALS -- any non-zero = raise HEAP_SIZE */
 extern "C" int   z_block_count;             /* core z_zone.c: zone blocks walked by the last zone walk */
@@ -2877,8 +2878,15 @@ static void fps_update(void)
                M_StringDuplicate BEFORE the first frame, not a perf regression.  (The lumpinfo calloc
                this comment used to fear is NOT the risk -- that array is a Z_Malloc in the LWRAM zone,
                and `calloc` is referenced by no project object.  The late allocator is m_menu's fopen.) */
-            snprintf(ovbuf, sizeof ovbuf, "FMp %d/%d/%d mx%u hp%d/%d!%d ",
-                     f_p50, f_p90, f_p99, mh_ms_mx,
+            /* `sk<KB>` (2026-08-21, RESOURCE_BUDGETS opp 3): doom_stack VIRGIN KB -- the 40 KB
+               stack's never-touched headroom (sentinel scan, main.cxx doom_stack_free).  The
+               pool-reclaim decision variable: >=16 stable across TNT+split+mêlée+load ->
+               cut 40->24 KB.  sk0 = stack OVERFLOW (or <1 KB left): raise, do not cut.
+               WHOLE KB on purpose (owner capture 1, E1M1: `FMp 56/56/312` + `mx8122` + a
+               decimal pushed hp's `!` -- the ONLY heap-famine light -- past column 40; the
+               8/16 KB thresholds never needed the decimal). */
+            snprintf(ovbuf, sizeof ovbuf, "FMp %d/%d/%d sk%u mx%u hp%d/%d!%d ",
+                     f_p50, f_p90, f_p99, doom_stack_free() >> 10, mh_ms_mx,
                      dg_heap_peak, dg_heap_size, dg_heap_fail);
             if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 10, ovbuf);
             /* row 11 (ENDGAME limits high-water): how close this ~1s window got to the render

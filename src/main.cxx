@@ -42,8 +42,46 @@ extern "C" void sat_mp_input_init(void);  /* wires the local-MP pad-2..4 input h
    the two sat_bsp_stage_buf/size assignments in main() and re-check build/Mimas.map
    (CRITICAL_PATH.md §4 M5 has the full story). */
 
-/* 40 KB dedicated stack for the Doom main loop, in high work RAM. */
-static char doom_stack[40 * 1024] __attribute__((aligned(16)));
+/* Dedicated stack for the Doom main loop, in high work RAM (deep BSP recursion).
+   SATURN 2026-08-21: 40 -> 24 KB, the RESOURCE_BUDGETS opp-3 cut, done in two steps the
+   same day and backed by the `sk` watermark (sentinel probe below, owner captures, Ymir):
+   E1M1 1p used ~2.3 KB; TNT MAP01 4p WORST = ~8 KB (sk32/40, attract demos + menus +
+   level loads included); TNT MAP20 (the big-map stress, warp build, 1p AND 4p mêlée at
+   2700 thinkers) used only ~3 KB -- the BSP recursion is shallow even on Central
+   Processing, the 40 was sized by guess at x5 the real need.  24 keeps 16 KB of margin
+   over the worst watermark; ISR frames push onto this stack too (SH-2 interrupts use the
+   current r15), which is what the fat margin is for.  The probe STAYS as the tripwire:
+   `sk` now reads against 24 -- alarm rule below.  (History: the first step, 40->36, was
+   forced mid-day when the TNT warp build failed the pool pre-flight at 4.66 KB.) */
+static char doom_stack[24 * 1024] __attribute__((aligned(16)));
+
+/* SATURN 2026-08-21 (RESOURCE_BUDGETS opp 3): doom_stack HIGH-WATER probe.  The 40 KB were
+   sized by guess (deep BSP recursion) and NEVER measured, while the TLSF pool pre-flight sits
+   at ~5.5 KB -- this is the largest single unmeasured .bss block in HWRAM.  Same discipline as
+   HEAP_SIZE (syscalls.c row-10 `hp`): fill with a sentinel BEFORE the stack is entered, scan
+   from the BOTTOM (the SH-2 stack grows DOWN from the top) for the first touched word; the
+   count of still-virgin bytes is the headroom that has never been needed.  Overlay row 10
+   prints it as `sk` (whole KB).  The cut rule this probe existed for (free >= 16 KB stable
+   across TNT + split + mêlée + load -> cut) was SATISFIED same-day by the owner's three
+   capture sessions -- see the note above the array; the probe stays as the tripwire with the
+   alarm rule below.  `sk0` = OVERFLOW: the stack ran past its bottom into the .bss below --
+   RAISE it, and treat every weird crash since boot as suspect. */
+/* Post-cut alarm rule (2026-08-21): against the 24 KB stack, `sk` should read ~16-21 in
+   normal play.  `sk < 8` on ANY capture = the margin thesis is wrong, RAISE the stack;
+   `sk0` = overflow, raise IMMEDIATELY and distrust the whole run. */
+#define DOOM_STACK_SENTINEL 0xA5A5A5A5u
+extern "C" unsigned int doom_stack_free(void)
+{
+    static unsigned int cached = 0;
+    static int ctr = 0;
+    if (ctr-- > 0) return cached;
+    ctr = 3;                           /* caller = the 1s overlay tick -> rescan every ~4s (scan = free/4 word reads) */
+    const unsigned int *w = (const unsigned int *)doom_stack;
+    unsigned int n = 0, max = sizeof(doom_stack) / 4;
+    while (n < max && w[n] == DOOM_STACK_SENTINEL) n++;
+    cached = n * 4;                    /* bytes never touched since boot (monotone decreasing) */
+    return cached;
+}
 
 static void __attribute__((noreturn, noinline)) run_on_doom_stack(void)
 {
@@ -75,6 +113,10 @@ int main(void)
     sat_split_vdp1      = 1;  /* split-screen renders walls on VDP1 per-view (pad X toggles to the
                                  software baseline live for HW A/B).  No effect in 1p (split path off). */
     sat_mp_input_init();      /* wire pad-2..4 -> ticcmd for local multiplayer */
+    {   /* stack watermark: sentinel-fill BEFORE entering it (we are still on the system stack) */
+        unsigned int *w = (unsigned int *)doom_stack;
+        for (unsigned int i = 0; i < sizeof(doom_stack) / 4; ++i) w[i] = DOOM_STACK_SENTINEL;
+    }
     /* (M5 BSP-staging arena retired -- see the note above doom_stack.) */
     /* sat_local_players defaults to 1 (single-player).  Local co-op is OPT-IN at the title screen:
        a 2nd pad pressing A arms 2..4-player split (dg_saturn.cxx poll_pad -> sat_count_local_pads).

@@ -2033,6 +2033,37 @@ extern "C" int sat_plane_q4cmd, sat_plane_q4pct;       /* top-4 runs: real bande
    them); the machinery itself lives next to the wall emitters (vdp1_floors_flush et al). */
 static int sat_vdp1_floor_on = 0;     /* pad R+Right (inc-0 vive A/B), boot OFF      */
 static int fvdp1_claims_w = 0, fvdp1_refuse_w = 0;   /* window counters (FLT row)    */
+/* WHY WAS *THAT* FLOOR NOT TAKEN? (owner, three console rounds asking it about a specific
+   surface).  `r<n>` counts refusals but names none of ~9 distinct causes, so every answer
+   so far has been a guess from a photo.  This keeps the cause code of the LARGEST refused
+   plane of the frame -- which, when the owner is pointing at a surface he expects taken,
+   is almost always that surface -- together with its own screen area in hundreds of px.
+   FLT prints it as @<code>.<area/100>.  Codes:
+     1 split  the plane is a PIECE of one sector's surface (R_CheckPlane forked it)
+     9 multi  two or more sectors sharing (height, picnum, lightlevel) MERGED into it, so no
+              single sector bbox describes it.  This one is NOT a fragment -- merging is
+              normal in Doom, most levels share a floor height/flat/light across many
+              sectors -- so a large @9 means the rule is too strict, not that the surface
+              is unfit: the fix is then to carry the UNION of the contributing bboxes
+              instead of a single sector index.
+     2 area   parea < FVDP1_MIN_PLANE_PX, or under 2 rows tall
+     3 flat   the flat has no VDP1 texture slot and none can be freed (fvdp1_slot_would)
+     4 grid   the SECTOR's world bbox is over FVDP1_GRID_MAX cells: a room, not an object
+     5 cells  the cell scan produced nothing (all under the near guard / column-pruned)
+     6 forbid every candidate cell overhangs sky or the RBG0 dominant
+     7 budget out of frame commands / plot charge, or the walls' reserve
+     8 slot   fvdp1_slot_get failed after acceptance
+   A code with a LARGE area is the answer to "why is that surface not taken"; a code with a
+   small area means the big surfaces were skipped before ever being scored (sky, the RBG0
+   dominant, a ceiling, potato) and none of those count as refusals. */
+static int fvdp1_why_code = 0, fvdp1_why_area = 0;
+static int fvdp1_why_code_w = 0, fvdp1_why_area_w = 0;   /* window survivors, FLT `@` */
+static void fvdp1_why(int code, int area)
+{
+    fvdp1_refuse_w++;
+    if (area <= fvdp1_why_area) return;
+    fvdp1_why_area = area; fvdp1_why_code = code;
+}
 static int fvdp1_cmds = 0;                           /* last frame's emitted cmds    */
 /* PASS-1 refusal counters (core r_things.c increments, THp row displays + resets, 2026-08-20):
    they split "THp n0" between its two possible causes -- area-floor rejects (r) vs texture-grant
@@ -2140,6 +2171,17 @@ static void sat_field_fence(void);   /* defined next to the long note in DG_Draw
    ~0 now that the flat path computes the colour when looking costs no disc -- a climbing `gy` is
    the owner's grey walls coming back, and means the budget is genuinely out on those frames. */
 int vdp1_wall_nocol = 0;
+/* WHY IS THIS WALL FLAT? (owner, console 2026-08-24: "les murs cpu sont flats sans
+   raison").  Three flatten rules were already readable on the overlay and ALL THREE read
+   zero on his capture -- `w0` (the LOD area rung, sat_lod_eff), `sb0` (the drawseg budget)
+   and `lb..:0/0/0` (sat_wall_flat_io, residency).  The two remaining ones live HERE, in the
+   VDP1 wall budget, and neither was counted, so a wall flattened by them looked like a wall
+   flattened for no reason at all:
+     fl_sur  = lost the per-view SURPLUS race (the bank cannot afford its extra tiles)
+     fl_slot = won the surplus but wall_tex_resolve() could not give it a texture slot
+                (pool full, or the victim is still on screen -- the 3-state lock)
+   Both are per-frame; V1 prints them as fl<sur>/<slot>. */
+static int vdp1_flat_sur = 0, vdp1_flat_slot = 0, vdp1_flat_pot = 0;
 static int vdp1_wall_drop = 0;   /* walls the core handed to VDP1 that the emit silently dropped --
                                     row 13 `N<orphan>/<drop>/<flip>`, summed over the window.  Watched
                                     at the command pointer, so it catches every early return in
@@ -2426,8 +2468,15 @@ static void fps_update(void)
            (rp_master_ms -- the B_s software budget the wall LOD gates on -- is on the row-18 SLV line.) */
         if (sat_dbg_overlay_mode == 0 && sat_local_players <= 1) {
             static char ovbuf[56];   /* trailing spaces clear the tail when a field narrows (else "i3"->"i33" ghost) */
-            snprintf(ovbuf, sizeof ovbuf, "V1 c%d B%d LP%d%% ec%d ws%d tx%d i%d W%d/%d   ",
-                     vdp1_last_cmds, vdp1_budget_cmds, vdp1_lp_pct,
+            /* fl<sur>/<slot> = the two VDP1-side flatten causes (see vdp1_flat_sur).  Read them
+   TOGETHER with `w` (row 21 GOV, the LOD area rung), `sb` (row 21, the drawseg budget)
+   and `lb..:<wall>` (row 18 VRM, residency): those five are ALL the ways a wall can end
+   up flat.  All five zero and a flat wall on screen means a sixth one exists. */
+snprintf(ovbuf, sizeof ovbuf, "V1 c%d B%d fl%d/%d/%d LP%d%% ec%d ws%d tx%d i%d W%d/%d   ",
+                     vdp1_last_cmds, vdp1_budget_cmds,
+                     (vdp1_flat_sur > 999 ? 999 : vdp1_flat_sur),
+                     (vdp1_flat_slot > 999 ? 999 : vdp1_flat_slot),
+                     (vdp1_flat_pot > 999 ? 999 : vdp1_flat_pot), vdp1_lp_pct,
                      sat_thing_emit_cap, sat_wall_cpu_span, vdp1_tx_used, sat_iso_mode,
                      vdp1_wpn_reserve, vdp1_wpn_cut);
             /* row 17, NOT 12: the CD row also prints to 12 and runs LATER, so V1 was being
@@ -2886,9 +2935,11 @@ static void fps_update(void)
                    the isolated term that was hiding inside row-1 `pr` when round 6 read
                    pr 69..243 ms.  Expect ~<50 (5 ms) after the DIVU/DDA rewrite; if it
                    climbs back, the geometry path regressed -- look here first. */
-                snprintf(ovbuf, sizeof ovbuf, "FLT A%c v%d p%d r%d ld%d ev%d f%d F%d/%d/%d ",
+                snprintf(ovbuf, sizeof ovbuf, "FLT A%c v%d @%d.%d p%d r%d ld%d ev%d f%d F%d/%d/%d ",
                          sat_flatcache_on ? '+' : '-',
                          (fvdp1_cpu10 > 999 ? 999 : fvdp1_cpu10),
+                         fvdp1_why_code_w,
+                         (fvdp1_why_area_w / 100 > 999 ? 999 : fvdp1_why_area_w / 100),
                          sat_flatcache_slots, sat_flatcache_live,
                          (sat_flatcache_load  > 99999 ? 99999 : sat_flatcache_load),
                          (sat_flatcache_evict > 99999 ? 99999 : sat_flatcache_evict),
@@ -2898,6 +2949,7 @@ static void fps_update(void)
                          (fvdp1_cmds > 99 ? 99 : fvdp1_cmds));
                 if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 19, ovbuf);
                 fvdp1_claims_w = 0; fvdp1_refuse_w = 0;   /* the field's own row resets it */
+                fvdp1_why_code_w = 0; fvdp1_why_area_w = 0;
             }
             /* row 20 PSP REMOVED 2026-08-07 -- its question is CLOSED and the pool needed the
                ~350 B for the boot sprite-header sweep.  What it established, in three capture
@@ -6236,9 +6288,8 @@ extern short *sat_floor_punch_near;    /*   "                       per-column p
      vp_flags[i] == 0   -> plane i IS the whole of exactly one sector's surface
      vp_sector[i]       -> which sector, hence its EXACT world AABB in sat_sector_bbox
    (4 shorts per sector, world units, BOXTOP/BOXBOTTOM/BOXLEFT/BOXRIGHT). */
-extern short *vp_sector;
+extern short *vp_bbox;                 /* 4 shorts per plane: world AABB (union of sectors) */
 extern unsigned char *vp_flags;
-extern short *sat_sector_bbox;
 #define VPF_SPLIT 1
 #define VPF_MULTI 2
 #define SAT_BOXTOP 0
@@ -6668,6 +6719,9 @@ static void vdp1_floors_flush_body(void)
     sat_vp_t *pl;
     fvdp1_claim_n = 0;
     fvdp1_cmds = 0;
+    if (fvdp1_why_area > fvdp1_why_area_w)                /* window peak, FLT owns the reset */
+    { fvdp1_why_area_w = fvdp1_why_area; fvdp1_why_code_w = fvdp1_why_code; }
+    fvdp1_why_area = 0; fvdp1_why_code = 0;
     for (int i = 0; i < FVDP1_SLOTS; ++i) fvdp1_slot[i].used = 0;
     if (!sat_vdp1_floor_on || sat_split_active) return;
     if (fixedcolormap) return;              /* CRAM banks can't do invuln/light-amp */
@@ -6679,6 +6733,7 @@ static void vdp1_floors_flush_body(void)
        onto anything CPU-drawn (walls, software planes) or VDP1 wall/thing punches is
        HARMLESS: opaque NBG1 masks the former, later-drawn quads win the latter. */
     const sat_vp_t *forbid[24];
+    unsigned char forbid_dom[24];      /* 1 = an RBG0 dominant plane, 0 = sky */
     int nforbid = 0;
     for (pl = visplanes; pl < lastvisplane; ++pl)
     {
@@ -6687,11 +6742,12 @@ static void vdp1_floors_flush_body(void)
                     && (pl->lightlevel >> 4) == sat_vdp2_floor_band);
         if (!fsky && !fdom) continue;
         if (nforbid >= 24) return;          /* can't guarantee safety -> no claims this frame */
+        forbid_dom[nforbid] = (unsigned char)fdom;
         forbid[nforbid++] = pl;
     }
     for (pl = visplanes; pl < lastvisplane; ++pl)
     {
-        int is_ceil, lumpnum, ph, slot, x, fv_sec = -1;
+        int is_ceil, lumpnum, ph, slot, x, fv_sec = -1, fv_coplanar = 0;
         int ymin = 255, ymax = -1, parea = 0;
         if (fvdp1_claim_n >= FVDP1_CLAIM_MAX) break;
         /* budgets exhausted -> NO later plane can accept a tile, but each would still
@@ -6714,6 +6770,10 @@ static void vdp1_floors_flush_body(void)
            farther wall bottom) -- rarer, the known accepted residual. */
         if (is_ceil) continue;
         if (sat_potato_floors) continue;   /* SQ parity */
+        /* same height AND same flat as the RBG0 dominant: our texels line up with its, so
+           its screen region stops being forbidden for us (see the test below) */
+        fv_coplanar = (pl->height == sat_vdp2_floor_h
+                       && pl->picnum == sat_vdp2_floor_pic);
         /* WHOLE SURFACE OR NOTHING, now EXACTLY (owner: "je ne veux jamais de bande
            verticale a l'interieur d'un grand ensemble").  A visplane is a screen FRAGMENT:
            R_CheckPlane forks it per seg, and R_FindPlane merges two sectors that share
@@ -6722,12 +6782,24 @@ static void vdp1_floors_flush_body(void)
            which is what made the mode oscillate build to build.  vp_flags says it outright,
            and a claim that is a piece of a bigger surface is exactly what produced the
            vertical band in the middle of a large floor. */
-        if (!vp_flags || !vp_sector || !sat_sector_bbox) { fvdp1_refuse_w++; continue; }
+        /* A SPLIT plane is a PIECE of a surface: refuse it (owner: no vertical band inside a
+           big ensemble).  A MULTI plane is NOT -- merging coplanar sectors is the norm in
+           Doom, and refusing it refused the corridor and the lit zone (console probe read
+           @9 with 3000 px, twice).  Its world box is the UNION of the sectors in it, which
+           is still an exact world bound; the visible-extent intersection below tightens it. */
+        if (!vp_flags || !vp_bbox) { fvdp1_why(1, 0); continue; }
         { int vpi = (int)(pl - visplanes);
-          if (vp_flags[vpi] || vp_sector[vpi] < 0) { fvdp1_refuse_w++; continue; }
-          fv_sec = (int)vp_sector[vpi]; }
+          if (vp_flags[vpi] & VPF_SPLIT)
+          {   /* score it by screen area so the probe can rank it against the others */
+              int a = 0, xx;
+              for (xx = pl->minx; xx <= pl->maxx; ++xx)
+              { unsigned int t = pl->top[xx], bb = pl->bottom[xx];
+                if (t != 0xffu && bb >= t) a += (int)bb - (int)t + 1; }
+              fvdp1_why(1, a); continue;
+          }
+          fv_sec = vpi; }
         lumpnum = firstflat + flattranslation[pl->picnum];
-        if (!fvdp1_slot_would(lumpnum)) { fvdp1_refuse_w++; continue; }   /* inc-2c: free refusal */
+        if (!fvdp1_slot_would(lumpnum)) { fvdp1_why(3, 0); continue; }   /* inc-2c: free refusal */
         /* plane row extent AND its own screen area over its used columns */
         for (x = pl->minx; x <= pl->maxx; ++x)
         {
@@ -6746,7 +6818,7 @@ static void vdp1_floors_flush_body(void)
            now: the fragment test above is exact (vp_flags), so a looser area bar can no
            longer let a piece of a big floor in. */
         if (ymax < 0 || ymax - ymin < 2 || parea < FVDP1_MIN_PLANE_PX)
-        { fvdp1_refuse_w++; continue; }
+        { fvdp1_why(2, parea); continue; }
         ph = pl->height - viewz; if (ph < 0) ph = -ph;
         /* WORLD FOOTPRINT -- the SECTOR's own bbox (option A'), not a reconstruction.
            inc-1 through inc-4 inverted the R_MapPlane mapping at the four corners of the
@@ -6760,12 +6832,46 @@ static void vdp1_floors_flush_body(void)
            128-unit blockmap version survived); sat_sector_bbox keeps it.  Reading it costs
            four loads and four shifts, against eight FixedMul + two table lookups. */
         {
-            const short *sb = sat_sector_bbox + fv_sec * 4;
+            const short *sb = vp_bbox + fv_sec * 4;
             int wminx = (int)sb[SAT_BOXLEFT]   << FRACBITS;
             int wmaxx = (int)sb[SAT_BOXRIGHT]  << FRACBITS;
             int wminy = (int)sb[SAT_BOXBOTTOM] << FRACBITS;
             int wmaxy = (int)sb[SAT_BOXTOP]    << FRACBITS;
             int ci, gx0, gx1, gy0, gy1, gx, gy, nc, na;
+            /* TIGHTEN with the VISIBLE extent.  The world box is an exact upper bound on
+               where this plane's texels can live; the R_MapPlane inverse at the four corners
+               of its screen bbox is an upper bound on what is VISIBLE.  Their INTERSECTION is
+               smaller than either and still contains the true footprint -- so a merged plane
+               spanning a room and the corridor off it is scanned over the part on screen,
+               not over both.  Neither bound alone worked: the screen one overshoots badly in
+               an oblique view (it is the bbox of a ROTATED frustum slice, the inc-1..4 bug),
+               the world one covers sectors that are not on screen at all. */
+            {
+                int vminx = 0x7fffffff, vmaxx = -0x7fffffff;
+                int vminy = 0x7fffffff, vmaxy = -0x7fffffff;
+                for (ci = 0; ci < 4; ++ci)
+                {
+                    int row = (ci < 2) ? ymin : ymax;
+                    int col = (ci & 1) ? pl->maxx : pl->minx;
+                    int dist, len, ang, wx, wy;
+                    if (row < 0) row = 0; else if (row >= viewheight) row = viewheight - 1;
+                    dist = FixedMul(ph, yslope[row]);
+                    len  = FixedMul(dist, distscale[col]);
+                    ang  = (int)((viewangle + xtoviewangle[col]) >> 19);
+                    wx = viewx + FixedMul(finecosine[ang], len);
+                    wy = viewy + FixedMul(finesine[ang], len);
+                    if (wx < vminx) vminx = wx;  if (wx > vmaxx) vmaxx = wx;
+                    if (wy < vminy) vminy = wy;  if (wy > vmaxy) vmaxy = wy;
+                }
+                /* one 64-unit cell of slack: the screen bbox corners are sampled, not exact */
+                vminx -= (64 << 16); vmaxx += (64 << 16);
+                vminy -= (64 << 16); vmaxy += (64 << 16);
+                if (vminx > wminx) wminx = vminx;
+                if (vmaxx < wmaxx) wmaxx = vmaxx;
+                if (vminy > wminy) wminy = vminy;
+                if (vmaxy < wmaxy) wmaxy = vmaxy;
+                if (wminx > wmaxx || wminy > wmaxy) { fvdp1_why(5, parea); continue; }
+            }
             struct { short gx, gy; int tz; } cand[FVDP1_CAND_KEEP];
             /* accepted tiles CARRY their geometry (window + projected corners) from the
                acceptance test to the emission -- computed exactly once (inc-2) */
@@ -6774,7 +6880,7 @@ static void vdp1_floors_flush_body(void)
             gx0 = wminx >> 22; gx1 = wmaxx >> 22;
             gy0 = wminy >> 22; gy1 = (wmaxy >> 22) + 1;   /* tile wy-range is (Y0-64, Y0] */
             if ((gx1 - gx0 + 1) * (gy1 - gy0 + 1) > FVDP1_GRID_MAX)
-            { fvdp1_refuse_w++; continue; }               /* sprawling footprint: stay CPU */
+            { fvdp1_why(4, parea); continue; }             /* sprawling footprint: stay CPU */
             /* collect the FVDP1_TILE_CAP NEAREST visible cells (they serve the most px;
                anything dropped simply stays software via the punch-follows-emission rule).
                INCREMENTAL (inc-2c): along a gy row, tz and txv are LINEAR in gx --
@@ -6865,6 +6971,22 @@ static void vdp1_floors_flush_body(void)
                 for (int f = 0; f < nforbid && ok; ++f)
                 {
                     const sat_vp_t *fp = forbid[f];
+                    /* COPLANAR, SAME FLAT -> the dominant does not forbid us (owner, console:
+                       the lit plate is refused when the floor around it is the elected RBG0
+                       dominant, and taken when it is not -- his own A/B).
+                       Mechanism: the plate is INSET in the dominant, so in its columns the
+                       dominant owns rows above AND below it; the plate's 64-unit cells reach
+                       past the plate onto those rows, and the overhang test refuses every
+                       one.  Forcing the source window to the full cell in x (the VDP1
+                       no-stride fix) widened that overhang further.
+                       Why it is safe HERE and nowhere else: the plate is COPLANAR with the
+                       dominant and carries the SAME picnum, and flat texels are glued to the
+                       global 64-unit world grid -- so the overhanging pixels land on exactly
+                       the texels RBG0 would have drawn there.  Only the CRAM light bank
+                       differs.  The artefact is a shade fringe of at most one cell around a
+                       surface we otherwise could not claim at all; a wrong TEXTURE is
+                       impossible by construction.  SKY still forbids unconditionally. */
+                    if (forbid_dom[f] && fv_coplanar) continue;
                     int x0f = fvdp1_exl - 1, x1f = fvdp1_exr + 1;
                     if (x0f < fp->minx) x0f = fp->minx;
                     if (x1f > fp->maxx) x1f = fp->maxx;
@@ -6878,7 +7000,14 @@ static void vdp1_floors_flush_body(void)
                         else if (xc > fvdp1_exr) xc = fvdp1_exr;
                         yt = fvdp1_eyt[xc]; yb = fvdp1_eyb[xc];
                         if (yt > yb) continue;
-                        if (yt - 1 <= (int)b && yb + 1 >= (int)t) ok = 0;   /* overlap */
+                        /* REAL overlap, not a touch (owner's capture: @6 on the staircase --
+                           every tread's cells refused).  A tread and the floor in front of it
+                           SHARE AN EDGE, so they project to ADJACENT rows; the old +-1 row
+                           margin turned that adjacency into an overhang and refused every
+                           tread against the RBG0 dominant below it.  The punch is already
+                           shrunk by one row on each side, so a quad can never punch a row it
+                           did not draw -- the margin was buying nothing here. */
+                        if (yt <= (int)b && yb >= (int)t) ok = 0;   /* overlap */
                     }
                 }
                 if (!ok)
@@ -6895,11 +7024,15 @@ static void vdp1_floors_flush_body(void)
                 napx += tpx;
                 ++na;
             }
-            if (!na || na > budget
-                || vdp1_wnext + na >= vdp1_wall_cap - 8)   /* leave the walls their room */
-            { fvdp1_refuse_w++; continue; }
+            if (!na)
+            {   /* nothing accepted: either the scan found no cell at all, or every one it
+                   found was refused by the forbidden test / the plot caps */
+                fvdp1_why(nc ? 6 : 5, parea); continue;
+            }
+            if (na > budget || vdp1_wnext + na >= vdp1_wall_cap - 8)
+            { fvdp1_why(7, parea); continue; }             /* leave the walls their room */
             slot = fvdp1_slot_get(lumpnum);   /* lumpnum resolved at the pre-probe */
-            if (slot < 0) { fvdp1_refuse_w++; continue; }
+            if (slot < 0) { fvdp1_why(8, parea); continue; }
             fvdp1_claim[fvdp1_claim_n].key = pl->top;
             fvdp1_claim[fvdp1_claim_n].vp = pl;
             fvdp1_claim[fvdp1_claim_n].nt = (short)na;
@@ -6978,6 +7111,7 @@ static void vdp1_walls_flush(void)
        is demoted in sat_wall_spec_cpu[] and r_segs keeps that texture on the SOFTWARE path
        from the next frame on, where keep_tex already forbids both flatten rules.  Cost of the
        failure: exactly one frame of flat, then textured CPU for the rest of the level. */
+    vdp1_flat_sur = vdp1_flat_slot = vdp1_flat_pot = 0;  /* per-frame: V1 row `fl` */
     for (int i = 0; i < wall_acc_n; ++i) wall_acc[i].slot = -1;
     if (!sat_iso_flat)
         for (int i = 0; i < wall_acc_n && i < budget; ++i)
@@ -7020,11 +7154,19 @@ static void vdp1_walls_flush(void)
         int wmode = sat_iso_flat            ? 2   /* iso mode 4: force every VDP1 wall FLAT (overdraw-vs-fill probe) */
                   : (wall_acc[i].special)  ? 0
                   : wall_potato(i);
+        /* THE SIXTH PATH (owner's console capture: w0 sb0 lb..:0 fl0/0 and flat walls on
+           screen -- all five known causes at zero, so a sixth existed).  Here it is: the
+           wall was never a candidate for texturing at all, because its own SQ style asked
+           for flat (wall_acc[].pot, the per-view potato mode) or iso mode 4 forced it.
+           Nothing was refused and nothing failed, so neither of the two budget counters
+           could ever see it.  Counted apart as `fl?/?/<pot>`. */
+        if (wmode == 2) vdp1_flat_pot++;
         if (wmode != 2)                                        /* textured/banded: charge extra to surplus */
         {
             int extra = ((wmode == 1) ? wall_banded_cost(i) : wall_tilecount(i)) - 1;
             if (extra < 0) extra = 0;
-            if (extra_used[v] + extra <= surplus_per_view)
+            if (extra_used[v] + extra > surplus_per_view) vdp1_flat_sur++;
+            else
             {
                 /* THE ONLY resolve site.  Near-first, same order as the old eager pass, so the LRU
                    still favours the nearest walls -- but a wall that lost the surplus race never
@@ -7038,6 +7180,7 @@ static void vdp1_walls_flush(void)
                     wall_acc[i].mode = (wmode == 1) ? 3 : 1;   /* banded=3, textured=1 */
                     continue;
                 }
+                vdp1_flat_slot++;
             }
         }
         wall_acc[i].mode = 2;                                  /* flat baseline (guaranteed to fit) */

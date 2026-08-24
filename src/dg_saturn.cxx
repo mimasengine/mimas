@@ -738,6 +738,7 @@ extern "C" int sat_wall_lod_hits;                      /* core r_segs.c: size LO
 extern "C" int sat_lod_mindist, sat_wall_lod_near;     /* core r_segs.c: LOD distance floor + rescues */
 extern "C" int sat_lod_eff, sat_lod_auto_step, sat_gov_debt;   /* governor, row 21                    */
 extern "C" int sat_gov_axis, sat_gov_p_step, sat_gov_p_dirty;   /* multi-axis governor: which knob    */
+extern "C" int sat_gov_p_min, sat_gov_p_bites;   /* plane-rung ladder start / is the floor landing now */
 extern "C" int sat_thing_role_cull, sat_thing_cull_dist, sat_thing_role_cut;   /* role cull, row 21   */
 extern "C" void R_CompositeWindowReset (void);   /* one writer for both + the 16-slot distinct set     */
 /* SATURN RESIDENT FLAT POOL (core/r_flatcache.c) -- the fix for the "flat treadmill": before it,
@@ -956,6 +957,10 @@ extern "C" int sat_mark_suppress;
    inline).  inc-1 is NON-overlapped -> expect byte-identical render + Bp off the master + w up
    ~21ms + fps UNCHANGED (the win is inc-2).  Row 1 shows wp<state>. */
 extern "C" int sat_wallprep_slave;
+/* ⚠ SATURN 2026-08-24: setting this is NOT enough any more.  core/r_segs.c compiles its 8 KB
+   walljobs[] queue out unless SAT_WALLPREP_DEFER is 1 there -- 8 192 B of .bss taken straight off
+   the boot pool for a harness no shipped binary can reach.  Reviving the defer means flipping the
+   flag in BOTH files; the note at walljobs[] says the same thing from the other side. */
 extern "C" int sat_wallprep_defer;
 /* SATURN (2026-07-18): frames of forced VDP1 erase after a render-MODE change.  Consumed by
    vdp1_walls_flush (takes the empty-bank present path instead of the coherent-pair HOLD) so the
@@ -1012,6 +1017,23 @@ static void sat_apply_mode(void)
         int gp = gov_sq[(sat_gov_p_step < 0 ? 0 : sat_gov_p_step > 2 ? 2 : sat_gov_p_step)];
         int ef = sq_floor > gp ? sq_floor : gp;
         int ec = sq_ceil  > gp ? sq_ceil  : gp;
+        /* 🔴 SATURN 2026-08-24 -- PUBLISH WHERE THE LADDER ACTUALLY STARTS, AND WHETHER IT BITES.
+           The floor is a max(), so any rung at or below the owner's own SQ is a BIT-IDENTICAL
+           no-op -- and the shipped default is `ld` for both planes, exactly rung 1.  The governor
+           was therefore spending a fire plus 24 probe frames to reach a rung that cannot change a
+           pixel, measuring nothing, and then blacklisting the whole axis -- rung 2 (`flat`, the
+           only real one) included.  Two values fix it, both computed here because gov_sq[] lives
+           here and nowhere else:
+             p_min   = the first rung whose level beats the LOWER of the owner's two planes, i.e.
+                       the first rung that can degrade at least one of them.  The core jumps
+                       straight to it instead of incrementing.
+             p_bites = whether the floor is landing RIGHT NOW.  r_plane.c counts one action per
+                       plane while it is set, which is what lets GOV_ACTWAIT convict the axis. */
+        {
+            int base = sq_floor < sq_ceil ? sq_floor : sq_ceil;
+            sat_gov_p_min   = (gov_sq[1] > base) ? 1 : 2;
+            sat_gov_p_bites = (ef > sq_floor || ec > sq_ceil);
+        }
         sat_potato_floors = (ef == SQ_FLAT);                     /* solid-colour software floors */
         sat_floor_ld      = (ef == SQ_LD);                       /* half-rate floor texel fetch */
         sat_ceil_potato   = (ec == SQ_FLAT);                     /* solid-colour software ceilings */
@@ -1120,6 +1142,11 @@ extern "C" void sat_view_sq_apply(int v)
     sat_floor_ld      = (f == SQ_LD);
     sat_ceil_potato   = (c == SQ_FLAT);
     sat_ceil_ld       = (c == SQ_LD);
+    /* SATURN 2026-08-24: this per-view path assigns the four flags DIRECTLY -- it does not go
+       through the governor's max(), so the plane rung does not land on a split view at ANY rung.
+       Say so, instead of letting r_plane.c count actions the governor did not cause: with this
+       at 0 the axis reads inert in split and GOV_ACTWAIT retires it there, which is the truth. */
+    sat_gov_p_bites = 0;
 }
 extern "C" void sat_view_sq_restore(void)
 {
@@ -1131,6 +1158,11 @@ extern "C" void sat_view_sq_restore(void)
     sat_floor_ld      = (sq_floor == SQ_LD);
     sat_ceil_potato   = (sq_ceil == SQ_FLAT);
     sat_ceil_ld       = (sq_ceil == SQ_LD);
+    /* SATURN 2026-08-24: this restores the owner's RAW SQ -- it does not re-apply the governor's
+       plane floor either (pre-existing: sat_apply_mode is what re-lands it, on the next
+       sat_gov_p_dirty).  So 0 is the honest reading of the flags as they now stand, and it keeps
+       r_plane.c from crediting the governor for a plane the owner degraded himself. */
+    sat_gov_p_bites = 0;
 }
 #define GS_LEVEL 0
 #define GS_INTERMISSION 1                   /* gamestate_t: WI owns the 200..223 band (meta line + grain-extended art) */
@@ -1773,7 +1805,11 @@ static int sat_things_n = 0, sat_things_decl = 0, thing_bake_n = 0;   /* 'th' em
    reserve), not just the overlay -- a SHOW_FPS=0 release build must keep it.  Latent until then
    (SHOW_FPS is hardcoded 1) but the gating was a release trap.  Overlay-only state (fb_ profiler,
    tx counts, percentiles) stays behind SHOW_FPS. */
-extern "C" unsigned int rp_master_ms;   /* master frame ms -- gates the wall-span LOD (software side saturated?) */
+extern "C" unsigned int rp_master_ms;   /* frame PERIOD in ms, 1 Hz sample -- overlay + VDP1 back-off */
+extern "C" unsigned int sat_gov_act_s;   /* core r_segs.c: free-running tally of tiers the CPU took
+                                           BECAUSE OF THE SPAN -- the span governor's action counter */
+extern "C" unsigned int rp_rend10;      /* frame RENDER (Bw+Bp+P+M, views summed) in tenths ms, PER FRAME
+                                           -- the wall-span governor's signal (core r_parallel.c) */
 static int vdp1_last_cmds = 0;
 /* VDP1 transfer-over meter (SEGA VDP1 UM p.52-53).  The real flicker signal: did the plot finish the
    command list in the frame?  LOPR/COPR are cmd addrs in (VRAM byte offset)>>3 units. */
@@ -1823,16 +1859,45 @@ static int vdp1_wpn_slot_disp = 0;                    /* ... in the list current
 static int vdp1_wpn_reserve   = WPN_RESERVE_MIN;      /* command-equivalents withheld from things/walls              */
 static int vdp1_wpn_cut       = 0;                    /* frames whose plot did NOT reach the weapon (window count)   */
 static int vdp1_wpn_safe      = 0;                    /* consecutive reached-frames (decay counter)                  */
-/* Two-engine LOD tuning knobs (HW-tune these -- read rp_master_ms on the row-18 SLV line to calibrate
-   SOFT_BUDGET_MS).  The wall LOD only engages when things are already shed and the walls ALONE still
-   overrun the VDP1 budget, AND the master (software) has room to take them (else it would cause the
-   decrochage we are avoiding).  Relaxes back to the core default when VDP1 fits or the master fills. */
-#define SOFT_BUDGET_MS        50                      /* rp_master_ms above this = software saturated -> stop offloading walls */
+/* Two-engine LOD tuning knobs.  The wall LOD only engages when things are already shed and the walls
+   ALONE still overrun the VDP1 budget, AND the master (software) has room to take them (else it would
+   cause the decrochage we are avoiding).  Relaxes back to the core default when VDP1 fits or the
+   master fills.
+   🔴 SATURN 2026-08-24 -- THE SOFTWARE SIDE'S SIGNAL WAS THE WRONG CLOCK, AND HAD BEEN SINCE 2026-06.
+   Both directions were gated on `rp_master_ms < SOFT_BUDGET_MS(50)`.  But rp_master_ms is not master
+   CPU time: it is `10000/inst10` = the frame PERIOD in ms, sampled once per SECOND by fps_update.
+   So "the master has room" meant "the game is running above 20 fps" -- and this game's own console
+   design point is 95 ms of RENDER (core GOV_TARGET10) inside a 181-222 ms frame.  The predicate was
+   false in every frame ever shipped: the whole descending half of the span range ([200, 480), the
+   only user of WALL_SPAN_MIN) was unreachable code, and the ascending half answered to a number that
+   also contains the tic, the sound and the blit -- a slow thinker frame pushed walls onto VDP1.
+   Steer on `rp_rend10` instead: RENDER only (Bw+Bp+P+M), tenths of a ms, PER FRAME, already summed
+   across the split views -- the LOD governor's own decision quantity (core r_parallel.c), so the two
+   loops can no longer disagree about what "slow" means.  Dead band around GOV_TARGET10 = 950 so the
+   two directions cannot chatter into each other. */
+#define WALL_REND_SAT10     1100                      /* rend >= 110,0 ms: software drowning -> push walls to VDP1, accept the swim */
+#define WALL_REND_OK10       800                      /* rend <   80,0 ms: room to take walls BACK from VDP1 (frees commands)      */
 #define WALL_LOD_TRIGGER       4                      /* VDP1 commands left for things <= this = walls are eating the budget */
 #define SAT_WALL_CPU_SPAN_DEF 480                     /* == core r_segs.c default; span relaxes back up to here */
+#define SAT_WALL_CPU_SPAN_MAX 800                     /* 2026-08-23: CPU-saturated ceiling -- past DEF we offload MORE walls to VDP1 and accept the swim */
 #define WALL_SPAN_MIN         200                     /* floor: cap how many near walls we push to software */
 #define WALL_SPAN_STEP         40                     /* per-frame span adjust (AIMD ramp; < BAND so a wall crosses over >=2 frames) */
 #define WALL_PREWARM_BAND      96                     /* = core (V1 576 - span 480); kept constant so the CPU/VDP1 handoff band survives the shift */
+/* SATURN 2026-08-24 -- THE SPAN GOVERNOR'S PROOF STATE.  Same contract as the LOD governor's
+   GOV_PROBE / GOV_PROOF / GOV_ACTWAIT / sat_gov_inert (core r_parallel.c), scaled to this loop:
+   the numbers are smaller because the span is a RAMP, not a rung, so its whole effect lands
+   inside the probe window instead of on one frame.  WSPAN_PROOF is 6,0 ms of RENDER -- below the
+   ~6 ms of Bp noise a build can shift on its own, a step is not distinguishable from luck. */
+#define WSPAN_PROBE           24                      /* frames before judging a direction        */
+#define WSPAN_ACTWAIT          6                      /* frames to see the action counter move    */
+#define WSPAN_PROOF           60                      /* 6,0 ms of rend: less and it bought nothing */
+#define WSPAN_UP               1                      /* raise the span: shed software walls      */
+#define WSPAN_DOWN             2                      /* lower the span: free VDP1 commands       */
+static int          wspan_wait  = 0;                  /* frames left in the probe, 0 = idle       */
+static int          wspan_dir   = 0;                  /* the direction under probe (WSPAN_*)      */
+static int          wspan_inert = 0;                  /* bit WSPAN_UP / WSPAN_DOWN proven useless */
+static unsigned int wspan_rend0 = 0;                  /* rp_rend10 when the probe was armed       */
+static unsigned int wspan_act0  = 0;                  /* sat_gov_act_s when the probe was armed   */
 
 #if SHOW_FPS
 extern "C" int rp_timeout_count;
@@ -1991,6 +2056,7 @@ static unsigned int rbg_sky_sum, rbg_upl_sum, rbg_xfm_sum, rbg_rpt_sum;
    link with RP_PROF off (then 0). */
 extern "C" int sat_prof_rec_max;                                 /* window max (= p100), tenths-ms */
 extern "C" int sat_prof_pk_bw, sat_prof_pk_bp, sat_prof_pk_p, sat_prof_pk_m;  /* per-phase peaks */
+extern "C" int sat_prof_bp_win;   /* peak Bp of the CURRENT 1 s window -- what row 20's split describes */
 extern "C" int sat_prof_mx_map, sat_prof_mx_x, sat_prof_mx_y, sat_prof_mx_ang, sat_prof_mx_t;
 /* worst-REC frame FULL detail, snapshotted at each new peak (row 14) -- phase split + slave b/Pb */
 extern "C" int sat_prof_mx_bw, sat_prof_mx_bp, sat_prof_mx_p, sat_prof_mx_m, sat_prof_mx_b, sat_prof_mx_pb;
@@ -2255,6 +2321,31 @@ static void fps_update(void)
                 rp_to_site[2] > 9 ? 9 : rp_to_site[2], rp_to_site[3] > 9 ? 9 : rp_to_site[3],
                 sat_cd_read_retries, sat_cd_loads, sat_cd_persector);
         if (sat_dbg_overlay_mode != 2) SRL::Debug::Print(0, 0, ovbuf);
+        /* SATURN 2026-08-22 (owner): the reduced modes (1 fps-only / 2 off) must disable the
+           CALCULATIONS too, not just the prints -- the row marshalling (percentile folds +
+           profiler reads) is dead work once the rows are hidden.  Rows 1-24 are gated on mode 0;
+           the window accumulators they consume are reset here so the reduced modes don't keep
+           feeding stale windows, and returning to mode 0 relaunches on a clean sample. */
+        if (sat_dbg_overlay_mode != 0) {
+            df_pre_sum = df_blit_sum = df_post_sum = 0;
+            df_tic_sum = df_snd_sum = df_present_sum = df_frames = 0;
+        }
+        /* SATURN 2026-08-24 -- PUBLISH THE FRAME PERIOD BEFORE THE MODE-0 GATE.  This assignment
+           lived 100 lines below, INSIDE `if (sat_dbg_overlay_mode == 0)`, so L+R (row 584, the
+           chord every video capture uses) froze rp_master_ms at whatever the overlay-taxed frames
+           last measured -- and its two consumers, the VDP1 proportional back-off (`fm` below) and
+           the wall-span governor, both run EVERY frame and are NOT gated on the overlay.  Exactly
+           the release trap this file already fixed once for the budget state (see the note at the
+           MEASURED VDP1 BUDGET STATE block): overlay-only state stays behind the gate, state the
+           EMISSION path consumes does not.  (`fps_update` itself is still under #if SHOW_FPS --
+           latent, since SHOW_FPS is hardcoded 1, and unchanged by this move.) */
+        rp_master_ms = mst;   /* frame PERIOD in ms (not master CPU time) -- see the governor note */
+        /* SATURN 2026-08-24: row 20's Bp sub-split rides THIS window's worst Bp frame, not the
+           map's.  Zeroed here, outside the mode-0 gate, so the latch keeps following the game even
+           while the rows are hidden (returning to mode 0 then shows a fresh sample, not a ghost). */
+        sat_prof_bp_win = 0;
+        if (sat_dbg_overlay_mode == 0)
+        {
         /* row 1: MASTER-FRAME COMPOSITION, window-AVERAGED over this 1s tick (ms) -- so a single
            heavy frame is never read as the general case (percentiles are on row 3).  Decomposes MST:
              R  = render (REC = B+P+M), DERIVED = MST - T - S - b - dg  (=> R+T+S+b+dg == MST)
@@ -2350,7 +2441,6 @@ static void fps_update(void)
         df_pre_sum = df_blit_sum = df_post_sum = 0;
         df_tic_sum = df_snd_sum = df_present_sum = df_frames = 0;
         rbg_sky_sum = rbg_upl_sum = rbg_xfm_sum = rbg_rpt_sum = 0;
-        rp_master_ms = mst;   /* master frame ms, exposed for the shared core */
         {
             /* row 2: VDP1 load + done-rate + build stamp.  VD1 = cmds this frame + D/B
                (EDSR-CEF this frame) + Dr = % of plotted frames Done over the window.
@@ -2580,7 +2670,7 @@ static void fps_update(void)
                existed for is answered; per the owner's rule NO machine-specific paths get built,
                so the revision is a fact for the notes, not a runtime input.  Re-read it with a
                one-liner here if a future SGL/emulator question needs it.) */
-            snprintf(ovbuf, sizeof ovbuf, "VD1 fb%d/%d MP%d w%d %dms g%d Q%d E%d/%d ",
+            snprintf(ovbuf, sizeof ovbuf, "VD1 fb%d/%d MP%d w%d %dms g%d Q%d E%d/%d        ",
                      fb_pk_starve, fb_pk_mag,
                      sat_mp_active, (sat_mp_wd > 999 ? 999 : sat_mp_wd),
                      (sat_mp_wait_ms > 99 ? 99 : sat_mp_wait_ms),
@@ -3014,8 +3104,20 @@ static void fps_update(void)
                  A<0/1>  0 = manual rung (or off), 1 = the governor is steering
                  d<B/P/M/-> the phase it elected last time it fired; `-` = held (Bw dominated, and
                          Bw has no quality knob at all, so electing it would degrade the innocent)
-                 w<0..3> wall-LOD rung: 0 = full quality, 3 = 800 px
-                 p<0..2> plane rung applied as a FLOOR over the owner's SQ (0 none / 1 LD / 2 FLAT)
+                 w<0..3> wall-LOD rung: 0 = full quality, 3 = 800 px.  From 2026-08-24 the SAME
+                         rung also owns the perspective-SUBDIVISION skip (sat_wall_subdiv_skip,
+                         core r_segs.c): w0 subdivides magnified walls, w>=1 emits them as one
+                         swimming quad -- the cheapest of the three `B` levers (it keeps the
+                         texture; the area rung and `sb` replace it with a flat colour).
+                 p<0..2> plane rung applied as a FLOOR over the owner's SQ (0 none / 1 LD / 2 FLAT).
+                         From 2026-08-24 the first election JUMPS to the first rung that can beat
+                         the owner's own setting instead of stepping: with the shipped SQ (`ld`
+                         both planes) rung 1 was BIT-IDENTICAL to rung 0, so `P` used to fire, probe
+                         24 frames, measure nothing and blacklist the whole axis -- rung 2, the only
+                         real one, with it.  Expect `p2` where you only ever saw `p1`.
+                         The axis now has an action counter too (planes the FLOOR actually
+                         degraded), so it can be convicted: in SPLIT it will be, and correctly --
+                         sat_view_sq_apply writes the flags per view without the max().
                  e<±n>   ⚠ **SIGNED WHOLE MILLISECONDS OF INTEGRATED ERROR** -- one accumulator, not
                          two.  >0 = behind the 70 ms render target, <0 = ahead.  Fires a degrade at
                          +300, gives quality back at -900.
@@ -3023,12 +3125,29 @@ static void fps_update(void)
                          other, and with `REC 50:36.0 95:86.0` the median frame took the low branch
                          and wiped the debt every time.  If `e` sits pinned at one value while the
                          rungs never move, that failure is back.
+                 L<0..2> lead-fill rung -- RETIRED 2026-08-24, expect a permanent `L0`.  The fill
+                         has been parked since sat_wall_lead_x went to 0 with no chord left to
+                         re-arm it (core r_segs.c), so sat_lead_arm always returns .on = 0 and
+                         SAT_LEAD_EMIT is unreachable: the rung cannot change a pixel.  It was
+                         still being ELECTED, though -- burning a fire, GOV_ACTWAIT frames of probe
+                         blackout, and (sat_lead_mode being an A/B window key) wiping the REC
+                         p50/p95 histogram twice per cycle.  The election is now gated on
+                         sat_wall_lead_x > 0, so re-arming the fill brings the rung back by itself.
                  px<n>   the wall threshold in force (sat_lod_eff)
                  nr<n>   tiers the DISTANCE FLOOR rescued: small on screen but inside
                          sat_lod_mindist, i.e. foreground the LOD is forbidden to flatten.  0 means
                          the floor is inert and the area rung is doing all the work.
-                 rc<n>   sprites dropped by the ROLE CULL (~1 s).  Independent of everything else
-                         here; it is on this row because there is room, not because it is governed.
+                 i<n>    INERT MASK, both governors.  bits 0-2 = the LOD governor's axes
+                         (1 = `w`, 2 = `p`, 4 = lead); bits 3-4 = the wall-span governor's
+                         DIRECTIONS (8 = raising the span proved useless, 16 = lowering it did).
+                         A bit set means that lever fired, bought less than its PROOF threshold,
+                         was undone, and is not elected again until the next map.  Both masks clear
+                         on a map change (parole).  `i0` = nothing has been convicted.
+                 (`rc`, the ROLE-CULL tally, RETIRED 2026-08-24 to make room for `ws`.  Its own
+                         legend said it was here "because there is room, not because it is
+                         governed" -- and with the span governor's `ws` and its inert bits there is
+                         no longer room.  sat_thing_role_cut still counts and is still zeroed
+                         below; re-add the field from git if the role cull is ever back on trial.)
                ⚠ The target is on `rend` = Bw+Bp+P+M, which is NOT the frame: MST runs ~20-25 ms
                higher.  70 ms of render defends roughly 10-11 fps. */
             {
@@ -3037,16 +3156,27 @@ static void fps_update(void)
                 if (gov_e < -999) gov_e = -999;
                 /* `nr` (near-rescues) RETIRED 2026-08-16 for `sb`: it validated the distance floor,
                    which is settled, and the budget is the half of the `B` axis now doing the work.
-                   `sb<budget>/<cut>` = the rung's seg allowance, and how many segs it actually
-                   flattened this ~1 s window.  `sb0/0` while `w>0` means the budget is inert and
-                   the AREA rung is carrying the axis alone -- which is exactly the state that let
-                   `Bp110,8` survive three governor fires on `ds118`. */
-                snprintf(ovbuf, sizeof ovbuf, "GOV d%c w%d p%d e%d sb%d/%d L%d i%d rc%d ",
+                   `sb<cut>` = how many segs the drawseg budget actually flattened this ~1 s
+                   window (the allowance itself is `w`'s gov_segb entry, so it is not printed).
+                   `sb0` while `w>0` means the budget is inert and the AREA rung is carrying the
+                   axis alone -- which is exactly the state that let `Bp110,8` survive three
+                   governor fires on `ds118`. */
+                /* SATURN 2026-08-24 -- `ws` MOVED HERE, and `sb` narrowed to pay for it.
+                   The wall-span governor now runs in EVERY mode, but its only readout was row 17,
+                   which is printed under `sat_local_players <= 1`: in split the loop that steers
+                   the CPU/VDP1 wall share was invisible.  Row 21 is the governor row and prints in
+                   every mode, so `ws` belongs here.  Its columns come from `sb`, which printed
+                   `<budget>/<cut>`: the budget half is a PURE FUNCTION of `w` (the gov_segb table
+                   in r_parallel.c), so it was the only redundant field on the row.  `sb` is now the
+                   cut count alone.
+                     ws<n>  the CPU-entry span in force (sat_wall_cpu_span, 200..800, step 40).
+                            HIGH = more walls on VDP1 (they swim), LOW = more walls in software.
+                            480 = the core default, i.e. the governor is neutral. */
+                snprintf(ovbuf, sizeof ovbuf, "GOV d%c w%d p%d e%d sb%d L%d i%d ws%d ",
                          (char)sat_gov_axis, sat_lod_auto_step, sat_gov_p_step,
-                         gov_e, sat_seg_budget,
+                         gov_e,
                          (sat_seg_budget_cut > 999 ? 999 : sat_seg_budget_cut),
-                         sat_gov_lead_step, sat_gov_inert,
-                         (sat_thing_role_cut > 999 ? 999 : sat_thing_role_cut));
+                         sat_gov_lead_step, sat_gov_inert | (wspan_inert << 3), sat_wall_cpu_span);
                 if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 21, ovbuf);
                 /* the field's own row owns its reset ([[debug-overlay-legend]]) */
                 sat_wall_lod_near = 0; sat_thing_role_cut = 0; sat_seg_budget_cut = 0;
@@ -3304,6 +3434,7 @@ static void fps_update(void)
            🔴 2026-08-20 (owner): SAME BUG, THIRD ROW SET -- 22 ghosted rows 23/24 (THK/TIC), the
            two lines that outlived every L+R press.  Bound = 24, the LAST overlay row; any new row
            below must raise it in the same commit. */
+        }   /* end mode-0 rows 1-24 (reduced modes skip the marshalling above) */
         if (sat_dbg_overlay_mode == 1) {
             static const char bl[] = "                                        ";
             for (int rr = 1; rr <= 24; ++rr) SRL::Debug::Print(0, rr, (char *)bl);
@@ -6099,6 +6230,21 @@ extern int   centerxfrac;              /* core r_main.c: centerx<<16 == vanilla 
 extern int   viewwidth;                /* core r_main.c: view columns                       */
 extern short *sat_floor_punch_edge;    /* core r_plane.c fclaim==2: per-column punch TOP row */
 extern short *sat_floor_punch_near;    /*   "                       per-column punch BOTTOM  */
+/* SATURN 2026-08-24 -- PLANE IDENTITY (option A', core r_plane.c/p_setup.c).  These are the
+   two facts a visplane never carried, and without which "is this a whole bounded surface?"
+   could only ever be approximated from screen space:
+     vp_flags[i] == 0   -> plane i IS the whole of exactly one sector's surface
+     vp_sector[i]       -> which sector, hence its EXACT world AABB in sat_sector_bbox
+   (4 shorts per sector, world units, BOXTOP/BOXBOTTOM/BOXLEFT/BOXRIGHT). */
+extern short *vp_sector;
+extern unsigned char *vp_flags;
+extern short *sat_sector_bbox;
+#define VPF_SPLIT 1
+#define VPF_MULTI 2
+#define SAT_BOXTOP 0
+#define SAT_BOXBOTTOM 1
+#define SAT_BOXLEFT 2
+#define SAT_BOXRIGHT 3
 extern unsigned char *R_FlatCachePeek (int lumpnum);
 extern int   W_LumpResident (int lump);
 extern void *W_CacheLumpNum (int lump, int tag);
@@ -6129,6 +6275,9 @@ extern sat_vp_t *visplanes, *lastvisplane;
    ~= src_rows * dest_width.  Calibration is a GUESS (~14k px-writes/ms -> ~3 ms of floor
    plot): tune against `pr`/`Dr` with capture evidence, not upward on faith. */
 #define FVDP1_PX_CAP    40000         /* whole-frame floor plot charge */
+/* plane's own screen px below this -> stays CPU.  Replaces the old `ymax-ymin < 8`
+   height rule; see the note at the eligibility test. */
+#define FVDP1_MIN_PLANE_PX 512
 #define FVDP1_TILE_PX   16000         /* single-tile cap: near monsters stay CPU */
 
 /* (sat_vdp1_floor_on + the fvdp1_claims_w/refuse_w/cmds counters are defined near line
@@ -6263,12 +6412,29 @@ static int fvdp1_tile_geom(int gx, int gy, int ph, const int *aabb,
     cx1 = aabb[1] < X0 + (64 << 16) ? aabb[1] : X0 + (64 << 16);
     cy0 = aabb[3] < Y0 ? aabb[3] : Y0;                    /* [wminy,wmaxy] ^ (Y0-64,Y0] */
     cy1 = aabb[2] > Y0 - (64 << 16) ? aabb[2] : Y0 - (64 << 16);
-    u0 = (cx0 - X0) >> 16;  u1 = ((cx1 - X0) + 0xffff) >> 16;
+    if (cx1 <= cx0 || cy0 <= cy1) return 0;   /* cell does not meet the plane's footprint */
+    /* SATURN 2026-08-24 -- U WINDOWING IS NOT ADDRESSABLE ON VDP1.  The owner's "les
+       textures des quads claim ne sont pas bonnes".
+       A VDP1 sprite has NO STRIDE REGISTER: CMDSRCA is a character address and CMDSIZE is
+       (width/8, height), and the part reads width*height CONTIGUOUS bytes -- width bytes
+       per line, then straight on to the next line.  A sub-rectangle of a 64-wide flat is
+       therefore NOT addressable: asking for u in [u0,u1) makes the hardware read
+       (u1-u0) bytes per line from a 64-byte-per-line image, so every line after the first
+       is fetched at the wrong offset and the texture shears.  The 8-texel snap this code
+       used to do addressed the SRCA alignment rule and missed the stride rule entirely.
+       Windowing in V is fine and stays: v0 skips whole 64-byte lines, and (v1-v0) lines
+       of 64 px ARE contiguous.
+       Latent until now: the old world AABB came from inverse-projecting a screen bbox and
+       was almost always wider than the cell, so u came out 0..64 by accident.  The exact
+       sector bbox (option A') clips in x at every sector edge -- which is what made the
+       bug visible on every claimed quad at once.
+       Cost of the fix: the quad spans the full 64-unit cell in x instead of hugging the
+       sector edge.  The overhang is masked the usual way (priority 0, opaque CPU pixels)
+       and the PUNCH is still clamped to the plane's own silhouette. */
+    u0 = 0; u1 = 64;
     v0 = (Y0 - cy0) >> 16;  v1 = ((Y0 - cy1) + 0xffff) >> 16;
-    u0 &= ~7; u1 = (u1 + 7) & ~7;                         /* 8-texel SRCA/SIZE grain */
-    if (u1 > 64) u1 = 64;
     if (v1 > 64) v1 = 64;
-    if (u0 < 0 || v0 < 0 || u1 - u0 < 8 || v1 <= v0) return 0;
+    if (v0 < 0 || v1 <= v0) return 0;
     wc[0] = X0 + (u0 << 16); wc[1] = Y0 - (v0 << 16);     /* A = texel (u0,v0) */
     wc[2] = X0 + (u1 << 16); wc[3] = Y0 - (v0 << 16);     /* B = (u1,v0)       */
     wc[4] = X0 + (u1 << 16); wc[5] = Y0 - (v1 << 16);     /* C = (u1,v1)       */
@@ -6481,7 +6647,23 @@ static void vdp1_floors_flush(void)
 }
 static void vdp1_floors_flush_body(void)
 {
+    /* WALL RESERVE (owner, console 2026-08-24: "les murs softwares ont ete degrades sans
+       raison a flats alors que le framerate etait correct").  Floors emit FIRST into the SAME
+       command bank, so every floor command comes straight off
+           surplus = vdp1_wall_cap - vdp1_wnext - wall_acc_n
+       which is the budget that buys wall TEXTURES (vdp1_walls_flush).  The old guard reserved
+       8 commands, i.e. nothing: 56 floor commands on a 248-slot bank took 22 % of the wall
+       budget and dropped walls to flats at a perfectly healthy frame rate -- and the LOD
+       governor was reading w0/L0, so the degradation was not even its doing.
+       Floors now bid for a QUARTER of the FREE surplus and never touch the rest: a wall-heavy
+       scene starves them by arithmetic, an empty one lets them have their whole cap.
+       wall_acc_n is final here -- the seg loop has run, the kick calls floors before walls. */
     int budget = FVDP1_CMD_CAP;
+    {
+        int wsurplus = vdp1_wall_cap - vdp1_wnext - wall_acc_n;
+        int floor_cap = (wsurplus > 0) ? (wsurplus >> 2) : 0;
+        if (budget > floor_cap) budget = floor_cap;
+    }
     int pxbudget = FVDP1_PX_CAP;      /* frame plot charge: src_rows * dest_width units */
     sat_vp_t *pl;
     fvdp1_claim_n = 0;
@@ -6509,8 +6691,8 @@ static void vdp1_floors_flush_body(void)
     }
     for (pl = visplanes; pl < lastvisplane; ++pl)
     {
-        int is_ceil, lumpnum, ph, slot, x;
-        int ymin = 255, ymax = -1;
+        int is_ceil, lumpnum, ph, slot, x, fv_sec = -1;
+        int ymin = 255, ymax = -1, parea = 0;
         if (fvdp1_claim_n >= FVDP1_CLAIM_MAX) break;
         /* budgets exhausted -> NO later plane can accept a tile, but each would still
            pay its full cell scan + acceptance just to refuse (round 7: v129 = 12.9 ms
@@ -6532,46 +6714,63 @@ static void vdp1_floors_flush_body(void)
            farther wall bottom) -- rarer, the known accepted residual. */
         if (is_ceil) continue;
         if (sat_potato_floors) continue;   /* SQ parity */
+        /* WHOLE SURFACE OR NOTHING, now EXACTLY (owner: "je ne veux jamais de bande
+           verticale a l'interieur d'un grand ensemble").  A visplane is a screen FRAGMENT:
+           R_CheckPlane forks it per seg, and R_FindPlane merges two sectors that share
+           (height, picnum, lightlevel).  Every previous form of this test -- screen-edge
+           contact, own area, key multiplicity -- was a proxy, and each failed differently,
+           which is what made the mode oscillate build to build.  vp_flags says it outright,
+           and a claim that is a piece of a bigger surface is exactly what produced the
+           vertical band in the middle of a large floor. */
+        if (!vp_flags || !vp_sector || !sat_sector_bbox) { fvdp1_refuse_w++; continue; }
+        { int vpi = (int)(pl - visplanes);
+          if (vp_flags[vpi] || vp_sector[vpi] < 0) { fvdp1_refuse_w++; continue; }
+          fv_sec = (int)vp_sector[vpi]; }
         lumpnum = firstflat + flattranslation[pl->picnum];
         if (!fvdp1_slot_would(lumpnum)) { fvdp1_refuse_w++; continue; }   /* inc-2c: free refusal */
-        /* plane row extent over its used columns */
+        /* plane row extent AND its own screen area over its used columns */
         for (x = pl->minx; x <= pl->maxx; ++x)
         {
             unsigned int t = pl->top[x], b = pl->bottom[x];
             if (t == 0xffu || b < t) continue;
             if ((int)t < ymin) ymin = (int)t;
             if ((int)b > ymax) ymax = (int)b;
+            parea += (int)b - (int)t + 1;
         }
-        if (ymax < 0 || ymax - ymin < 8) { fvdp1_refuse_w++; continue; }
+        /* AREA, not HEIGHT (owner: "focaliser sur la LARGEUR de l'ecran plutot que la
+           hauteur").  `ymax - ymin < 8` is a pure height test and it is what refused the
+           lit rectangle in the middle of the room and every stair tread past the first:
+           both are WIDE and SHALLOW -- 300 columns x 6 rows is 1800 px of real span work,
+           and neither ever reaches 8 rows of depth at playing distance.  Width is where
+           the pixels are, so the sliver guard belongs on the area.  Safe to loosen ONLY
+           now: the fragment test above is exact (vp_flags), so a looser area bar can no
+           longer let a piece of a big floor in. */
+        if (ymax < 0 || ymax - ymin < 2 || parea < FVDP1_MIN_PLANE_PX)
+        { fvdp1_refuse_w++; continue; }
         ph = pl->height - viewz; if (ph < 0) ph = -ph;
-        /* WORLD FOOTPRINT (inc-1, the owner's baked-quads model): the R_MapPlane inverse
-           at the 4 extreme corners of the plane's screen bbox -> world AABB -> candidate
-           64-grid cells.  The footprint is a convex frustum slice, so its world extremes
-           sit at those corners.  Vanilla flats are glued to the global 64-unit grid, so
-           the grid IS the pre-baked quad decomposition -- no level-load pass needed. */
+        /* WORLD FOOTPRINT -- the SECTOR's own bbox (option A'), not a reconstruction.
+           inc-1 through inc-4 inverted the R_MapPlane mapping at the four corners of the
+           plane's SCREEN bbox to get a world AABB.  That rectangle is the bounding box of
+           a rotated frustum slice: seen at an angle it overshoots the true footprint
+           badly, so the cell scan proposed cells the plane never covers, tile_geom
+           windowed quads against a box larger than the surface, and the coverage law then
+           refused the plane or accepted it with holes.  It is where the lit inset
+           rectangle and the stair treads died.
+           P_GroupLines already computes the exact box and used to throw it away (only the
+           128-unit blockmap version survived); sat_sector_bbox keeps it.  Reading it costs
+           four loads and four shifts, against eight FixedMul + two table lookups. */
         {
-            int wminx = 0x7fffffff, wmaxx = -0x7fffffff;
-            int wminy = 0x7fffffff, wmaxy = -0x7fffffff;
+            const short *sb = sat_sector_bbox + fv_sec * 4;
+            int wminx = (int)sb[SAT_BOXLEFT]   << FRACBITS;
+            int wmaxx = (int)sb[SAT_BOXRIGHT]  << FRACBITS;
+            int wminy = (int)sb[SAT_BOXBOTTOM] << FRACBITS;
+            int wmaxy = (int)sb[SAT_BOXTOP]    << FRACBITS;
             int ci, gx0, gx1, gy0, gy1, gx, gy, nc, na;
             struct { short gx, gy; int tz; } cand[FVDP1_CAND_KEEP];
             /* accepted tiles CARRY their geometry (window + projected corners) from the
                acceptance test to the emission -- computed exactly once (inc-2) */
             struct { short gx, gy; int sx[4], sy[4], uv[4]; } acc[FVDP1_TILE_CAP];
             int aabb4[4], napx;
-            for (ci = 0; ci < 4; ++ci)
-            {
-                int row = (ci < 2) ? ymin : ymax;
-                int col = (ci & 1) ? pl->maxx : pl->minx;
-                int dist, len, ang, wx, wy;
-                if (row < 0) row = 0; else if (row >= viewheight) row = viewheight - 1;
-                dist = FixedMul(ph, yslope[row]);
-                len  = FixedMul(dist, distscale[col]);
-                ang  = (int)((viewangle + xtoviewangle[col]) >> 19);
-                wx = viewx + FixedMul(finecosine[ang], len);
-                wy = viewy + FixedMul(finesine[ang], len);
-                if (wx < wminx) wminx = wx;  if (wx > wmaxx) wmaxx = wx;
-                if (wy < wminy) wminy = wy;  if (wy > wmaxy) wmaxy = wy;
-            }
             gx0 = wminx >> 22; gx1 = wmaxx >> 22;
             gy0 = wminy >> 22; gy1 = (wmaxy >> 22) + 1;   /* tile wy-range is (Y0-64, Y0] */
             if ((gx1 - gx0 + 1) * (gy1 - gy0 + 1) > FVDP1_GRID_MAX)
@@ -6598,7 +6797,13 @@ static void vdp1_floors_flush_body(void)
                     {
                         int j;
                         /* centre-to-corner <= 45.3 units -> corners keep tz >= TZ_NEAR */
-                        if (tz < FVDP1_TZ_NEAR + (46 << 16)) continue;
+                        /* The centre guard only SCREENS the geom call: fvdp1_tile_geom
+                           windows the cell against the sector's own bbox and gates its own
+                           projected corners.  The old +46u margin (70 units on the centre)
+                           was throwing away exactly the nearest cells -- a step or the
+                           start of a corridor at playing distance never had one.  16u
+                           keeps the screen cheap without eating the near band. */
+                        if (tz < FVDP1_TZ_NEAR + (16 << 16)) continue;
                         {   /* centre-column prune, DIVISION-FREE (inc-2): with t16 > 0
                                the scol +- marg vs [minx,maxx] compares cross-multiply
                                exactly (products <= ~2^24, 32-bit safe; the +-2 slack
@@ -6644,10 +6849,22 @@ static void vdp1_floors_flush_body(void)
                 if (tpx > FVDP1_TILE_PX || tpx > pxbudget - napx) continue;
                 fvdp1_tile_raster(sx, sy);
                 if (fvdp1_exl > fvdp1_exr) continue;
-                for (int f = 0; f < nforbid + fvdp1_claim_n && ok; ++f)
+                /* CLAIMED FLOORS ARE NO LONGER FORBIDDEN (owner, console: the staircase took
+                   its first tread and then stopped dead).  The nearest tread is claimed
+                   first, joined this list, and every tread behind it -- whose quad reaches
+                   down to its own near edge, i.e. onto the tread in front -- was refused:
+                   one claim per staircase, by construction.
+                   It is safe to drop now, and only now: with the EXACT sector bbox (option
+                   A') a quad is windowed to its own sector's footprint, and two adjacent
+                   sectors' bboxes TOUCH but do not overlap, so two claimed floors no longer
+                   fight over pixels at all.  It was the inverse-projected screen bbox --
+                   which overshot the true footprint badly in an oblique view -- that made
+                   claim-vs-claim overlap real in the first place.
+                   Sky and the RBG0 dominant stay forbidden: those ARE punched regions VDP1
+                   shows through. */
+                for (int f = 0; f < nforbid && ok; ++f)
                 {
-                    const sat_vp_t *fp = (f < nforbid) ? forbid[f]
-                                                       : fvdp1_claim[f - nforbid].vp;
+                    const sat_vp_t *fp = forbid[f];
                     int x0f = fvdp1_exl - 1, x1f = fvdp1_exr + 1;
                     if (x0f < fp->minx) x0f = fp->minx;
                     if (x1f > fp->maxx) x1f = fp->maxx;
@@ -6711,6 +6928,7 @@ static void vdp1_floors_flush_body(void)
    over-estimate -- VD1 finished at ~147/248 yet far walls vanished -- dropped them to mode 0 = sky.)
    Painted far->near (painter's algorithm). */
 
+extern "C" unsigned int sat_wall_spec_cpu[8];   /* core r_segs.c: SPECIALS demoted to the CPU */
 static void vdp1_walls_flush(void)
 {
     wtex_bakes_win += wtex_bakes;        /* fold the PREVIOUS flush's count into the row-18 window */
@@ -6747,6 +6965,33 @@ static void vdp1_walls_flush(void)
        (extra_used + (c-1) <= budget-n  <=>  used + c + (n-i-1) <= budget). */
     extern int sat_split_active, sat_local_players;     /* core: split flag + live player count */
     int budget = vdp1_wall_cap - vdp1_wnext;
+    /* PASS 0 -- SPECIALS FIRST (owner contract, restated on console 2026-08-24: "je vois
+       souvent des flats a la place de textures speciales... ils devraient etre en murs vdp1,
+       et en fallback cpu si pas possible").  The 2026-08-20 specials blocker only ever fixed
+       the INTENT here -- `special` forced wmode 0 -- and then let the wall fall through to
+       `mode = 2` = FLAT by either of two doors: losing the surplus race, or wall_tex_resolve()
+       failing to free a slot.  A flat switch or door face is invisible as an interactive
+       element and the level stops being playable.
+       So a special is resolved BEFORE any ordinary wall can take the last slot, and WITHOUT
+       the surplus gate (specials are a tiny fraction of segs; their extra is still CHARGED to
+       the surplus below, just not gated on it).  If one still cannot get a slot, its texture
+       is demoted in sat_wall_spec_cpu[] and r_segs keeps that texture on the SOFTWARE path
+       from the next frame on, where keep_tex already forbids both flatten rules.  Cost of the
+       failure: exactly one frame of flat, then textured CPU for the rest of the level. */
+    for (int i = 0; i < wall_acc_n; ++i) wall_acc[i].slot = -1;
+    if (!sat_iso_flat)
+        for (int i = 0; i < wall_acc_n && i < budget; ++i)
+        {
+            if (!wall_acc[i].special) continue;
+            int slot = wall_tex_resolve(wall_acc[i].texnum, wall_acc[i].cmap);
+            if (slot >= 0) { wall_acc[i].slot = (short)slot; wall_acc[i].mode = 1; }
+            else
+            {
+                int t = wall_acc[i].texnum & 255;
+                sat_wall_spec_cpu[(t >> 5) & 7] |= 1u << (t & 31);
+                wall_acc[i].mode = 2;
+            }
+        }
     int nv = sat_local_players; if (nv < 1) nv = 1; else if (nv > 4) nv = 4;
     int nviews = sat_split_active ? nv : 1;             /* d_main renders nv views in split (2..4) */
     int surplus = budget - wall_acc_n;                 /* cmds available beyond the all-flat baseline */
@@ -6755,10 +7000,19 @@ static void vdp1_walls_flush(void)
     int extra_used[4] = { 0, 0, 0, 0 };
     for (int i = 0; i < wall_acc_n; ++i)
     {
-        wall_acc[i].slot = -1;                                /* no slot until one is actually won */
         if (i >= budget) { wall_acc[i].mode = 0; continue; }   /* n > budget (cap makes this unreachable) */
         int v = (nviews > 1) ? (int)wall_acc[i].view : 0;     /* per-view surplus bin (0..nviews-1) */
         if (v >= nviews) v = nviews - 1;
+        if (wall_acc[i].special && !sat_iso_flat)
+        {   /* settled in pass 0.  Its upgrade still CHARGES the surplus (the bank is shared);
+               it simply was not gated on it. */
+            if (wall_acc[i].slot >= 0)
+            {
+                int extra = wall_tilecount(i) - 1;
+                if (extra > 0) extra_used[v] += extra;
+            }
+            continue;
+        }
         /* 3-way: 0=textured 1=banded 2=flat.  A SPECIAL wall (door/switch, wall_acc[i].special) is
            forced TEXTURED for readability even in pot2.  The "no texture slot -> flat" arm has moved
            DOWN, past the budget test: asking for a slot is the expensive part (a bake, and in the
@@ -7783,7 +8037,20 @@ static void vdp1_wpn_kick(void)
                is not a budget for this one, and nothing else in the loop ever clears it. */
             { extern int gamemap;
               if (gamemap != vdp1_budget_map)
-              { vdp1_budget_map = gamemap; vdp1_budget_cmds = 0; vdp1_budget_clean = 0; } }
+              { vdp1_budget_map = gamemap; vdp1_budget_cmds = 0; vdp1_budget_clean = 0;
+                /* SATURN 2026-08-24: same argument, same line -- the SPAN is a learned state too,
+                   and nothing else ever cleared it.  A span raised to 800 in the previous level's
+                   worst room started the next one with every near wall already on VDP1. */
+                sat_wall_cpu_span = SAT_WALL_CPU_SPAN_DEF;
+                sat_wall_cpu_v1   = SAT_WALL_CPU_SPAN_DEF + WALL_PREWARM_BAND;
+                /* PAROLE: a direction convicted in the previous level's geometry deserves another
+                   try in this one -- the LOD governor's GOV_RETEST argument, with the map change
+                   as the trigger (no rate limit needed: a map change cannot repeat twice a second). */
+                wspan_inert = 0; wspan_wait = 0; wspan_dir = 0;
+                /* SPECIALS demotion is per-LEVEL: a texture the slot pool could not serve in
+                   the previous map deserves a fresh try here (and the texnum space itself
+                   changes with a new IWAD/level set). */
+                for (int si = 0; si < 8; ++si) sat_wall_spec_cpu[si] = 0; } }
             if (overran) { vdp1_budget_cmds = got / 4; vdp1_budget_clean = 0; }
             else if (vdp1_budget_cmds > 0 && ++vdp1_budget_clean >= THING_LP_CLEAN) {
                 int gap = WALL_CMD_CAP - vdp1_budget_cmds;    /* geometric climb, additive near the top */
@@ -8075,6 +8342,102 @@ extern "C" void sat_walls_kick(void)
         vdp1_wall_cap = wall_cap_full;   /* things flush + budget law allocate against the FULL bank */
 #endif
 #endif
+#if VDP1_WALL_TEST
+        /* 🔴 WALL SPAN GOVERNOR -- UNIFIED, ALL MODES, and MOVED HERE 2026-08-24.
+           It lived 80 lines below, inside `#if SAT_WORLD_THINGS_VDP1`: a governor of WALLS behind
+           the THINGS guard, so turning world-things off for an A/B silently took the wall loop with
+           it.  Its home is here, right after vdp1_walls_flush(), under the WALL guard -- and this
+           is also where `vdp1_wnext` means what the loop needs it to mean (the walls just flushed).
+
+           SIGNAL: rp_rend10 = the frame's TOTAL render (Bw+Bp+P+M), tenths of a ms, per frame,
+           split views already summed by the core.  See the WALL_REND_* note at the constants for
+           why it replaced rp_master_ms.  `room` = the frame's TOTAL VDP1 command headroom.
+             - render drowning + VDP1 headroom -> RAISE the span (more walls -> VDP1, near walls
+               swim) to shed the software R_GetColumn bill;
+             - VDP1 overrun + render has room  -> LOWER the span (more software, frees commands);
+             - otherwise relax toward the core default.
+
+           PROOF (owner 2026-08-24; the mechanism the LOD governor has had since 2026-08-17 and this
+           one did not).  An ineffective step is a one-way trap: it costs picture, buys nothing, and
+           nothing ever takes it back.  So after a step, watch for WSPAN_PROBE frames --
+             * if the render did not drop by WSPAN_PROOF tenths, SNAP BACK to the default and mark
+               that DIRECTION inert; it is not elected again until parole;
+             * fast path, UP direction only: if sat_gov_act_s (free-running, r_segs.c -- one per
+               tier the CPU took BECAUSE OF THE SPAN) has not moved at all, raising the span has
+               nothing to hand back to VDP1.  Convict at once instead of paying 24 frames.
+               The DOWN direction gets no such test: its purpose is VDP1 relief and its action
+               INCREASES that same counter, so "did not move" cannot convict it.
+           The ramp stays free-running inside a probe -- the span has 16 micro-steps and one step
+           per probe would need ~24 s to cross its range at this frame rate.  What the probe judges
+           is the DIRECTION, which is the thing that can be wrong.
+           PAROLE: the inert bits clear with the span itself on a map change (see the budget reset),
+           because a corridor with no span-clampable walls says nothing about the next level. */
+        {
+            int cap = vdp1_wall_cap;
+            if (vdp1_budget_cmds > 0 && vdp1_budget_cmds < cap) cap = vdp1_budget_cmds;
+            int room = cap - vdp1_wnext - vdp1_wpn_reserve;
+            int rend_ok  = (rp_rend10 > 0 && rp_rend10 <  WALL_REND_OK10);   /* render has room */
+            int rend_sat = (rp_rend10 >=     WALL_REND_SAT10);               /* render drowning */
+            int vdp1_room = (room > WALL_LOD_TRIGGER);
+            int want = 0;                       /* WSPAN_UP = shed CPU, WSPAN_DOWN = free VDP1 */
+
+            /* --- judge the step in flight ------------------------------------------------
+               🔴 EACH DIRECTION IS JUDGED ON THE RESOURCE IT BUYS, NOT ON A SHARED ONE.
+               First version judged BOTH on rp_rend10 and the owner's very first 4p capture said
+               `i24` -- both directions convicted -- which is exactly what that had to produce:
+               the DOWN direction moves walls FROM VDP1 TO SOFTWARE to free commands, so it can
+               only make `rend` WORSE.  Judging it on render time is judging a lever by the cost
+               it pays instead of the thing it buys, and it was guaranteed to be blacklisted on
+               its first probe, every level, forever.
+                 UP   buys master time    -> judge on rp_rend10 (must drop by WSPAN_PROOF);
+                 DOWN buys VDP1 headroom  -> judge on `room` (the saturation must actually end). */
+            if (wspan_wait > 0)
+            {
+                int convict = 0;
+                if (wspan_dir == WSPAN_UP && sat_gov_act_s == wspan_act0
+                    && wspan_wait <= WSPAN_PROBE - WSPAN_ACTWAIT)
+                    convict = 1;                /* nothing to buy -- see the fast path above */
+                if (--wspan_wait == 0)
+                    convict |= (wspan_dir == WSPAN_DOWN)
+                            ? (room <= WALL_LOD_TRIGGER)          /* still saturated: bought nothing */
+                            : (rp_rend10 + WSPAN_PROOF > wspan_rend0);   /* no measurable gain */
+                if (convict)
+                {
+                    sat_wall_cpu_span = SAT_WALL_CPU_SPAN_DEF;
+                    wspan_inert |= wspan_dir;
+                    wspan_wait = 0; wspan_dir = 0;
+                }
+                else if (wspan_wait == 0) wspan_dir = 0;   /* proven: leave the span where it is */
+            }
+
+            /* --- elect a direction ------------------------------------------------------- */
+            if (vdp1_budget_cmds > 0 && !vdp1_room && rend_ok) want = WSPAN_DOWN;
+            else if (rend_sat && vdp1_room)                    want = WSPAN_UP;
+            if (want & wspan_inert) want = 0;                  /* blacklisted for this level */
+
+            if (want == WSPAN_DOWN) {
+                if (sat_wall_cpu_span > WALL_SPAN_MIN) sat_wall_cpu_span -= WALL_SPAN_STEP;
+            } else if (want == WSPAN_UP) {
+                if (sat_wall_cpu_span < SAT_WALL_CPU_SPAN_MAX) sat_wall_cpu_span += WALL_SPAN_STEP;
+            } else if (sat_wall_cpu_span < SAT_WALL_CPU_SPAN_DEF) {
+                sat_wall_cpu_span += WALL_SPAN_STEP;
+                if (sat_wall_cpu_span > SAT_WALL_CPU_SPAN_DEF) sat_wall_cpu_span = SAT_WALL_CPU_SPAN_DEF;
+            } else if (sat_wall_cpu_span > SAT_WALL_CPU_SPAN_DEF) {
+                sat_wall_cpu_span -= WALL_SPAN_STEP;
+                if (sat_wall_cpu_span < SAT_WALL_CPU_SPAN_DEF) sat_wall_cpu_span = SAT_WALL_CPU_SPAN_DEF;
+            }
+
+            /* --- arm the probe the frame a direction first leaves the default ------------- */
+            if (want && wspan_wait == 0)
+            {
+                wspan_wait  = WSPAN_PROBE;
+                wspan_dir   = want;
+                wspan_rend0 = rp_rend10;
+                wspan_act0  = sat_gov_act_s;
+            }
+            sat_wall_cpu_v1 = sat_wall_cpu_span + WALL_PREWARM_BAND;   /* keep the pre-warm band -> V1 is the real VDP1-exit */
+        }
+#endif
 #if SAT_WORLD_THINGS_VDP1
         /* ADAPTIVE things budget (AIMD).  The VDP1 raster is SHARED with the walls, whose share
            swings wildly (open outdoor = few segs, spare VDP1 -> many enemies fit; tech room = dense
@@ -8123,20 +8486,6 @@ extern "C" void sat_walls_kick(void)
             if (sat_thing_emit_cap < budget_cap)      sat_thing_emit_cap += 2;         /* smooth ramp up */
             else if (sat_thing_emit_cap > budget_cap) sat_thing_emit_cap = budget_cap; /* snap down to fit */
             if (sat_thing_emit_cap < 0) sat_thing_emit_cap = 0;
-            /* (2) WALL LOD: engage only when things are already shed and the walls STILL overrun the
-               VDP1 budget (room for things <= trigger), AND the master (software) has room to take them.
-               Lower the span -> more near walls -> software (CPU), freeing VDP1; relax back to the core
-               default when VDP1 fits again OR the master is saturated (never worsen decrochage). */
-            {   int room_for_things = cap_cmds - vdp1_wnext - vdp1_wpn_reserve;  /* left after walls + gun */
-                int master_ok = (rp_master_ms > 0 && rp_master_ms < SOFT_BUDGET_MS);
-                if (vdp1_budget_cmds > 0 && room_for_things <= WALL_LOD_TRIGGER && master_ok) {
-                    if (sat_wall_cpu_span > WALL_SPAN_MIN)         sat_wall_cpu_span -= WALL_SPAN_STEP;
-                } else if (sat_wall_cpu_span < SAT_WALL_CPU_SPAN_DEF) {
-                    sat_wall_cpu_span += WALL_SPAN_STEP;
-                    if (sat_wall_cpu_span > SAT_WALL_CPU_SPAN_DEF) sat_wall_cpu_span = SAT_WALL_CPU_SPAN_DEF;
-                }
-                sat_wall_cpu_v1 = sat_wall_cpu_span + WALL_PREWARM_BAND;   /* keep the pre-warm band width -> V1 is the real VDP1-exit */
-            }
         } else {
             /* SPLIT WBUDGET (2026-07-20): identical command-budget policy to the 1p branch above, but
                sat_thing_emit_cap is PER-VIEW and nv views each emit up to it into the shared queue, so
@@ -9210,6 +9559,8 @@ static unsigned char keyq_decode(unsigned char k)
         case 5: return KEY_FIRE;
         case 6: return KEY_USE;
         case 7: return KEY_RSHIFT;
+        case 8: return KEY_STRAFE_L;
+        case 10: return KEY_STRAFE_R;
         default: return k;
     }
 }
@@ -9225,6 +9576,8 @@ static unsigned char keyq_encode(unsigned char key)
         case KEY_FIRE:      return 5;
         case KEY_USE:       return 6;
         case KEY_RSHIFT:    return 7;
+        case KEY_STRAFE_L:  return 8;
+        case KEY_STRAFE_R:  return 10;
         default: return key;
     }
 }
@@ -9639,6 +9992,14 @@ static void poll_pad(void)
                whole NBG3 text layer only in mode 2. */
             sat_dbg_overlay_mode = (sat_dbg_overlay_mode + 1) % 3;
             nbg3_show = (sat_dbg_overlay_mode != 2);
+            /* The L/R remap (','/'.' <-> strafe) is mode-dependent, so a shoulder held ACROSS the
+               toggle sends its keydown under the OLD key and its keyup under the NEW one -> the old
+               key stays stuck "pressed".  Force-release BOTH mappings so the toggle never leaves
+               L or R latched. */
+            keyq_push(0, keyq_encode(','));
+            keyq_push(0, keyq_encode('.'));
+            keyq_push(0, keyq_encode(KEY_STRAFE_L));
+            keyq_push(0, keyq_encode(KEY_STRAFE_R));
         }
         lr_was = lr_now;
     }
@@ -9871,7 +10232,17 @@ static void poll_pad(void)
             if (pad_map[i].mask == PER_DGT_TX
                 && (sat_local_players > 1 || !(cur & PER_DGT_TL) || !(cur & PER_DGT_TR)))   /* also eat TAB when L/R held (perf toggles) */
                 continue;
-            keyq_push(pressed, keyq_encode(pad_map[i].key));
+            /* SATURN 2026-08-22 (owner): in the reduced debug modes (1 fps-only / 2 off), the L/R
+               shoulders are NOT needed for chords, so re-map them to STRAFE (the mp_input.cxx
+               convention: TL = strafe-left, TR = strafe-right).  In mode 0 (full debug) they stay
+               ','/'.' so the L+* chords keep their modifier.  key_strafeleft/right are 0xa0/0xa1
+               (doomkeys.h KEY_STRAFE_L/R); they pass through keyq_encode/decode untouched. */
+            unsigned char pk = pad_map[i].key;
+            if (sat_dbg_overlay_mode != 0) {
+                if      (pad_map[i].mask == PER_DGT_TL) pk = KEY_STRAFE_L;
+                else if (pad_map[i].mask == PER_DGT_TR) pk = KEY_STRAFE_R;
+            }
+            keyq_push(pressed, keyq_encode(pk));
             if (pad_map[i].mask == PER_DGT_TA)
                 keyq_push(pressed, KEY_ENTER);
         }

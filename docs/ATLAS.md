@@ -58,7 +58,7 @@ Corollaries that follow directly, and that this document is organised around:
 | 14–16 | `dg_saturn.cxx:2136/2118` | misc | — |
 | 17 | `dg_saturn.cxx:2062` (1p) / `:2024` (split) | `V1 c B fl<sur>/<slot> LP% ec ws W<res>/<cuts>` **1p only** / `SPL … tc bal` | player-count |
 | 18 | `dg_saturn.cxx:2323` | `VRM tx<n>/26 bk q cb lb<b>:<w>/<p>/<s>.<nocol>` | — |
-| 19 | `dg_saturn.cxx:2346` | `FLT A<+/-> v @<why>.<area> p r ld ev f F<claims>/<refuse>/<cmds>` | — |
+| 19 | `dg_saturn.cxx:2346` | `FLT A<+/-> v s<punch>/<texcol> @<why>.<area> r ld f F<claims>/<refuse>/<cmds>` — **all the `v`/`s`/`@`/`F` fields read 0: the VDP1 floor claim is PARKED** (`SAT_VDP1_FLOORS 0`). `A`/`ld`/`f` are the flat cache and stay live. | — |
 | 20 | `r_parallel.c:2146` | parallel profiler | — |
 | **21, 22** | **free** | ← §6 claims row 21 | — |
 | 23 | `dg_saturn.cxx:7756` | `PLAYERS: n` | — |

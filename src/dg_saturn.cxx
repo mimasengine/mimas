@@ -724,6 +724,7 @@ extern "C" int sat_tex_load_budget;    /* core r_segs.c: textures faulted in per
 extern "C" int sat_wall_flat_io;       /* core r_segs.c: tiers drawn flat for want of residency        */
 extern "C" int sat_wall_flat_nocol;    /* core r_segs.c: ...and with no cached dominant colour either  */
 extern "C" int sat_plane_flat_io;      /* core r_plane.c: visplanes drawn potato for want of residency */
+extern "C" int sat_plane_texcol_px;    /* core r_plane.c: px drawn PER PIXEL, master-only    */
 extern "C" int sat_plane_flat_nocol;   /* core r_plane.c: ...with no cached flat colour either         */
 extern "C" int sat_spr_flat_io;        /* core r_things.c: sprites skipped for want of residency       */
 extern "C" int r_composite_builds;     /* core r_data.c: composites REBUILT (CPU copy, no disc I/O)    */
@@ -2056,6 +2057,18 @@ static int fvdp1_claims_w = 0, fvdp1_refuse_w = 0;   /* window counters (FLT row
    A code with a LARGE area is the answer to "why is that surface not taken"; a code with a
    small area means the big surfaces were skipped before ever being scored (sky, the RBG0
    dominant, a ceiling, potato) and none of those count as refusals. */
+/* THE LEDGER (owner, console: "est-ce qu'on arrete bien de dessiner ce qui est pris ?  ca a
+   l'air plus lent avec ce mode que sans").  The punch DOES remove rows from the span pass --
+   r_plane.c trims top[]/bottom[] to the software leftover -- but nothing ever weighed that
+   against what the mode ADDS, so the question could not be answered from a frame time.
+   Two numbers, both in hundreds of pixels, printed as s<saved>/<texcol>:
+     saved  = rows actually punched (the span pass never sees them)
+     texcol = the FAR residue of a partial claim, drawn PER PIXEL and MASTER-ONLY by
+              sat_plane_texcol, where the untouched plane would have been spans
+   texcol >= saved means the mode is losing on the fill alone -- before counting `v` (its own
+   decision cost) and the extra VDP1 commands.  The geometry is currently computed TWICE per
+   claimed tile, once in the flush and again in the punch hook, which is most of `v`. */
+static int fvdp1_punch_px = 0;
 static int fvdp1_why_code = 0, fvdp1_why_area = 0;
 static int fvdp1_why_code_w = 0, fvdp1_why_area_w = 0;   /* window survivors, FLT `@` */
 static void fvdp1_why(int code, int area)
@@ -2935,14 +2948,15 @@ snprintf(ovbuf, sizeof ovbuf, "V1 c%d B%d fl%d/%d/%d LP%d%% ec%d ws%d tx%d i%d W
                    the isolated term that was hiding inside row-1 `pr` when round 6 read
                    pr 69..243 ms.  Expect ~<50 (5 ms) after the DIVU/DDA rewrite; if it
                    climbs back, the geometry path regressed -- look here first. */
-                snprintf(ovbuf, sizeof ovbuf, "FLT A%c v%d @%d.%d p%d r%d ld%d ev%d f%d F%d/%d/%d ",
+                snprintf(ovbuf, sizeof ovbuf, "FLT A%c v%d s%d/%d @%d.%d r%d ld%d f%d F%d/%d/%d ",
                          sat_flatcache_on ? '+' : '-',
                          (fvdp1_cpu10 > 999 ? 999 : fvdp1_cpu10),
+                         (fvdp1_punch_px / 100 > 999 ? 999 : fvdp1_punch_px / 100),
+                         (sat_plane_texcol_px / 100 > 999 ? 999 : sat_plane_texcol_px / 100),
                          fvdp1_why_code_w,
                          (fvdp1_why_area_w / 100 > 999 ? 999 : fvdp1_why_area_w / 100),
-                         sat_flatcache_slots, sat_flatcache_live,
+                         sat_flatcache_live,
                          (sat_flatcache_load  > 99999 ? 99999 : sat_flatcache_load),
-                         (sat_flatcache_evict > 99999 ? 99999 : sat_flatcache_evict),
                          (sat_flatcache_full  > 9999  ? 9999  : sat_flatcache_full),
                          (fvdp1_claims_w > 999 ? 999 : fvdp1_claims_w),
                          (fvdp1_refuse_w > 999 ? 999 : fvdp1_refuse_w),
@@ -6289,6 +6303,7 @@ extern short *sat_floor_punch_near;    /*   "                       per-column p
      vp_sector[i]       -> which sector, hence its EXACT world AABB in sat_sector_bbox
    (4 shorts per sector, world units, BOXTOP/BOXBOTTOM/BOXLEFT/BOXRIGHT). */
 extern short *vp_bbox;                 /* 4 shorts per plane: world AABB (union of sectors) */
+extern int    sat_plane_texcol_px;     /* core r_plane.c: px drawn per-pixel, master-only  */
 extern unsigned char *vp_flags;
 #define VPF_SPLIT 1
 #define VPF_MULTI 2
@@ -6312,6 +6327,46 @@ typedef struct { int height, picnum, lightlevel, minx, maxx;
 extern sat_vp_t *visplanes, *lastvisplane;
 }
 
+/* ============================ VDP1 FLOORS -- PARKED ============================
+   Set to 1 to build the claim back in.  Everything it needs is still here, with the
+   whole inc-0..inc-4 history in the comments; flipping this flag is the only step.
+
+   WHY IT IS PARKED (owner's console A/B, 2026-08-24, three ON/OFF pairs at the same
+   spot, read off the ledger this mode finally grew -- FLT `s<punch>/<texcol>` and `v`):
+
+     pair   v (ms)   punched px   texcol px   verdict
+       1      2.2        1300           0     Bp -1.7, P +2.0  -> net loss
+       2      4.4        4600           0     Bp -3.9, P +3.8  -> net loss
+       3      9.2         100         300     P +10.9, 28->20 fps
+
+   The BEST case in three pairs is 4600 punched pixels.  Spans cost ~7 cycles/px
+   (the repo's own R_DrawColumn figure), so that is under a millisecond of saved fill
+   -- against 4.4 ms of decision and 3.8 ms of extra VDP1 emission in the very same
+   frame.  A factor of ten against, and pair 3 is the degenerate case: 9.2 ms spent to
+   punch a hundred pixels.  This is not a tuning problem, it is the arithmetic round 9
+   already wrote down (savings ceiling 1.5-3 ms whatever you do) and the plot exchange
+   rate dest/src = d*d/(cx*ph), which is ~1.5 at the bottom of the screen and ~0.06
+   twenty rows under the horizon.
+
+   Would console invert it?  No, and it leans the WRONG way: `s` is a COUNT, identical
+   there; the saved fill is memory-bound so it grows on console (the one favourable
+   term, bounded at ~1.6 ms even at 10 cycles/px); but `v` is DIVU + array walks whose
+   cache misses Ymir does not charge, and Ymir does not model VDP1 PLOT TIME AT ALL --
+   and this mode only ever had the VDP1's idle margin.  For the sign to flip a span
+   pixel would have to cost ~55 cycles.
+
+   WHAT WOULD HAVE TO BE TRUE to reopen: punched area an order of magnitude larger --
+   tens of thousands of px per frame, on surfaces LOW on screen where the exchange rate
+   is ~1.5.  The large low surface is the dominant floor, which RBG0 already draws for
+   free.  That is the whole difficulty, in one sentence.
+
+   KEPT OUTSIDE THIS FLAG because they stand on their own: the specials contract, the
+   wall budget reserve, the V1 `fl<sur>/<slot>/<pot>` flatten causes, and
+   sat_plane_texcol_px (which prices ANY partial claim, not just these).
+   The VDP1 no-stride rule this work uncovered is in ../saturn-refs/knowledge/HW_VDP1.md.
+   ============================================================================== */
+#define SAT_VDP1_FLOORS 0
+#if SAT_VDP1_FLOORS
 #define FVDP1_SLOTS     3
 #define FVDP1_BASE      0x25C7D000u
 #define FVDP1_SLOTSZ    0x1000u
@@ -6379,6 +6434,12 @@ static inline int fvdp1_fdiv(int a, int b)
    identity dist = ph*yslope[y] <=> y = centery + ph*halfW/tz.  Returns 0 when the
    point is nearer than the guard (the caller's centre check makes this unreachable
    for emitted tiles -- belt only).  Coords are clamped to a VDP1-safe range. */
+/* +1 while projecting a FLOOR, -1 while projecting a CEILING.  R_MapPlane's identity
+   dist = |height-viewz| * yslope[y] is symmetric about centery: the same |ph| and distance
+   give TWO rows, centery+d for a surface below the eye and centery-d for one above.  The
+   floors-only path could hard-code the plus; opening ceilings cannot.  Set once per plane by
+   the flush and by the punch hook, which must agree or the punch would not trace the quad. */
+static int fvdp1_psign = 1;
 static int fvdp1_project(int wx, int wy, int ph, int *psx, int *psy)
 {
     extern int detailshift;              /* core: block-scope like every other site here */
@@ -6390,7 +6451,7 @@ static int fvdp1_project(int wx, int wy, int ph, int *psx, int *psy)
     xs  = fvdp1_fdiv(centerxfrac, tz);
     sx  = (centerxfrac + FixedMul(tx, xs)) >> 16;
     hw2 = (viewwidth << detailshift) >> 1;
-    sy  = centery + (int)(((long long)fvdp1_fdiv(ph, tz) * hw2) >> 16);
+    sy  = centery + fvdp1_psign * (int)(((long long)fvdp1_fdiv(ph, tz) * hw2) >> 16);
     if (sx < -1024) sx = -1024; else if (sx > 1023) sx = 1023;
     if (sy < -512)  sy = -512;  else if (sy > 1000) sy = 1000;
     *psx = sx; *psy = sy;
@@ -6574,7 +6635,9 @@ static void fvdp1_emit_tile(int slot, int ph, int lightlevel,
        row lands the near seam on the IDENTICAL colormap the CPU/VDP2 side uses there.
        What remains is the 7-CRAM-bank snap (hardware-bound) and the tile being uniformly
        lit where the CPU has a gradient -- both move the error INSIDE the tile. */
-    for (i = 1; i < 4; ++i) if (sy[i] > nr) nr = sy[i];
+    /* the tile's NEAR row -- LOWEST on screen for a floor, HIGHEST for a ceiling */
+    for (i = 1; i < 4; ++i)
+        if (fvdp1_psign > 0 ? (sy[i] > nr) : (sy[i] < nr)) nr = sy[i];
     if (nr < 0) nr = 0; else if (nr >= viewheight) nr = viewheight - 1;
     zi = FixedMul(ph, yslope[nr]) >> 20;                 /* LIGHTZSHIFT */
     if (li < 0) li = 0; else if (li > 15) li = 15;
@@ -6597,7 +6660,12 @@ static void fvdp1_emit_tile(int slot, int ph, int lightlevel,
     if (sat_wall_paint & 1)
     {
         cmd[0] = 0x0004;                                 /* POLYGON (SRCA/SIZE ignored) */
-        cmd[3] = (unsigned short)(0x0100u | 224u);       /* PLAYPAL bright yellow */
+        /* PLAYPAL 88 = saturated RED.  Was 224, which is in the light beige/white ramp:
+           on screen it reads WHITE and the overlay text is white too, so the rows sitting
+           over a claimed floor became unreadable (owner).  Red completes the triad with
+           the VDP1 walls (112, green) and the VDP1 things (198, blue), and is dark enough
+           for white text to stay legible on top of it. */
+        cmd[3] = (unsigned short)(0x0100u | 88u);        /* PLAYPAL saturated red */
     }
     for (i = 0; i < 4; ++i)
     {
@@ -6628,7 +6696,9 @@ static int sat_vdp1_floor_claim(int picnum, int height, int minx, int maxx,
     {
         if (fvdp1_claim[i].key != top) continue;
         unsigned short fv_t0 = frt_read();       /* FLT `v` probe: hook side */
-        int ph = viewz - height; if (ph < 0) ph = -ph;
+        int ph = viewz - height;
+        fvdp1_psign = (ph < 0) ? -1 : 1;   /* MUST match the flush, or the punch misses */
+        if (ph < 0) ph = -ph;
         for (int x = minx; x <= maxx; ++x) { fvdp1_ptop[x] = 0x7fff; fvdp1_pbot[x] = 0; }
         for (int j = 0; j < fvdp1_claim[i].nt; ++j)
         {
@@ -6673,6 +6743,7 @@ static int sat_vdp1_floor_claim(int picnum, int height, int minx, int maxx,
             { fvdp1_ptop[x] = 0x7fff; fvdp1_pbot[x] = 0; continue; }
             if (fvdp1_ptop[x] < (short)t2) fvdp1_ptop[x] = (short)t2;
             if (fvdp1_pbot[x] > (short)b2) fvdp1_pbot[x] = (short)b2;
+            fvdp1_punch_px += (int)fvdp1_pbot[x] - (int)fvdp1_ptop[x] + 1;
             if (fvdp1_ptop[x] > fvdp1_pbot[x])
             { fvdp1_ptop[x] = 0x7fff; fvdp1_pbot[x] = 0; }
         }
@@ -6719,6 +6790,7 @@ static void vdp1_floors_flush_body(void)
     sat_vp_t *pl;
     fvdp1_claim_n = 0;
     fvdp1_cmds = 0;
+    fvdp1_punch_px = 0; sat_plane_texcol_px = 0;          /* per-frame ledger */
     if (fvdp1_why_area > fvdp1_why_area_w)                /* window peak, FLT owns the reset */
     { fvdp1_why_area_w = fvdp1_why_area; fvdp1_why_code_w = fvdp1_why_code; }
     fvdp1_why_area = 0; fvdp1_why_code = 0;
@@ -6763,12 +6835,18 @@ static void vdp1_floors_flush_body(void)
         if (pl->height == sat_vdp2_floor_h && pl->picnum == sat_vdp2_floor_pic
             && (pl->lightlevel >> 4) == sat_vdp2_floor_band) continue;
         is_ceil = (pl->height > viewz);
-        /* FLOORS ONLY (since 0c).  A claimed CEILING z-fights the VDP1 walls: a wall quad
-           drawn later (walls win overlaps) paints over the punched region of a NEARER/LOWER
-           ceiling -- the case the legacy cross_hi cut machinery existed for, unplugged with
-           it.  Floors keep the mirror risk only in the pedestal profile (nearer floor vs
-           farther wall bottom) -- rarer, the known accepted residual. */
-        if (is_ceil) continue;
+        /* CEILINGS OPENED 2026-08-24 (owner: "appliquer les memes regles au plafond").
+           They ran the identical pipeline from here on -- plane identity, union world bbox,
+           area rule, forbidden regions, plot caps -- only the projection SIGN and the near
+           row differ, and both are now carried by fvdp1_psign.
+           The old note kept them out on a z-fight: a wall quad drawn later (walls win
+           overlaps) painting over the punched region of a nearer, lower ceiling.  That was
+           written for the one-frame-late ftex ceiling quads, and the cut machinery it refers
+           to (cross_hi) was unplugged with them; the claims here are plotted in the SAME
+           frame.  KNOWN RESIDUAL, watch for it: a ceiling seen past a nearer wall top can
+           still be overpainted by that wall's quad.  It is the exact mirror of the pedestal
+           profile floors already accept. */
+        fvdp1_psign = is_ceil ? -1 : 1;
         if (sat_potato_floors) continue;   /* SQ parity */
         /* same height AND same flat as the RBG0 dominant: our texels line up with its, so
            its screen region stops being forbidden for us (see the test below) */
@@ -7052,6 +7130,11 @@ static void vdp1_floors_flush_body(void)
         }
     }
 }
+
+#else   /* SAT_VDP1_FLOORS == 0: the claim is parked -- stubs, and not one byte of .bss */
+static void vdp1_floors_flush(void) {}
+#define sat_vdp1_floor_claim NULL
+#endif
 
 /* drain accumulated walls into the current bank (from vdp1_wpn_begin, behind the weapon).
    ZERO CLIPPING: EVERY accumulated wall draws AT LEAST a 1-command FLAT (never dropped to sky);
@@ -7417,12 +7500,16 @@ static void vdp1_wpn_init(void)
        tests the hook alone -- the legacy sat_vdp1_floor flag stays 0 forever).  The punch
        arrays feed the fclaim==2 partial path: per-column band the core punches; the rest
        rides the normal software span path (master+slave worklist). */
+#if SAT_VDP1_FLOORS
     for (int i = 0; i < FVDP1_SLOTS; ++i)
     { fvdp1_slot[i].lumpnum = -1; fvdp1_slot[i].lru = 0; fvdp1_slot[i].used = 0; }
     fvdp1_tick = 0;
     sat_floor_punch_edge = fvdp1_ptop;
     sat_floor_punch_near = fvdp1_pbot;
     sat_floor_vdp1_hook = sat_vdp1_floor_claim;
+#endif
+    /* parked -> the hook stays NULL, and r_plane.c gates the whole claim on the hook
+       alone, so R_DrawPlanes runs its ordinary software path untouched. */
 #endif
 
     VDP1_TVMR = 0x0000;                              /* 16bpp, VBE=0 (erase in display: full-screen safe) */

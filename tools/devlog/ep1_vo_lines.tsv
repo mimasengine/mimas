@@ -1,0 +1,31 @@
+# stem	take	block	text
+# take may carry a time range: 56/0-5.87 means "take 56, from 0 to 4.38 s".
+# Take 56 holds TWO lines: the owner read the opener and the hook back to back.
+# The split is the file's only 1.16 s silence (5.290 -> 6.446 in the RAW file), cut at its middle.
+# Established by measurement, not by ear: at 22 words the take reads 0.360 s per
+# word, inside this batch's 0.273-0.419 band; at 14 words it would read 0.566,
+# and every later take would then land at impossible rates (0.72, 0.80).
+n01	56/0-5.87	B1	This is a DOS Doom port on a Sega Saturn, captured on real hardware.
+n02	56/5.87-	B1	Can it run it? Let's see that together.
+n03	57	B1	Welcome to the first devlog episode.
+n04	58	B2	The walls are drawn by one chip, and almost everything else by another.
+n05	59	B2	Nothing here was built initially for the Saturn -- the WAD content is read off the disc as it is.
+n06	60	B2	Eight to fifteen frames per second, on average, across these three clips.
+n07	61	B2	But this episode is about something else: chip synchronisation.
+n08	62	C3	Standing still, the picture is fine. It only tears when it moves.
+n09	63	C3	Walking forward, one frame of lateness moves the picture by a few pixels.
+n10	64	C3	But turning around? it moves it by the rotation angle.
+n11	65	C4	Watch these three frames. The room moves, and the walls stay. Then the walls move, and the room stays.
+n12	66	C4	Each layer moves in exactly the frame the other one does not.
+n13	67	C5	The weapon and the status bar are drawn by VDP1 as well, and they are just as late.
+n14	68	C5	Nothing is wrong with either of them, because neither one moves with the room.
+n15	69	C5	Same chip, same frame, same lateness. It only breaks where the content follows the world.
+n16	70	B4	These are two hardware captures, one month apart.
+n17	71	C9	Whether the drawing was finished was read from a flag called CEF.
+n18	72	C9	And the manual says that flag is reset by the very swap it is supposed to gate.
+n19	73	C9	On real hardware, it latches on about half the frames.
+n20	74	C10	The manual gets two things wrong on the same page, on the same developer CD.
+n21	75	C10	With the word frame, the sentence means nothing. With the word field, it is an instruction.
+n22	76	C10	And the register value it prescribes is the one that means: stay automatic.
+n23	77	C11	The sequence that works is the one SEGA's own library shipped, and Lobotomy shipped in Quake.
+n24	78	C12	In split screen, when the queue runs short, the walls now give up their place to the monsters.

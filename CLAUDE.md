@@ -190,9 +190,33 @@ Uses SRL's `shared.mk` build system. Outputs `game.iso` + `game.cue`.
 - `SRL_MAX_TEXTURES` not needed (Doom does not use VDP1 quads for gameplay)
 - Framebuffer: static array in high work RAM, blitted via SRL VDP2 bitmap sync
 
+## Shared Saturn knowledge — `../saturn-refs/knowledge/`
+
+**Every hardware, SDK and emulator fact lives in
+[`../saturn-refs/knowledge/`](../saturn-refs/knowledge/README.md)** — one base shared by the four
+Saturn projects (Mimas, Tethys, Lesto, ISS 98): memory & bus, VDP1, VDP2, SRL/SGL defect register,
+emulators, diagnostic method. **Read it before rediscovering anything about the hardware.**
+
+**When you establish a new hardware fact, write it THERE**, tagged with the project that measured
+it — not here. Sorting rule: *would this sentence still be true if the game were a different
+genre?* Yes → shared; no → local. Never duplicate a fact, only pointers: if a shared fact is
+wrong, fix it at the source.
+
+Mimas is the main *source* of that base: much of it was distilled from this project's memory,
+including the 37 files written under the old project name **DoomSRL** (reunified into the Mimas
+memory namespace on 2026-08-04). The corrected Sega VDP1/VDP2 manuals sit next door in
+`../saturn-refs/manuals/`.
+
 ## SRL documentation
 
 See `docs/SRL_API.md` for the full SRL API reference.
 See `docs/SRL_NOTES.md` for Mimas-specific integration notes.
 Online: https://srl.reye.me/
 GitHub: https://github.com/ReyeMe/SaturnRingLib
+
+## Devlog video
+
+`docs/DEVLOG_VIDEO.md` is the method — cut structure, the side-by-side
+comparison recipe, loudness targets, thumbnail, and the YouTube / SegaXtreme
+post formats. Tooling in `tools/devlog/` (cards, thumbnail, annotation style).
+Ported from the Tethys ep6 cut, where the whole chain was proven end to end.

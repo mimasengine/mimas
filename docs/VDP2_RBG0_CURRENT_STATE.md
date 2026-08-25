@@ -153,7 +153,8 @@ The VDP2/RBG0 floor is **one rotation plane** (one height, one transform), so it
 ships only where it pays and is safe:
 
 ```
-rbg0_active = (potato_level == 0) && (sat_local_players <= 1);   // dg_saturn.cxx:2990
+rbg0_active   = (sat_m != M0_SOFT) && (sat_local_players <= 1);      // dg_saturn.cxx:9169
+rbg0_split_p1 = RBG0_SPLIT_P1HW && (sat_m != M0_SOFT) && (sat_local_players == 2);
 ```
 
 - **potato-0 only** — the floor's fps value is largest at full detail and shrinks
@@ -164,6 +165,51 @@ rbg0_active = (potato_level == 0) && (sat_local_players <= 1);   // dg_saturn.cx
 In any potato level > 0, or in split-screen, the floor **falls back to the
 software (CPU) floor** (`sat_vdp2_floor = 0` → sw floor draws, RBG0 display off).
 Gate landed in commit `ea6967c`.
+
+### 3p/4p: SETTLED-NEGATIVE (2026-08-25)
+
+**Do not extend the HW floor to the 3p/4p quadrants.** Parked by the owner after the
+arithmetic, and the arithmetic is worse than it first looks.
+
+*The mechanism was never the obstacle.* `slScrWindow1(x0,y0,x1,y1)` is already a full
+rect (only `x0 = 0` and `y1 = 223` are hardcoded, via `rbg0_floor_win_xend`); the
+per-view election exists (`sat_rbg0_view`, `r_plane.c:1121`); the per-view punch exists
+(`sat_split_p1hw`, `d_main.c:418`). Roughly 60-100 lines: a quadrant set of
+`rbg0_split_cx/cy/hz/pitch/sd` reprojection constants plus the VDP2 cycle
+re-declaration. It is buildable. It is just not worth building.
+
+**One plane, one transform.** VDP2 windows clip the *display*, not the transform. Four
+quadrants are four viewpoints, so RBG0 can serve **exactly one** of them. Everything
+below is therefore a per-quadrant number, not a per-frame one.
+
+**The subtraction** (console, 2026-08-25, 106 frames, shareware -- `docs/captures/`):
+
+| | |
+|---|---|
+| `P` (plane phase), 4p frame | **15.5 ms** -- and 14.8-15.6 ms in *all four* modes |
+| per view | ~3.9 ms |
+| dominant flat's share | ~50-64 % (`RBG0_FLOOR_PLAN.md` FLAT profiler) |
+| **ceiling on the saving** | **~2 ms of a 162 ms frame = 1.2 %** |
+
+**And the real figure is far below that ceiling**, because in 3/4p the software floor is
+**already `SQ_FLAT`** -- solid colour, applied once per player-count transition
+(`dg_saturn.cxx:9445`, `flat34 = (sat_local_players >= 3) ? SQ_FLAT : SQ_LD`). RBG0 would
+be replacing a memset-class span with a hardware plane. The 2 ms above was derived from a
+textured-fill baseline that 3/4p does not run.
+
+**The split law rules it out by category.** `P` is *flat* across 1p/2p/3p/4p while `Bw`
+goes x3.5 and drawsegs x3.8: the 4p cost is per-view **generation**, not fill. RBG0
+attacks fill. It is a 1p lever being carried to the mode where fill matters least.
+
+**Parity is not an argument either.** A textured perspective floor in one quadrant beside
+three solid-colour ones is a visual *inconsistency*, not parity.
+
+Cost of not doing it: **zero**. A0+A1 are unconsumed in 3/4p and stay available for
+anything that does pay -- and a VDP2 cycle re-declaration carries a hardware-only snow
+risk (starvation is invisible on Ymir), which this decision also avoids.
+
+Revisit only if 3/4p ever runs a *textured* floor again, which would first require the
+generation cost to come down enough for the plane budget to matter.
 
 ## slSynch and VDP1 tearing (do not conflate)
 

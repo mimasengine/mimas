@@ -178,8 +178,11 @@ mettre la table K en CRAM (CRKTE) risque de **collisionner avec la palette 8bpp*
 > - Le rappel utile reste vrai : **le gain REC (+20-33% fps) vient du SKIP du sol software**, pas du
 >   RBG0 lui-même (`docs/VDP2_ARCHITECTURE.md:355-364`). Le RBG0 bitmap apporte en plus un sol texturé
 >   réel sans coût CPU de span.
-> - slSynch reste **abandonné** comme modèle de frame (~16% fps + mute le SFX direct-SCSP, qui possède
->   le MVOL) — mais il n'a jamais été nécessaire au sol : le commit se fait par pokes RAMCTL/CYC directs.
+> - slSynch reste **abandonné** comme modèle de frame (−1 à −2,5 fps mesurés sur 5 spots HW 2026-06-28,
+>   zéro bénéfice — ⚠ correction 2026-08-20 : « mute le SFX » était FAUX, l'épisode SFX muet était une
+>   race MVOL/KYONEX corrigée à part, cf. mémoire slsynch-not-a-miracle-fix ; la branche
+>   vdp1-full-slsynch l'adopte d'ailleurs exprès) — mais il n'a jamais été nécessaire au sol : le
+>   commit se fait par pokes RAMCTL/CYC directs.
 >
 > État, layout de banques définitif et conditions de gating : **`docs/VDP2_RBG0_CURRENT_STATE.md`**.
 

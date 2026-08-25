@@ -155,6 +155,22 @@ endif
 #   (8/29/30/30/31/32/33/34/36/38/39/41/43/45), so 64 keeps ~40 % margin over the worst case seen.
 #   Overflow is graceful (r_visplane_pool_ovf: that surface is not drawn -- one plane, one frame,
 #   HOM, no freeze).  ⚠ Watch `vp` on the LIM row: if it ever reaches 64 on a real map, put it back.
+# 🔴 2026-08-25 -- THIS TRIP-WIRE HAS FIRED, AND THE VALUE HAS NOT BEEN CHANGED YET (owner's call).
+#   TNT MAP01, 4 players, Phase-A build, Ymir: the LIM row read `vp66.2` and `vp67.8` on two frames
+#   of six -- peak 66 and 68 against the 64 slices, with 2 then 8 plane-slices served from the shared
+#   `vp_fallback`.  Those planes' spans are corrupt by construction (r_plane.c:107-121 says so:
+#   "their spans glitch visually"), i.e. a VISIBLE defect, first caught in the act here.  The 14 MAP11
+#   captures that sized 64 were 1p; `r_visplane_peak` is a max over VIEWS and over the ~1 s window, so
+#   4p samples four times as many views per second and finds the tail the 1p pass never could.
+#   TWO WAYS TO CLOSE IT, priced, neither taken without the owner:
+#     (a) VP_POOL_PLANES 64 -> 80 costs 16 * 2 * 322 = 10 304 B of ZONE (not the TLSF pool) -- the
+#         same zone the big-WAD loader is short of, which is why this is not a free call.
+#     (b) FREE: VP_SLICE_BYTES is hard-wired to SCREENWIDTH+2 = 322, but pl->minx/maxx are
+#         VIEW-relative ([0,viewwidth), asserted by r_plane.c's own VP_DIAG check) and
+#         plane_pool_ptr is bump-reset PER VIEW (r_plane.c:556).  In 3/4p viewwidth is 160, so
+#         HALF of every slice is never touched.  A stride derived from viewwidth holds 127 planes
+#         in 4p out of the same 41 KB -- exactly where the overflow is.  Cost: one load instead of
+#         a constant, ~130 calls/frame.  Touches core/, so it is a shared-submodule change.
 # ⚠ NEVER put a `#` comment INSIDE the backslash-continued flag list below -- make truncates the
 #   variable at that line and half the -D flags silently vanish.  Comments go here, above it.
 # -DRP_CMD_BUF_SIZE=0x2000: L2-RECLAIM (2026-07-10).  The legacy parity column-renderer cmd ring

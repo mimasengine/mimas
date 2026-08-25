@@ -1,4 +1,8 @@
-# Décharger le maître sur l'esclave — étude disruptive (2026-07-15)
+# Décharger le maître sur l'esclave — étude disruptive (2026-07-15, re-testée 2026-08-25)
+
+> **§7 EN FIN DE FICHIER : re-test des prémisses.** La prémisse §0.1 (« le slave n'est pas idle
+> en 1p ») est MORTE — console 08-21 : b6-9 %. La conclusion, elle, tient : c'est **K2** qui tuait
+> les pistes, pas l'occupation du slave. Lire §7 avant de re-proposer quoi que ce soit d'ici.
 
 > Workflow `wf_86743cf6-937` : 3 agents ground-truth + 7 pistes « 2ᵉ renderer » chacune
 > pressurée puis tuée en adversarial (17 agents, 0 erreur). Ce doc = la synthèse + le prototype
@@ -150,3 +154,125 @@ du bruit ±6 ms, aucun offload ne peut aider.
 - **#7 pipeline** : déjà mesurable via `sat_wallprep_slave` (RANK3) — si `Bp` slave ≥ `Bp` maître,
   l'inc-2 overlap ne paye pas.
 - **#3 compositing** : `continue` past `AM_DrawMiniMap` + band memcpy → borne du gain de bande/minimap.
+
+---
+
+## 7. RE-TEST DES PRÉMISSES — 2026-08-25, avec les captures console du 21/08
+
+> Cette section ne rouvre pas les 7 pistes du §2. Elle re-teste **les prémisses** dont elles
+> dépendaient, parce que l'une des deux vient de basculer, et elle pose la question que l'étude
+> de juillet n'a jamais posée : **l'étude de juillet est une étude de RENDU.** Elle a examiné sept
+> façons de donner du rendu au slave. Le rendu n'est plus le mur.
+
+### 7.1 Ce qui a basculé
+
+Trois captures console 1p (TNT **MAP20**, spot fixe `-672,-929 a64`, 575 things vivants,
+2026-08-21). Même scène, trois vidéos, donc trois mesures comparables :
+
+| | test2 @30 s | test3 @35 s | test1 @55 s |
+|---|---|---|---|
+| MST | 181 | 172 | 172 |
+| **R** (rendu) | **73** | **73** | **64** |
+| **T** (tic de jeu) | **87** | **81** | **88** |
+| `th` / `mo` / `s` | 82 / 58 / 8 | 76 / 52 / 7 | 79 / 54 / 7 |
+| `ph` / `sm` / `mv` | 2 / 19 / 3 | 2 / 14 / 1 | 2 / 16 / 2 |
+| **SLV `b`** | **9 %** | **7 %** | **6 %** |
+
+Deux faits, tous deux [HW] :
+
+1. **`T` > `R` dans les trois.** La frame est **tic-bound**, pas render-bound. Tous les verdicts
+   du §2 ont été rendus quand `R` était le mur.
+2. **La prémisse §0.1 est MORTE.** Elle disait : « l'esclave n'est PAS idle en 1p/2p, il tourne à
+   plein sur le plane-steal TAS ». Le console lit **b 6-9 %**, soit ~10-16 ms occupés sur 172-181,
+   et **~160 ms idle par frame**. La raison est celle que §0.2 donnait pour le 3/4p, devenue vraie
+   en 1p : les sols sont partis sur VDP1/RBG0, donc **le plane-steal n'a plus rien à voler.**
+   (§1.2 de `RESOURCE_BUDGETS.md` donne b7-29 % [HW 08-20] ; 6-9 % est le bas de cette plage, sur
+   une carte lourde — cohérent, pas contradictoire.)
+
+Et un troisième, structurel, qui ne se lit sur aucune ligne : **pendant `T` le slave est idle à
+100 %.** Rien ne lui est dispatché en dehors de `R_RenderPlayerView`. Ce sont **81-88 ms d'un
+deuxième CPU, garanties libres, juste à côté du plus gros terme de la frame.**
+
+### 7.2 Ce qui n'a PAS bougé — et qui décide encore
+
+| Mur | État 2026-08-25 |
+|---|---|
+| **K1 — RAM** | Desserré mais pas levé. Le pool TLSF est passé de 5,6 Ko à **31,6 Ko** (récupérations BACKUPTICS 32 + `doom_stack`). Un 2ᵉ état de vue reste ~100-117 Ko de `.bss` : toujours ~3-4× au-dessus. **K1 tient.** |
+| **K2 — memory-bound** | **Intact, et jamais contredit.** Taxe bus 2,1× sur tout memory-bound ; slave mesuré **+5,8 ms plus LENT** que le maître au wall-prep (3× HW) ; speedup dual plafonné S≈1,3-1,5. Le 2ᵉ SH-2 ne paie que sur du **fill compute-bound cache-chaud**. |
+
+**C'est le point de l'analyse.** La prémisse qui a basculé (« le slave est occupé ») n'était pas
+celle qui tuait les pistes — **c'est K2 qui les tuait**. Et le tic est *le travail le plus
+memory-bound de toute la frame* : ~577 `mobj_t` de 156 octets en LWRAM, soit **90 Ko parcourus par
+tic** contre 4 Ko de cache. Donner ça au slave, c'est donner à un CPU 2,1× plus lent en LWRAM
+précisément le profil sur lequel il est 2,1× plus lent.
+
+### 7.3 Les candidats du TIC, chiffrés
+
+Décomposition de `T` (moyennes des trois captures) : `th` 76-82, dont `mo` 52-58 (`ph` 2,
+`sm` 14-19, `mv` 1-3, **résidu 34-35**), `s` 7-8, `th − mo − sc` ≈ **24**, `T − th` ≈ 5.
+
+| # | Candidat | Plafond | Bloqueur | Verdict |
+|---|---|---|---|---|
+| **A** | **La boucle de thinkers (`mo`)** | 52-58 ms (**32 % de la frame**) | (i) `P_Random` est consommé **dans l'ordre de la liste** — réordonner change le jeu ; (ii) `P_TryMove` mute blockmap + listes de secteur, et le blocage thing-contre-thing est ordre-dépendant ; (iii) charge utile = `mobj_t` en LWRAM = **exactement K2** | **MORT.** Et même en réglant (i)+(ii), (iii) fait perdre. |
+| **B** | **Sous-ensemble PURE ANIMATION de `mo`** — mobjs dont la chaîne d'états a `action == NULL` : le travail est `tics--` + avance d'état. Pas de RNG, pas de mutation globale, **réellement ordre-indépendant** | leur part de `mo` | Le **parking** (08-21) retire déjà les `tics == -1`, qui en sont le gros. Reste torches / décor animé : population marginale. Coût : 2ᵉ liste + purge de cache par dispatch (**1-2 ms mesurés**) + sync | **La charge utile est plus petite que le dispatch.** Nommé pour ne pas être re-dérivé. |
+| **C** | **Pré-remplissage du cache de visibilité (`s`)** — le slave marche le BSP pour le tic N+1 | **7-8 ms = 4 %** | La marche BSP est l'archétype du memory-bound (K2, même forme que les +5,8 ms du wall-prep). Le cache temporel (4-16 tics) a déjà pris 13-21 → 7-8 ms. La variante DSP est déjà morte [dsp-idle-sight-tic-verdict] | **NO-GO** : plafond 4 %, mécanisme exactement interdit par K2. |
+| **D** | **Pré-passe décimation/parking** — ≤4 `P_AproxDistance` + lectures de `flags` par mobj, **read-only**, sortie = 1 bit par mobj. Calculable par le slave pour le tic N+1 depuis la position joueur du tic N (seuil `SAT_DECIM_DIST` = 1536 unités ≫ ~50 unités de déplacement par tic) | **inconnu** : la pré-passe vit dans `th − mo − sc` | Rien de structurel. Le seul inconnu est **combien elle coûte** | **À CHIFFRER, pas à construire.** C'est exactement ce que mesure le nouveau champ `w` (§7.5). |
+| **E** | **Effacement index-0 du framebuffer en SPLIT** (`dg` post) | **1 ms mesuré** [Ymir 08-25] — pas les 1,5-3 estimés | Aucun sur le fond, mais **le budget n'existe pas** | **MORT le jour même** — voir §7.4bis. |
+| **F** | **Blit** | — | Mesuré **pire** en dual-CPU (bus-bound) | Mort, inchangé. |
+
+### 7.4bis Le candidat E est mort — Ymir, 2026-08-25, le jour où l'instrument a été posé
+
+Deux captures 2p (Doom1s) lisent **`dg2/1`** et **`dg19/1`**, avec **`h0.0`** sur la ligne SPL.
+Donc, du `dg` de 19 ms : **1 ms dans `post`** (l'effacement) et **~0 dans la peinture du HUD split**.
+Tout le reste est dans `pre`.
+
+C'est **concluant malgré Ymir**, par l'asymétrie posée avant de regarder : `pre` contient des
+écritures VRAM VDP2 dont l'émulateur **sous-estime** le coût (pas de contention de bus), `post`
+est un `memset` HWRAM qu'il modélise correctement. Ymir montrant déjà `pre` ≫ `post`, la console
+ne peut qu'aggraver l'écart. Le sens ne peut pas s'inverser.
+
+⇒ **Le slave n'a plus rien à prendre du tout.** Le dernier candidat valait 1 ms, pas 3. §7.4
+reste vrai et devient sans réserve.
+
+⇒ Et la question `dg` **change de cible** : elle sort de cette étude (ce n'est plus un sujet de
+déport) et devient « qu'est-ce qui coûte 19-24 ms dans `pre` en split ». Le champ `p<c><ms>` de la
+ligne SPL le nomme — le suspect nommé d'avance est `u` (`rbg0_upload_flat`, reconstruction de
+texture ~131 Ko, que le sol dominant peut faire basculer entre les deux vues à chaque frame).
+
+### 7.4 Verdict
+
+**L'oisiveté du slave n'a jamais été la contrainte liante. K2 l'était.**
+
+La prémisse qui a basculé n'ouvre **aucune** piste de rendu nouvelle et **aucune** piste de tic
+nouvelle, parce que le tic est du parcours mémoire et que K2 est une loi sur le parcours mémoire.
+Le levier sur `T` est de **rendre `T` plus petit** — ordre des champs (`p_mobj.h` 2026-08-25),
+parking, décimation — **pas de le déplacer**.
+
+Ce que les 160 ms libres achètent réellement aujourd'hui : **le candidat E**, et E vaut quelques
+millisecondes en split. C'est peu, et c'est honnête.
+
+### 7.5 Ce qu'il faudrait pour qu'un déport de tic devienne vrai
+
+Quatre conditions **simultanées**, écrites ici pour que la prochaine proposition se teste contre
+elles au lieu d'être re-argumentée :
+
+1. **Working-set qui tient dans les 4 Ko de cache du slave** — donc *pas* `mobj_t`. Un tableau
+   latéral compact `{x, y, bits}` fait 8-12 octets par mobj, soit **4,6-6,9 Ko pour 577 things** :
+   toujours au-dessus de 4 Ko, mais **13-19× moins de trafic** que les 90 Ko de la marche complète.
+2. **Read-only vis-à-vis de l'état partagé** (pas de blockmap, pas de listes de secteur).
+3. **Zéro `P_Random`.**
+4. **≥ ~10 ms de charge utile**, pour franchir la purge de cache de ~1-2 ms par dispatch.
+
+**Seul D peut réunir les quatre**, et seulement si la pré-passe s'avère être une part importante
+de `w`. Le tableau latéral du point 1 coûte au maître 2 stores par mobj déplacé — à mettre en face
+du gain, avant d'écrire une ligne.
+
+### 7.6 Les instruments qui tranchent (livrés le 2026-08-25)
+
+Aucun de ces candidats ne se décide sans chiffre. Trois champs ont été ajoutés pour ça :
+
+| Champ | Ligne | Ce qu'il tranche |
+|---|---|---|
+| `w` | 23 (THK) | `th − mo − sc − pt` = **la marche de liste nue**, instrument soustrait. Si `w` reste gros après le réordonnancement de `mobj_t`, le coût est la **traversée**, pas les champs → et le candidat **D** devient chiffrable. |
+| `pt` | 23 (THK) | Le coût **mesuré** de la sonde elle-même sur cette console. Sans lui, `w` était une soustraction dont un des termes était l'instrument. |
+| `dg<pre>/<post>` | 1 | Chiffre le candidat **E** : en 2p, `post` EST le `memset` maître. (Et `h`, ligne SPL, chiffre le seul autre item 2p-spécifique de `pre`, la peinture du HUD split.) |

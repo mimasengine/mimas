@@ -48,6 +48,37 @@ present ≈ 3,9 **inclus dans R** (identité row-1 : MST = R + T + S + b + dg, o
   compté **dans P** (bracket row-2) — ne pas le soustraire aussi de Bp (double compte).
 - Le « gros skip Bp » n'existe pas [audit adversarial 2026-08-19].
 
+**🔴 2026-08-21 [HW], TNT MAP20, 1p, 3 captures au MÊME spot fixe (`-672,-929 a64`, 575 things
+vivants) — LE 1p N'EST PLUS RENDER-BOUND SUR CETTE CLASSE DE CARTE.**
+
+| | test2 @30 s | test3 @35 s | test1 @55 s |
+|---|---|---|---|
+| MST | 181 | 172 | 172 |
+| **R** | **73** | **73** | **64** |
+| **T** | **87** | **81** | **88** |
+| Bw / Bp / P / M | 9,2 / 30,9 / 21,0 / 4,8 | 5,5 / 53,4 / 23,0 / 0,5 | 2,4 / 19,4 / 28,1 / 0,4 |
+| `pr` | 13,7 | 12,9 | 15,7 |
+| `th` / `mo` / `s` | 82 / 58 / 8 | 76 / 52 / 7 | 79 / 54 / 7 |
+| `ph` / `sm` / `mv` | 2 / 19 / 3 | 2 / 14 / 1 | 2 / 16 / 2 |
+| SLV `b` | 9 % | 7 % | 6 % |
+
+`T` > `R` dans les trois : **la frame est tic-bound**, et « 1p render-bound » ci-dessus reste
+vrai pour le shareware, faux sur une carte peuplée. Deux blocs y sont NON ATTRIBUÉS et pèsent
+ensemble ~58 ms, soit un tiers de la frame — plus que `Bp` :
+- **`mo − ph − sm − mv` = 34/35/34 ms**, remarquablement stable sur trois captures
+  indépendantes. ~2900 appels ⇒ **~12 µs par `P_MobjThinker` qui ne fait presque rien.**
+- **`th − mo − sc` ≈ 24 ms**, tout aussi stable : la marche de liste, le comptage `nshoot`, la
+  pré-passe de décimation, les libérations — **et la sonde elle-même** (2 lectures FRT par
+  mobj). ⚠ Les captures ci-dessus PRÉCÈDENT le gouverneur de tic (vidéos 07:04-07:26 contre
+  commit 10:39) : ni parking ni décimation n'y sont reflétés.
+- ⚠ `n2887 / 5 tics = 577` = exactement le nombre de spawns de MAP20 : **toute la liste est
+  parcourue**, chaque tic.
+
+Corrections livrées le 2026-08-25 : ordre des champs de `mobj_t` (6 lignes de cache → 3 sur le
+chemin chaud, `p_mobj.h`), sonde `mo` échantillonnée 1/8 + auto-calibrée, nouveaux champs `pt`
+(coût mesuré de l'instrument) et `w` (marche de liste nue). **Falsificateur : `mo` et `w` sur
+console, jamais sur Ymir** (qui ne modélise ni le cache SH-2 ni l'écart LWRAM/HWRAM).
+
 **Tic (T)** sur gros WADs, console TNT : T 69-83 ms typique = ~40 % de la frame
 [HW 2026-08-16], jusqu'à T 165 [HW 2026-08-17] ; th (thinkers) = 21-49 % du CPU machine ;
 mv (P_CheckPosition/blockmap) jusqu'à 23 % de frame en fusillade ; résidu mo ~25-45 ms =
@@ -70,7 +101,7 @@ géométrie/émission côté maître, pas le fill** [m7-lowres-fill-bound-not-34
 
 | Mode | b% mesuré | État |
 |---|---|---|
-| 1p | b7-29 % [HW 08-20] | Pile s3 défaut (plane-split TAS + masked-split + clear-on-slave), +3 fps HW pris (24→27, sweep 2026-07-29/30 [m7-slave-share-per-category]). **Plafond pratique atteint** : seul le FILL de P est offloadable, la génération (R_MakeSpans, Bw/Bp) est sérielle [m7-critical-path F]. |
+| 1p | b7-29 % [HW 08-20] ; **b6-9 %** [HW 08-21, TNT MAP20] | Pile s3 défaut (plane-split TAS + masked-split + clear-on-slave), +3 fps HW pris (24→27, sweep 2026-07-29/30 [m7-slave-share-per-category]). **Plafond pratique atteint** : seul le FILL de P est offloadable, la génération (R_MakeSpans, Bw/Bp) est sérielle [m7-critical-path F]. |
 | 2p | b0 % pré-fix [HW 08-20] ; Ps 3,3-4,0 ms post-`sat_mp_slave` [Ymir] | Gate `sat_local_players<=1` levé la nuit du 08-20 (kill R+B) ; **re-mesure console à faire**. |
 | 3/4p | b0 % pré-fix [HW 08-20] ; b1-5 % même R+B ON [Ymir] | Parts plans/masked **structurellement petites** en quadrants — le slave n'y est pas un gisement, le master est le mur [mp-4p-hw-baseline R13]. |
 
@@ -79,6 +110,19 @@ masked-split (lvl 1), SOLS+PLAFONDS via plane-split TAS (lvl 2, worklist partag�
 le slave prend ~60 % de la phase P en 1p, Pb59-61 %), MURS **jamais** (rp_disabled=1,
 la colonne pleine ne passe pas par le REC), clear framebuffer sur slave (dg 8→5 ms).
 Le b% par phase **en split** n'a jamais été relevé (lacune §9).
+
+**🔴 2026-08-25 — la prémisse « le slave n'est pas idle en 1p » est MORTE.** Console 08-21 :
+b6-9 %, soit ~10-16 ms occupés sur 172-181 et **~160 ms idle par frame** ; et pendant `T`
+(81-88 ms) le slave est idle à **100 %** par construction — rien ne lui est dispatché hors
+`R_RenderPlayerView`. La cause est celle que l'étude donnait pour le 3/4p, devenue vraie en 1p :
+les sols sont partis sur VDP1/RBG0, **le plane-steal n'a plus rien à voler**.
+**Ça n'ouvre aucune piste** : ce qui tuait les leviers n'était pas l'occupation du slave, c'était
+**K2** (2,1× sur tout memory-bound), et le tic est le travail le plus memory-bound de la frame
+(~90 Ko de `mobj_t` parcourus par tic contre 4 Ko de cache). Re-test complet, candidats chiffrés
+et conditions de réouverture : **`docs/SLAVE_OFFLOAD_STUDY.md` §7**. Le dernier candidat — l'effacement
+index-0 en split — est **mort le jour même** : Ymir 08-25 lit `dg19/1` en 2p, donc **1 ms** dans
+`post`, et `h0.0` (peinture HUD split ≈ 0). **Le slave n'a plus rien à prendre.** La masse de `dg`
+en split est dans `pre` ; nommée par le nouveau champ SPL `p<c><ms>`, suspect = `rbg0_upload_flat`.
 
 Lois : taxe bus 2,1× sur tout memory-bound (+5,8 ms mesurés wall-prep ×3 [HW]) ; le 2e
 SH-2 ne paie QUE sur du fill compute-bound cache-chaud ; speedup dual plafonne S≈1,3-1,5
@@ -370,10 +414,10 @@ de la fraîcheur IA) ; relevé overlay tx/bk par mode (chiffre les ~300 Ko WTEX 
 
 1. **tx/bk WTEX par mode** — le « tx6/26 bk0 split » est un relevé owner non consigné ;
    1 capture overlay par mode le règle.
-2. **Ventilation row-2 complète en 2p ET en 3/4p** (Bw/Bp/P/M par vue) — n'existe pas ;
-   et la seule ventilation 1p complète (2026-07-29) est antérieure aux fixes d'août
-   (R_GetColumn 08-14, pr/DIVU 08-20) — une re-capture 1p console est due. Le b% slave
-   PAR PHASE en split n'a jamais été relevé non plus.
+2. **Ventilation row-2 complète en 2p ET en 3/4p** (Bw/Bp/P/M par vue) — n'existe pas.
+   ~~une re-capture 1p console est due~~ **FAITE le 2026-08-21** (3 captures TNT MAP20, §1.1) :
+   elle a retourné le diagnostic 1p en tic-bound. Le b% slave PAR PHASE en split n'a toujours
+   pas été relevé.
 3. **RAMCTL/CYC par mode** — ce que deviennent A0/A1 quand RBG0 est OFF (3/4p) n'est
    écrit nulle part.
 4. **doom_stack high-water** — sonde jamais posée (opportunité 3).

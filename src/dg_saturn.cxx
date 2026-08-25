@@ -146,6 +146,11 @@ extern "C" int   r_drawseg_peak;   /* core r_bsp.c: running high-water of drawse
 extern "C" int   r_solidseg_peak;  /* core r_bsp.c: solidsegs high-water (vs MAXSEGS 32); ==32 => guard fired = M7 freeze root-cause */
 extern "C" int   r_solidseg_ovf;   /* core r_bsp.c: latched '!' when a solidsegs post was dropped (over-budget view) */
 extern "C" int   r_opening_ovf;    /* core r_plane.c: openings-pool overflow redirects THIS frame (0 = fine; >0 = garde-OPENINGS sinking) */
+/* SATURN 2026-08-25 -- row 11 `o`.  ⚠ DIFFERENT CADENCE from r_opening_ovf next door: the ovf count
+   is reset per VIEW in R_ClearPlanes (so row 22 `op` is the last quadrant), while THIS one is a
+   running high-water folded per view and zeroed by the platform's own ~1 s window -- it therefore
+   spans every view.  `op0` beside a hot `o` is not a contradiction. */
+extern "C" int   r_opening_peak;   /* core r_plane.c: high-water of openings CONSUMPTION (sizes MAXOPENINGS) */
 extern "C" int   r_composite_ovf;  /* core r_data.c: # textures stubbed by garde-COMPOSITE (0 = fine; >0 = a composite OOM was crash-proofed) */
 extern "C" int   r_readlump_short; /* core w_wad.c: # streaming reads sunk by garde-W_ReadLump (0 = fine; >0 = a short CD read was zero-filled not I_Error-frozen) */
 extern "C" int   r_nopatch_col;    /* core r_data.c: textures with a patchless column -- the ex-printf site, row 22 `np` */
@@ -165,8 +170,11 @@ extern "C" int   r_nopatch_col;    /* core r_data.c: textures with a patchless c
    `Fl` the field lock, row 19 `V1 c/B/LP/ec/ws/tx`.  Those are the ones a sync bug will need. */
 #define OVL_RETIRED 0
 
-extern "C" unsigned int prof_seg_cols, prof_seg_fill, prof_seg_px, prof_lead_px;  /* row 14 `SEG` */
-extern "C" unsigned int prof_gc_st[4], prof_gc_sn[4];                             /* row 16 `GCS` */
+/* SATURN 2026-08-25: rows 14/16 read the FRAME sums, never the per-view prof_* they replace.  The
+   old externs are DELETED rather than left beside them on purpose -- a live extern to a per-view
+   counter next to a frame-scoped row is exactly how this defect got introduced in the first place. */
+extern "C" unsigned int sat_seg_cols_f, sat_seg_fill_f, sat_seg_px_f, sat_lead_px_f; /* row 14 `SEG` */
+extern "C" unsigned int sat_gc_st_f[4], sat_gc_sn_f[4];                              /* row 16 `GCS` */
 extern "C" unsigned int prof_wallprep, prof_segloop, prof_segrout;  /* core: the Bp split, FRT ticks */
 extern "C" unsigned char r_column_stub[256];
 extern "C" int  *texturewidthmask;   /* core r_data.c: width-1 per texture -- the sky uploader's only
@@ -211,6 +219,7 @@ extern "C" int   z_block_count;             /* core z_zone.c: zone blocks walked
 extern "C" unsigned int sat_bp_zw;          /* core r_parallel.c: zone blocks walked on the PK-Bp frame */
 /* split-screen perf breakdown (ms per piece of the 2p render block) -- diagnose the slowdown */
 extern "C" unsigned int sat_spl_sw, sat_spl_v0, sat_spl_v1, sat_spl_v2, sat_spl_v3, sat_spl_kick;
+extern "C" unsigned int sat_spl_mmap;   /* core d_main.c: the 3p minimap, ms (row 17, 4th slot) */
 extern "C" int   sat_bsp_stage_used, sat_bsp_stage_want;  /* M5 BSP staging, row 1 st readout */
 extern "C" int   sat_bsp_stage_on;                 /* M5 staging live A/B state (pad R+C) */
 extern "C" void  P_BspStageApply(int on);          /* core/p_setup.c: swap LWRAM<->HWRAM sets */
@@ -646,6 +655,7 @@ extern "C" int            sat_vdp2_sky;     /* core: skip software sky (=> VDP2)
 extern "C" int            sat_frame_has_sky;/* core: a sky visplane was in view this frame */
 extern "C" int            sat_sky_view;         /* core Part 5: elected split view for the HW sky (-1 = none => all software) */
 extern "C" unsigned int   sat_sky_px_view[4];   /* core Part 5: per-view SKY pixel coverage (election metric) */
+extern "C" unsigned int   sat_sky_frt_view[4];  /* SATURN 2026-08-25: per-view SOFTWARE-sky cost, FRT ticks (row 12 `SKY`) -- what the 3-quadrant HW-sky plan is worth */
 extern "C" unsigned int   sat_sky_view_angle;   /* core Part 5: elected view's viewangle (angle_t) for the NBG0 scroll */
 extern "C" int            sat_rbg0_view;        /* core: the split view whose floor is punched to RBG0 (round-4 sky map cut) */
 extern "C" int            sat_vdp2_floor;   /* core: skip software floor (=> VDP2 RBG0) */
@@ -756,6 +766,7 @@ extern "C" int sat_flatcache_evict;    /* cumulative LRU evictions              
 extern "C" int sat_flatcache_full;     /* views where every slot was busy -> classic zone path       */
 /* SATURN: row-2 `P` split into its parts (core/r_parallel.c).  Row 20 `PSP`; k+n+d+j == `P`. */
 extern "C" unsigned int sat_p_kick10;  /* VDP1 wall kick + R_DrawPlayerSprites (weapon), tenths-ms  */
+extern "C" unsigned int sat_bps_pr10, sat_bps_lp10, sat_bps_hd10, sat_bps_tl10;  /* row 4, FRAME sums (r_parallel); hd+pr+lp+tl == row-2 Bp */
 /* (sat_p_net10 / _draw10 / _join10 removed with the row that printed them -- settled at ~0.) */
 extern "C" int R_TextureIOFree(int tex);  /* core r_data.c: 1 = resolving this texture hits no disc */
 extern "C" int sat_tex_load_spent;     /* core r_segs.c: tenths of a ms of disc spent this frame    */
@@ -2015,11 +2026,27 @@ static int rbg0_floor_contrast = 0;   /* base bake cancelled -> 0 (no texture-co
    the index-0 view clear.  Summed over the fps 1s window, printed by fps_update on row 11. */
 extern "C" uint32_t DG_GetTicksMs(void);
 static unsigned int df_pre_sum, df_blit_sum, df_post_sum, df_frames;
+/* SATURN 2026-08-25 -- scale a SAMPLED accumulator back to the full population.
+   The THK probe times 1 mobj thinker in 8 (r_parallel.c), so row 23's mo/ph/sm/mv are sums over
+   `ns` samples that stand for `n` calls.  Scaling by the constant 8 would be wrong: a tic ends
+   wherever it ends, so n/ns drifts.  Split the multiply across the division so the product never
+   leaves 32 bits -- sum can reach tens of thousands of FRT ticks over a 1 s window and n tens of
+   thousands of calls, and (sum * n) would overflow. */
+static unsigned int scale_sample(unsigned int sum, unsigned int n, unsigned int ns)
+{
+    if (!ns) return 0u;
+    return (sum / ns) * n + ((sum % ns) * n) / ns;
+}
 /* SATURN PERF (2026-07-04): master-frame composition.  MST = REC(render) + T(game-tic) + S(sound)
    + blit + present(VDP1 kick) + other.  T/S come from the core (d_main.c, per tick); blit is the
    existing DG split; present is the VDP1 wall-kick FRT timed at its call sites.  Window sums,
    averaged once/sec by fps_update alongside df_pre/blit/post -> the decomposition on overlay row 1. */
 static unsigned int df_tic_sum, df_snd_sum;      /* window sums of the core game-tic / sound ms  */
+/* SATURN 2026-08-25 (SPL row `h`) -- THE SPLIT-HUD PAINT, the only 2p-specific item inside `dg`.
+   Row 1 now prints dg<pre>/<post>; if the 2p `dg24` (against 4-6 in 1p) sits in `pre`, this is the
+   block to look at: two 160x64 panel blits + widgets + a per-half flash, repainted whenever the
+   HUD signature changes.  FRT ticks, window-summed, converted and reset by fps_update. */
+static unsigned int sat_hud_split_frt = 0;
 static unsigned int df_present_sum;              /* window sum of the VDP1 present-kick (tenths-ms) */
 static unsigned int sat_present_frt = 0;         /* VDP1 kick FRT ticks THIS frame (reset in DG df block) */
 extern "C" int sat_tic_ms, sat_snd_ms;           /* core d_main.c: game-tic / sound ms this tick   */
@@ -2093,6 +2120,13 @@ static int fvdp1_cpu10 = 0;                          /* LAST frame's floors CPU,
    xf = rbg0_set_transform (slScrMatConv/slScrMatSet matrix); rp = the RPT VRAM memcpy. 1s-window
    sums, printed by fps_update on row 12. Whichever dominates IS the ~110ms facing-wall stall. */
 static unsigned int rbg_sky_sum, rbg_upl_sum, rbg_xfm_sum, rbg_rpt_sum;
+/* SATURN 2026-08-25 -- `s`, carved OUT of `y`.  Ymir read `py15` in 2p (15 of `dg` pre's 17 ms in
+   the sky bucket), but `y` is 330 lines wide: it spans the whole head of DG_DrawFrame, and the one
+   thing in it that can cost tens of ms is the sky TEXTURE upload.  Both upload sites are guarded
+   by `skytexture != sky_loaded_tex`, so they should fire once per level -- if `s` is the winner,
+   the guard is not holding and the sky is being re-packed every frame. */
+static unsigned int rbg_skyup_sum;
+static unsigned int skyup_frame;      /* this frame's share, subtracted out of `y` below */
 
 /* SATURN PERF (2026-06-24): windowed REC stats exported by core/r_parallel.c (set on the
    ship path's rp_p3_prof_show), surfaced on the 1/s overlay tick + reset by RP_ProfReset
@@ -2430,10 +2464,24 @@ static void fps_update(void)
            reads ~0 the gap is the slop of a derived number and should be treated as noise. */
         unsigned int rs10 = _f ? (sat_r_setup_frt * 10u / 224u) / _f : 0u;
         sat_r_setup_frt = 0;
-        sprintf(ovbuf, "R%u T%u S%u b%u.%u%c%c dg%u pr%u.%u rs%u.%u  ",
-                _rec, _tic, _snd, bmt / 10, bmt % 10, blit_c, blit_w, _dg, _pr10 / 10, _pr10 % 10,
-                rs10 / 10, rs10 % 10);
-        ovbuf[40] = ' ';
+        /* SATURN 2026-08-25 -- `dg` IS PRINTED SPLIT: dg<pre>/<post>.  Both halves were already
+           measured separately (df_pre_sum / df_post_sum) and then thrown away added together,
+           which hid the largest unnamed term in split-screen: the 2p capture of 2026-08-21 reads
+           MST144 = R82 + T15 + b5,2 + dg24, against dg 4-6 in 1p.  The halves are different work
+           with different fixes:
+             pre  = sky + RBG0 setup/upload + the VDP1 present-kick + THE SPLIT HUD PAINT + this
+                    overlay.  The split HUD is the only 2p-specific item in it -- `h` on the SPL
+                    row times exactly that block.
+             post = the index-0 wipe of the 3D view.  In 1p it is DISPATCHED TO THE SLAVE
+                    (sat_clear_slave, gated on sat_local_players <= 1); in split it is a master
+                    memset of 160-224 rows x 320.  A big `post` in split IS that gate, which
+                    exists for a freeze whose root cause is written up at the clear site. */
+        unsigned int _dgpre  = df_pre_sum  / _f;
+        unsigned int _dgpost = df_post_sum / _f;
+        sprintf(ovbuf, "R%u T%u S%u b%u.%u%c%c dg%u/%u pr%u.%u rs%u.%u  ",
+                _rec, _tic, _snd, bmt / 10, bmt % 10, blit_c, blit_w, _dgpre, _dgpost,
+                _pr10 / 10, _pr10 % 10, rs10 / 10, rs10 % 10);
+        ovbuf[40] = '\0';
         if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 1, ovbuf);
         /* row 17: SPLIT per-view render times, ms (the CLEAN probe for "does M7 lowres actually
            save time in 3/4p?").  v0..v3 = each R_RenderPlayerView (d_ms-bracketed in d_main's split
@@ -2446,10 +2494,59 @@ static void fps_update(void)
            help); if k dominates, it's VDP1-fill-bound.  Split-only (values are stale in 1p). */
         if (sat_dbg_overlay_mode == 0 && sat_local_players > 1) {
             extern int sat_split_thingcull;   /* core piste-3 */
-            unsigned int vsum = sat_spl_v0 + sat_spl_v1 + sat_spl_v2 + sat_spl_v3;
-            snprintf(ovbuf, sizeof ovbuf, "SPL %u %u %u %u k%u =%u tc%d bal%d ",
-                     sat_spl_v0, sat_spl_v1, sat_spl_v2, sat_spl_v3, sat_spl_kick, vsum,
-                     sat_split_thingcull, sat_split_balance);
+            unsigned int vsum = sat_spl_v0 + sat_spl_v1 + sat_spl_v2 + sat_spl_v3 + sat_spl_mmap;
+            /* `h` (2026-08-25) = the SPLIT-HUD PAINT, tenths-ms, window mean.  Read it against
+               row 1's dg<pre>/<post>: `h` is a subset of `pre`, and it is the only 2p-specific
+               item in it.  If dg-pre is ~20 ms in 2p and `h` is ~0, the cost is the sky/RBG0
+               setup or the overlay itself, NOT the HUD -- and the next bracket goes there. */
+            unsigned int h10 = _f ? ((sat_hud_split_frt * ns_per_frt) / 100000u) / _f : 0u;  /* FRT -> tenths-ms */
+            sat_hud_split_frt = 0;
+            /* `p<c><ms>` (2026-08-25) = WHAT DOMINATES `dg` `pre`, and by how much.
+               Ymir 2026-08-25 routed the split-screen `dg` (24 ms console 2p against 4-6 in 1p)
+               into `pre`: it read dg19/1 with `h0.0`, so it is neither the index-0 clear nor the
+               split-HUD paint.  This names the winner instead of adding four columns nobody has
+               room for.  The four sums have existed since 2026-06-29 (`rbg_*_sum`) and were
+               accumulated every frame and PRINTED NOWHERE -- measurement paid for and thrown away.
+                 y = sky scroll + colormap + slScrAutoDisp (the whole head of DG_DrawFrame)
+                 s = the sky TEXTURE upload, carved out of `y` -- it is guarded by
+                     `skytexture != sky_loaded_tex` and should fire ONCE PER LEVEL, so `s`
+                     winning means the guard is not holding
+                 u = rbg0_upload_flat (a ~131 KB texture rebuild -- normally guarded, and the
+                     prime suspect in split, where the dominant floor can flip between the two
+                     views every frame)
+                 x = rbg0_set_transform (slScrMatConv / slScrMatSet)
+                 r = the RPT VRAM memcpy.  CAVEAT: `r` is billed from THREE sites, one in `pre`
+                     and two after the blit, so a dominant `r` must be read beside row-1 `b`
+                     before concluding anything about `pre`.
+                 o = the remainder of `pre`: the VDP1 present-kick, the VDP1 HUD capture, and the
+                     1 Hz overlay burst itself.
+               All four are DG_GetTicksMs sums, so 1 ms granularity -- printed as integers on
+               purpose, tenths here would be invented precision. */
+            unsigned int _ps = _f ? rbg_sky_sum / _f : 0u, _pu = _f ? rbg_upl_sum / _f : 0u;
+            unsigned int _px = _f ? rbg_xfm_sum / _f : 0u, _pr = _f ? rbg_rpt_sum / _f : 0u;
+            unsigned int _pk = _f ? rbg_skyup_sum / _f : 0u;
+            unsigned int _acc = _ps + _pu + _px + _pr + _pk;
+            unsigned int pv = (_dgpre > _acc) ? (_dgpre - _acc) : 0u;
+            char pc = 'o';
+            if (_ps > pv) { pc = 'y'; pv = _ps; }
+            if (_pu > pv) { pc = 'u'; pv = _pu; }
+            if (_px > pv) { pc = 'x'; pv = _px; }
+            if (_pr > pv) { pc = 'r'; pv = _pr; }
+            if (_pk > pv) { pc = 's'; pv = _pk; }   /* s = the sky TEXTURE upload, carved out of y */
+            /* SATURN 2026-08-25 -- THE 4th SLOT IS `v3` IN 4p AND THE MINIMAP IN 3p.  They are
+               mutually exclusive by construction (d_main.c: sat_spl_v3 = (n>3) ? ... : 0, and
+               sat_spl_mmap is written only under `if (n == 3)`), so the sum costs ZERO columns --
+               which matters because this row ALREADY overruns the 40 visible cells in 4p
+               (~42 chars: the `p<phase><ms>` dominant-`pre` field falls off the right edge in
+               every 4p capture ever taken -- same defect class as the row-11 overrun of 08-10,
+               NOT fixed here, flagged).  The minimap is the only cost centre unique to 3p and it
+               had never been timed; 3p runs MST 131-192 against 2p's 100-172 and nobody could say
+               how much of the gap is a third view. */
+            snprintf(ovbuf, sizeof ovbuf, "SPL %u %u %u %u k%u =%u tc%d bal%d h%u.%u p%c%u   ",
+                     sat_spl_v0, sat_spl_v1, sat_spl_v2, sat_spl_v3 + sat_spl_mmap,
+                     sat_spl_kick, vsum,
+                     sat_split_thingcull, sat_split_balance, h10 / 10u, h10 % 10u,
+                     pc, pv > 999u ? 999u : pv);
             SRL::Debug::Print(0, 17, ovbuf);
         }
         /* row 12 (1p): VDP1 REAL-limiter probe (docs/VDP1_LIMITS_SOURCED.md).  Moved off row 17
@@ -2479,30 +2576,54 @@ static void fps_update(void)
            (LP<100 = the flicker; e.g. L6c0/6e8 = 94% -> B = 0.94*c), one that FINISHES reads Lc (LP=100).
            Ymir doesn't model LOPR (never overruns anyway), so LP=100 / B unmeasured there is correct.
            (rp_master_ms -- the B_s software budget the wall LOD gates on -- is on the row-18 SLV line.) */
-        if (sat_dbg_overlay_mode == 0 && sat_local_players <= 1) {
-            static char ovbuf[56];   /* trailing spaces clear the tail when a field narrows (else "i3"->"i33" ghost) */
-            /* fl<sur>/<slot> = the two VDP1-side flatten causes (see vdp1_flat_sur).  Read them
-   TOGETHER with `w` (row 21 GOV, the LOD area rung), `sb` (row 21, the drawseg budget)
-   and `lb..:<wall>` (row 18 VRM, residency): those five are ALL the ways a wall can end
-   up flat.  All five zero and a flat wall on screen means a sixth one exists. */
-snprintf(ovbuf, sizeof ovbuf, "V1 c%d B%d fl%d/%d/%d LP%d%% ec%d ws%d tx%d i%d W%d/%d   ",
+        /* SATURN 2026-08-25 -- V1 NOW PRINTS IN SPLIT TOO.  The `sat_local_players <= 1` term that
+           stood here made VDP1 command-bank pressure UNMEASURED in every multiplayer mode: the
+           console ledger of that morning has `V1` in 26 of 26 legible 1p frames and in 0 of 80
+           legible split frames.  things->VDP1 in split and any command-bank change both depend on
+           knowing whether the surplus ever fires in 3/4p, and nothing could say.
+           It goes to ROW 6 in split (row 17 belongs to SPL there, and row 17's own 4p overrun is a
+           separate, older defect).  Row 6's 1p tenant is the MX locator, which is now gated 1p-only
+           at its Print ~120 lines below -- the two are mutually exclusive by construction.
+           FOUR FIELDS RETIRED to make it fit in 40 cells, all of them duplicates or dead:
+             LP%  -- read LP100% in 26 of 26 console frames and CANNOT read anything else under the
+                     manual present (the LOPR guillotine cannot fire); the live signal is row-8 `g`.
+             ws   -- exact duplicate of row-21 GOV `ws`, which has no player gate.
+             tx   -- exact duplicate of row-18 VRM `tx<n>/<n>`, which also shows the denominator,
+                     and it was this row's last `#if SHOW_FPS` dependency.
+             i    -- compressed from `i%d` to a one-char prefix on the row name.
+           KEPT: c, B, fl trio, ec, W -- the five that have never been measured in split.
+           ⚠ SPLIT CAVEATS FOR READING IT: (a) `c` is measured against a cap SHRUNK by
+           THING_FLUSH_MARGIN + 2*reserve while `B` is learned against the full one, so `c` vs `B`
+           is not the same subtraction as in 1p; (b) `ec` clamps at 99 because the console has
+           already shown ec33 against a core THING_EMIT_MAX of 32; (c) `fl<pot>` will be large and
+           meaningless in 3/4p, where the floor SQ is forced FLAT -- read it beside row-7 `SQ:`.
+           fl<sur>/<slot>/<pot> = the three VDP1-side flatten causes.  Read them TOGETHER with `w`
+           (row 21 GOV, the LOD area rung), `sb` (row 21, the drawseg budget) and `lb..:<wall>`
+           (row 18 VRM, residency): those six are ALL the ways a wall can end up flat.  All six zero
+           and a flat wall on screen means a seventh one exists. */
+        if (sat_dbg_overlay_mode == 0) {
+            snprintf(ovbuf, sizeof ovbuf, "V1%c c%d B%d fl%d/%d/%d ec%d W%d/%d              ",
+                     "-12"[sat_iso_mode % 3],
                      vdp1_last_cmds, vdp1_budget_cmds,
                      (vdp1_flat_sur > 999 ? 999 : vdp1_flat_sur),
                      (vdp1_flat_slot > 999 ? 999 : vdp1_flat_slot),
-                     (vdp1_flat_pot > 999 ? 999 : vdp1_flat_pot), vdp1_lp_pct,
-                     sat_thing_emit_cap, sat_wall_cpu_span, vdp1_tx_used, sat_iso_mode,
-                     vdp1_wpn_reserve, vdp1_wpn_cut);
-            /* row 17, NOT 12: the CD row also prints to 12 and runs LATER, so V1 was being
-               overwritten -- the owner's captures show the CD row with V1's tail (`tx13 i0 W6/9`)
-               still hanging off the right.  Row 17 is blank in every capture. */
-            SRL::Debug::Print(0, 17, ovbuf);
+                     (vdp1_flat_pot > 999 ? 999 : vdp1_flat_pot),
+                     (sat_thing_emit_cap > 99 ? 99 : sat_thing_emit_cap),
+                     vdp1_wpn_reserve,
+                     (vdp1_wpn_cut > 99 ? 99 : vdp1_wpn_cut));
+            ovbuf[40] = '\0';   /* pad, then cut: the OLD format was 63 worst case and truncated
+                                    inside `W` -- all 26 captured V1 strings stop mid-`tx`, and `i`
+                                    and `W` appear in ZERO console frames ever taken. */
+            vdp1_wpn_cut = 0;   /* the field's own row resets it: `cuts` is a WINDOW count from here
+                                   on (it was cumulative since boot, with no reset anywhere). */
+            SRL::Debug::Print(0, sat_local_players <= 1 ? 17 : 6, ovbuf);
         }
         /* window reset -- read the row-1 composition ABOVE before this zeroes the sums.  The
            dead RAM/TXC/ZON sizer block (TEX/SPL/TXC/ZON, all display-off) was cut with the
            overlay clean-up; re-add from git if a memory-lever session needs it. */
         df_pre_sum = df_blit_sum = df_post_sum = 0;
         df_tic_sum = df_snd_sum = df_present_sum = df_frames = 0;
-        rbg_sky_sum = rbg_upl_sum = rbg_xfm_sum = rbg_rpt_sum = 0;
+        rbg_sky_sum = rbg_upl_sum = rbg_xfm_sum = rbg_rpt_sum = rbg_skyup_sum = 0;
         {
             /* row 2: VDP1 load + done-rate + build stamp.  VD1 = cmds this frame + D/B
                (EDSR-CEF this frame) + Dr = % of plotted frames Done over the window.
@@ -2541,12 +2662,18 @@ snprintf(ovbuf, sizeof ovbuf, "V1 c%d B%d fl%d/%d/%d LP%d%% ec%d ws%d tx%d i%d W
                handful of adds can cost.  Expect `pr` to dominate => the lever is PER-SEG work, and
                the seg COUNT (ds104) is the multiplier -- not the pixels. */
             {
-                unsigned int pr10 = prof_segrout  * 10u / 224u;
-                unsigned int lp10 = prof_segloop  * 10u / 224u;
-                unsigned int wp10 = prof_wallprep * 10u / 224u;
-                snprintf(ovbuf, sizeof ovbuf, "BPS pr%u.%u lp%u.%u wp%u.%u        ",
-                         pr10 / 10u, pr10 % 10u, lp10 / 10u, lp10 % 10u, wp10 / 10u, wp10 % 10u);
-                if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 4, ovbuf);
+                /* FRAME sums now (r_parallel.c publishes them on the last view) -- the raw
+                   prof_* are per-view and row 4 used to print whichever view happened to be
+                   last, which in 3p was sometimes a 1 ms sliver reading pr0.0 lp0.0 wp0.0. */
+                /* SATURN 2026-08-25, SAME DAY, SECOND ROUND -- THE PRINT MOVED OUT OF HERE, down to
+                   the per-frame block at the end of DG_DrawFrame.  The console pass caught it: row 2
+                   is written EVERY frame by rp_p3_prof_show while this burst runs at 1 Hz, so on 7 of
+                   23 single-player frames `wp` differed from row-2 `Bp` by more than 25 % -- once
+                   65,1 against 25,1 -- although in 1p they are literally the SAME bracket
+                   (bp10 = prof_wallprep when !sat_wallprep_slave).  They were not disagreeing; they
+                   were describing frames up to a second apart.  A row whose whole purpose is to be
+                   differenced against another row must share that row's cadence.
+                   (The `em`/`ki` reasoning that used to sit here went with it.) */
             }
             /* row 16 (moved off row 5 -- row 5 belongs to r_parallel's per-frame SLVi%/w slave-
                occupancy readout, the WORK-DISTRIBUTION meter; the 1/s W72 stamp was stomping it
@@ -2581,8 +2708,10 @@ snprintf(ovbuf, sizeof ovbuf, "V1 c%d B%d fl%d/%d/%d LP%d%% ec%d ws%d tx%d i%d W
                      o = everything else (r_plane.c's sky column, ...)
                    ms/calls each, per frame, same window as rows 4 and 14. */
                 {
-                    unsigned int w10 = prof_gc_st[1] * 10u / 224u, p10g = prof_gc_st[2] * 10u / 224u;
-                    unsigned int m10 = prof_gc_st[3] * 10u / 224u, o10 = prof_gc_st[0] * 10u / 224u;
+                    /* SATURN 2026-08-25: FRAME sums (sat_gc_*_f), same defect and same fix as
+                       row 14 -- prof_gc_st/sn are reset per VIEW in RP_BeginFrame. */
+                    unsigned int w10 = sat_gc_st_f[1] * 10u / 224u, p10g = sat_gc_st_f[2] * 10u / 224u;
+                    unsigned int m10 = sat_gc_st_f[3] * 10u / 224u, o10 = sat_gc_st_f[0] * 10u / 224u;
                     /* `o` gave up its columns to the LUMP PIN readout (2026-08-17): it read 0 on
                        every capture but one, and `P` is the witness of the fix `c8..c12` called
                        for -- `P0/n` means the pin is yielding and holding nothing, exactly the
@@ -2593,9 +2722,14 @@ snprintf(ovbuf, sizeof ovbuf, "V1 c%d B%d fl%d/%d/%d LP%d%% ec%d ws%d tx%d i%d W
                        that would have decided the previous build: `P<rung><kb>/<yields>.<EVICTIONS>`.
                        `yields` only ever counted the floor guard, so `P2122/0` was read as "no
                        pressure" when the ring may have been shedding an entry on every add. */
-                    snprintf(ovbuf, sizeof ovbuf, "GCS w%u.%u/%u m%u.%u/%u P%c%d/%d.%d      ",
-                             w10/10, w10%10, prof_gc_sn[1] > 9999u ? 9999u : prof_gc_sn[1],
-                             m10/10, m10%10, prof_gc_sn[3] > 9999u ? 9999u : prof_gc_sn[3],
+                    /* ⚠ THE TENTHS ON `w`/`m` WERE DROPPED 2026-08-25 to pay for the frame sum's
+                       extra digit: at 3-digit ms the old `w%u.%u` form reached 41 content chars
+                       against the ovbuf[40] cut below, which would have eaten the last EVICTIONS
+                       digit with no visible sign.  A tenth on a 3-digit ms is noise anyway.  No
+                       field is lost.  The `P` half is per-LEVEL, not per-view, and is unaffected. */
+                    snprintf(ovbuf, sizeof ovbuf, "GCS w%u/%u m%u/%u P%c%d/%d.%d                   ",
+                             w10/10 > 999u ? 999u : w10/10, sat_gc_sn_f[1] > 9999u ? 9999u : sat_gc_sn_f[1],
+                             m10/10 > 999u ? 999u : m10/10, sat_gc_sn_f[3] > 9999u ? 9999u : sat_gc_sn_f[3],
                              "-12"[sat_lpin_on % 3], r_lpin_kb,   /* rung: - off / 1 64K / 2 128K */
                              r_lpin_yield > 999 ? 999 : r_lpin_yield,
                              r_lpin_evict > 999 ? 999 : r_lpin_evict);
@@ -2611,7 +2745,11 @@ snprintf(ovbuf, sizeof ovbuf, "V1 c%d B%d fl%d/%d/%d LP%d%% ec%d ws%d tx%d i%d W
             snprintf(ovbuf, sizeof ovbuf, "MX m%d %d,%d a%d t%ds        ",
                     sat_prof_mx_map, sat_prof_mx_x, sat_prof_mx_y, sat_prof_mx_ang,
                     sat_prof_mx_t/35);
-            if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 6, ovbuf);   /* row 6: REC-max locator */
+            /* SATURN 2026-08-25: 1p ONLY.  Row 6 is now V1's home in SPLIT, and this Print runs
+               ~120 lines AFTER the V1 block, so without the player gate it would overwrite V1 every
+               window.  ⚠ the consequence is real and deliberate: the MX locator is UNAVAILABLE in
+               split -- that is the price of the first split VDP1 command-bank readout. */
+            if (sat_dbg_overlay_mode == 0 && sat_local_players <= 1) SRL::Debug::Print(0, 6, ovbuf);   /* row 6: REC-max locator (1p) */
             /* row 14: WORST-frame DETAIL, snapshotted at the same peak as the MX locator (row 6) and
                the REC mx (row 3).  Updates ONLY when a new all-time-worst REC frame occurs (persists
                until beaten or a config change) -> a fresh peak is a capture opportunity.  Bw/Bp/P/M =
@@ -2642,11 +2780,26 @@ snprintf(ovbuf, sizeof ovbuf, "V1 c%d B%d fl%d/%d/%d LP%d%% ec%d ws%d tx%d i%d W
                screens.  `k` far below that PROVES `lp` is not fill, and kills the `w` axis on
                arithmetic rather than on a 24-frame probe.  `lk` vs `k` prices the lead-fill in the
                one unit that decides whether the governor needs a finer rung than on/off. */
-            snprintf(ovbuf, sizeof ovbuf, "SEG c%u f%u k%u lk%u        ",
-                     prof_seg_cols > 99999u ? 99999u : prof_seg_cols,
-                     prof_seg_fill > 99999u ? 99999u : prof_seg_fill,
-                     prof_seg_px / 1000u > 9999u ? 9999u : prof_seg_px / 1000u,
-                     prof_lead_px / 1000u > 9999u ? 9999u : prof_lead_px / 1000u);
+            /* SATURN 2026-08-25 -- FRAME SUMS.  prof_seg_* are zeroed in RP_BeginFrame, which runs
+               once per VIEW, while this row prints once per FRAME: in split it showed the LAST
+               QUADRANT ONLY.  The console CSV of that morning is the proof -- `c` medians 433 in 1p
+               (range 160-937) against a FLAT 257 in 2p and 256 in 4p, a per-view constant that
+               cannot be a frame census.  `n<v>` leads the row on the row-2 precedent so a photo
+               states how many views it is the sum of; 1p reads `n1` and stays comparable with every
+               1p frame already captured.
+               ⚠ THE DENOMINATOR FOR us-PER-WALL-COLUMN IS ROW-4 `lp`, NEVER ROW-2 `Bp`: every one
+               of these counters increments strictly between RP_SegRoutMark and RP_SegLoopLeave,
+               which is exactly the `lp` bracket, whereas `Bp` is all of R_StoreWallRange and now
+               carries `hd`/`tl` beside it.
+               ⚠ `lk` is NOT a subset of `k`: SAT_LEAD_EMIT counts on both the master and the
+               slave-list path, SAT_PROF_FILL only on the master one, so `lk > k` is legal. */
+            snprintf(ovbuf, sizeof ovbuf, "SEGn%u c%u f%u k%u lk%u                      ",
+                     (unsigned)(sat_local_players < 1 ? 1 : (sat_local_players > 4 ? 4 : sat_local_players)),
+                     sat_seg_cols_f > 99999u ? 99999u : sat_seg_cols_f,
+                     sat_seg_fill_f > 99999u ? 99999u : sat_seg_fill_f,
+                     sat_seg_px_f / 1000u > 9999u ? 9999u : sat_seg_px_f / 1000u,
+                     sat_lead_px_f / 1000u > 9999u ? 9999u : sat_lead_px_f / 1000u);
+            ovbuf[40] = '\0';   /* pad, then cut -- frame sums are ~4x the old per-view values */
             if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 14, ovbuf);
             /* row 7: ACTIVE A/B state -- so a photo is never read against the wrong config.  Kept
                SHORT (<=~40 visible cols; see the debug-overlay-line-width memory): the changing
@@ -3077,10 +3230,34 @@ snprintf(ovbuf, sizeof ovbuf, "V1 c%d B%d fl%d/%d/%d LP%d%% ec%d ws%d tx%d i%d W
                every healthy frame go to row 22.  The trailing pad is REQUIRED -- nothing clears the
                text rows per frame, and this row no longer always exceeds 40 (it used to hide its own
                ghosting off-screen).  Worst case now 39 + pad; the old 59 also overran ovbuf[56]. */
-            snprintf(ovbuf, sizeof ovbuf, "LIM vp%d.%d ds%d ss%d%s zf%dk lg%dk       ",   /* SATURN: ss = solidsegs peak vs MAXSEGS 32, '!' = overflow guard fired (M7 freeze root-cause) */
-                     r_visplane_peak, r_visplane_pool_ovf_pk,
-                     r_drawseg_peak, r_solidseg_peak, r_solidseg_ovf ? "!" : "",
-                     Z_FreeMemory() >> 10, Z_LargestAllocatable() >> 10);
+            /* SATURN 2026-08-25 -- `o` ADDED, and the row made to fit for good.
+               `o<rows>` = the ~1 s HIGH-WATER of openings CONSUMPTION, in 320-word rows, against
+               the 64 in `#define MAXOPENINGS SCREENWIDTH*64` (r_plane.c).  That array is 40 960 B
+               of .bss -- LARGER THAN THE WHOLE TLSF POOL -- and 64 has always been a vanilla guess
+               that nothing ever measured.  Row-22 `op` is the overflow-redirect COUNT, the alarm
+               that only rings once it is already too late; `o` is the number that SIZES the array.
+               ⚠ `o` is a high-water, NOT a ceiling: the theoretical worst is 3 writes x width x
+               MAXDRAWSEGS = 245 760 words, 12x the array, so MAXOPENINGS stays a probability bet
+               backstopped by the garde -- read `o` on TNT/Plutonia vistas before cutting it.
+               PAID FOR WITHOUT LOSING A FIELD: the two literal `k` suffixes go (-2, the legend
+               carries the unit); zf/lg are clamped at 999 (-2 -- the zone is 1016 KB, so a 4-digit
+               reading at level load is exactly what used to push this row to 41 cells and drop the
+               last one silently); and the pool-overflow digit is printed as PLANES instead of
+               slices (-1) so nobody has to halve it by hand any more.  Now exactly 40 cells.
+               The two Z_ calls are hoisted into locals: written as ternaries they would each run
+               TWICE, and each is an O(blocks) walk (~0.83 ms). */
+            {
+                int zf = (int)(Z_FreeMemory() >> 10);          if (zf > 999) zf = 999;
+                int lg = (int)(Z_LargestAllocatable() >> 10);  if (lg > 999) lg = 999;
+                int po = r_visplane_pool_ovf_pk / 2;           if (po > 99)  po = 99;
+                int op = (r_opening_peak + 319) / 320;   /* SCREENWIDTH is core-only; 320 literal here */
+                if (op > 999) op = 999;
+                snprintf(ovbuf, sizeof ovbuf, "LIM vp%d.%d ds%d ss%d%s o%d zf%d lg%d             ",   /* SATURN: ss = solidsegs peak vs MAXSEGS 32, '!' = overflow guard fired (M7 freeze root-cause) */
+                         r_visplane_peak, po,
+                         r_drawseg_peak, r_solidseg_peak, r_solidseg_ovf ? "!" : "",
+                         op, zf, lg);
+            }
+            ovbuf[40] = '\0';   /* pad, then cut -- this row has overrun 40 twice before */
             if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 11, ovbuf);
             /* row 22 (GUARD LATCHES): the three "a crash was prevented" counters evicted from row 11.
                op = openings sink (PER VIEW, zeroed in R_ClearPlanes -- in 3/4p this shows the LAST
@@ -3288,6 +3465,13 @@ snprintf(ovbuf, sizeof ovbuf, "V1 c%d B%d fl%d/%d/%d LP%d%% ec%d ws%d tx%d i%d W
                 unsigned int xt10 = _f ? (sat_tic_runs  * 10u) / _f : 0u;  /* tics RUN per frame  */
                 unsigned int av10 = _f ? (sat_tic_avail * 10u) / _f : 0u;  /* tics TryRunTics elected */
                 unsigned int bl10 = _f ? (sat_tic_built * 10u) / _f : 0u;  /* tics NetUpdate WANTED     */
+                /* HOISTED above row 23 (2026-08-25): `w` there subtracts it.  Still printed as
+                   `sc` on row 24 and still reset there -- one owner, two readers. */
+                /* `sc` is now sampled on the same tics as the rest of row 23 (it is one of `w`'s
+                   subtrahends), so it carries the same scale factor. */
+                unsigned int sc10  = _f ? (scale_sample(sat_thk_sect_frt, sat_tic_runs,
+                                                        sat_thk_tics ? sat_thk_tics : 1u) * 10u/224u)/_f : 0u;
+                unsigned int sc_ms = sc10 / 10u;
                 /* 🔴 ROW 23 (was blank) 2026-08-17 -- THE INSIDE OF `th`.  Hardware reads `th` at
                    24-38 ms on 178-200 ms frames: a fifth of the frame that is not rendering, and
                    the only number describing it was `th` itself.  `s` already carves out
@@ -3316,12 +3500,37 @@ snprintf(ovbuf, sizeof ovbuf, "V1 c%d B%d fl%d/%d/%d LP%d%% ec%d ws%d tx%d i%d W
                    so the decimal was precision the measurement does not have -- and six fields at
                    40 columns leave no room for it ([[debug-overlay-line-width]]). */
                 {
-                    unsigned int mo_ms = _f ? (sat_thk_mobj_frt  * 10u/224u)/_f/10u : 0u;
-                    unsigned int ph_ms = _f ? (sat_thk_phys_frt  * 10u/224u)/_f/10u : 0u;
-                    unsigned int sm_ms = _f ? (sat_thk_state_frt * 10u/224u)/_f/10u : 0u;
-                    unsigned int mv_ms = _f ? (sat_thk_move_frt  * 10u/224u)/_f/10u : 0u;
-                    unsigned int sb_ms = _f ? (sat_thk_sub_frt   * 10u/224u)/_f/10u : 0u;
-                    unsigned int bt_ms = _f ? (sat_thk_blk_frt   * 10u/224u)/_f/10u : 0u;
+                    /* SATURN 2026-08-25 -- THE PROBE IS NOW SAMPLED (1 mobj thinker in 8) AND
+                       SELF-CALIBRATED (see the THK block in r_parallel.c).  Two consequences for
+                       this row, and BOTH must be read before quoting a number off a photograph:
+                         - mo/ph/sm/mv are SAMPLE sums.  They are scaled back up here by the exact
+                           ratio n/ns (not by the constant 8: a tic can end mid-phase).  They are
+                           ESTIMATES from ~360 samples a frame -- good to a few percent, and never
+                           a per-call figure read off a single frame.
+                         - `pt` is THE PROBE'S OWN COST, measured on this console: the timer reads
+                           the thinker path actually made, times the calibrated cost of one read.
+                           It is INSIDE `th`, so `w` -- the bare thinker-list walk -- is
+                           th - mo - sc - pt, with the instrument subtracted out.
+                       Reading `w`: it is a pointer chase over ~2900 thinkers whose payload is the
+                       156-byte mobj_t in LWRAM.  A `w` that stays large after the mobj_t reorder
+                       (p_mobj.h, 2026-08-25) says the WALK, not the work, is the memory cost, and
+                       the lever is then traversal ORDER, not field order. */
+                    /* ONE scale factor for the WHOLE group -- every term below is a sum over the
+                       same sampled tics, including the `th` they are subtracted from.  Carried in
+                       TENTHS as far as the subtraction, floored ONCE for the print (flooring each
+                       term first biased `w` up by ~3 ms out of ~24). */
+                    unsigned int _tn  = sat_thk_tics ? sat_thk_tics : 1u;
+                    unsigned int mo10 = _f ? (scale_sample(sat_thk_mobj_frt,  sat_tic_runs, _tn) * 10u/224u)/_f : 0u;
+                    unsigned int ph10 = _f ? (scale_sample(sat_thk_phys_frt,  sat_tic_runs, _tn) * 10u/224u)/_f : 0u;
+                    unsigned int sm10 = _f ? (scale_sample(sat_thk_state_frt, sat_tic_runs, _tn) * 10u/224u)/_f : 0u;
+                    unsigned int mv10 = _f ? (scale_sample(sat_thk_move_frt,  sat_tic_runs, _tn) * 10u/224u)/_f : 0u;
+                    unsigned int pt10 = _f ? (scale_sample((sat_thk_frt_calls * sat_thk_frt_cost_x256) / 256u,
+                                                           sat_tic_runs, _tn) * 10u/224u)/_f : 0u;
+                    unsigned int ths10 = _f ? (scale_sample(sat_thk_th_frt, sat_tic_runs, _tn) * 10u/224u)/_f : 0u;
+                    unsigned int used  = mo10 + sc10 + pt10;
+                    unsigned int w10   = (ths10 > used) ? (ths10 - used) : 0u;
+                    unsigned int mo_ms = mo10/10u, ph_ms = ph10/10u, sm_ms = sm10/10u;
+                    unsigned int mv_ms = mv10/10u, pt_ms = pt10/10u, w_ms = w10/10u;
                     unsigned int thn   = _f ? sat_thk_n / _f : 0u;
                     /* dc (2026-08-21) = the TIC governor's decimation rung (core sat_tic_decim:
                        0 full rate / 1 far monsters think 1:2 / 2 think 1:4).  `n` now EXCLUDES
@@ -3329,17 +3538,20 @@ snprintf(ovbuf, sizeof ovbuf, "V1 c%d B%d fl%d/%d/%d LP%d%% ec%d ws%d tx%d i%d W
                        low IS the parking working; dc>0 with `mo` NOT dropping = decimation dead,
                        see the law's falsifier in p_tick.c. */
                     snprintf(ovbuf, sizeof ovbuf,
-                             "THK n%u mo%u ph%u sm%u mv%u dc%d sb%u bt%u  ",
+                             /* `dc` LAST on purpose: at 40 visible columns a wide frame
+                                truncates the tail, and a one-digit governor rung is the
+                                cheapest field to lose -- `w` is not. */
+                             "THK n%u mo%u ph%u sm%u mv%u pt%u w%u dc%d  ",
                              thn > 9999u ? 9999u : thn,
                              mo_ms > 999u ? 999u : mo_ms, ph_ms > 999u ? 999u : ph_ms,
                              sm_ms > 999u ? 999u : sm_ms, mv_ms > 999u ? 999u : mv_ms,
-                             sat_tic_decim,
-                             sb_ms > 999u ? 999u : sb_ms, bt_ms > 999u ? 999u : bt_ms);
-                    ovbuf[40] = ' ';
+                             pt_ms > 999u ? 999u : pt_ms, w_ms > 999u ? 999u : w_ms,
+                             sat_tic_decim);
+                    ovbuf[40] = '\0';
                     if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 23, ovbuf);
                     sat_thk_mobj_frt = sat_thk_move_frt = sat_thk_n = 0;
                     sat_thk_phys_frt = sat_thk_state_frt = 0;
-                    sat_thk_sub_frt  = sat_thk_blk_frt   = 0;
+                    sat_thk_frt_calls = sat_thk_tics = sat_thk_th_frt = 0;
                 }
                 /* 🔴 2026-08-18 -- `sp` EXISTS BECAUSE I MISREAD THIS ROW, TWICE.  I compared `b`
                    (what NetUpdate WANTED) against `v` and reported the clock healthy at 94-95 %.
@@ -3352,7 +3564,6 @@ snprintf(ovbuf, sizeof ovbuf, "V1 c%d B%d fl%d/%d/%d LP%d%% ec%d ws%d tx%d i%d W
                    `a` only to separate "elected but not run" from "never built", and a == x on every
                    capture ever taken answers it.  `mk` RETIRED with the grate feature.
                    `sc` = the SECTOR thinkers, so `th - mo - sc` is the bare list walk + Z_Free. */
-                unsigned int sc_ms = _f ? (sat_thk_sect_frt * 10u/224u)/_f/10u : 0u;
                 unsigned int owed10 = (vb10 * 583u) / 1000u;          /* 35 Hz / 60 Hz = 0,583 */
                 unsigned int sp     = owed10 ? (xt10 * 100u) / owed10 : 0u;
                 /* ca (2026-08-21) = sight-cache validity window in tics (pad L+A cycles
@@ -3364,7 +3575,7 @@ snprintf(ovbuf, sizeof ovbuf, "V1 c%d B%d fl%d/%d/%d LP%d%% ec%d ws%d tx%d i%d W
                          xt10 / 10u, xt10 % 10u, vb10 / 10u, vb10 % 10u,
                          sp > 999u ? 999u : sp, sc_ms > 999u ? 999u : sc_ms,
                          sat_sight_cache_tics, sat_sight_cache_auto ? "a" : ""); }
-                ovbuf[40] = ' ';
+                ovbuf[40] = '\0';
                 if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 24, ovbuf);
                 sat_tic_think_frt = 0; sat_tic_sight_frt = 0;
                 sat_tic_runs = 0; sat_tic_avail = 0; sat_tic_built = 0; sat_thing_masked_cut = 0;
@@ -3376,6 +3587,7 @@ snprintf(ovbuf, sizeof ovbuf, "V1 c%d B%d fl%d/%d/%d LP%d%% ec%d ws%d tx%d i%d W
             sat_wall_lod_hits = 0;   /* same rule: the field's own row clears it, right after printing */
             r_visplane_pool_ovf_pk = 0;
             r_visplane_peak = 0;   /* zero the core running-maxes -> next window re-accumulates its own peak */
+            r_opening_peak  = 0;   /* SATURN 2026-08-25: same rule for row 11 `o` (folded per VIEW in R_ClearPlanes, so this window max spans every view) */
             r_drawseg_peak  = 0;
             r_solidseg_peak = 0;   /* r_solidseg_ovf stays latched (sticky) so a single overflow event stays visible */
             /* (Rows FLR / PAR / FBK REMOVED 2026-08-06 -- they were three cut rows that still
@@ -3453,6 +3665,45 @@ snprintf(ovbuf, sizeof ovbuf, "V1 c%d B%d fl%d/%d/%d LP%d%% ec%d ws%d tx%d i%d W
                          (sat_lead_stale > 9999 ? 9999 : sat_lead_stale));
                 (void)sat_cd_persistent;
                 if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 12, ovbuf);
+            }
+            /* SATURN 2026-08-25 -- ROW 12's SECOND TENANT.  The two are mutually exclusive by the
+               ONE predicate above, so this costs no column anywhere: on a CD-streaming disc row 12
+               is the `CD` row, on a >=4 MB cart build it is `SKY`.
+               ⚠ THE COST: ATLAS P11 and §6.4 both wanted this cart half for `ob`/`st`/`gy`.  It is
+               spent here; the CD-only guards now have no home on a cart build at all.
+               WHAT IT ANSWERS, and why a pixel count could not: the 3-quadrant HW-sky plan is worth
+               exactly what the SOFTWARE sky costs in the views that do not carry NBG0, and nothing
+               measured that.  sat_sky_px_view counts PIXELS, and px cannot be converted to ms on
+               this path -- R_DrawSkyColumn does a 128-byte per-column memcpy plus the grain loop, so
+               the factor swings 2-4x with scene geometry.  These are FRT-clocked ms.
+               `e<v>` = the view carrying the HW sky.  ITS ms READS 0.0 BY CONSTRUCTION (the
+               sat_vdp2_sky branch draws nothing) -- that IS the HW/software distinction, and it is
+               how a photo identifies the elected view without trusting `e`.  ⚠ `e` is the election
+               for the NEXT frame (it runs before this burst), so it disagrees only on a transition.
+               `p` = total sky px over the live views: the count Ymir is valid for.
+               MANDATORY STALE-GUARD: the arrays are written ONLY inside d_main's split loop and are
+               never reset, so in 1p and 2p the dead slots would otherwise print a previous
+               session's values.  Forced to 0 below 2 players, and every slot >= nv zeroed.
+               LAST FRAME, like row 2 -- never difference it against rows 0/1. */
+            else if (sat_dbg_overlay_mode == 0)
+            {
+                unsigned int sm[4]; int vv;
+                int nv = sat_local_players; if (nv > 4) nv = 4; if (nv < 2) nv = 0;
+                for (vv = 0; vv < 4; vv++)
+                {
+                    if (vv >= nv) { sm[vv] = 0; continue; }
+                    sm[vv] = sat_sky_frt_view[vv] * 10u / 224u;
+                    if (sm[vv] > 999u) sm[vv] = 999u;
+                }
+                unsigned int px = 0;
+                for (vv = 0; vv < nv; vv++) px += sat_sky_px_view[vv];
+                if (px > 99999u) px = 99999u;
+                snprintf(ovbuf, sizeof ovbuf, "SKY e%2d %2u.%u %2u.%u %2u.%u %2u.%u p%5u      ",
+                         nv ? sat_sky_view : -1,
+                         sm[0]/10u, sm[0]%10u, sm[1]/10u, sm[1]%10u,
+                         sm[2]/10u, sm[2]%10u, sm[3]/10u, sm[3]%10u, px);
+                ovbuf[40] = '\0';
+                SRL::Debug::Print(0, 12, ovbuf);
             }
             /* row 18: memory-latency calibration (one-shot cold 32 KB read per bank, FRT
                ticks).  rL = LWRAM/HWRAM ratio -- >1.0 means LWRAM (cmd buf + visplanes) is
@@ -8818,6 +9069,7 @@ extern "C" void DG_DrawFrame(void)
     if (clear_slave_pending) { RP_AuxWait(); clear_slave_pending = 0; }
 
     uint32_t df0 = DG_GetTicksMs();   /* SATURN PERF: DG_DrawFrame ms split (entry) */
+    skyup_frame = 0;                  /* SPL row `s`: this frame's sky-texture upload, carved out of `y` */
 
     /* SATURN sky -> VDP2: (re)upload on level/episode change; position the layer.
        SKY_FIXED keeps it static; otherwise scroll by viewangle (90deg = 256 sky
@@ -8826,7 +9078,7 @@ extern "C" void DG_DrawFrame(void)
     if (skytexture > 0 && skytexture != sky_loaded_tex)
     {
         if (sky_retry_wait > 0) sky_retry_wait--;   /* stubbed last time: back off, then re-attempt */
-        else                    sky_upload();
+        else { uint32_t su0 = DG_GetTicksMs(); sky_upload(); skyup_frame += DG_GetTicksMs() - su0; }
     }
 #if SKY_FIXED
     slScrPosNbg0(toFIXED(0.0), toFIXED(-(double)VIEW_Y_OFFSET));   /* centred like NBG1/VDP1 */
@@ -8843,7 +9095,8 @@ extern "C" void DG_DrawFrame(void)
     if (skytexture > 0 && skytexture != sky_loaded_tex)
     {
         if (sky_retry_wait > 0) sky_retry_wait--;   /* stubbed last time: back off, then re-attempt */
-        else                    sky_cell_upload();  /* re-pack the sky into B1 cells on level/episode change */
+        /* re-pack the sky into B1 cells on level/episode change */
+        else { uint32_t su0 = DG_GetTicksMs(); sky_cell_upload(); skyup_frame += DG_GetTicksMs() - su0; }
     }
 #if VDP2_SPLIT_HW_SKY
     /* Part 5 (docs/RBG0_SKY_SPLIT_ANALYSIS.md §5): in a co-op split, elect ONE view to receive the HW
@@ -9082,7 +9335,12 @@ extern "C" void DG_DrawFrame(void)
                 if (framebuffer[i] == 0) framebuffer[i] = nb;
     }
 
-    rbg_sky_sum += DG_GetTicksMs() - df0;   /* SATURN PERF: 'sky' = sky scroll + cmap + slScrAutoDisp */
+    {   /* SATURN PERF: 'y' = sky scroll + cmap + slScrAutoDisp, with the texture upload ('s')
+           carved out so a once-per-level rebuild cannot masquerade as per-frame scroll cost. */
+        unsigned int _d = DG_GetTicksMs() - df0;
+        rbg_skyup_sum += skyup_frame;
+        rbg_sky_sum   += (_d > skyup_frame) ? (_d - skyup_frame) : 0u;
+    }
 
 #if VDP2_RBG0_TEST
     /* When the floor toggle is on: upload the player's floor texture to RBG0 (only when the
@@ -9319,6 +9577,8 @@ extern "C" void DG_DrawFrame(void)
            repaint while the menu is up -> the menu (NBG1) stays on top of the band. */
         if (sat_local_players > 1 && usergame && gamestate == GS_LEVEL && !automapactive && !menuactive)
         {
+            /* SPL row `h`: bracket INSIDE the gate, so 1p pays nothing for a split-only probe. */
+            unsigned short hud_t0 = frt_read();
             if (sat_local_players == 2)
             {
                 /* 2p: two 160x64 compact-HUD panels in the bottom 64 rows (P1 left, P2 right),
@@ -9357,6 +9617,7 @@ extern "C" void DG_DrawFrame(void)
                 }
                 hud4p_apply_flash(n);
             }
+            sat_hud_split_frt += (unsigned short)(frt_read() - hud_t0);
         }
     }
     /* VDP1 HUD (1p): ST_Drawer / HU_Drawer already composed this frame's elements (D_Display runs
@@ -9659,6 +9920,47 @@ extern "C" void DG_DrawFrame(void)
         df_present_sum += ((unsigned int)sat_present_frt * ns_per_frt) / 100000u;  /* FRT -> tenths-ms */
         sat_present_frt = 0;
         df_frames++;
+
+        /* ROW 4 (BPS), PER FRAME.  `em` = the VDP1 command emit loop (sat_p_emit10, written every
+           frame since 2026-08-07 and never printed until today); `pr`/`lp`/`wp` split Bp (per-seg
+           setup / per-column loop / the whole of prof_wallprep, so wp == row-2 Bp in 1p).  All four
+           are FRAME sums: sat_bps_* are latched by rp_p3_prof_show on the frame's LAST view, exactly
+           like row 2.
+           2026-08-25 (2nd round) -- `wp` RETIRED, `hd`/`tl` ADDED.  `wp` was prof_wallprep, i.e.
+           LITERALLY row-2 `Bp` (r_parallel.c reads the same variable for both), so it spent 7 of
+           40 columns restating a number one row above; those 7 columns are what hd/tl are paid
+           with.  The four are now the PARTITION of R_StoreWallRange:
+             hd = the head -- scale + texture resolution, silhouette setup, BOTH R_CheckPlane
+             pr = R_RenderSegLoop's per-seg routing preamble
+             lp = its per-column loop
+             tl = the tail -- the four openings memcpy + the drawseg store
+           `hd+pr+lp+tl` MUST equal row-2 `Bp`.  VERIFY THAT IDENTITY FIRST on the next console
+           pass, before reading anything into hd/tl; the residual is bracket overhead (~0.3-0.6 ms
+           in 4p -- each term is an upper bound by one FRT read) plus, if it ever fires, the
+           drawseg-overflow early return in r_segs.c.  The hole it names was measured at
+           (wp - pr - lp) = 1p 2.5 / 2p 7.0 / 3p 11.3 / 4p 11.2 ms -- 24 % of the 4p `Bp`.
+           ⚠ outside overlay mode 0 hd/tl do not accrue (they share RP_SegRoutMark's gate) while
+           prof_wallprep does, so the identity holds only in mode 0 -- the only mode that prints it.
+           FIXED WIDTH: exactly 40 cells in EVERY frame ("BPS " + 5x7 + 1 pad), so the longest
+           render equals the shortest and this row can never ghost the previous frame's tail.
+           Clamped at 999.9, and a clamped field is deliberately indistinguishable from a real
+           999.9 -- a 1000 ms Bp term is a hang, not a measurement.
+           Read `em` against row-1 `pr` in 1p and row-17 `k` in split -- those are the whole kick,
+           `em` is the loop inside it.  ⚠ this `pr` is NOT row 1's `pr`. */
+        if (sat_dbg_overlay_mode == 0)
+        {
+            static char r4buf[48];
+            unsigned int e10 = sat_p_emit10, h10 = sat_bps_hd10, p10 = sat_bps_pr10;
+            unsigned int l10 = sat_bps_lp10, t10 = sat_bps_tl10;
+            if (e10 > 9999u) e10 = 9999u;   if (h10 > 9999u) h10 = 9999u;
+            if (p10 > 9999u) p10 = 9999u;   if (l10 > 9999u) l10 = 9999u;
+            if (t10 > 9999u) t10 = 9999u;
+            snprintf(r4buf, sizeof r4buf, "BPS em%3u.%uhd%3u.%upr%3u.%ulp%3u.%utl%3u.%u ",
+                     e10 / 10u, e10 % 10u, h10 / 10u, h10 % 10u,
+                     p10 / 10u, p10 % 10u, l10 / 10u, l10 % 10u,
+                     t10 / 10u, t10 % 10u);
+            SRL::Debug::Print(0, 4, r4buf);
+        }
 
         /* SESSION percentile metrics: one sample per frame.  RESET on a MODE change (sat_m / SQ) so
            the histograms describe the whole run at the current mode (not the level).  Frame time =

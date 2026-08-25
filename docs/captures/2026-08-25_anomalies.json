@@ -1,0 +1,422 @@
+[
+ [
+  "1PLAYER-DEBUG1",
+  "Row 2 reads n1 on every legible frame, as expected for 1PLAYER-DEBUG1. No SPL row exists in 1p (row 17 is the V1 row), so the row-2-sum vs SPL '=<sum>' cross-check could not be performed on any frame."
+ ],
+ [
+  "1PLAYER-DEBUG1",
+  "d/n > ds violations: frame 03 (d34 vs ds0, level-load frame), frame 10 (d5 vs ds3), frame 12 (d19 vs ds14). All other legible frames satisfy d/n <= ds."
+ ],
+ [
+  "1PLAYER-DEBUG1",
+  "row-4 wp vs row-2 Bp diverge notably on 05 (wp65.1 vs Bp25.1, +40.0), 07 (25.5 vs 16.1, +9.4), 12 (17.3 vs 26.7, -9.4), 08 (33.5 vs 25.7, +7.8), 13 (44.3 vs 50.6, -6.3), 10 (21.5 vs 26.5, -5.0). Frames 03/04/09/11/14/15/16 match closely."
+ ],
+ [
+  "1PLAYER-DEBUG1",
+  "row-4 em vs row-1 pr: violated on 03 where em43.7 is far OVER pr0.0 (level-load frame). Large under-shoots (em far below pr rather than a little under) on 12 (1.7 vs 10.9), 14 (4.8 vs 13.9), 15 (2.5 vs 11.6), 13 (4.4 vs 11.6)."
+ ],
+ [
+  "1PLAYER-DEBUG1",
+  "Frame 10: VD1 reads Q0 E0/0 (no VDP1 queue and no emission at all) while row-2 Bp26.5 and row-4 lp19.5 / wp21.5 remain substantial -- the only frame with a fully empty VDP1 line."
+ ],
+ [
+  "1PLAYER-DEBUG1",
+  "Frame 11 is the only frame with a large slave wait: SLV w6.8 mw6 (every other frame is w0.0-w1.1, mw0/mw1)."
+ ],
+ [
+  "1PLAYER-DEBUG1",
+  "SLV row carries an extra trailing token on frames 06 and 07 ('mw1 0') and 12 ('mw0 0'), absent on the other frames."
+ ],
+ [
+  "1PLAYER-DEBUG1",
+  "Right-edge truncation: frame 04 row 1 ends 'rs0.2  2' (stray character), and the V1 row is cut before its tx value on frames 06, 08, 12, 13, 14, 15, 16; row 0 ld field is cut on frames 03, 05, 06, 07, 08, 15, 16."
+ ],
+ [
+  "1PLAYER-DEBUG1",
+  "THp 'n' steps 0/0 -> 0/2 -> 0/4 -> 1/4 through the capture while row-2 n stays 1 (different counters, noted so it is not mistaken for a view-count change)."
+ ],
+ [
+  "1PLAYER-DEBUG1",
+  "Fields deliberately left absent rather than guessed: frame 08 row-2 d (reads 43 or 48), frames 04/06/07 TIC x digit (buried under the red HUD, marked '?'), frame 07 SLV Pm/Ps (covered by a bright sprite), frame 09 LIM zf digits (washed out)."
+ ],
+ [
+  "1PLAYER-DEBUG1",
+  "Frames 00-02 are title/skill-select menu screens: the overlay is drawn but every counter reads zero over the red title art; marked not legible."
+ ],
+ [
+  "1PLAYER-DEBUG2",
+  "row-2 reads n1 on every legible frame, as expected for 1PLAYER-DEBUG2. No SPL row exists in 1p (V1 occupies row 17), so the 'row-2 sum vs SPL =<sum>' cross-check could not be run on any frame."
+ ],
+ [
+  "1PLAYER-DEBUG2",
+  "d/n vs LIM ds VIOLATED on 02.png (d20 > ds13) and 03.png (d34 > ds23). Elsewhere d/n <= ds, but it is EXACTLY equal on three frames (05: 22/22, 07: 38/38, 13: 49/49). Two overshoots plus three exact ties suggests row-2 d and row-11 ds are sampled over different windows, or ds is latched/clamped below the true drawseg count."
+ ],
+ [
+  "1PLAYER-DEBUG2",
+  "row-4 wp vs row-2 Bp VIOLATED on four frames: 02 (wp16.5 vs Bp45.5), 03 (wp12.3 vs Bp33.4), 09 (wp10.8 vs Bp53.1), 10 (wp4.5 vs Bp40.3). On the other eight legible frames wp tracks Bp digit-for-digit (40.6/40.6, 54.4/54.4, 18.9/18.9, 40.9/40.9, 28.6/29.5, 40.1/40.9, 28.9/27.7, 20.9/~19). The four outliers are all frames where lp is small yet Bp stays in the 33-53 range, consistent with Bp being stale/latched on exactly those frames."
+ ],
+ [
+  "1PLAYER-DEBUG2",
+  "row-4 em vs row-1 pr VIOLATED on 05.png (em3.4 > pr1.5), and exactly equal on 04.png (4.8 / 4.8). On the remaining frames em is under pr, but the gap is very wide on 08 (em3.8 vs pr15.0) and 13 (em6.0 vs pr25.3)."
+ ],
+ [
+  "1PLAYER-DEBUG2",
+  "06.png: VD1 reads Q0 E0/0 (nothing emitted to VDP1) while row-2 still reports Bp40.9 and row-0 MST80. Same frame has row-2 d1 against SEG c160 f160 k30 -- 160 segs for a single drawseg."
+ ],
+ [
+  "1PLAYER-DEBUG2",
+  "SEG c160 recurs verbatim on 06.png (c160 f160 k30), 10.png (c160 f0 k0) and both intermission frames (c160 f160 k30). Identical c with wildly different f/k looks like a latched or capped seg counter rather than three coincidental scenes."
+ ],
+ [
+  "1PLAYER-DEBUG2",
+  "13.png: row-1 reads R0 alongside T914 while row-0 MST169 -- a 914 ms tic term far larger than MST, with renderer time reported as zero on a frame that is plainly rendering. It is the first frame after the map load (MX t0s, ld206/46, REC reset), consistent with the known post-load T spike, but R0 is internally inconsistent with MST169."
+ ],
+ [
+  "1PLAYER-DEBUG2",
+  "08.png: row-2 P23.8 and M15.5 both exceed Bp18.9 -- the only frame where Bp is not the dominant row-2 term. Its row-1 pr15.0 is the second-highest of the run."
+ ],
+ [
+  "1PLAYER-DEBUG2",
+  "06.png and 10.png: SLV Pb0% with Ps0.0 while slave busy b is still 7% and 12% -- nonzero slave occupancy with zero parallel share."
+ ],
+ [
+  "1PLAYER-DEBUG2",
+  "11.png and 12.png are the same intermission frame duplicated in the capture (identical throughout, MST81 / ld202/4 / zf558k / e-350), so the set contains 13 distinct frames, not 14."
+ ],
+ [
+  "2PLAYER-DEBUG1",
+  "Frame 12: row-2 terms (Bw13.3 + Bp63.4 + P20.3 + M0.7 = 97.7 ms) exceed the SPL sum =80 by ~18 ms, and exceed MST126 for a 2-view frame. Bp63.4 is also 23 ms above BPS wp39.9. All other frames keep Bp within ~6 ms of wp. Verified at 6x on raw pixels — the digit is 6."
+ ],
+ [
+  "2PLAYER-DEBUG1",
+  "Frame 10: row-2 terms sum 68.1 ms vs SPL =66 (2.1 ms over). Small but on the wrong side of the check."
+ ],
+ [
+  "2PLAYER-DEBUG1",
+  "Frames 05 and 08: row-2 terms sum far UNDER the SPL sum (53.3 vs =73, and 70.3 vs =89) — ~19 ms unaccounted in both, while frames 04/06/07/09/11/13 land 4-8 ms under."
+ ],
+ [
+  "2PLAYER-DEBUG1",
+  "Frame 05: wp37.1 vs Bp27.1 (10 ms apart); frame 12: wp39.9 vs Bp63.4 (23.5 ms apart). Elsewhere wp tracks Bp within ~6 ms."
+ ],
+ [
+  "2PLAYER-DEBUG1",
+  "n2 holds on every legible in-game frame (03-13) and the SPL row always has exactly 2 non-zero view slots — consistent with the 2PLAYER label."
+ ],
+ [
+  "2PLAYER-DEBUG1",
+  "THp `n` reads n0/5 or n0/6 on frames 04-07 but n2/5 on frames 08-13, while the FMp/thing counts do not obviously change; noting it because THp n0 with r33/r32/r22 nonzero looks inconsistent."
+ ],
+ [
+  "2PLAYER-DEBUG1",
+  "VD1 fb reads fb0/0 on frames 03-08 and flips to fb0/1 on frames 09-13 and stays there."
+ ],
+ [
+  "2PLAYER-DEBUG1",
+  "VRM bk is 6 on frames 03 and 08 but 0 on every other legible frame; tx climbs 6 -> 8 -> 11 -> 17 -> 18 and never returns."
+ ],
+ [
+  "2PLAYER-DEBUG1",
+  "Frame 03 (first frame after the load): T6195 ms, dg1304/1, MST2000, SPL h106.3, SLV b0%, GOV ws440/i0/e97 while every later frame reads ws480/i16 and a negative e. Post-load outlier, consistent with previously recorded post-load spikes."
+ ],
+ [
+  "2PLAYER-DEBUG1",
+  "Row 0 is rendered in red (not white) on frames 10, 11 and 12; still readable, but the colour change is not explained by the HUD underneath."
+ ],
+ [
+  "2PLAYER-DEBUG1",
+  "SEG reads exactly 'c257 f0 k0 lk0' on all 11 in-game frames, including the post-load frame 03 where every other counter is an outlier — a frozen-looking value."
+ ],
+ [
+  "2PLAYER-DEBUG1",
+  "GCS P-field and LIM ss7 / FMp 'sk21 mx8108 hp1256/4096!0' are likewise identical across all in-game frames."
+ ],
+ [
+  "2PLAYER-DEBUG2",
+  "Frame 02 is the only frame where row-2 (Bw+Bp+P+M = 71.8 ms) exceeds the SPL sum (=63) instead of sitting a few ms under it. It is also the frame with the largest wp-vs-Bp divergence (wp32.9 vs Bp47.3). The Bp leading digit is the soft glyph; a value near 37.3 would satisfy both checks, so treat Bp47.3 in frame 02 as suspect rather than as a real spike."
+ ],
+ [
+  "2PLAYER-DEBUG2",
+  "Frame 10 violates d/n <= ds: row-2 d47 with n2 gives 23.5 drawsegs per view while row-11 reads ds20. All other frames satisfy the check (frame 09 is exactly at the limit: 30/2 = 15 = ds15)."
+ ],
+ [
+  "2PLAYER-DEBUG2",
+  "SPL second-view-time digits merge with the first value on screen in several frames. Where v0+v1 does not reach the printed '=' sum, the printed sum is the more trustworthy figure: frames 00 (29.3+21.0 vs =61), 03 (18.3+21.0 vs =50), 04 (16.2+9.0 vs =45), 05 (16.4+9.0 vs =65) and 06 (16.2+10.0 vs =38) each look short by roughly one lost leading digit on v1. Frames 01, 02, 07, 08, 09, 10, 11, 12 reconcile exactly."
+ ],
+ [
+  "2PLAYER-DEBUG2",
+  "row-4 wp tracks row-2 Bp closely on most frames but diverges by more than 6 ms on frames 08 (wp40.5 vs Bp33.8) and 10 (wp18.6 vs Bp24.9), and by 3.4 ms on frame 06 (wp18.1 vs Bp14.7) -- in addition to frame 02 noted above."
+ ],
+ [
+  "2PLAYER-DEBUG2",
+  "row 2 reads n2 on all 13 frames, as expected for a 2-player capture, and every SPL row shows exactly two non-zero view times with slots 3 and 4 at 0."
+ ],
+ [
+  "2PLAYER-DEBUG2",
+  "SLV goes fully idle (b0% Pb0% Ps0.0) on frames 03 and 05 while the rest of the set runs b4-8% / Pb24-61%. Frame 05 also shows VD1 Q0 E0/0 (no VDP1 emission at all) with g0."
+ ],
+ [
+  "2PLAYER-DEBUG2",
+  "VD1 g reads g8 on frames 00-02 and g0 on every frame from 03 onward; the E pair likewise changes from a stable 37/96 (frames 00-03) to varying values afterwards."
+ ],
+ [
+  "2PLAYER-DEBUG2",
+  "THp n reads n3/5 on frames 00-05 and n2/5 on frames 06-12."
+ ],
+ [
+  "2PLAYER-DEBUG2",
+  "FMp third field decreases monotonically over the capture (312 -> 312 -> 312 -> 280 -> 280 -> 272 -> 272 -> 272 -> 264 -> 264 -> 264 -> 264 -> 256), and the FMp hp field ends with a trailing '!0' on frames 00-10 but a bare '!' on frames 11-12 (the digit runs off the readable area)."
+ ],
+ [
+  "2PLAYER-DEBUG2",
+  "GOV reads d- w0 p0 sb0 L0 i16 ws480 on every frame -- only e varies (-66 to -853). Nothing in this set shows the governor releasing anything."
+ ],
+ [
+  "2PLAYER-DEBUG2",
+  "row 24 (TIC) x and v values are unreadable on almost every frame: they sit directly under the red HUD ammo digits. Only th, sp, sc were transcribed; frame 01 is the sole frame where x4.4 could be read."
+ ],
+ [
+  "3PLAYER-DEBUG1",
+  "Frame 05 breaks three checks at once: row-4 wp65.0 vs row-2 Bp30.3 (35 ms over, all other frames agree within 1-2 ms), row-4 lp44.0 vs Bw15.4, and row-2 sum 62.1 ms vs SPL =129 (67 ms under). SLV also collapses there (b0%, Pm0.7, Ps0.6) while Pb jumps to 35%. It is the frame right after the load (SEG f39, GCS w31.5/39, GRD zw1796), so the row-2 phase accumulators and the SPL view timers appear to be measuring different frames."
+ ],
+ [
+  "3PLAYER-DEBUG1",
+  "Frame 10: row-4 wp30.8 is 9.5 ms BELOW row-2 Bp40.3 (every other clean frame has wp within ~2 ms of Bp, and slightly above)."
+ ],
+ [
+  "3PLAYER-DEBUG1",
+  "Frame 08: row-4 wp46.3 vs row-2 Bp39.0, 7.3 ms over -- larger than the ~1 ms agreement seen on frames 06,07,09,11,12,13,14,15,16."
+ ],
+ [
+  "3PLAYER-DEBUG1",
+  "Frame 14: row-2 (Bw+Bp+P+M) = 55.6 ms vs SPL =77 -- a 21 ms shortfall, roughly double the typical 6-15 ms gap; the missing time is mostly in P (9.6 ms, lowest of the run despite a normal SPL profile 21/31/21)."
+ ],
+ [
+  "3PLAYER-DEBUG1",
+  "SPL 4th slot (minimap in 3p) is not always 0-3 ms: frame 11 shows 10 ms and frame 05 shows 8 ms."
+ ],
+ [
+  "3PLAYER-DEBUG1",
+  "SPL per-view balance is extremely uneven on the post-load frames despite bal0 being reported every frame: 05 = 9/33/79/8, 06 = 8/28/5/4, 07 = 38/31/7/3. From frame 12 onward the three views settle to ~21-31 each."
+ ],
+ [
+  "3PLAYER-DEBUG1",
+  "Frame 10 row-1 dg reads 23/2 while every other in-game frame is 4-10/2; the same frame carries THp l27 and SPR td0/27/0."
+ ],
+ [
+  "3PLAYER-DEBUG1",
+  "GOV e is +22 on the first in-game frame (04) and negative on every subsequent frame (-96 to -892), with no intermediate values -- it never crosses back above zero."
+ ],
+ [
+  "3PLAYER-DEBUG1",
+  "Row-2 n reads 3 on all 13 in-game frames, as expected for 3PLAYER-DEBUG1. Row-2 d/n never exceeds row-11 ds on any frame (max 28.3 vs ds37 on frame 11)."
+ ],
+ [
+  "3PLAYER-DEBUG1",
+  "SPL sums verified: on every legible frame the four printed view times add exactly to the printed =<sum>, so the SPL row is internally consistent even where it disagrees with row 2."
+ ],
+ [
+  "3PLAYER-DEBUG1",
+  "Rows 12 (CD), 13 (LOS), 19 (FLT), 22 (GRD) are largely buried under the red/coloured HUD bands on the in-game frames and were only partially readable; row 17 in split mode replaced the V1 row as expected (no V1 row on any in-game frame)."
+ ],
+ [
+  "3PLAYER-DEBUG1",
+  "Frames 00-03 (menus/load) still print stale non-split rows: no n/row-2 at all, V1 row present instead of SPL, and ld climbing 164->186 while fps falls 15.0 -> 5.2 -- consistent with loading, but worth noting the overlay shows a V1 row in a 3-player session before the level starts."
+ ],
+ [
+  "3PLAYER-DEBUG2",
+  "Row 2 reads n3 on all 10 frames and SPL always shows 3 real view times plus a 3 ms 4th slot (the minimap) - consistent with 3PLAYER throughout, no n mismatch anywhere."
+ ],
+ [
+  "3PLAYER-DEBUG2",
+  "SPL check: the four listed view times add up exactly to the '=<sum>' field on every frame (64, 93, 56, 83, 80, 91, 61, 83, 83, 85) - internally consistent."
+ ],
+ [
+  "3PLAYER-DEBUG2",
+  "Cross-check row2 (Bw+Bp+P+M) vs SPL sum: passes on every frame (a few ms under), but on 05.png the margin is essentially zero: 22.8+47.0+18.6+2.5 = 90.9 vs SPL =91. Everywhere else the gap is 8-15 ms."
+ ],
+ [
+  "3PLAYER-DEBUG2",
+  "VIOLATION on 05.png: row-2 d103 / n3 = 34.3 > row-11 ds32. All other frames satisfy d/n <= ds (e.g. 01: 91/3=30.3 vs ds34; 04: 80/3=26.7 vs ds30)."
+ ],
+ [
+  "3PLAYER-DEBUG2",
+  "Frame 04.png is borderline on the same check: d80/3 = 26.7 vs ds30 - only 3 of slack, while frames 03/08/09 keep 10+."
+ ],
+ [
+  "3PLAYER-DEBUG2",
+  "Row-4 wp tracks row-2 Bp closely everywhere (delta -2.8 to +2.6 ms); the largest positive delta is 02.png (wp26.5 vs Bp23.9) and the only negative one of size is 05.png (wp44.2 vs Bp47.0)."
+ ],
+ [
+  "3PLAYER-DEBUG2",
+  "Slave utilisation is near-zero across the whole split capture: SLV b reads 0-3% on all 10 frames (b0% on 00 and 02), consistent with the known 'slave b0% in the whole split' finding."
+ ],
+ [
+  "3PLAYER-DEBUG2",
+  "VD1 E<n>/<n> collapses over the capture: 16/97, 34/94, 18/93, 9/82, 10/73, then a frozen 10/73 on frames 04-07 and again on 08-09, while VD1 fb goes 0/1 on frames 00-02 and 0/2 from 03 onward."
+ ],
+ [
+  "3PLAYER-DEBUG2",
+  "THp n reads n4/6 on frames 00-07 but n3/6 on 08 and 09 - the things-budget view count drops while row-2 still reads n3."
+ ],
+ [
+  "3PLAYER-DEBUG2",
+  "LIM lg reads 159k on 00.png and 151k on every subsequent frame; zf is a constant 609k throughout."
+ ],
+ [
+  "3PLAYER-DEBUG2",
+  "REC row changes mid-capture: 50:22.0 on frames 00-06 vs 50:24.0 on 08-09 (95:32.0 and mx90.5 constant everywhere)."
+ ],
+ [
+  "3PLAYER-DEBUG2",
+  "GOV e is negative on all 10 frames (-789, -175, -506, -870, -65, -160, -338, -555, -622, -702) and swings by an order of magnitude frame to frame; d, w, p, sb, L are all at their zero/'-' values on every frame while i16 ws480 never move."
+ ],
+ [
+  "3PLAYER-DEBUG2",
+  "SPL trailing p-field is not stable: po5/po4 on frames 00-02, py5 on 03, py1 on 04/05/07/08/09, and py17 on 06."
+ ],
+ [
+  "3PLAYER-DEBUG2",
+  "Row 12 (CD) is under the red HUD band on every frame and was not readable on any of them; rows 21-24 were readable despite the second HUD band."
+ ],
+ [
+  "3PLAYER-DEBUG2",
+  "GCS reads all-zero (w0.0/0 m0.0/0 P158/0.0) on every frame except 02.png (w0.9/18), which is also the only frame with SEG f18 k1."
+ ],
+ [
+  "4PLAYER-DEBUG1",
+  "Frame 06: row-2 sum (Bw13.1+Bp59.7+P14.3+M1.4 = 88.5 ms) is 17.5 ms OVER the SPL sum =71 -- row 2 should be a few ms UNDER the split total."
+ ],
+ [
+  "4PLAYER-DEBUG1",
+  "Frame 10: row-2 sum (13.3+60.6+10.7+1.1 = 85.7 ms) is 12.7 ms OVER the SPL sum =73."
+ ],
+ [
+  "4PLAYER-DEBUG1",
+  "Frames 06, 07, 10: row-4 wp does not track row-2 Bp (06: wp36.3 vs Bp59.7; 07: wp149.9 vs Bp61.0; 10: wp36.7 vs Bp60.6). On all other in-game frames wp is within ~5 ms of Bp."
+ ],
+ [
+  "4PLAYER-DEBUG1",
+  "Whole run: Bp alone reads ~42-62 ms while the four SPL view times only total 71-100 ms, so on frames 08, 09, 11, 13, 14 the row-2 sum (~69-87 ms) sits at or barely under the split total instead of a few ms under -- Bp looks inflated relative to the per-view accounting."
+ ],
+ [
+  "4PLAYER-DEBUG1",
+  "Frame 05: GOV ws drops to ws240 for a single frame while every other in-game frame reads ws480."
+ ],
+ [
+  "4PLAYER-DEBUG1",
+  "Frames 12 and 14: GOV e is negative (e-2, e-22); every other frame has e in 1..286."
+ ],
+ [
+  "4PLAYER-DEBUG1",
+  "Frame 07: outlier frame -- VD1 79ms g61, BPS lp108.7 wp149.9, SPL views 83/27/63/28 =201 ms, i.e. ~2.4x the row-2 sum 85.1 ms; two of the four views cost 63-83 ms each."
+ ],
+ [
+  "4PLAYER-DEBUG1",
+  "Frames 13-14: VD1 fb pre-count jumps 0 -> 6 (fb6/2) and stays; frames 00-12 all read fb0/x."
+ ],
+ [
+  "4PLAYER-DEBUG1",
+  "Frame 03 shows n4 with the skill-select menu still drawn over the picture (level already ticking: THK n31, R1084 ms, MST1111) -- overlay/menu overlap rather than a clean state; its REC row is all 0.0 and SPL =389."
+ ],
+ [
+  "4PLAYER-DEBUG1",
+  "VRM tx climbs 4 -> 5 -> 6 -> 7 across frames 03-11 then jumps to 15/26 on frames 12-14."
+ ],
+ [
+  "4PLAYER-DEBUG1",
+  "row-2 d/n never exceeds row-11 ds on any frame (max 31 vs ds34 on frame 03) -- that cross-check holds throughout."
+ ],
+ [
+  "4PLAYER-DEBUG2",
+  "02.png: row-2 sum Bw+Bp+P+M = 97.2 ms EXCEEDS the SPL sum =94 by ~3 ms (the check expects row-2 a few ms UNDER). All other legible frames are under."
+ ],
+ [
+  "4PLAYER-DEBUG2",
+  "11.png: row-4 wp34.3 vs row-2 Bp25.5 -- 8.8 ms apart, by far the worst wp/Bp divergence of the capture (every other frame agrees within ~5 ms). The same frame also has the largest row-2 vs SPL gap (50.3 vs =71, 20.7 ms unaccounted)."
+ ],
+ [
+  "4PLAYER-DEBUG2",
+  "12.png: row-2 sum 30.8 vs SPL =46 -- 15 ms unaccounted, second-largest gap; it is also the only frame with VD1 Q0 E0/0 (queue and emission both zero) while row-1 pr8.1 is non-zero."
+ ],
+ [
+  "4PLAYER-DEBUG2",
+  "00.png and 07.png: row-4 wp exceeds row-2 Bp by ~4.6-4.8 ms (49.5 vs 44.9; 49.3 vs 44.5); 02.png shows the opposite sign (44.9 vs 49.3)."
+ ],
+ [
+  "4PLAYER-DEBUG2",
+  "SLV b stays at 1-3 % on EVERY frame of this 4p capture -- the slave is essentially idle throughout the split, consistent with the known b0 % split behaviour."
+ ],
+ [
+  "4PLAYER-DEBUG2",
+  "THp reads n4/7 on all 15 frames: the things-budget count never moves across the whole capture, while THp r swings 16-51."
+ ],
+ [
+  "4PLAYER-DEBUG2",
+  "GOV is fully released and static on every frame (d- w0 p0 sb0 L0 i16 ws480) and its e drifts monotonically more negative within runs (-21, -63, -116, -117 ... -443, -548, -614)."
+ ],
+ [
+  "4PLAYER-DEBUG2",
+  "FMp row is byte-identical on all 15 frames (136/168/312 sk21 mx8217 hp1256/4096!), including the trailing '!' overflow marker."
+ ],
+ [
+  "4PLAYER-DEBUG2",
+  "12.png and 13.png show REC 95:28.0 while every other frame shows 95:30.0 -- the 95th-percentile ceiling drops only on the two fastest frames."
+ ],
+ [
+  "4PLAYER-DEBUG2",
+  "14.png: row-0 ld = 198/41 whereas all 14 other frames read 197/41 (one extra load event); the same frame shows T45 (tic ~3x the 7-20 ms typical), TIC th42, sc3 and sp66 %, i.e. a post-load spike."
+ ],
+ [
+  "4PLAYER-DEBUG2",
+  "row-2 n reads 4 on all 15 frames, as expected for this capture; d/n never exceeds row-11 ds on any frame."
+ ],
+ [
+  "4PLAYER-DEBUG2",
+  "SPL 3rd view time is repeatedly much smaller than the others (4, 6, 7, 8, 9 ms on frames 05, 06, 09, 10, 12, 13, 14) while the other three sit at 13-40 ms -- an unusually persistent imbalance for a 4-view split, with bal0 reported every frame."
+ ],
+ [
+  "4PLAYER-DEBUG3",
+  "All 6 frames read n4 on row 2 and 4 non-zero view times on SPL, as expected for 4PLAYER-DEBUG3."
+ ],
+ [
+  "4PLAYER-DEBUG3",
+  "row-4 wp is systematically HIGHER than row-2 Bp on every frame, by 8.2 / -1.4 / 8.0 / 10.1 / -0.9 / 2.3 ms (00/01/02/03/04/05). Frames 00, 02, 03 exceed the 'close to Bp' expectation by 8-10 ms; frames 01 and 04 have wp slightly BELOW Bp."
+ ],
+ [
+  "4PLAYER-DEBUG3",
+  "row-2 sum (Bw+Bp+P+M) is well under the SPL '=' sum on every frame, gap = 21.0 / 5.4 / 26.1 / 19.6 / 8.1 / 9.8 ms. Frames 00, 02, 03 show unusually large gaps (~20-26 ms unaccounted)."
+ ],
+ [
+  "4PLAYER-DEBUG3",
+  "Frame 03 only: VD1 shows Q0 E0/0 (all other frames have Q6-Q14 and non-zero E) -- matches the known 'Q0/0 = rp_active block dead' pattern."
+ ],
+ [
+  "4PLAYER-DEBUG3",
+  "Frame 03 only: SEG f53 k5 (all other frames f0-f14, k0) and GCS w2.6/58 (others <=w0.7) and SPL py17 (others py1) -- a texture/flat-fetch spike frame."
+ ],
+ [
+  "4PLAYER-DEBUG3",
+  "Frame 04: BP x491 vs x58-x62 on other non-zero frames -- an order-of-magnitude outlier."
+ ],
+ [
+  "4PLAYER-DEBUG3",
+  "row-2 d/n never exceeds row-11 ds on any frame (18.3<=48, 14.8<=30, 10.3<=34, 8.3<=24, 17.3<=33, 17.0<=36): check passes."
+ ],
+ [
+  "4PLAYER-DEBUG3",
+  "row-1 pr and row-4 em stay within ~1-9 ms of each other, but em EXCEEDS pr on frames 01 (8.7 vs 8.8, near-equal) and 04 (10.4 vs 10.2); the 1p 'em a little under pr' rule is not cleanly satisfied here (this is split, so may not apply)."
+ ],
+ [
+  "4PLAYER-DEBUG3",
+  "FMp row is identical on all 6 frames (136/168/312 sk21 mx8217 hp1256/4096!) and ends with a '!' -- hp at 1256/4096 flagged."
+ ],
+ [
+  "4PLAYER-DEBUG3",
+  "MX row is byte-identical on all 6 frames (m1 1519,-2449 a12 t12s), suggesting a frozen/static field rather than live data across the capture."
+ ],
+ [
+  "4PLAYER-DEBUG3",
+  "row 12 (CD) is buried under the red HUD band on every frame and could not be read."
+ ]
+]

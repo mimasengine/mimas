@@ -190,11 +190,7 @@ extern "C" int sat_plane_vscale;      /* deported-plane VERTICAL decrochage fill
    border_max every frame -- cost paid, benefit nil.  Cutting that computation is a core commit
    (shared with DoomJo), tracked separately.  border_max is still printed on overlay row 11. */
 extern "C" int sat_plane_border_max;
-extern "C" int sat_plane_fill_mode;
-extern "C" int sat_plane_border_v;    /* live vertical fill-border px this frame (overlay readout) */
 /* SATURN VALIDATION (Ymir-readable, deterministic): RAM-lever sizing telemetry. */
-extern "C" int   r_visplane_coverage_peak;  /* #1: peak sum of live-plane spans (top-bytes) */
-extern "C" int   r_visplane_pool_peak;      /* #1: peak bytes used in the span pool (0 if off) */
 extern "C" int   r_visplane_pool_ovf;       /* #1: planes that overflowed VP_POOL_PLANES (0 = ok) */
 extern "C" int   r_visplane_pool_ovf_pk;    /* ...and its ~1 s HIGH-WATER: the per-view reset made the
                                                raw counter read 0 on the overlay almost always.
@@ -219,7 +215,6 @@ extern "C" unsigned int sat_spl_sw, sat_spl_v0, sat_spl_v1, sat_spl_v2, sat_spl_
 extern "C" unsigned int sat_dd_st10, sat_dd_hu10, sat_dd_ot10;
 extern "C" unsigned int sat_spl_mmap;   /* core d_main.c: the 3p minimap, ms (row 17, 4th slot) */
 extern "C" int   sat_bsp_stage_used, sat_bsp_stage_want;  /* M5 BSP staging, row 1 st readout */
-extern "C" int   sat_bsp_stage_on;                 /* M5 staging live A/B state (pad R+C) */
 extern "C" void  P_BspStageApply(int on);          /* core/p_setup.c: swap LWRAM<->HWRAM sets */
 /* VDP1 wall-texture bakes (cache misses) THIS flush -- diagnoses the `k` cost: if the split
    views thrash the 19 shared slots, bk stays high every frame => re-bake is the kick cost. */
@@ -757,7 +752,6 @@ extern "C" void R_CompositeWindowReset (void);   /* one writer for both + the 16
    Read row 19 `FLT`: `ld` must PLATEAU -- a flat disc-read count that keeps climbing means the pool
    is bypassed (A-), too small (`f`>0, `ev` climbing), or never carved (`p0`). */
 extern "C" int sat_flatcache_on;       /* live A/B bypass (pad R+Z); slab stays carved either way    */
-extern "C" int sat_flatcache_slots;    /* slots carved this level (0 = zone too tight -> pool-less)  */
 extern "C" int sat_flatcache_live;     /* slots currently holding a flat                             */
 extern "C" int sat_flatcache_load;     /* cumulative slot fills = the REAL flat disc reads           */
 extern "C" int sat_flatcache_full;     /* views where every slot was busy -> classic zone path       */
@@ -766,7 +760,6 @@ extern "C" unsigned int sat_p_kick10;  /* VDP1 wall kick + R_DrawPlayerSprites (
 extern "C" unsigned int sat_bps_pr10, sat_bps_lp10, sat_bps_hd10, sat_bps_tl10;  /* row 4, FRAME sums (r_parallel); hd+pr+lp+tl == row-2 Bp */
 /* (sat_p_net10 / _draw10 / _join10 removed with the row that printed them -- settled at ~0.) */
 extern "C" int R_TextureIOFree(int tex);  /* core r_data.c: 1 = resolving this texture hits no disc */
-extern "C" int sat_tex_load_spent;     /* core r_segs.c: tenths of a ms of disc spent this frame    */
 extern "C" int R_LoadBudgetLeft(void); /* core r_segs.c: 1 = the frame can still afford a fault     */
 extern "C" int sat_budget_refused;     /* core r_segs.c: 1 once the budget has refused something    */
 extern "C" int R_WallPotatoColorPeek(int tex);  /* core r_data.c: cached dominant colour, -1 = none,
@@ -952,7 +945,6 @@ extern "C" int sat_hud_dirty;            /* core st_stuff.c: HUD region (re)draw
 extern "C" unsigned int ST_SplitHudSig(void);  /* core: 2p/4p compact-HUD value signature */
 /* core/r_plane.c L1 toggle (1 = visplane hash, 0 = vanilla linear scan); frozen at 1 (HW: NULL
    at E1M1, REC §C.2) -- kept extern for the row-1 stamp only, no longer pad-toggled. */
-extern "C" int sat_visplane_hash;
 /* core/r_parallel.c visplane-split A/B (0 = static half-split [default, good], 1 = two-pointer
    work-steal); pad Y toggles it live -> read row-3 'w' (master wait at the barrier) + 'P' + fps.
    Row 1 shows ws<state>; the profiler window auto-resets on the flip. */
@@ -965,6 +957,9 @@ extern "C" int sat_mark_suppress;
    inline).  inc-1 is NON-overlapped -> expect byte-identical render + Bp off the master + w up
    ~21ms + fps UNCHANGED (the win is inc-2).  Row 1 shows wp<state>. */
 extern "C" int sat_wallprep_slave;
+/* core r_segs.c: minimum column height (rows) that goes to the SLAVE instead of being filled
+   by the master.  0 = off.  See R_WallFillArm -- one knob, one subject. */
+extern "C" int sat_wallfill_min;
 /* ⚠ SATURN 2026-08-24: setting this is NOT enough any more.  core/r_segs.c compiles its 8 KB
    walljobs[] queue out unless SAT_WALLPREP_DEFER is 1 there -- 8 192 B of .bss taken straight off
    the boot pool for a harness no shipped binary can reach.  Reviving the defer means flipping the
@@ -2306,8 +2301,19 @@ static void fps_update(void)
         /* tenths of an fps, for resolution at 5-10 fps; EMA (~4s) for a stable
            average to compare builds with. */
         unsigned int inst10 = (frames * 10u * hz + elapsed / 2) / elapsed;
-        static unsigned int avg10 = 0;
-        avg10 = avg10 ? (avg10 * 3 + inst10) / 4 : inst10;
+        /* 🔴 SATURN 2026-08-26 -- the EMA is now carried at x4 precision and rounds.  Written as
+           `avg10 = (avg10*3 + inst10)/4` it could NOT REACH A RISING TARGET: every a in (i-4, i] is
+           a fixed point of the truncating divide, so a climb stalled at i-3 -- 0.3 fps SHORT, for
+           ever -- while a FALL converged exactly (truncation runs with the descent).  The bias was
+           one-directional and it sat on the one field this row calls THE build-comparison number,
+           so it under-reported every improvement it was built to measure.  Owner caught it on the
+           wall-fill A/B: inst pinned at 8.4, `a` pinned at 8.1, indefinitely.
+           ⚠ alpha is unchanged at 1/4 per SECOND: "~4s" is the TIME CONSTANT (63%), not the
+           settling time -- closing a 0.8 fps step still takes ~9 s.  Read `inst` for a step, `a`
+           only once it has stopped moving. */
+        static unsigned int avg40 = 0;                       /* = avg10 * 4 (no truncation floor) */
+        avg40 = avg40 ? (avg40 * 3 + inst10 * 4 + 2) / 4 : inst10 * 4;
+        unsigned int avg10 = (avg40 + 2) / 4;
         /* one-shot memory-latency calibration on the first 1/s tick (a single ~30ms
            hitch at startup, off the render path) -> row 18. */
         static int mem_done = 0;
@@ -10738,6 +10744,24 @@ static void poll_pad(void)
     }
     /* (SAT_DIAG_SLAVE_TOGGLES=0: L+R free -- only tap ','/'.' to Doom.) */
 #endif
+
+    /* 🔴 Pad R+X (R held, L RELEASED, X edge): WALL FILL ON THE SLAVE -- off / 24 / 48 / 96 rows.
+       The number is the MINIMUM column height handed to the second SH-2; below it the master
+       fills the column itself, because a 24-byte record only beats a direct fill once the column
+       is taller than the record.  Cycle rather than a plain on/off: the break-even is a guess
+       until hardware prices it, and the ladder makes the A/B live on one scene.
+       Read row 14 `lk` (pixels the master did NOT fill = the offload), row 12 `st` (spans whose
+       texture had gone by drain time -- MUST tend to 0) and row 5 `b%` (slave busy).
+       ⚠ NOT L+R: that chord is the NBG3 overlay cycle (:10562), i.e. exactly the counters this
+       toggle exists to be read against -- one press would have moved both.  R+X is free in 1p AND
+       split: L+X is sat_wall_paint, the X-alone split_vdp1 toggle needs BOTH shoulders released,
+       and the X->KEY_TAB forward is already eaten while a shoulder is held (:10831).  The
+       incidental '.' (R) tap to Doom is the usual chord cost. */
+    if (!(cur & PER_DGT_TR) && (cur & PER_DGT_TL)
+        && (changed & PER_DGT_TX) && !(cur & PER_DGT_TX))
+        sat_wallfill_min = (sat_wallfill_min == 0)  ? 24
+                         : (sat_wallfill_min == 24) ? 48
+                         : (sat_wallfill_min == 48) ? 96 : 0;
 
     /* Split-screen wall-path A/B (live, mid-game): in local multiplayer, pad-1 X toggles the
        half-views' walls between VDP1 (sat_split_vdp1=1, the new mode) and pure software

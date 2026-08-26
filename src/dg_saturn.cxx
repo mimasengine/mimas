@@ -419,7 +419,7 @@ static int  sky_horizon_row = SKY_HORIZON_ROW;  /* HW-sky horizon row (baked at 
 #error "VDP2_SPLIT_HW_SKY needs VDP2_CELL_SKY (the NBG0 cell sky layer)"
 #endif
 #if VDP2_SPLIT_HW_SKY
-static int hwsky_split_on = 1;   /* Part 5 LIVE toggle (pad L+C): 1 = HW sky for the elected split view (DEFAULT ON), 0 = software split sky.  Toggle OFF with L+C if it snows/misaligns on HW (cosmetic size/anchor still WIP -- docs §10). */
+enum { hwsky_split_on = 1 }; /* BAKED 2026-08-26: adopted with the round-4 geometry */   /* Part 5 LIVE toggle (pad L+C): 1 = HW sky for the elected split view (DEFAULT ON), 0 = software split sky.  Toggle OFF with L+C if it snows/misaligns on HW (cosmetic size/anchor still WIP -- docs §10). */
 #endif
 /* Frames a challenger must out-cover the leader (by margin) before the elected HW-sky view switches.
    2026-08-21 owner: "30 frames c'est peut-être un peu long comme bascule" -- at split fps (10-15)
@@ -709,21 +709,13 @@ extern int sat_thing_emit_cap;         /* core: max things emitted/frame -- we A
 extern int sat_wall_cpu_span;          /* core r_segs.c: near-wall->software CPU-entry span -- LOD-driven */
 extern int sat_wall_cpu_v1;            /* core r_segs.c: VDP1-exit span (kept = span + prewarm band) -- LOD-driven */
 
-/* SATURN live A/B toggles (2026-07-09) -- three perf levers, each a one-HW-session flip (see poll_pad):
-   sat_clear_slave (R+C): dispatch the end-of-frame fb clear to the idle slave SH-2 (docs/BLIT_DMA_PLAN
-     Inc3).  It writes HWRAM, not the B-bus, so the SCU-DMA hang law does not apply; the core joins it
-     (RP_AuxWait) at the top of R_RenderPlayerView.  Watch dg/MST (rows 1/0).
-   sat_near_sprites: FastDoom nearSprites cull of far decorations (defined in core/r_things.c).
-     ⚠ NOT A TOGGLE and NOT OBSERVABLE.  It is baked ON, its R+X chord was reclaimed for the texture
-     load budget (verified 2026-08-06), and row 7's `ns` -- a constant printed as if it were a knob --
-     was cut 2026-08-09.  Listed here only so it is not re-discovered as a live A/B: there is no way
-     to turn it off in a shipping build and no field that shows its effect.
-   (things-AIMD is no longer a toggle: wbudget is baked for 1p -- see the emit-budget block.) */
-extern "C" int sat_clear_slave = 1;    /* default ON: HW-validated -2..-3ms dg (R+C to A/B off) */
-extern int     sat_near_sprites;       /* defined in core/r_things.c; default ON there.  (Its old R+X
-                                          chord is GONE -- verified 2026-08-06 on PER_DGT_TX: no site
-                                          binds it.  R+X now cycles sat_tex_load_budget.) */
-extern "C" int sat_tex_load_budget;    /* core r_segs.c: textures faulted in per frame, 0 = off (R+X) */
+/* (The 2026-07-09 "three perf levers" block ENDED HERE on 2026-08-26.  All three are baked and
+   none of them is a toggle any more: sat_clear_slave ON (HW -2..-3 ms of `dg`, its R+C chord and
+   row-7 `cs` both removed), sat_near_sprites ON in core/r_things.c (never observable, `ns` cut
+   2026-08-09), things-AIMD baked for 1p in the emit-budget block.  A lever that cannot be moved
+   and cannot be read is not a lever; keeping the vocabulary around it is how a settled question
+   gets re-opened by someone reading the header.) */
+extern "C" int sat_tex_load_budget;    /* core r_segs.c: disc ms/frame spent faulting textures, baked 20 */
 extern "C" int sat_wall_flat_io;       /* core r_segs.c: tiers drawn flat for want of residency        */
 extern "C" int sat_wall_flat_nocol;    /* core r_segs.c: ...and with no cached dominant colour either  */
 extern "C" int sat_plane_flat_io;      /* core r_plane.c: visplanes drawn potato for want of residency */
@@ -751,12 +743,12 @@ extern "C" void R_CompositeWindowReset (void);   /* one writer for both + the 16
    ~42 ms disc read next frame (measured 80..221 non-resident flat fetches PER SECOND on TNT MAP11).
    Read row 19 `FLT`: `ld` must PLATEAU -- a flat disc-read count that keeps climbing means the pool
    is bypassed (A-), too small (`f`>0, `ev` climbing), or never carved (`p0`). */
-extern "C" int sat_flatcache_on;       /* live A/B bypass (pad R+Z); slab stays carved either way    */
 extern "C" int sat_flatcache_live;     /* slots currently holding a flat                             */
 extern "C" int sat_flatcache_load;     /* cumulative slot fills = the REAL flat disc reads           */
 extern "C" int sat_flatcache_full;     /* views where every slot was busy -> classic zone path       */
 /* SATURN: row-2 `P` split into its parts (core/r_parallel.c).  Row 20 `PSP`; k+n+d+j == `P`. */
 extern "C" unsigned int sat_p_kick10;  /* VDP1 wall kick + R_DrawPlayerSprites (weapon), tenths-ms  */
+extern "C" unsigned int sat_q_scan10;  /* row 8 `Q<n>/<ms>`: the quad probe's own cost   */
 extern "C" unsigned int sat_bps_pr10, sat_bps_lp10, sat_bps_hd10, sat_bps_tl10;  /* row 4, FRAME sums (r_parallel); hd+pr+lp+tl == row-2 Bp */
 /* (sat_p_net10 / _draw10 / _join10 removed with the row that printed them -- settled at ~0.) */
 extern "C" int R_TextureIOFree(int tex);  /* core r_data.c: 1 = resolving this texture hits no disc */
@@ -863,8 +855,6 @@ static const char *const sat_m_name[M_COUNT] = { "soft", "rbg0", "nospr", "lowr"
    wall / M0-crash lived; with one mode there is nothing to break.  M0/M4/M5/M6 remain valid modes in
    the code (sat_apply_mode still maps them) reachable only by editing THIS ring; pad-Z is now a no-op
    (cycles M7->M7).  Re-add a mode here ONLY once switching has been made atomic. */
-static const int sat_m_cycle[] = { M7_LOWRES };
-#define SAT_M_CYCLE_N ((int)(sizeof(sat_m_cycle) / sizeof(sat_m_cycle[0])))
 enum { SQ_FULL, SQ_LD, SQ_BAND, SQ_FLAT };
 static int sq_wall = SQ_FULL, sq_floor = SQ_LD, sq_ceil = SQ_LD;   /* floor+ceil ld by default (HW-tested "fll":
                                                                      ld is ~invisible on the ceiling and fine on the
@@ -2160,7 +2150,6 @@ extern "C" int sat_fb_mag_t, sat_fb_starve_t;   /* the two that still print (row
    amplitude means the walls are not DISPLACED.  What replaces it is core/r_segs.c's entry coverage:
    a wall that just came into view is drawn by the CPU for its first frames, because on that frame
    the VDP1 quad is not in the wrong place -- it is not on screen at all. */
-extern "C" int sat_wall_entry;    /* core r_segs.c: CPU frames covering a newly-visible VDP1 wall */
 extern "C" int sat_seg_frame;     /* core r_segs.c: per-seg visit tag, advanced once per frame here */
 /* FIELD LOCK -- PARKED 2026-08-03 (owner: *"supprime wm1, 2, et park wm3"*), SUPERSEDED
    2026-08-19: the manual-present fence (sat_mp_fence) now edge-locks EVERY frame and its
@@ -2169,7 +2158,7 @@ extern "C" int sat_seg_frame;     /* core r_segs.c: per-seg visit tag, advanced 
    sat_field_fence); reviving it would mean disabling the manual present, which the 2026-08-19
    validation (holes gone, +fps) argues against ever doing. */
 static int sat_field_lock = 0;
-static int rbg0_rpt_late  = 2;    /* RBG0 rotation-table copy timing, 0/1/2 -- pad R+Left, row-13
+enum { rbg0_rpt_late = 2 };  /* BAKED 2026-08-26: copy before the fence, same-field latch */    /* RBG0 rotation-table copy timing, 0/1/2 -- pad R+Left, row-13
                                      `F<m><rp>` 2nd digit.  Declared up here only so the row-13
                                      overlay can read it; the derivation lives at its old home
                                      (search rbg0_rpt_pending). */
@@ -2190,7 +2179,7 @@ static int rbg0_rpt_late  = 2;    /* RBG0 rotation-table copy timing, 0/1/2 -- p
          meeting it exactly.  The geometric fix, if 1 is not enough.  Costs a cell of sky at the
          horizon (those rows show RBG0 instead).
    (A 4th mode forced the sky OFF entirely.  Removed once it had answered -- see the horizon block.) */
-static int sky_mode       = 1;
+enum { sky_mode = 1 };   /* BAKED 2026-08-26: the shipped deferred-map boundary fix */
 static int sat_field_n    = 0;    /* fields the last locked frame occupied -- row-13 readback.  MUST
                                      be STEADY: a value flipping N/N+1 means the frame sits on a
                                      field boundary and the beat is back, coarser (judder). */
@@ -2232,7 +2221,6 @@ extern "C" int sat_lead_cols;      /* core r_segs.c: extra software column-spans
    since the MATELAS the character grows with the quad, so the mapping is exact wherever the pad
    covers it and degrades to the old stretch only where it cannot -- the seam is worth more than the
    residual.  Flat/untextured quads (wall_emit_flat) keep their own grow -- no texels to shift. */
-static int sat_wall_grow = 2;
 
 /* The fb_cur_* snapshots and the fb_pk_clamp / fb_pk_px peaks were REMOVED 2026-08-26: every one
    of them was assigned once a frame and read by nothing.  Only these two are printed. */
@@ -2324,7 +2312,7 @@ static void fps_update(void)
            so each A/B run starts a clean min/avg/max window -- no manual button needed
            (the pad is already saturated: Y=SQ X=split Z=mode-M L+A=blit). */
         {
-            static int l_map=-1, l_m=-1, l_sq=-1, l_blit=-1, l_ms=-1, l_cls=-1, l_ns=-1, l_opt=-1, l_wen=-1, l_wb=-1;
+            static int l_map=-1, l_m=-1, l_sq=-1, l_blit=-1, l_ms=-1, l_opt=-1;
             static int l_lx=-1, l_lm=-1;   /* lead-fill chord (pad R+Right): depth + mode */
             static int l_lp=-1;            /* PATCH-LUMP pin (pad L+Left) -- see below */
 #if SAT_DIAG_SLAVE_TOGGLES
@@ -2332,14 +2320,12 @@ static void fps_update(void)
 #endif
             if (gamemap != l_map || sat_m != l_m || (sq_wall<<6|sq_sprite<<4|sq_floor<<2|sq_ceil) != l_sq || blit_mode != l_blit
                 || sat_mark_suppress != l_ms
-                || sat_clear_slave != l_cls || sat_near_sprites != l_ns
+                /* (sat_clear_slave / sat_near_sprites / sat_wall_entry / sat_wall_grow dropped from
+                   this key 2026-08-26 -- all four are baked constants now, so they can never differ
+                   from their latch and only cost the comparison.) */
                 || sat_opt != l_opt          /* pad L+C: the perf-lever ladder IS an A/B -> flush the
                                                 profiler + every windowed peak, else /o4 vs /o5 is read
                                                 through numbers latched before the switch */
-                || sat_wall_entry != l_wen   /* pad L+Left/Right: entry coverage costs software columns,
-                                                so En0 vs En1 must be read on a clean Bp window too */
-                || sat_wall_grow != l_wb    /* pad L+Up: the grow adds VDP1 fill -> read its cost on
-                                               a clean window as well */
                 || sat_wall_lead_x != l_lx || sat_lead_mode != l_lm
                                             /* 🔴 2026-08-12: pad R+Right was MISSING from this key,
                                                and it is an A/B like every other entry.  Consequence
@@ -2365,7 +2351,7 @@ static void fps_update(void)
                 fb_pk_mag = fb_pk_starve = 0;   /* Phase-0: clean fallback A/B window */
                 blit10_sum = blit10_cnt = 0;   /* row-1 'b' precise window: fresh sample on the L+A toggle */
                 l_map=gamemap; l_m=sat_m; l_sq=(sq_wall<<6|sq_sprite<<4|sq_floor<<2|sq_ceil); l_blit=blit_mode; l_ms=sat_mark_suppress;
-                l_cls=sat_clear_slave; l_ns=sat_near_sprites; l_opt=sat_opt; l_wen=sat_wall_entry; l_wb=sat_wall_grow;
+                l_opt=sat_opt;
                 l_lx=sat_wall_lead_x; l_lm=sat_lead_mode; l_lp=sat_lpin_on;
 #if SAT_DIAG_SLAVE_TOGGLES
                 l_wp=sat_wallprep_slave;
@@ -2502,7 +2488,6 @@ static void fps_update(void)
            scene and compare v0..v3 + k: if v_i is ~flat, 3/4p is emission/BSP-bound (lowres can't
            help); if k dominates, it's VDP1-fill-bound.  Split-only (values are stale in 1p). */
         if (sat_dbg_overlay_mode == 0 && sat_local_players > 1) {
-            extern int sat_split_thingcull;   /* core piste-3 */
             unsigned int vsum = sat_spl_v0 + sat_spl_v1 + sat_spl_v2 + sat_spl_v3 + sat_spl_mmap;
             /* `h` (2026-08-25) = the SPLIT-HUD PAINT, tenths-ms, window mean.  Read it against
                row 1's dg<pre>/<post>: `h` is a subset of `pre`, and it is the only 2p-specific
@@ -2558,10 +2543,14 @@ static void fps_update(void)
                becomes `tb%d%d` (5), which buys back the five the three-digit per-view times
                need.  No field lost: `tb<tc><bal>` is the thing-cull digit then the SQ-balance
                digit, in that order.  ⚠ Legend updated in docs/ATLAS.md in the same commit. */
-            snprintf(ovbuf, sizeof ovbuf, "SPL %u %u %u %u k%u =%u tb%d%d h%u.%u p%c%u   ",
+            /* `tb<tc><bal>` -> `tb<bal>` 2026-08-26: sat_split_thingcull is baked ON, as its own
+               definition always argued ("impractical to A/B on HW -- needs a monster-dense room,
+               so you cannot stand still and read the overlay").  A knob that cannot be measured
+               should not spend a pad chord and an overlay cell saying so. */
+            snprintf(ovbuf, sizeof ovbuf, "SPL %u %u %u %u k%u =%u tb%d h%u.%u p%c%u   ",
                      sat_spl_v0, sat_spl_v1, sat_spl_v2, sat_spl_v3 + sat_spl_mmap,
                      sat_spl_kick, vsum,
-                     sat_split_thingcull, sat_split_balance, h10 / 10u, h10 % 10u,
+                     sat_split_balance, h10 / 10u, h10 % 10u,
                      pc, pv > 999u ? 999u : pv);
             SRL::Debug::Print(0, 17, ovbuf);
         }
@@ -2857,12 +2846,30 @@ static void fps_update(void)
                control arm of the A/B, not merely "the feature is off".  The number to read
                against it is row-2 `d`, a COUNT, which is what makes this decidable on Ymir.
                Width: this row's worst case was 34 of 40 cells; ` f%d` takes it to 38. */
-            snprintf(ovbuf, sizeof ovbuf, "M%d %s ms%d pm%d SQ:%c%c%c%c cs%d lr%d/o%d f%d",
-                     sat_m, sat_m_name[sat_m], sat_mark_suppress,
-                     sat_plane_tas,
+            /* [!] 2026-08-26 -- `ms` AND `pm` CUT, `w` ADDED.  This row exists so a photo is never
+               read against the wrong config, and it was spending 8 of its 40 cells on two values
+               that CANNOT CHANGE: `pm` (sat_plane_tas) has NO WRITER anywhere in the tree -- the
+               pad-C cycle was cut 2026-07-16 when TAS won -- and `ms` is DERIVED from the player
+               count (sat_mark_suppress = players >= 3), so it restated row-2 `n<v>`.  Both read as
+               live knobs while being constants, which is exactly why `ns` was cut from this row on
+               2026-08-09; the reasoning is quoted six lines above.
+               `w<rows>` = sat_wallfill_min, the wall-fill offload threshold (pad R+X, 0/24/48/96).
+               IT IS THE ONE KNOB CURRENTLY UNDER A/B AND IT WAS NOWHERE ON SCREEN.  The four
+               hardware videos of 2026-08-26 had to be identified by INFERENCE -- row-14 `lk` for
+               on/off, `f` for the rung (it counts the columns SHORTER than the threshold), row-5
+               `b%` to confirm -- and that only worked because all four were the same spot: those
+               three fields are scene-relative, so on any other map the inference is gone.  A state
+               that has to be deduced from a photo is a state the photo does not carry.
+               Width: 34 of 40 in the worst case (was 38 with ms/pm). */
+            /* `cs` CUT 2026-08-26 with the settled-toggle sweep: sat_clear_slave is baked ON
+               (HW-validated -2..-3 ms of `dg` on 2026-07-09, never contested since), so the field
+               could only ever print `cs1`.  Same disease as `ns`/`ms`/`pm` before it. */
+            snprintf(ovbuf, sizeof ovbuf, "M%d %s SQ:%c%c%c%c lr%d/o%d f%d w%d",
+                     sat_m, sat_m_name[sat_m],
                      sqch[sqw & 3], sqch[sqf & 3], sqch[sqc & 3], sqch[sqs & 3],
-                     sat_clear_slave, sat_lowres, sat_opt,   /* /o = perf-lever level 0-4 (pad L+C) */
-                     (sat_fov_half * 45 + 256) / 512);       /* fine-angle half -> whole degrees */
+                     sat_lowres, sat_opt,   /* /o = perf-lever level 0-4 (pad L+C) */
+                     (sat_fov_half * 45 + 256) / 512,        /* fine-angle half -> whole degrees */
+                     sat_wallfill_min);                      /* pad R+X: 0 / 24 / 48 / 96 rows */
             if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 7, ovbuf);
             /* row 8: RELIABLE VDP1 load (replaces the CEF-aliased Dr%).
                ⚠ 2026-08-10, legend corrected: THE FORMAT PRINTS ONLY `fbw` AND `fbm`.  Everything
@@ -2921,12 +2928,20 @@ static void fps_update(void)
                existed for is answered; per the owner's rule NO machine-specific paths get built,
                so the revision is a fact for the notes, not a runtime input.  Re-read it with a
                one-liner here if a future SGL/emulator question needs it.) */
-            snprintf(ovbuf, sizeof ovbuf, "VD1 fb%d/%d MP%d w%d %dms g%d Q%d E%d/%d        ",
+            /* [!] `Q<n>/<ms>` since 2026-08-26: the piecewise-quad probe now declares WHAT IT
+               COSTS beside what it reports.  RP_PlanePixels is a per-visplane, per-COLUMN rescan
+               that runs only in full-overlay mode -- i.e. on exactly the frames that get
+               photographed -- and it sits INSIDE row 5 `Pv`.  Row 5 subtracts it; this is where
+               you read how much was subtracted.  A probe whose cost hides inside the phase it
+               measures is not a measurement. */
+            snprintf(ovbuf, sizeof ovbuf, "VD1 fb%d/%d MP%d w%d %dms g%d Q%d/%u.%u E%d/%d   ",
                      fb_pk_starve, fb_pk_mag,
                      sat_mp_active, (sat_mp_wd > 999 ? 999 : sat_mp_wd),
                      (sat_mp_wait_ms > 99 ? 99 : sat_mp_wait_ms),
                      (sat_mp_gate_ms > 99 ? 99 : sat_mp_gate_ms),
                      (sat_plane_quad_n > 999 ? 999 : sat_plane_quad_n),
+                     (sat_q_scan10 > 999u ? 999u : sat_q_scan10) / 10u,
+                     (sat_q_scan10 > 999u ? 999u : sat_q_scan10) % 10u,
                      (sat_plane_q4cmd > 999 ? 999 : sat_plane_q4cmd),
                      (sat_plane_q4pct > 99 ? 99 : sat_plane_q4pct));
             /* (fbf -- floor tiles truncated -- dropped 2026-08-02 with the VDP1 floor deport: it
@@ -2945,10 +2960,11 @@ static void fps_update(void)
                R+A was silently shared with the lead-fill X cycle until 2026-08-05, so a whole round
                of staircase-hole captures was taken with this bit in an unknown state.  It is the
                first thing to read on any missing-wall-band report.
-               En/<d> = CPU frames covering a newly-visible VDP1 wall (core sat_wall_entry, pad
-               L+Left/L+Right, 1p).  En0 = off = the pre-2026-08-02 behaviour, where a wall entering
-               the view is drawn by nobody on its first frame and shows sky.  Raising it trades a few
-               software columns on the walls that just appeared for that hole.
+               En<d> = DWELL ONLY since 2026-08-26.  The entry-coverage digit that used to lead this
+               field is gone with sat_wall_entry, baked at its documented default 1: a wall entering
+               the view is covered by the CPU for one frame instead of showing sky, always.  (Its pad
+               L+Left shared a byte-identical predicate with the lump-pin cycle and only ever
+               decremented, so any capture taken after someone stepped the pin had it silently at 0.)
                <d> = DWELL (core sat_wall_dwell, pad R+Up: 0/4/8): once a seg flips CPU<->VDP1 it is
                PINNED to the CPU for <d> frames, so a seg oscillating on the routing threshold cannot
                strobe.  Pins to the CPU only, never to VDP1 -- forcing VDP1 could hit a tier with no
@@ -2995,13 +3011,16 @@ static void fps_update(void)
                `<spans>` off the 40-col edge on the owner's first capture, and this row is the WALL
                row, not the LOS row.  Both live in `sightcounts[]` if ever needed again.) */
             {   extern int sat_wall_nodraw, sat_wall_flip;
-            snprintf(ovbuf, sizeof ovbuf, "LOS C%c En%d/%d Wg%d P%d N%d/%d/%d F%d%d L%d%c/%d ",
+            /* 2026-08-26 settled-toggle sweep: `En` loses its FIRST digit (sat_wall_entry baked
+               at the documented default 1, so only the dwell is left), `Wg` goes entirely
+               (sat_wall_grow baked 2) and `F<sky><rpt>` goes with sky_mode=1 / rbg0_rpt_late=2.
+               Eight cells back on a 40-cell row -- baking a knob is never only about the branch. */
+            snprintf(ovbuf, sizeof ovbuf, "LOS C%c En%d P%d N%d/%d/%d L%d%c/%d ",
                      sat_wall_clamp ? '+' : '-',
-                     sat_wall_entry, sat_wall_dwell, sat_wall_grow, sat_wall_paint,
+                     sat_wall_dwell, sat_wall_paint,
                      (sat_wall_nodraw > 999 ? 999 : sat_wall_nodraw),
                      (vdp1_wall_drop  > 999 ? 999 : vdp1_wall_drop),
                      (sat_wall_flip   > 999 ? 999 : sat_wall_flip),
-                     sky_mode, rbg0_rpt_late,
                      sat_wall_lead_x,
                      sat_lead_span_drop ? '!' : "-sf"[sat_lead_mode % 3],
                      (sat_lead_cols > 9999 ? 9999 : sat_lead_cols));
@@ -3137,8 +3156,11 @@ static void fps_update(void)
                    the isolated term that was hiding inside row-1 `pr` when round 6 read
                    pr 69..243 ms.  Expect ~<50 (5 ms) after the DIVU/DDA rewrite; if it
                    climbs back, the geometry path regressed -- look here first. */
-                snprintf(ovbuf, sizeof ovbuf, "FLT A%c v%d s%d/%d @%d.%d r%d ld%d f%d F%d/%d/%d ",
-                         sat_flatcache_on ? '+' : '-',
+                /* `A<+/->` CUT 2026-08-26: sat_flatcache_on is baked ON.  The resident flat slab
+                   answered its A/B on 2026-08-06 (treadmill measured, fixed, `ld` capped) and the
+                   slab was carved in BOTH states anyway -- so the bypass only ever chose between
+                   using memory already spent and wasting it. */
+                snprintf(ovbuf, sizeof ovbuf, "FLT v%d s%d/%d @%d.%d r%d ld%d f%d F%d/%d/%d ",
                          (fvdp1_cpu10 > 999 ? 999 : fvdp1_cpu10),
                          (fvdp1_punch_px / 100 > 999 ? 999 : fvdp1_punch_px / 100),
                          (sat_plane_texcol_px / 100 > 999 ? 999 : sat_plane_texcol_px / 100),
@@ -3653,7 +3675,6 @@ static void fps_update(void)
                Ymir now models CD latency (~36-41 ms/cmd) so k/t are meaningful here, not HW-only. */
             if (sat_wad_base == nullptr)   /* CD-streaming mode */
             {
-                extern int sat_cd_persistent;
                 extern unsigned int w_cd_ms10;   /* core w_wad.c -- also the load budget's clock */
                 /* `L<s>s/<n>` = the LAST detected level load: seconds inside CD commands, and how
                    many commands.  This is the number that answers "why is loading slow" -- `t`
@@ -3696,7 +3717,6 @@ static void fps_update(void)
                 snprintf(ovbuf, sizeof ovbuf, "CD t%us px%d ob%d gy%d st%d ",
                          w_cd_ms10 / 10000, r_patch_ovf, r_composite_oob, vdp1_wall_nocol,
                          (sat_lead_stale > 9999 ? 9999 : sat_lead_stale));
-                (void)sat_cd_persistent;
                 if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 12, ovbuf);
             }
             /* SATURN 2026-08-25 -- ROW 12's SECOND TENANT.  The two are mutually exclusive by the
@@ -5244,7 +5264,8 @@ static void sky_cell_write_map(void)
         return;
     }
     int thresh = sky_horizon_row >> 3;   /* cell-row boundary (8px cells) */
-    if (sky_mode == 2) thresh--;
+    /* (sky_mode 2's one-cell lift went with the mode itself 2026-08-26: 1, the deferred-map fix,
+       shipped, and the geometric fallback was never needed.) */
     if (thresh < 0) thresh = 0;
     /* CLAMP to what is actually stored: only SKY_CELL_ROWS rows exist in VRAM (the B1 budget note
        above), and the horizon is re-derived live by the auto-track -- an un-clamped thresh would
@@ -6383,11 +6404,11 @@ static void wall_emit(int wi)
            (2*dt - dtt - dtb texels) degrades to the plain stretch: exact where the pad covers it,
            partial in between, and never worse than the pre-matelas grow. */
         int gt = 0, gb = 0, dtt = 0, dtb = 0;
-        if (sat_wall_grow > 0)
-        {
+        {   /* sat_wall_grow baked at 2 (2026-08-26), the shipped value; 0 and the 3/4 test rungs
+               went with the flag.  WTEX_VPAD is 2 -- exactly the largest grow that stays exact. */
             int sA = yh1b - yl1b, sB = yh2b - yl2b;
             int span = sA > sB ? sA : sB;
-            int dt = (span > 0) ? (sat_wall_grow * rows + (span >> 1)) / span : 0;
+            int dt = (span > 0) ? (2 * rows + (span >> 1)) / span : 0;
             int at = vp + vmod;                        /* texel rows available above this band */
             int ab = vp + (H - vmod - rows);           /* and below                            */
             if (at < 0) at = 0;
@@ -6395,7 +6416,7 @@ static void wall_emit(int wi)
             dtt = (dt < at) ? dt : at;
             dtb = (dt < ab) ? dt : ab;
             while (rows + dtt + dtb > 255) { if (dtb) dtb--; else if (dtt) dtt--; else break; }
-            gt = gb = sat_wall_grow;
+            gt = gb = 2;
         }
         unsigned int taddr = base + (unsigned int)(vp + vmod - dtt) * (unsigned int)padW * 1u;  /* 8bpp */
         unsigned short ca = (unsigned short)((taddr - VDP1_VRAM_BASE) >> 3);
@@ -9138,7 +9159,7 @@ extern "C" void DG_DrawFrame(void)
        CPU-derived geometry (mirror at upload, 0.625/0.5 scale, one scroll law; see the round-4
        comments at sky_cell_upload / the scale block / the scroll block below).  L+C stays the
        live A/B. */
-    int hwsky_split = (hwsky_split_on && sat_local_players >= 2 && gamestate == GS_LEVEL && !automapactive);
+    int hwsky_split = (sat_local_players >= 2 && gamestate == GS_LEVEL && !automapactive);   /* hwsky_split_on baked ON 2026-08-26 */
     /* SATURN 2026-08-21 (owner: "élection sur le(s) joueur(s) ayant le plus de ciel avec
        protection pour ne pas flick") -- DYNAMIC ELECTION, the documented Part 5 next step.
        NBG0 is ONE layer (one scroll angle + one window), so exactly ONE split view can carry
@@ -9436,12 +9457,11 @@ extern "C" void DG_DrawFrame(void)
           if ((hz >> 3) != (sky_horizon_row >> 3) || rbg0_floor_win_xend != last_xend)
           {
               last_xend = rbg0_floor_win_xend; sky_horizon_row = hz;
-              if (sky_mode == 0) sky_cell_build_map();      /* legacy: map + window, both here */
-              else
               {
                   /* Split the commit: the WINDOW is registers (latched at vblank) so it belongs
                      here, before the fence; the MAP is VRAM read during display, so it must land
-                     with the picture -> deferred to just after the fence.  See sky_mode. */
+                     with the picture.  (The legacy build-both-here path, sky_mode 0, went with the
+                     mode on 2026-08-26 -- this deferral IS the shipped behaviour.) */
                   sky_map_pending = 1;
 #if RBG0_FLOOR_WINDOW
                   rbg0_floor_window_apply(sky_horizon_row & ~7);
@@ -9481,8 +9501,7 @@ extern "C" void DG_DrawFrame(void)
            hardware floor and the software picture adopt the new view angle on the SAME field -- see
            rbg0_rpt_to_vram.  slScrMatSet has already written the RAM buffer here and nothing touches
            it before the blit, so postponing only the VRAM write is safe. */
-        if (rbg0_rpt_late) rbg0_rpt_pending = 1;
-        else               rbg0_rpt_to_vram();
+        rbg0_rpt_pending = 1;   /* rbg0_rpt_late baked at 2 (2026-08-26): always deferred */
 #endif
         uint32_t rb_t3 = DG_GetTicksMs();   /* SATURN PERF: split upl/xfm/rpt to pin the stall */
         rbg_upl_sum += rb_t1 - rb_t0;
@@ -9750,7 +9769,7 @@ extern "C" void DG_DrawFrame(void)
        software picture.  VDP2 reads the rotation parameter table during vblank (which is exactly
        why SGL does this DMA from _BlankIn), so a copy made after that vblank -- mode 1, after the
        blit -- misses the field it belongs to.  See the declaration for the full derivation. */
-    if (rbg0_rpt_late == 2 && rbg0_rpt_pending)
+    if (rbg0_rpt_pending)   /* rbg0_rpt_late baked at 2 -- the copy lands before the fence */
     {
         uint32_t rp_t0 = DG_GetTicksMs();
         rbg0_rpt_to_vram();
@@ -9911,7 +9930,7 @@ extern "C" void DG_DrawFrame(void)
            98%.  The kill is the masked-phase allocation race, closed in r_things.c by
            sat_masked_inflight.  Kept as a live comment, not as code: if the stall ever comes back,
            `!sat_lowres` here is a one-line workaround that buys a playable build while you look. */
-        if (sat_clear_slave && gamestate == GS_LEVEL && sat_local_players <= 1) {
+        if (gamestate == GS_LEVEL && sat_local_players <= 1) {   /* clear-on-slave baked ON 2026-08-26 */
             /* SATURN M7 2026-07-30: the `!sat_lowres` hard-off is GONE -- the plane-split now runs in M7
                (r_plane.c), which restores exactly the TAS-sync coverage whose ABSENCE (slave-idle M7, no
                plane-split) was blamed for the ds_p .bss stomp above.  HW-validated as the default. */
@@ -10235,24 +10254,14 @@ static void poll_pad(void)
             sat_iso_mode = (sat_iso_mode + 1) % 3;
             sat_apply_iso();                             /* all / walls-only / walls+things / walls+weapon / flat */
         }
-        /* Pad R+Z (R held, L released): live A/B of the RESIDENT FLAT POOL (core/r_flatcache.c).
-           ON = visplanes read their flat from the contiguous LRU slab (a flat the player keeps
-           looking at is read from the disc ONCE); OFF = the classic W_CacheLumpNum/PU_CACHE path,
-           i.e. the treadmill.  The slab stays CARVED in both states, so the two sides of the A/B
-           have a byte-identical memory layout -- which is the only way this measurement is honest
-           ([[interbuild-perf-noise]]: ~600 B of .bss shift is worth +-6 ms of Bp).  Watch row-2 `P`
-           and row 19 `FLT ld`.  R+Z was free: the R+Z present-couple A/B lives under
-           VDP1_MANUAL_CHANGE (0 = parked), and R+Z otherwise fell through to the Z-alone mode
-           cycle, which is a no-op now that only M7 is in it ([[parked-single-mode-m7-baseline]]). */
-        else if (!(cur & PER_DGT_TR) && (cur & PER_DGT_TL))
-            sat_flatcache_on = !sat_flatcache_on;   /* declared extern "C" at file scope */
-        else
-        {   /* Z (no modifier): cycle only the LIVE playable modes {M7}; M0+M5 are parked (off the cycle). */
-            int ci = 0;
-            for (int i = 0; i < SAT_M_CYCLE_N; ++i) if (sat_m_cycle[i] == sat_m) { ci = i; break; }
-            sat_m = sat_m_cycle[(ci + 1) % SAT_M_CYCLE_N];
-            sat_apply_mode();
-        }
+        /* (Pad R+Z RESIDENT-FLAT-POOL A/B REMOVED 2026-08-26 -- sat_flatcache_on baked ON.
+           The slab was CARVED in both states, so "off" only ever meant paying for memory and
+           then refusing to read it; the treadmill it answers was measured and closed on
+           2026-08-06.  Row-19 `A<+/->` went with it.  R+Z is free.) */
+        /* (Z ALONE REMOVED 2026-08-26.  It cycled sat_m_cycle, which has held exactly ONE entry
+           -- {M7_LOWRES} -- since M0/M5 were parked: the "cycle" re-selected the mode it was already
+           on and called sat_apply_mode() to rewrite identical values.  A no-op wearing a button.
+           sat_m itself stays: row 7 prints it and sat_apply_mode is driven from it.) */
     }
 
 #if VDP2_RBG0_TEST
@@ -10267,16 +10276,12 @@ static void poll_pad(void)
     /* (Pad L+A blit A/B ring CUT 2026-07-07: W5 HUD-skip is a real idle win -> now permanently ON
        (blit_mode fixed = c5); the slDMACopy paths were HW-dead.  docs/BLIT_DMA_PLAN.md.) */
 
-    /* Pad L+A now toggles the R2 CD persistent-handle read path (sat_cd_persistent, w_file_saturn.cxx)
-       for a live HW A/B of streaming fluidity: ON = GFS_Seek+Fread on the open handle (rides the CD
-       read-ahead), OFF = LoadBytes per read (a full GFS_Load).  Edge-triggered on A while L held (L
-       taps ',' and A taps fire -- harmless; toggle at a level boundary, not mid-combat).  Only
-       meaningful in CD mode; inert (but harmless) in cart mode.  Row 12 shows p<0/1> fb<n>. */
-    if (!(cur & PER_DGT_TL) && (changed & PER_DGT_TA) && !(cur & PER_DGT_TA))
-    {
-        extern int sat_cd_persistent;
-        sat_cd_persistent = !sat_cd_persistent;
-    }
+    /* (Pad L+A R2 PERSISTENT-CD-HANDLE A/B REMOVED 2026-08-26, with the whole GFS_Seek+Fread
+       path in w_file_saturn.cxx.  Settled DEFAULT-OFF -- row 12's own legend already said so --
+       because on an ODE the fast seek INVERTS the cost model the persistent handle was built
+       for, and the ODE is the test hardware.  It also collided: this predicate required L held
+       and said nothing about R, so L+A fired it AND the sight-cache cycle, and L+R+A fired it
+       AND the wall clamp.) */
 
     /* SATURN 2026-07-09 -- three perf-lever live A/B toggles, one HW session.  Letter+modifier chords
        (the established pattern; the incidental Doom tap is harmless).  The d-pad is deliberately NOT
@@ -10289,9 +10294,8 @@ static void poll_pad(void)
        CYCLES the AIMD mode ad0/1/2".  `ns` was cut from row 7 (08-09) and its chord had already been
        reclaimed; `ad` was never in the row-7 format; `ec`/`ef` were cut from row 15 (08-09); and the
        L+X AIMD cycle was cut on 2026-07-16 (see :7488).  Read instead: row 7 `cs`, row 17 `ec`. */
-    if (!(cur & PER_DGT_TR) && (cur & PER_DGT_TL)                 /* R held, L released */
-        && (changed & PER_DGT_TC) && !(cur & PER_DGT_TC))
-        sat_clear_slave ^= 1;
+    /* (Pad R+C CLEAR-ON-SLAVE A/B REMOVED 2026-08-26 -- baked ON, HW-validated at -2..-3 ms of
+       `dg` on 2026-07-09 and never contested.  Row-7 `cs` went with it.  R+C is free.) */
     /* Pad L+C (L held, R released, 1p only): cycle the CUMULATIVE perf-lever level 0->1->2->3->4->0
        (core sat_opt, defined + fully documented in core/r_segs.c).
          0 = all off (the 2026-07-29 reference)   1 = +L1 span fill (r_plane.c)
@@ -10326,23 +10330,13 @@ static void poll_pad(void)
     /* (Pad L+Left/Right 1p VDP1 fill-budget A/B REMOVED 2026-07-25: fill is not the flicker limiter --
        see docs/VDP1_LIMITS_SOURCED.md.  L+Left/Right are free again in 1p; the VDP1 isolation cycle is
        on L+Z.  The split levers below still take L+Left/Right at players>1.) */
-    /* Pad R + X (1p): PER-FRAME TEXTURE LOAD BUDGET -- off / 1 / 2 / 4 textures faulted in per
-       frame.  In the CD-streaming build a wall texture that is not resident costs a SYNCHRONOUS
-       ~42 ms disc read inside R_GetColumn, charged to `Bp`, for a wall that may be three screen
-       columns wide: that is the entire 480..790 ms `Bp` frames in the owner's TNT MAP11 captures.
-       Past the budget the tier draws FLAT (sat_dc_solid skips R_GetColumn -> no composite, no
-       patch, NO DISC) and textures itself over the following frames as the budget refills.
-       No distance test: the BSP walk is front-to-back, so the budget is spent on the NEAREST
-       walls by construction.  0 = off = every texture faults on sight (the old behaviour).
-       The chord cycles 10 -> 20 -> 40 -> 0 -> 10 MILLISECONDS of disc per frame (it was a count
-       of reads, 0/1/2/4, until 2026-08-07); the DEFAULT is 20, so the gate is armed at boot.
-       Read `lb<budget>:<wall>/<plane>/<sprite>.<nocol>` on row 18.  (R+X was documented for sat_near_sprites but
-       NEVER bound -- verified on PER_DGT_TX, the only sites are L+X and split-X.) */
-    if (sat_local_players <= 1 && !(cur & PER_DGT_TR) && (cur & PER_DGT_TL)
-        && (changed & PER_DGT_TX) && !(cur & PER_DGT_TX))
-        sat_tex_load_budget = (sat_tex_load_budget == 10) ? 20
-                            : (sat_tex_load_budget == 20) ? 40
-                            : (sat_tex_load_budget == 40) ? 0  : 10;
+    /* 🔴 (Pad R+X TEXTURE-LOAD-BUDGET rung REMOVED 2026-08-26.  The MECHANISM stays, baked at
+       its shipped 20 ms/frame -- what goes is the chord, because it was the SECOND owner of R+X.
+       Its predicate was byte-identical to the wall-fill ladder's below (R held, L released, X
+       edge) apart from a 1p gate, so in single-player one press moved BOTH: the wall-fill rung
+       AND the disc budget, 20 -> 40 -> 0 -> 10.  The 4p hardware videos of 2026-08-26 escaped
+       only because the split gate kept this one silent -- `lb20:0/0/0.0` on all four frames.
+       A chord with two owners does not measure a lever, it measures their sum. */
     /* Pad R + Down: TEST cheat cycle -- off -> GOD -> GOD+NOCLIP -> off, applied to every local
        player and re-established each tic by core P_Ticker (survives level/map warp, deaths, the
        E1M8 super-damage floor).  R held, L released, Down edge (free chord -- R+Down was the cut
@@ -10355,35 +10349,24 @@ static void poll_pad(void)
        is harmless (tune while standing).  L+Left = piste-3 split thing-cull (drop tiny-projected
        sprites per view); L+Right = piste-5 rotating SQ-balance cycle (0 off / 1 = 1 view degraded per
        frame / 2 = 2 views).  Row 17 (SPL, split-only) shows tc<0/1> bal<0/1/2>. */
-    if (sat_local_players > 1 && !(cur & PER_DGT_TL) && (cur & PER_DGT_TR)   /* L held, R released */
-        && (changed & PER_DGT_KL) && !(cur & PER_DGT_KL))
-    { extern int sat_split_thingcull; sat_split_thingcull ^= 1; }
+    /* (Pad L+Left split THING-CULL A/B REMOVED 2026-08-26 -- baked ON, exactly as its own
+       definition in r_things.c always argued: it "is impractical to A/B on HW (needs a
+       monster-dense room = can't stand still to read the overlay)".  Row-17 `tb` keeps only
+       the balance digit.) */
     if (sat_local_players > 1 && !(cur & PER_DGT_TL) && (cur & PER_DGT_TR)   /* L held, R released */
         && (changed & PER_DGT_KR) && !(cur & PER_DGT_KR))
         sat_split_balance = (sat_split_balance + 1) % 3;
-    /* 1p: the same two chords (free here -- the split levers above are gated on >1 player) dial the
-       WALL ENTRY COVERAGE live: CPU frames drawn over a wall that just came into view, 0..3.  This
-       replaces the removed yaw-anticipation gain on the same chord -- same symptom, opposite model.
-       0 = off = the pre-2026-08-02 behaviour (a wall entering the view shows sky for one frame);
-       1 = the default.  Raise it only if a hole survives at 1: each extra frame is software columns
-       on every wall that just appeared, so watch row-2 `Bp` while you do.  Row 13 shows `En<n>`. */
-    if (sat_local_players <= 1 && !(cur & PER_DGT_TL) && (cur & PER_DGT_TR)
-        && (changed & PER_DGT_KL) && !(cur & PER_DGT_KL))
-    { if (sat_wall_entry > 0) sat_wall_entry--; }
-    if (sat_local_players <= 1 && !(cur & PER_DGT_TL) && (cur & PER_DGT_TR)
-        && (changed & PER_DGT_KR) && !(cur & PER_DGT_KR))
-    { if (sat_wall_entry < 3) sat_wall_entry++; }
-    /* Pad L+Up (L held, R released, 1p): cycle the VDP1 WALL GROW 0 -> 1 -> 2 -> 0 (sat_wall_grow) --
-       the owner's counter-proposal to growing the software plane: grow the LATE layer instead of the
-       one that is on time.  It is the better place in principle (one grown quad covers its own gap
-       on every side at once, instead of every neighbouring plane having to reach out for it).
-       ⚠ It costs exactly what commit 66e590c removed: DISTORSP maps the WHOLE character corner to
-       corner, so moving the vertices without changing the character stretches `rows` texels over
-       `span + 2*grow` rows -- an error of grow*rows/span TEXELS at the band edges, worst on FAR
-       walls (~6 texels at span 20 for grow 1), repeating down the wall.  That IS the software-vs-VDP1
-       misalignment he had me fix.  Judge Wg1 on the gap first; if it closes it, the clean form is a
-       PADDED character (bake texw+2 x rows+2 with the edge texels duplicated and grow the quad to
-       match) -- exact mapping AND a 1px halo, at ~+6% tile VRAM.  Row 13 shows `Wg<n>`. */
+    /* 🔴 (1p L+Left/Right WALL-ENTRY COVERAGE REMOVED 2026-08-26 -- baked at the documented
+       default 1.  It was the worst collision on the pad: L+Left's predicate here was
+       byte-identical to the lump-pin cycle's below, and this one only ever DECREMENTS with a
+       floor at 0.  So the first press anyone made to step the lump pin also set the entry
+       coverage to 0 -- permanently, with no way back on that chord -- and 0 is the
+       pre-2026-08-02 behaviour where a wall entering the view shows sky for one frame.  Every
+       capture taken after someone touched the pin carried it.  L+Right is free. */
+    /* (Pad L+Up VDP1 WALL GROW REMOVED 2026-08-26 -- baked at its shipped 2, which is exactly
+       WTEX_VPAD, i.e. the largest grow the padded character can still map EXACTLY.  Rungs 3 and
+       4 existed only to test whether the residual slip was a gap wider than the grow; the manual
+       present answered that from the other end.  Row-13 `Wg` went with it.  L+Up is free.) */
     /* Pad L+X (L held, R released; freed when M5 was cut): WALL PATH PAINT 0 -> 1 -> 2 -> 3.
        1 = every VDP1 wall a flat GREEN quad + VDP1 floor tile YELLOW + VDP1 THING BLUE,
        2 = every CPU wall flat RED, 3 = both.  Answers the owner's question directly --
@@ -10404,23 +10387,9 @@ static void poll_pad(void)
     if (!(cur & PER_DGT_TL) && (cur & PER_DGT_TR)
         && (changed & PER_DGT_TX) && !(cur & PER_DGT_TX))
         sat_wall_paint = (sat_wall_paint + 1) & 3;
-    /* Pad L+Down (L held, R released, 1p): SKY/FLOOR BOUNDARY MODE 0 -> 1 -> 2 (see sky_mode for
-       what each one is; 1 is the shipped fix, 0 is the A/B reference, 2 adds the 8px lift).
-       sky_horizon_row = -1 forces the rebuild test true on the next frame so the change takes
-       effect at once (sky_cell_build_map otherwise only runs on an 8px horizon crossing). */
-    if (sat_local_players <= 1 && !(cur & PER_DGT_TL) && (cur & PER_DGT_TR)
-        && (changed & PER_DGT_KD) && !(cur & PER_DGT_KD))
-    {
-        sky_mode = (sky_mode + 1) % 3;
-#if VDP2_CELL_SKY
-        sky_horizon_row = -1;   /* force the rebuild test true next frame so the change lands at once */
-#endif
-    }
-    if (sat_local_players <= 1 && !(cur & PER_DGT_TL) && (cur & PER_DGT_TR)
-        && (changed & PER_DGT_KU) && !(cur & PER_DGT_KU))
-        sat_wall_grow = (sat_wall_grow + 1) % 5;   /* 0..4: 3 and 4 exist to TEST whether the
-                                                      residual slip is simply a gap wider than the
-                                                      grow on a double-tic frame -- see row-13 `t` */
+    /* (Pad L+Down SKY/FLOOR BOUNDARY MODE REMOVED 2026-08-26 -- baked at 1, the shipped fix
+       (window before the fence, map deferred to just after it).  0 was the A/B reference and 2
+       the geometric fallback "if 1 is not enough"; 1 was enough.  L+Down is free.) */
     /* (Low-res is no longer a pad toggle -- it is render MODE M7 in the pad-Z cycle, since it is
        whole-view (shared projection + whole-layer VDP2 zoom), not a per-zone lever.  sat_apply_mode
        sets sat_lowres when M7 is selected.  This freed the old L+R+X binding.) */
@@ -10428,17 +10397,10 @@ static void poll_pad(void)
     /* (Pad R+Up/Down vertical decrochage-fill + R+Left/Right border-cap knobs CUT 2026-07-07 --
        tuning finished, values baked: sat_plane_vscale=4 (r_main.c), sat_plane_border_max=10
        (dg_saturn.cxx:~2738).  R+Up/Down are taken since; R+Left is the band knob below.) */
-    /* Pad R+Left (R held, L released, 1p): RBG0 RPT TIMING 0 -> 1 -> 2 -> 0.  The owner's
-       *"entre le sol vdp2 et un autre sol cpu"* junction: 1 = the copy after the blit (one field
-       LATE -- VDP2 latched the table at the vblank the blit started on), 2 = DEFAULT, the copy
-       before the fence so the same vblank latches it.  0 = the original early timing.  Judge it on
-       the hardware-floor / software-floor seam while walking straight -- no walls involved, which
-       is what makes it the clean test.  Row 13 `Rp<n>`.  (This chord held the software-plane-grow
-       knob, removed 2026-08-02: growing the on-time layer to chase the late one was the wrong end
-       of the problem.) */
-    if (sat_local_players <= 1 && !(cur & PER_DGT_TR) && (cur & PER_DGT_TL)
-        && (changed & PER_DGT_KL) && !(cur & PER_DGT_KL))
-        rbg0_rpt_late = (rbg0_rpt_late + 1) % 3;
+    /* (Pad R+Left RBG0 RPT TIMING REMOVED 2026-08-26 -- baked at 2, the shipped timing: the
+       rotation table is copied just before the fence so the same vblank latches it and the
+       hardware floor adopts the new view angle in the SAME field as the software picture.
+       Modes 0 and 1 were the two ways of being one field wrong.  R+Left is free.) */
     /* Pad R+Up (R held, L released, 1p): PATH DWELL 0 -> 4 -> 8 (row 13 `En<entry>/<dwell>`).
        Frames a seg that just changed CPU<->VDP1 path stays covered by the CPU -- bounds the flip
        RATE where the hysteresis only widened the threshold.  Pins to the CPU only, never to VDP1:
@@ -10463,14 +10425,10 @@ static void poll_pad(void)
     if (sat_local_players <= 1 && !(cur & PER_DGT_TR) && (cur & PER_DGT_TL)
         && (changed & PER_DGT_KR) && !(cur & PER_DGT_KR))
         sat_vdp1_floor_on ^= 1;
-    /* Pad R+B (R held, L released, 1p) 2026-08-20: SLAVE-IN-MP kill switch (sat_mp_slave, core
-       r_parallel.c, boot ON = the fix).  Chords are 1p-gated, so set it BEFORE starting the
-       split session -- the flag persists into it.  OFF = the pre-2026-08-20 behaviour (slave
-       fully idle in MP: the HW videos read SLV b0% across every 2p/3p/4p session).  Readouts
-       in split: SLV b%/Pb% must leave 0 with it ON, SPL per-view ms + fps for the A/B. */
-    if (sat_local_players <= 1 && !(cur & PER_DGT_TR) && (cur & PER_DGT_TL)
-        && (changed & PER_DGT_TB) && !(cur & PER_DGT_TB))
-    { extern int sat_mp_slave; sat_mp_slave ^= 1; }
+    /* (Pad R+B SLAVE-IN-MP kill switch REMOVED 2026-08-26 -- baked ON.  The fix it guarded is
+       validated on console: the 4p captures of this same day read SLV b4%..b35% where every
+       pre-fix video read b0%.  It also collided -- in 1p its predicate was the sprite-SQ
+       chord's, so R+B flipped the SQ zone AND the MP slave underneath it.) */
     /* Pad L+Left (L held, R released, 1p): live A/B of the COMPOSITE PIN (core/r_data.c).
        ON = the last composites stay non-purgeable under a 64 KB budget; OFF = the classic PU_CACHE
        demote, i.e. the treadmill `cb20/6` measured (SIX textures rebuilt 20x a second, `k33` each).
@@ -10509,14 +10467,24 @@ static void poll_pad(void)
        consumers).  The piecewise-quad probe (row 8 `Q<n>/<pct>`) went RESIDENT 2026-08-19 evening
        (owner: a pure probe should not need arming) -- it reads live in the full overlay with no
        chord.  Row 5 `Pm/Ps` never depended on this toggle. */
-    if (sat_local_players <= 1 && !(cur & PER_DGT_TL) && (cur & PER_DGT_TR)
+    /* [!] 2026-08-26: the 1p gate is LIFTED and this flag now arms the WHOLE plane rescan, not
+       just the legacy sizer.  The rescan was resident and billed 9.1 ms of a 119 ms 4p frame --
+       so the switch has to exist exactly where the cost does, which is split, not 1p.  Q/E on the
+       VD1 row read 0 until it is armed. */
+    if (!(cur & PER_DGT_TL) && (cur & PER_DGT_TR)
         && (changed & PER_DGT_TB) && !(cur & PER_DGT_TB))
         sat_prof_planepix ^= 1;
 
-    /* Pad L+Y (L held, R RELEASED -- ALL player counts): cycle the FIELD OF VIEW
-       90 -> 75 -> 65 -> 90 degrees.  Row 7 shows `f<deg>`.  Free chord: the only other Y
-       site is the R-held FBK cycle at :10502 (`!(cur & PER_DGT_TR)` = R HELD), so holding
-       L alone cannot reach it and holding R alone cannot reach this.
+    /* 🔴 MOVED TO PAD R+C ON 2026-08-26 -- L+Y WAS NOT FREE.  The claim below ("the only other
+       Y site is the R-held FBK cycle") was checked against the wrong thing: the R-held wall-SQ
+       cycle indeed cannot collide, but the CEILING SQ cycle further down takes L held + R
+       released + Y, which is this predicate byte for byte apart from its `!menuactive`.  So every
+       L+Y press moved the FOV **and** the ceiling quality -- two axes at once, on the one lever
+       whose whole validity rests on an IDENTITY test at f90.  R+C came free the same day when the
+       clear-slave A/B was baked, and it collides with nothing: L+C is the perf ladder (L held),
+       R+Y is the wall SQ (Y, not C).  Chord audits must match on the PREDICATE, never on prose.
+       Pad R+C (R held, L released -- ALL player counts): cycle the FIELD OF VIEW
+       90 -> 75 -> 65 -> 90 degrees.  Row 7 shows `f<deg>`.
        WHY IT IS WORTH A CHORD, and it is the whole argument for the lever: FIELDOFVIEW is
        a compile-time constant and focallength is built on centerxfrac = viewwidth/2, so a
        160-px SPLIT QUADRANT still shows a full 90 degrees -- four views accept four
@@ -10535,8 +10503,8 @@ static void poll_pad(void)
        reading means a thing.
        ⚠ The HW sky mis-tracks below 90: its scroll law is derived from the 90-degree
        geometry and is deliberately NOT scaled here.  Cosmetic, does not touch `d`. */
-    if (!(cur & PER_DGT_TL) && (cur & PER_DGT_TR)                 /* L held, R released */
-        && (changed & PER_DGT_TY) && !(cur & PER_DGT_TY))
+    if (!(cur & PER_DGT_TR) && (cur & PER_DGT_TL)                 /* R held, L released */
+        && (changed & PER_DGT_TC) && !(cur & PER_DGT_TC))
         R_SetFovHalf (sat_fov_half > 1000 ? 853        /* 90 -> 75 */
                     : sat_fov_half >  800 ? 740        /* 75 -> 65 */
                                           : 1024);     /* 65 -> 90 */
@@ -10588,16 +10556,10 @@ static void poll_pad(void)
         lr_was = lr_now;
     }
 #endif
-#if VDP2_SPLIT_HW_SKY
-    /* Pad L + C toggles the Part 5 HW split sky (docs/RBG0_SKY_SPLIT_ANALYSIS.md §5): OFF (default) =
-       every split view draws the software sky; ON = the elected view (P1) gets the hardware NBG0 sky,
-       windowed to its band.  Only meaningful in a co-op split (inert in 1p: hwsky_split needs
-       sat_local_players>=2).  Edge-triggered on C while L is held (R NOT held, so it never collides
-       with the L+R nbg3 chord); the incidental ',' (L) and run (C) taps to Doom are harmless.  This is
-       the live A/B for the HW path, which is not yet validated on real Saturn. */
-    if (!(cur & PER_DGT_TL) && (changed & PER_DGT_TC) && !(cur & PER_DGT_TC))
-        hwsky_split_on = !hwsky_split_on;
-#endif
+    /* (Pad L+C PART-5 HW SPLIT SKY A/B REMOVED 2026-08-26 -- baked ON, adopted 2026-08-20 once
+       the round-4 geometry landed.  It also collided: this predicate wanted L held and said
+       nothing about R, so in 1p it rode along with the L+C perf-lever ladder -- harmless only
+       because hwsky_split additionally requires >= 2 players. */
     /* (Pad L+Up/Down HW-sky horizon nudge CUT 2026-07-07 -- tuning finished, baked into
        SKY_HORIZON_ROW=96 (dg_saturn.cxx:~361).  L+Up/Down are free.  sky_cell_build_map() is
        still driven live by the horizon auto-track at ~5669.) */
@@ -10685,21 +10647,10 @@ static void poll_pad(void)
           for (int k=0;k<4;k++) sq_ceil_view[k] = c; }
         else { sq_ceil = sq_plane_cycle(sq_ceil); sat_apply_mode(); }
     }
-    /* Pad L+A (L held, R released, 2026-08-21, owner: "SIGHT_CACHE_TICS peut être en toggle ?"):
-       cycle the sight-cache validity window 4 -> 8 -> 16 -> 4 tics (core p_sight.c
-       sat_sight_cache_tics; see the trade note there: longer = fewer full BSP sight walks on
-       thinker-heavy maps, monsters react up to N tics late).  Read TIC row: `ca<t>` = the
-       current window, `s` = the sight ms it should shrink.  The incidental A tap (use/open)
-       is the usual chord cost -- cycle it standing clear of doors. */
-    { extern int sat_sight_cache_tics, sat_sight_cache_auto;
-      if (!(cur & PER_DGT_TL) && (cur & PER_DGT_TR)
-          && (changed & PER_DGT_TA) && !(cur & PER_DGT_TA))
-      {   /* AUTO (mobj-count ladder, boot default) -> 4 -> 8 -> 16 -> AUTO */
-          if      (sat_sight_cache_auto)          { sat_sight_cache_auto = 0; sat_sight_cache_tics = 4; }
-          else if (sat_sight_cache_tics == 4)     sat_sight_cache_tics = 8;
-          else if (sat_sight_cache_tics == 8)     sat_sight_cache_tics = 16;
-          else                                    { sat_sight_cache_auto = 1; sat_sight_cache_tics = 4; }
-      } }
+    /* (Pad L+A SIGHT-CACHE WINDOW override REMOVED 2026-08-26 -- the AUTO mobj-count ladder
+       (core p_tick.c) is the boot default and the answer; the manual 4/8/16 rungs were a
+       one-session question.  The window is still live and still printed as TIC `ca<t>a`.
+       It also collided with the persistent-CD chord on the same L+A.) */
     /* Pad R+A: live A/B of the Phase-1 WALL CLAMP (partially-occluded tiers kept on VDP1 via the
        world-anchored cut + software wedge, core sat_wall_cut_floor/_ceil).  Row 6 W<n><+/-> = tiers
        kept + state.  (MOVED off L+R+Y -- the L+R chord fires the overlay toggle, so L+R+Y was

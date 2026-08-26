@@ -1920,6 +1920,9 @@ extern "C" int (*sat_wall_edge_hook)(int, int, int, int, int, int, int, int, int
 extern "C" int sat_wall_edge_split(int, int, int, int, int, int, int, int, int,
                                    int *, int *, int *, int *, int *);
 extern "C" int sat_opt;                  /* core r_segs.c: cumulative perf-lever level L1..L4 (pad L+C) */
+extern "C" int sat_fov_half;             /* core r_main.c: fine-angle HALF-fov, 1024 = 90 deg (pad L+Y) */
+extern "C" void R_SetFovHalf(int half);  /* core r_main.c: the ONLY writer -- it also invalidates BOTH
+                                            view-table caches, which a bare assignment would not. */
 static unsigned int dg_frame_count = 0;
 /* (the measured-budget / weapon-reserve / wall-LOD state that lived here moved ABOVE this #if on
    2026-08-19 -- it drives emission, not just the overlay.  vdp1_tx_total stays here: overlay-only.) */
@@ -2457,11 +2460,28 @@ static void fps_update(void)
            toggle) -> resolves the ~1.5ms W5/DMA deltas the old integer rounded away.  Folded into
            THIS field (no new overlay row -- rows are saturated across dg_saturn + r_parallel). */
         unsigned int bmt = blit10_cnt ? (blit10_sum / blit10_cnt) : 0u;   /* tenths-ms */
-        /* 🔴 `rs` (2026-08-18) = R_RenderPlayerView's PRE-BSP setup -- the slave-clear join,
-           R_SetupFrame, R_PostFlatCacheFrame.  `R` here is DERIVED (MST - T - S - b - dg) while
-           row 2's Bw/Bp/P/M are MEASURED, and the two differ by ~11,6 ms.  `rs` is the only
-           candidate phase in that gap: if it reads ~11 the frame is fully accounted for, if it
-           reads ~0 the gap is the slop of a derived number and should be treated as noise. */
+        /* 🔴 `rs` -- REDEFINED 2026-08-25, AND ITS OLD QUESTION IS ANSWERED "NO".
+           1. The 2026-08-18 form bracketed R_RenderPlayerView's pre-BSP setup (RP_AuxWait,
+              R_SetupFrame, R_PostFlatCacheFrame) and read **rs0.0 on every capture taken**.
+              That was a real answer, not a broken probe: those three calls cost nothing.
+           2. The old legend's other branch -- "if it reads ~0 the gap is the slop of a derived
+              number" -- is WRONG and is retracted here.  Re-derived per frame from the console
+              ledger, R - (Bw+Bp+P+M) - kick = **-2.0 / 5.9 / 19.7 / 20.8 ms** in 1p/2p/3p/4p
+              (medians, n=22/23/22/31).  A number that is ZERO in 1p and ~5-7 ms PER VIEW in
+              split is not slop: it is a SPLIT LAW member, and it was the largest term in the
+              frame with no name and no roadmap item.
+           3. So the bracket MOVED (core/r_main.c, R_RenderViewPass) to the block that actually
+              fits that signature: R_ClearClipSegs / R_ClearDrawSegs / R_ClearPlanes /
+              R_ClearSprites / NetUpdate, which run ONCE PER VIEW and sit outside every phase
+              mark.  Both sites accumulate into sat_r_setup_frt, so `rs` now reads ALL the
+              unbracketed per-view setup at no extra overlay column.
+           ⚠ `R` is still DERIVED (mst - _tic - _snd - _blit - _dg, :2456) while Bw/Bp/P/M are
+           MEASURED -- so never present `MST - (R+T+S+b+dg)` as a hole: it is 0 by construction.
+           ⚠ The presentation fence is NOT in this residual: it lives inside `_blit` (before
+           blit_t0), hence inside the term already subtracted.  Read it on the VD1 row instead --
+           medians 7/13/15/18 ms, with the watchdog non-zero on 29 of 33 4p frames.
+           ⚠ If `rs` STILL reads ~0 in 4p on console, the term is deeper in R_RenderPlayerView
+           and the next FRT pair goes inside R_RenderBSPNode or between MarkP and BeginMasked. */
         unsigned int rs10 = _f ? (sat_r_setup_frt * 10u / 224u) / _f : 0u;
         sat_r_setup_frt = 0;
         /* SATURN 2026-08-25 -- `dg` IS PRINTED SPLIT: dg<pre>/<post>.  Both halves were already
@@ -2542,7 +2562,14 @@ static void fps_update(void)
                NOT fixed here, flagged).  The minimap is the only cost centre unique to 3p and it
                had never been timed; 3p runs MST 131-192 against 2p's 100-172 and nobody could say
                how much of the gap is a third view. */
-            snprintf(ovbuf, sizeof ovbuf, "SPL %u %u %u %u k%u =%u tc%d bal%d h%u.%u p%c%u   ",
+            /* 🔴 SATURN 2026-08-25 -- WIDTH FIX.  This row's worst case was ~45 content chars
+               against the 40-cell screen, and the 4p captures prove it: `SPL 24 21 18 28 k16
+               =91 tc1 bal0 h3.2 po` -- the `po` VALUE fell off the right edge, silently, in
+               exactly the mode the row exists for.  `tc%d bal%d` (10 chars with its space)
+               becomes `tb%d%d` (5), which buys back the five the three-digit per-view times
+               need.  No field lost: `tb<tc><bal>` is the thing-cull digit then the SQ-balance
+               digit, in that order.  ⚠ Legend updated in docs/ATLAS.md in the same commit. */
+            snprintf(ovbuf, sizeof ovbuf, "SPL %u %u %u %u k%u =%u tb%d%d h%u.%u p%c%u   ",
                      sat_spl_v0, sat_spl_v1, sat_spl_v2, sat_spl_v3 + sat_spl_mmap,
                      sat_spl_kick, vsum,
                      sat_split_thingcull, sat_split_balance, h10 / 10u, h10 % 10u,
@@ -2822,11 +2849,18 @@ static void fps_update(void)
             /* `ns` CUT 2026-08-09: sat_near_sprites has no chord (the R+X it was documented for was
                never bound -- see the note at the R+X budget chord) and no other writer, so it read
                a constant 1 forever while occupying a column and reading as a live knob. */
-            snprintf(ovbuf, sizeof ovbuf, "M%d %s ms%d pm%d SQ:%c%c%c%c cs%d lr%d/o%d",
+            /* `f<deg>` (2026-08-25) = the LIVE FIELD OF VIEW, pad L+Y, 90/75/65.  Default 90,
+               at which the whole render path is bit-identical to a build without the lever
+               (sat_fov_mul is a ratio of tangents, exactly FRACUNIT there) -- so `f90` is the
+               control arm of the A/B, not merely "the feature is off".  The number to read
+               against it is row-2 `d`, a COUNT, which is what makes this decidable on Ymir.
+               Width: this row's worst case was 34 of 40 cells; ` f%d` takes it to 38. */
+            snprintf(ovbuf, sizeof ovbuf, "M%d %s ms%d pm%d SQ:%c%c%c%c cs%d lr%d/o%d f%d",
                      sat_m, sat_m_name[sat_m], sat_mark_suppress,
                      sat_plane_tas,
                      sqch[sqw & 3], sqch[sqf & 3], sqch[sqc & 3], sqch[sqs & 3],
-                     sat_clear_slave, sat_lowres, sat_opt);   /* /o = perf-lever level 0-4 (pad L+C) */
+                     sat_clear_slave, sat_lowres, sat_opt,   /* /o = perf-lever level 0-4 (pad L+C) */
+                     (sat_fov_half * 45 + 256) / 512);       /* fine-angle half -> whole degrees */
             if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 7, ovbuf);
             /* row 8: RELIABLE VDP1 load (replaces the CEF-aliased Dr%).
                ⚠ 2026-08-10, legend corrected: THE FORMAT PRINTS ONLY `fbw` AND `fbm`.  Everything
@@ -10488,6 +10522,34 @@ static void poll_pad(void)
     if (sat_local_players <= 1 && !(cur & PER_DGT_TL) && (cur & PER_DGT_TR)
         && (changed & PER_DGT_TB) && !(cur & PER_DGT_TB))
         sat_prof_planepix ^= 1;
+
+    /* Pad L+Y (L held, R RELEASED -- ALL player counts): cycle the FIELD OF VIEW
+       90 -> 75 -> 65 -> 90 degrees.  Row 7 shows `f<deg>`.  Free chord: the only other Y
+       site is the R-held FBK cycle at :10502 (`!(cur & PER_DGT_TR)` = R HELD), so holding
+       L alone cannot reach it and holding R alone cannot reach this.
+       WHY IT IS WORTH A CHORD, and it is the whole argument for the lever: FIELDOFVIEW is
+       a compile-time constant and focallength is built on centerxfrac = viewwidth/2, so a
+       160-px SPLIT QUADRANT still shows a full 90 degrees -- four views accept four
+       complete 90-degree arcs to paint 1.00x the pixels of the 1p view.  Narrowing the arc
+       narrows `clipangle` and the BSP accepts fewer segs.
+       ⚠ READ IT AS A COUNT, NOT AS MILLISECONDS.  The decisive number is row-2 `d`
+       (drawsegs, frame sum), and a count is exactly what Ymir IS authoritative for -- the
+       ms it prints beside it are not.  Same spot, same map, 4 players, do not move:
+         PREDICTED d(65)/d(90) = 0.70-0.75.
+         KILL CRITERION: a ratio above 0.85 means the WALLS are doing the culling, not the
+         angle, and the lever collapses before anyone touches the console.
+       ⚠ SECOND TEST, AND RUN IT FIRST -- AN IDENTITY: at f90 every counter must be
+       IDENTICAL to a build without this patch.  sat_fov_mul is a RATIO of tangents, so it
+       is exactly FRACUNIT at the default and every consumer is bit-identical (see the long
+       note at core/r_main.c:47).  If f90 moves anything, the refactor is wrong and no 65
+       reading means a thing.
+       ⚠ The HW sky mis-tracks below 90: its scroll law is derived from the 90-degree
+       geometry and is deliberately NOT scaled here.  Cosmetic, does not touch `d`. */
+    if (!(cur & PER_DGT_TL) && (cur & PER_DGT_TR)                 /* L held, R released */
+        && (changed & PER_DGT_TY) && !(cur & PER_DGT_TY))
+        R_SetFovHalf (sat_fov_half > 1000 ? 853        /* 90 -> 75 */
+                    : sat_fov_half >  800 ? 740        /* 75 -> 65 */
+                                          : 1024);     /* 65 -> 90 */
 
     /* (Pad L+Right — the FAR-DEGRADATION LADDER — REMOVED 2026-08-16, one session after it was
        added: rung 1 rejected on sight, rungs 2 and 3 killed by their own counters. */

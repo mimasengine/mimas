@@ -1,192 +1,213 @@
 # Mimas — TODO
 
-Running list. Ordered: the governor first (the playability wall), then the visual
-defects the owner reported 2026-08-16.
+**Rewritten 2026-08-25.** The previous version was a *numbers* document, and that is why it
+rotted: nine of its twelve entries were overtaken within ten days, its headline claim was
+disproved by its own instrument, and its "branch state" section was wrong the moment it was
+written. This one is deliberately two things and nothing else:
 
-Every entry states **what is measured** vs **what is assumed**. Do not promote an
-assumption to a cause without the subtraction ([[budget-before-mechanism]]).
+1. **A ranked board** — what to do next and what decides it.
+2. **A DEAD table with the LAW that kills each entry** — the law is what stops a re-proposal;
+   the number is what makes the law credible.
 
----
-
-## 0. THE GOVERNOR — make 5 fps not happen
-
-### 0.1 The frame is not one thing: there are TWO regimes, measured
-
-| regime | capture | fps | MST | `R` | dominant term | tic |
-|---|---|---|---|---|---|---|
-| **render-bound** | 2026-08-16 c1 | 5,5 | 181 | 150 | **`Bp` 110,8** (`P`44,6 `Bw`7,4 `M`3,3) | `T18 th16,0 x2,1` |
-| **render-bound** | 2026-08-16 c2 | 4,3 | 232 | 210 | **`Bp` 91,0** (`P`43,9 `M`4,1) | `T19 th17,7 x2,2` |
-| **tic-bound** | DOOM-TNT-latest t70 | 3,6 | 277 | 177 | `th` **111,4** | `T115 s2,2` |
-
-The governor today only degrades the RENDER (axes `B`/`P`/`M`). It has **no axis at
-all** for the tic-bound regime, and in the render-bound one it elects `B` and pulls
-the wall-LOD rung — which flattens *texture on small distant walls* while the cost
-is `Bp` = R_StoreWallRange over **`ds118` drawsegs**.
-
-**Flattening a wall does not remove it from the seg list.** That is the gap.
-
-### 0.2 What to give it — ranked by (measured size / cost to build)
-
-1. **A drawseg budget.** `ds118` with `Bp110` is ~0,9 ms per drawseg. A rung that
-   caps drawsegs (drop the farthest first, they are the cheapest to lose visually)
-   attacks `Bp` directly instead of by proxy. ⚠ Must drop **far** first — the
-   opposite mistake killed the VDP1 wall offload ([[wall-offload-vdp1-slave-dead]]).
-2. **A things axis.** `M` has no knob. `sat_thing_role_cull` / `sat_thing_cult_dist`
-   exists but is static at 1024. Make the distance a governed rung (1024/768/512).
-   Small in these captures (`M3,3`) — build it only when a capture shows `M` electing.
-3. **Feed the governor COUNTS, not only times.** `ds`, `vp`, `ss` are on screen and
-   are leading indicators; `Bp` is the lagging one. Entering a big room is visible in
-   `ds` one frame before it is visible in `Bp`.
-4. **A tic axis** for the tic-bound regime — but see 0.3 first, which may dissolve it.
-
-### 0.3 🔴 THE GAME IS RUNNING AT ~1/3 SPEED — read this before building a tic axis
-
-`x` (tics per frame, shipped 2026-08-16) says so on its first capture:
-
-| capture | fps | `x` measured | `x` expected (35 / fps) | ratio |
-|---|---|---|---|---|
-| c1 | 5,5 | **2,1** | 6,4 | 0,33 |
-| c2 | 4,3 | **2,2** | 8,0 (capped) | 0,27 |
-
-The game world advances at ~10-12 Hz instead of 35. This is the **ralenti invisible**
-that [[gametic-slowmotion-tic-cap]] says was fixed by raising the maketic cap +2 → +8
-("vrai 35Hz jusqu'à ~4fps"). At 4-5 fps it is **not** being achieved.
-
-**Prime suspect, and it is already half-proven:** `maketic` is driven by `d_ms()` /
-`DG_GetTicksMs`, the same clock caught SATURATING at 72-73 ms on hardware across three
-different frame rates while the FRT said 106-110. A millisecond clock that
-under-reports elapsed time hands `TryRunTics` too few tics — exactly this symptom, from
-exactly the defect already measured for another reason.
-
-**This is cheap to test and changes how the game FEELS at a given fps**, which is worth
-more than the next few ms of render. Measure `DG_GetTicksMs` against the FRT over a
-second before touching anything.
-
-⚠ Open question for the owner once it is fixed: at 5 fps, true 35 Hz means ~7 tics of
-monster movement between two displayed frames. Correct Doom, possibly worse to play.
-The honest answer is to fix the clock first and let him judge, not to pre-decide.
-
-### 0.4 Offline (WAD) vs live — both, and they do not overlap
-
-They answer different questions and neither substitutes for the other:
-
-- **Live** owns the *dynamic* peak: a horde spawns, you turn into a big room. No
-  offline pass can see that coming.
-- **Offline** owns the *structural* cost that is identical every time you enter that
-  room, and it is FREE at runtime.
-
-**The highest-value offline lever we have proven today is texture size.** Every
-256x128 TNT patch is **35080 bytes and must land in ONE contiguous run**, against a
-longest run measured at **20-38 KB depending on the scene**. That is a cliff the
-engine cannot dodge — it is the bug that ate the sky, and at `lg20k` *no* 256x128
-patch fits, walls included. `tools/strip_wad.py` already rewrites the WAD:
-down-sizing the big patches (256x128 → 128x128 ≈ 9 KB) removes the whole class.
-
-Other offline candidates, unmeasured: seg/detail reduction on the worst maps, flat
-count per neighbourhood (sizes the `FLT` pool, see [[streaming-load-budget-and-flat-treadmill]]).
-
-### 0.5 What is expensive on Saturn — the standing list
-
-Ordered by how often it has actually bitten this project:
-
-1. **Any contiguous zone allocation over ~32 KB.** The run is structurally 20-38 KB
-   (~366 KB of small unpurgeable PU_STATIC texture blocks chop the middle).
-   *Everything* above that size is a lottery, and losing the lottery is silent.
-2. **Per-column software fill** (`Bw`/`Bp`/`P`/`M`) — one 28 MHz SH-2 on a shared bus.
-3. **Pointer-chasing over the LWRAM (DRAM) zone heap** — thinkers, BSP, LOS.
-   4 KB write-through cache, one system bus for two CPUs ([[saturn-memory-map]]).
-4. **Synchronous CD reads inside the frame loop** — ~33 ms each.
-5. **VDP1 command COUNT and transfer-over**, not fill ([[vdp1-transfer-over-lopr-probe]]).
-6. **Composite rebuilds** (`cb`) — 8..32 KB column copies.
+**Rules for editing this file.** Numbers live in the ledger (`docs/captures/`), the measured
+board (`docs/HEADROOM_2026-08-25.md`) and the hardware dossier
+(`docs/DOSSIER_MATERIEL_2026-08-25.md`) — cite them, do not copy them. Never restate git state
+in prose. Every entry states **what decides it** and **whether Ymir is legal for that
+decision** (counts, identities, bug reproduction and the sign of a boolean effect: yes;
+milliseconds: never — [[ymir-not-a-perf-oracle]]).
 
 ---
 
-## 1. BUGS reported by the owner, 2026-08-16
+## The board
 
-### 1.1 ✅ CONFIRMED — the TNT sky shows only a quarter of itself
-Owner: *"mimas-tnt a un ciel non continu. Je suppose que … il est en plusieurs parties
-et qu'on en affiche une seule."* **Correct**, verified against the WAD:
+### 0. THE CONSOLE SESSION — three discs, one trip. This is the gate.
 
-```
-TNT SKY1/SKY2/SKY3 = 1024x128, FOUR 256-wide patches
-   originx = 0 / 256 / 512 / 768
-```
-`sky_cell_upload` (dg_saturn.cxx) hardcodes `ccol < 32` × `rx < 8` = **columns 0..255**,
-i.e. patch 0 only, then tiles that quarter twice across the 512 px NBG0 page. DOOM1
-shareware is the same 1024x128/4 — the bug is there too, just invisible on a uniform sky.
+Everything below rank 3 is priced off **one map** (shareware E1M1). The marginal cost of a
+drawseg has a 95 % CI of **0.38–0.98 ms** — a 2.6× spread — so a second measured map is worth
+more than any single lever on this board.
 
-**The fix is a VRAM budget decision, not a loop bound.** A full 1024-wide 8bpp cell sky
-is 128x16 cells = **128 KB of VDP2 VRAM**; today's quarter uses ~32 KB in bank B1's low
-half (map at +0x A000). Options, cheapest first:
-- **2:1 horizontal downscale** of the full 1024 into the existing 512 page (take every
-  other column). Keeps VRAM, keeps the layer, sky is low-frequency — likely invisible.
-- 4bpp cells → 64 KB for the full width (see [[rbg0-cell-floor-4bpp-snow-fix]] for the
-  4bpp trap on hardware).
-- A 1024-wide plane (`PL_SIZE_2x1`) at 128 KB — does not fit beside the RBG0 floor.
+- **Disc A — TNT MAP20, 1p**, walked to the fixed spot (−672, −929, facing `a64`) where three
+  prior captures already exist. The only genuinely controlled A/B this project can perform, and
+  it is the **only** falsifier for the `mobj_t` cache-line reorder (core `2e2b48b`), which is
+  shipped into a shared submodule and currently unvalidated. **Kill criterion stated in
+  advance: if `mo − ph − sm − mv` still reads 33–36 ms at that spot, revert the reorder.**
+- **Disc B — shareware, 4p**, exercising the live chords in the *same* footage
+  ([[interbuild-perf-noise]]: a build-vs-build photo is not evidence).
+- **Disc C — big WAD, 4p, CARTLESS**: rows 11, 13, 0 `ld`, 12 `t`.
+  ⚠ **Decide the cart fork before burning**: row 12 is `CD` on a streaming disc and `SKY` on a
+  ≥4 MB cart build. One disc cannot answer both the CD pump and the 3-quadrant HW sky.
 
-⚠ Also re-check the SCROLL divisor: with 1024 mapping to 360°, the current
-`SKY_ANGLESHIFT` was calibrated against a 256-wide layer.
+**Decides:** everything. **Ymir: illegal** for every millisecond here.
 
-### 1.2 Transparent grates vs monsters are z-inverted
-Owner: *"quand la grille est derrière le monstre, on la voit à travers le monstre.
-Quand la grille est devant le monstre, le monstre cache la grille."*
+### 1. The split-only per-view residual — the largest unattacked term
 
-**Structural, not a rounding bug:** world things are on **VDP1** (sprite priority 5)
-while masked midtextures (grates) are drawn into the **NBG1 software framebuffer**
-(priority 6). NBG1 sits above every sprite, so the grate wins *unconditionally* —
-which is right in one of the two cases and wrong in the other, exactly as described.
-Two surfaces on two layers with a fixed priority **cannot** z-sort against each other.
+`R − (Bw+Bp+P+M) − kick` = **−2.0 / 5.9 / 19.7 / 20.8 ms** in 1p/2p/3p/4p (console medians,
+n=22/23/22/31). **Zero in 1p** — so it is a split-law member, not the slop of a derived number.
 
-Fix directions: put masked midtextures on VDP1 too (they are already texture-mapped
-quads), or route things overlapping a masked midtexture back to the software path.
-See the layer-inversion contract in [[doomsrl-vdp1-capacity]].
+`rs` has been moved (2026-08-25) onto the candidate that fits that signature: the
+`R_ClearClipSegs / ClearDrawSegs / ClearPlanes / ClearSprites / NetUpdate` block in
+`R_RenderViewPass`, which runs **once per view, outside every phase bracket**.
 
-### 1.3 1 px vertical gaps — LOCALISED by the owner: **between two VDP1 walls**
-Owner, after investigating: *"Les bandes 1px verticales manquantes se produisent aux
-jonctions entre deux murs vdp1."*
+**Decides:** read `rs` in split. Non-zero ⇒ the term is named and can be attacked. Still ~0 ⇒
+it is deeper, and the next FRT pair goes inside `R_RenderBSPNode` or between `MarkP` and
+`BeginMasked`. **Ymir: legal** (zero vs non-zero is a boolean).
 
-That kills the CPU↔VDP1 routing hypothesis and leaves **quad edge rounding**: two
-adjacent quads each round their own x independently, so one screen column ends up
-inside neither. The software path never had this — it walks columns, so column *n*
-belongs to exactly one seg by construction; a quad rasteriser has to be *told* where
-the shared edge is.
+### 2. `pr` — a per-drawseg CONSTANT of ~0.21 ms, and it is our own code
 
-**Fix direction:** make the shared edge explicit rather than emergent — the left quad's
-right edge must be *the same number* as the right quad's left edge, not a rounding of
-the same world point computed twice. Failing that, the horizontal twin of `Wg`
-(grow each quad 1 px right, since the neighbour will overwrite it) closes the seam at
-the cost of a 1 px overdraw. **Grow is the cheap patch; the shared edge is the fix.**
+Console medians: `pr` = 3.4 / 9.6 / 15.8 / 15.2 ms over `d` = 19.5 / 47 / 75.5 / 73 ⇒
+**0.174 / 0.204 / 0.210 / 0.208 ms per drawseg** — ~5 950 SH-2 cycles **before a single pixel**.
+`core/r_parallel.c` defines it as the per-seg VDP1/CPU tier routing, hysteresis, clamp,
+perspective subdivision and lead-fill arming: Saturn additions, not vanilla Doom.
 
-⚠ Order this AFTER 1.4 — both are in the emission path and 1.4 may be the same rounding
-producing a degenerate (zero-width) quad rather than a 1 px one.
+**Why it matters more than it looks:** from 1p to 4p, `pr` grows **+11.8 ms** and `hd`+`tl`
+grows **+9.9 ms** while `lp` **falls 3.8 ms**. `pr`+`hd` carry *all* of `Bp`'s split inflation,
+and **every shipped LOD rung reaches only `lp`**.
 
-### 1.4 A wall routed to VDP1 is never drawn — **the counter for this already exists**
-Owner: *"le mur invisible devrait être vdp1 mais n'est pas affiché. je vois le
-'rattrapage de mouvement' (fallback) cpu s'afficher pour ce mur, mais pas le mur
-lui-même."*
+**Two zero-risk probes before any mechanism**, both readable on the existing row-4 partition:
+(a) hoist the per-seg tier decision to per-frame wherever its inputs are frame-constant;
+(b) run one frame with the VDP1 wall route forced off — if `pr` collapses, it belongs in the
+same budget as `P`, not in `Bp`. **Ymir: legal** for the identity that a hoist changes no
+output; illegal for the ms.
 
-This is diagnostic gold: the lead-fill spans ARE drawn, which proves the core routed
-the seg to VDP1 (the software loop skipped it, and the lead fill only records quads
-actually handed to VDP1). So the loss is **downstream of the routing, inside the emit
-dispatch** — exactly what `N<orphan>/<drop>/<flip>` on row 13 was built to separate:
+### 3. Deathmatch — ~20 lines for the showcase's headline mode
 
-- **`drop` > 0** ⇒ `vdp1_wall_drop`: the core handed the wall over and the emit
-  dispatch silently returned early. Measured at the command pointer (`vdp1_wnext` did
-  not move across the emit call), so it catches every early return without auditing
-  them: **the wall-cap guard, a texture slot that will not resolve, a degenerate quad.**
-- **`orphan` > 0** ⇒ claimed by neither path (should be 0 here — the lead fill proves
-  VDP1 claimed it).
-- **`drop0` and `orphan0`** ⇒ the wall was emitted and VDP1 did not plot it: a
-  different search entirely (bank, clip, or the wall-cap on the VDP1 side — watch
-  `V1 ... W<n>/<n>` on row 19 and `B<n>` for a budget latch,
-  [[vdp1-budget-latch-kills-sprites]]).
+`sat_deathmatch` is declared in `core/g_game.c`, read twice, and has **zero writers anywhere**:
+the whole core side ships as unreachable dead code. Missing: one platform writer, a title-screen
+cycle beside the existing `PLAYERS:` banner, and frag display (the HUD slot already exists).
 
-**Next capture must include row 13.** One photo picks the branch, and the three
-candidates behind `drop` are each a few lines to check.
+**Decides:** first a **count** — do the target maps carry 4 DM starts (shareware E1M1–E1M9 do)?
+**Ymir: legal.** Then a play session: this is a game-design gate, not a perf gate.
+⚠ Priced on shareware, where `T` is 11 ms of a 158 ms frame. On the endgame class `T` is 81–88 ms
+and the *larger* half of the frame — DM there is **unpriced**.
+
+### 4. Audio quality at 0.00 ms
+
+`S` = 0 ms on **106/106** console frames, so the master can neither lose nor gain time here.
+MUS channel 15 (percussion) is skipped in *both* arms and is **34.6 % (shareware) / 38.9 %
+(Doom II)** of all note-ons — thrown away. The whole timbre budget is **96 bytes**.
+Order: `mus_step` on the vblank ISR (~15 lines) → percussion + 24-voice pool + real ADSR + pan
+→ per-map sample bank. Detail and the sound-RAM conflicts: `DOSSIER_MATERIEL §7.2-D`, `§7.4`.
+⚠ **Conditional on the CDDA fix**: if CDDA returns, verify this is still on the default path
+before writing 350 lines.
+
+### 5. CDDA boot (~480 s) — run the free probe first
+
+`GFS_Init` runs **before** `CDC_CdInit`, the inverse of both shipping references on disk.
+The probe needs **zero code change** (six printf markers already print). The fix is ~4 patch
+lines in `patches/saturnringlib.patch` — which is **shared with Tethys**, so a mistake
+propagates. ⚠ A naive reorder can trade an 8-minute boot for silent music (`CdPlay` is silent
+without `CdInit`). **Ymir: legal** — bug reproduction and marker ordering are identities; but an
+Ymir boot that *completes* is inconclusive, not exculpatory.
+
+### 6. FOV — DEMOTED 2026-08-25, and here is why
+
+The chord (**pad L+Y**, 90/75/65, row-7 `f<deg>`) is shipped and the mechanism is real:
+measured on Ymir, `d(65)/d(90) = 0.78` — under the 0.85 kill criterion.
+**But the model died anyway.** `c` (column iterations) *rises* 1068 → 1215 as the arc narrows:
+fewer walls, each wider on screen. `pr` and `hd` fall, `lp` rises, and **`Bp` moves only −6.7 %**
+against a predicted −28 %. The `−9 to −15 ms` figure assumed `Bp ∝ d`; under an FOV change it
+is not. Keep it as a **game** option (and it sharpens the image: 1.78 → 2.46 px/degree), not as
+a perf lever. ⚠ Still probe-grade: the HW sky's scroll law is 90°-derived and unscaled.
+
+### 7. Openings — the cut is now safe to size, but not yet to make
+
+`openings[]` is **40 960 B of `.bss`, larger than the whole ~28 KB TLSF pool**, and 64 rows was
+a vanilla guess nothing measured. The instrument was fixed first (2026-08-25): it folds
+**demand**, not consumption, because all three sinks redirect without advancing `lastopening`
+and the old counter therefore **saturated by construction**. Take the reading on a big-WAD vista
+before cutting anything.
+
+### 8. Grate / monster z-inversion — owner's call when to return
+
+Structural: world things are VDP1 sprite priority 5, masked midtextures are NBG1 priority 6, and
+the order is fixed in hardware. **Two fixes were built and withdrawn**, both measured as *worse*
+picture: demoting the sprite gave a half-res monster filling the screen (M7 renders 160 columns,
+no depth test); the replacement used the sprite's **bounding box**, so the grate vanished in the
+transparent margins beside it. The only honest direction left is a **per-row** occlusion test —
+**price its `.bss` before writing code**, since the deferred openings cut is what would fund it.
+
+### 9. R2.3 async CD pump — BLOCKED, do not build
+
+Nobody has measured it on console, and the one configuration that *was* measured is a cart build
+where the whole path is inert by construction. **Ymir illegal for this entire item** (its CD
+model is protocol-level: no seek, no rotation). Blocked on disc C.
+**Free correction to fold in now:** `R_LoadBudgetFrame` is called **per view**, not per frame, so
+in 4p the 20 ms budget refills four times — 80 ms of allowed stall in a 158 ms frame. Fixing the
+comment that claims otherwise is free; changing the cadence is an owner decision between fairness
+and a frame-wide stall ceiling.
 
 ---
 
-## 2. Branch state
+## DEAD — do not re-propose. The LAW, then the number.
 
-On **`flicker-clean`**, 44 commits ahead of `master`, 0 behind. Nothing has been pushed.
-Merging to master is an owner decision, not a prerequisite for any of the above.
+| lever | LAW |
+|---|---|
+| **SCSP DSP as a compute co-processor** (any form) | *The shipped binary is **1.55 % multiply-class instructions against 51 % memory moves**; the hottest loop in the game is 0.71 %. You cannot offload a cache miss to a DSP that cannot branch, cannot divide, cannot chase a pointer, sees only sound RAM, and answers no sooner than 250 µs.* At Doom precision it is **0.27× one master SH-2**. ⚠ Record the honest distinction: unlike the SCU-DSP, **the readback IS legal**. There is simply nothing worth carrying through it. Its one real client is *compression*, not compute. |
+| **68EC000 hosting game logic** | *Postage to sound RAM costs the master ~4.1 cycles/byte; a Doom per-mobj decision costs 0.5–3 cycles per byte of the row it reads. **The decision is cheaper than shipping the row.*** Plus: the whole tic domain is **11 ms of a 158 ms 4p frame**. Plus: provable determinism needs an unconditional read-back = **a second presentation fence**. ⚠ "68K inatteignable" is **false** — it is reachable, and that is not why it fails. |
+| **MUS sequencer on the 68K as a PERF move** | *`S` = 0 ms on 106 of 106 console frames. There is no time to move.* |
+| **Non-VDP1 data in VDP1 VRAM** | *28–33 KB of **uncached** B-bus DRAM that arbitrates against the drawing engine (the manual: **both** stall), against 609–624 KB of cached LWRAM.* And the linker closes it first: the image is a flat `.bin`, so every initialised table ships in it and a runtime copy frees **zero** pool. |
+| **Offline floor dicing (SlaveDriver route)** | *The scan is a ~0.5 ms **constant**; the measured cost is ~0.48 ms **per emitted tile**. The bake removes the constant and none of the slope.* And the prize is 8.6 ms in 1p but **3.4 ms in 4p** — the split law at its sharpest. |
+| **Cart-conditioned DRP rotation ladder** | *The cartless player is the ladder's **beneficiary**: 8-way rotations put 5 lumps per rotated frame in the working set instead of 3 (~+130 first-sight CD reads per map) on the machine with no cart to hide them.* Scope is 6 %: 8 maps of 132, always one step. |
+| Merging collinear same-texture linedefs | *The excess in id maps is **BSP splitting**, not authored fragmentation: +0.0 to +1.5 % on top of a nodebuilder.* |
+| Removing decorative two-sided linedefs | *`core/r_bsp.c` returns **before** any clip call: they emit **zero** drawsegs already.* |
+| Reducing sector count | *`P` is flat at 14.3–15.3 ms across all four modes while `d` moves 3.8×.* |
+| SCSP internal DMA as an HWRAM→sound-RAM engine | *The manual: it transfers only between the SCSP control registers and sound memory, 3 812 B max.* |
+| 32-bit stores in the SFX upload path | *The SCSP port is 16-bit; a longword becomes two bus cycles. Same cost.* Unlike VDP2 VRAM, **no widening win here**. |
+| Pre-rendered music resident as a loop | *LSA/LEA are 16-bit offsets from SA: 65 536 samples max per slot = **5.9 s** at 11 kHz.* |
+| A VDP1 texture ATLAS in the free holes | *VDP1 pattern data has **no stride register**; a sub-rectangle is unaddressable and shears.* |
+| "Drop the farthest drawsegs" (as opposed to flattening them) | *Skipping a solid wall leaves solidsegs open and the visplanes behind it unclosed — a **see-through hole**, not a degradation.* What ships bounds the count and flattens. |
+| A render-governor rung retargeted to make the picture worse | *The governor's job is to degrade the picture, and a lever that changes nothing visible beats it.* It currently contributes **0.0 ms**: `w0 p0` on 106/106 frames at 6.2 fps, because its target is expressed against `rend` (75.3 ms) inside a 158 ms frame. Retargeting is ~10 lines — **ask the owner whether he wants quality traded away at 6 fps at all** before writing them. |
+
+---
+
+## The witness corpus — which WAD prices which question
+
+`wads_temoins/` holds 18 WADs; `tools/boot_matrix.ps1` builds and pre-flights them (it does
+**not** boot them — there is no headless Saturn here).
+
+🔴 **Only 11 of the 18 are IWADs, and only an IWAD builds standalone.** Verified 2026-08-26 by
+reading every header: a PWAD carries maps but inherits its textures, so `flatten_textures.py`
+dies on *no PNAMES lump* and `build.ps1` aborts — which is exactly what `grid1212` and `HR` did
+on this script's first real run. `Doom2HR` / `Doom2SCYTHE` / `Doom2NUTS` **are** the pre-merged
+builds of three of the PWADs. **`grid1212` has no merged counterpart**, so it cannot be tested
+until one is minted — and ⚠ minting one first requires fixing `tools/merge_wad.py`, which writes
+lumps back-to-back while `strip_wad.py` deliberately 4-pads, because an unaligned 32-bit read on
+the big-endian SH-2 returns garbage ([[saturn-cart-lump-alignment]]).
+
+| WAD | kind | prices |
+|---|---|---|
+| `Doom1s` | IWAD | the reference ledger; every split constant we own |
+| `Tnt` | IWAD | `vp`/`ds` pressure, the 1p tic-bound spot (MAP20), the 4 maps that degrade rotations — **and where the visplane-pool overflow was actually measured**, so it is the direct before/after for the slice-stride change |
+| `Doom2` | IWAD | lazy texture directories (MAP13) |
+| `SCYTHE` | PWAD *(ships a PNAMES, so it builds)* | **zone exhaustion** — MAP30 763 KB, MAP29 684 KB, the last hard `I_Error` |
+| `Doom2HR` | IWAD (merged) | `ds` / openings demand — use this, not bare `HR` |
+| `Doom2SCYTHE` | IWAD (merged) | the merged Scythe |
+| `Doom2NUTS` | IWAD (merged) | **expected to fail** — documented, not a regression |
+| `grid1212` | PWAD, **no PNAMES** | the visplane pool — **unbuildable as-is**, needs a merge that does not exist yet |
+| `HR`, `HRMUS`, `nuts`, `Nuts2` | PWAD, no PNAMES | unbuildable standalone |
+| `Nuts3` | PWAD *(has PNAMES)* | builds |
+
+⚠ **Cost, measured**: four WADs **with** `-Repack` took **517 minutes** — the LZSS repack of a
+full IWAD dominates, not the compile. `-Repack` is therefore opt-in; a plain sweep still answers
+the three questions the script exists for (compiles / pool clears the boot-loop floor / cue is
+BOM-free), but the discs it leaves carry a **stale DRP and are not shippable**.
+
+---
+
+## Retired from this document on 2026-08-25 — do not restore
+
+- **"The game runs at ~1/3 speed"** — the *clock* half was fixed 2026-08-17. The *cap* half was
+  real but mis-diagnosed: `new_sync = 0` made the `+8` cap unreachable, so the "+2→+8" fix never
+  ran a single frame. Now `>= 9`. See [[gametic-slowmotion-tic-cap]] (retracted and rewritten).
+- **The two-regimes table** — every magnitude came from a build that no longer exists and from
+  per-view instruments now folded to frame sums. Its *conclusion* survives (`Bp` dominant on
+  92/100 frames); its numbers do not.
+- **"Any contiguous zone allocation over ~32 KB is a lottery"** — disproved: `lg` min 117 KB,
+  median 159, max 370 over n=106, zero frames below 40 KB. `split_patches.py` closed it offline.
+- **Composite rebuild cost** — killed offline by `flatten_textures.py`; a texture whose columns
+  are single-patch never builds a composite.
+- **The TNT quarter-sky, the 1 px VDP1 seam** — both shipped.
+- **"A wall routed to VDP1 is never drawn"** — the instrument has existed since 2026-08-03 and
+  has **never been read**, and two things changed under it since. **Ask the owner whether he
+  still sees it on the current build** before spending a capture.
+- **Branch state in prose** — git is the source of truth; a doc can only be wrong about it.

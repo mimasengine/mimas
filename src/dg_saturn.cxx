@@ -173,6 +173,7 @@ extern "C" int   r_nopatch_col;    /* core r_data.c: textures with a patchless c
    old externs are DELETED rather than left beside them on purpose -- a live extern to a per-view
    counter next to a frame-scoped row is exactly how this defect got introduced in the first place. */
 extern "C" unsigned int sat_seg_cols_f, sat_seg_fill_f, sat_seg_px_f, sat_lead_px_f; /* row 14 `SEG` */
+extern "C" unsigned int sat_prof_show10;   /* row 14 `ov`: rp_p3_prof_show's own cost, frame sum */
 extern "C" unsigned int sat_gc_st_f[4], sat_gc_sn_f[4];                              /* row 16 `GCS` */
 extern "C" unsigned int prof_wallprep, prof_segloop, prof_segrout;  /* core: the Bp split, FRT ticks */
 extern "C" unsigned char r_column_stub[256];
@@ -759,6 +760,24 @@ extern "C" int R_WallPotatoColorPeek(int tex);  /* core r_data.c: cached dominan
                                                    in through R_GetColumn -- see wall_emit_flat)    */
 #define SAT_WALL_FLAT_UNKNOWN 100      /* neutral palette index, same as the software path uses      */
 static unsigned int sat_p_emit10 = 0;  /* ...in the wall EMIT loop (flush minus the resolve pass)      */
+/* [!] SATURN 2026-08-26 -- row 14 `pl`: THE DEPORTABLE SHARE OF THE VDP1 KICK, as a percent of `em`.
+   Owner asked how to start the study of moving row-1 `pr` (the VDP1 kick) onto the slave.  First
+   the arithmetic, then the mechanism -- [[budget-before-mechanism]].  What `pr` actually contains,
+   measured, not assumed: on the 4p console captures of this day row-1 `pr` reads 14.5 ms and row-4
+   `em` reads 13.6, so 94 % of the kick IS vdp1_walls_flush's emit.  Inside that, this function
+   already has the shape an offload needs:
+     - a DECISION loop (mode 3-way, surplus budget, wall_tex_resolve) -- it ALLOCATES and can bake
+       a texture off the disc, so it is master-only forever, exactly like `Pv`'s flat-resolve half;
+     - a PLOT loop (the three wall_emit_* calls) -- a pure transform of an already-decided
+       wall_acc[] into VDP1 command records.  No zone, no lump, no allocation.
+   `pl` is the second one's share.  If it is small the offload dies here for 2 register reads; if
+   it is large, the mechanism below is worth building.
+   ⚠ WHAT THIS MEASUREMENT CANNOT TELL YOU, and it is why the toggle has to be console-judged:
+   the plot loop writes VDP1 VRAM over the B-BUS, and the bus is shared.  The wall-fill ladder
+   priced that exact effect on hardware this same day -- row-4 `pr` rose 29.8 -> 30.3 -> 32.7 as
+   slave occupancy went 4 % -> 11 % -> 35 %.  So the win is not `em`'s fall, it is `em`'s fall
+   MINUS what hd/pr/lp rise.  Read row 2 `Bp`, never `em` alone.  [[cut-all-useless-work-always]] */
+static unsigned int sat_p_plot10 = 0;  /* ...and the PLOT-loop half of it (deportable), tenths-ms  */
 /* (sat_p_thgcd10 / _thgcdn -- the CD half of that bracket -- removed with the PSP row 2026-08-07,
    after they proved c ~= e in 13/13 captures.  sat_p_thg10 went the same way on 2026-08-26 -- the
    claim that it was "the one live number" was wrong: nothing read it either.) */
@@ -2180,6 +2199,25 @@ enum { rbg0_rpt_late = 2 };  /* BAKED 2026-08-26: copy before the fence, same-fi
          horizon (those rows show RBG0 instead).
    (A 4th mode forced the sky OFF entirely.  Removed once it had answered -- see the horizon block.) */
 enum { sky_mode = 1 };   /* BAKED 2026-08-26: the shipped deferred-map boundary fix */
+/* [!] SATURN 2026-08-26 -- ROW-13 `F<min>+<pct>%`: THE FIELD-SPILL RATE, and it exists because a
+   MEAN CANNOT SHOW WHAT THIS MACHINE ACTUALLY DOES.  The owner watched the late-kick A/B and
+   reported *"en K0, le fps est moins stable et varie de 19.4 a 19.7"* -- a real, visible difference
+   that BOTH SIDES of the overlay reported as the same number, MST50, because 50.05 ms is exactly
+   three NTSC fields and the mean rounds to the floor on both.
+   The arithmetic behind what he saw: at mean frame time T the fraction of frames spilling onto a
+   FOURTH field is (T - 50.05) / 16.683, so 19.4 fps = 9.0 % and 19.7 fps = 4.3 %.  Five points of
+   frames, about one extra judder per second, invisible in every field the overlay printed.
+   `sat_field_n` -- the count this needs -- has been computed in sat_field_fence since the Fl era and
+   its own comment says "row-13 readback ... MUST be STEADY: a value flipping N/N+1 means the frame
+   sits on a boundary".  It was never printed.  Same defect class as `ns`, `ms`, `pm` and `dd` before
+   it: computed, never displayed, so the fact it names could not be used.
+   Histogram over the 1 s window, then MIN + the percent above it.  `F3+0%` = every frame fits three
+   fields, the frame is comfortably inside its budget.  `F3+9%` = the frame is SITTING ON THE LINE
+   and nine per cent of it falls off -- which is judder you can see and no ms figure can show. */
+static unsigned char sat_fn_hist[8];
+static unsigned int  sat_fn_cnt   = 0;
+static int           sat_fn_min   = 0;   /* row 13 `F<min>` -- fields the typical frame occupies  */
+static int           sat_fn_pct   = 0;   /* ...and the % of frames that needed MORE than that     */
 static int sat_field_n    = 0;    /* fields the last locked frame occupied -- row-13 readback.  MUST
                                      be STEADY: a value flipping N/N+1 means the frame sits on a
                                      field boundary and the beat is back, coarser (judder). */
@@ -2411,6 +2449,16 @@ static void fps_update(void)
            map's.  Zeroed here, outside the mode-0 gate, so the latch keeps following the game even
            while the rows are hidden (returning to mode 0 then shows a fresh sample, not a ghost). */
         sat_prof_bp_win = 0;
+        {   /* row 13 `F<min>+<pct>%` -- fold this window's field histogram.  Outside the mode-0
+               gate for the same reason rp_master_ms is: a window that keeps filling while the rows
+               are hidden would show a ghost on the way back. */
+            unsigned int tot = sat_fn_cnt, i, at_min = 0;
+            int mn = -1;
+            for (i = 0; i < 8u; ++i) if (sat_fn_hist[i]) { mn = (int)i; at_min = sat_fn_hist[i]; break; }
+            if (mn >= 0 && tot) { sat_fn_min = mn; sat_fn_pct = (int)((tot - at_min) * 100u / tot); }
+            for (i = 0; i < 8u; ++i) sat_fn_hist[i] = 0;
+            sat_fn_cnt = 0;
+        }
         if (sat_dbg_overlay_mode == 0)
         {
         /* row 1: MASTER-FRAME COMPOSITION, window-AVERAGED over this 1s tick (ms) -- so a single
@@ -2808,11 +2856,28 @@ static void fps_update(void)
                today sits where the cut can never reach it, and it is `lk`'s tail that would go
                ([[debug-overlay-line-width]]).  `c` and `f` also drop from a 5-digit clamp to 4: they
                read ~2 000 and 0, and 99 999 was never a reachable value for a per-frame column count. */
-            snprintf(ovbuf, sizeof ovbuf, "SEGn%u dd%u/%u/%u c%u f%u k%u lk%u              ",
+            /* `ov` ADDED 2026-08-26, and it sits WITH `dd` on purpose: both name work the frame
+               pays outside the game, and this row's own law (see ATLAS) is that the field being
+               read today goes where the 40-cell cut cannot reach -- `lk`'s tail is what gives.
+               `ov` = what rp_p3_prof_show costs, frame-summed tenths-ms.  788 lines, ~36 divides,
+               ONCE PER VIEW, and only two of its blocks are overlay-gated: the rest runs in the
+               fps-only and overlay-off builds too.  If it is small, the function stays as it is.
+               If it is not, the fix is per-block gating -- never a blanket early return, because
+               the LOD governor takes its `p10` from inside it. */
+            /* `pl<pct>` = how much of row-4 `em` is the PLOT loop, i.e. the share of the VDP1
+               kick a second SH-2 could take (the decision loop allocates and cannot move).  A
+               PERCENT on purpose: it costs 4 cells where tenths-ms would cost 7, and `em` is one
+               row away, so `em` x `pl` is the millisecond answer.  It sits early for the same
+               reason `ov` does -- this row pads to 40 and then cuts, and `lk`'s tail is what gives. */
+            snprintf(ovbuf, sizeof ovbuf, "SEGn%u dd%u/%u/%u ov%u.%u pl%u c%u f%u k%u lk%u              ",
                      (unsigned)(sat_local_players < 1 ? 1 : (sat_local_players > 4 ? 4 : sat_local_players)),
                      sat_dd_st10 > 999u ? 999u : sat_dd_st10,
                      sat_dd_hu10 > 999u ? 999u : sat_dd_hu10,
                      sat_dd_ot10 > 999u ? 999u : sat_dd_ot10,
+                     (sat_prof_show10 > 999u ? 999u : sat_prof_show10) / 10u,
+                     (sat_prof_show10 > 999u ? 999u : sat_prof_show10) % 10u,
+                     (sat_p_emit10 ? (sat_p_plot10 * 100u / sat_p_emit10) : 0u) > 100u
+                         ? 100u : (sat_p_emit10 ? (sat_p_plot10 * 100u / sat_p_emit10) : 0u),
                      sat_seg_cols_f > 9999u ? 9999u : sat_seg_cols_f,
                      sat_seg_fill_f > 9999u ? 9999u : sat_seg_fill_f,
                      sat_seg_px_f / 1000u > 9999u ? 9999u : sat_seg_px_f / 1000u,
@@ -2864,6 +2929,9 @@ static void fps_update(void)
             /* `cs` CUT 2026-08-26 with the settled-toggle sweep: sat_clear_slave is baked ON
                (HW-validated -2..-3 ms of `dg` on 2026-07-09, never contested since), so the field
                could only ever print `cs1`.  Same disease as `ns`/`ms`/`pm` before it. */
+            /* (`K` lived here for ONE afternoon -- added with the late-kick A/B and cut with its
+               verdict the same day.  That is the intended lifetime of a field on this row: a knob
+               under test carries a cell, a settled one carries none.) */
             snprintf(ovbuf, sizeof ovbuf, "M%d %s SQ:%c%c%c%c lr%d/o%d f%d w%d",
                      sat_m, sat_m_name[sat_m],
                      sqch[sqw & 3], sqch[sqf & 3], sqch[sqc & 3], sqch[sqs & 3],
@@ -3015,7 +3083,11 @@ static void fps_update(void)
                at the documented default 1, so only the dwell is left), `Wg` goes entirely
                (sat_wall_grow baked 2) and `F<sky><rpt>` goes with sky_mode=1 / rbg0_rpt_late=2.
                Eight cells back on a 40-cell row -- baking a knob is never only about the branch. */
-            snprintf(ovbuf, sizeof ovbuf, "LOS C%c En%d P%d N%d/%d/%d L%d%c/%d ",
+            /* `F<min>+<pct>%` ADDED 2026-08-26 -- see the note at sat_fn_hist.  It is the ONLY
+               field that can show a lever worth 1-3 ms on a frame that already sits on a field
+               boundary: those milliseconds do not become fps, they become the difference between
+               a frame that always fits and one that falls off the line nine times a second. */
+            snprintf(ovbuf, sizeof ovbuf, "LOS C%c En%d P%d N%d/%d/%d L%d%c/%d F%d+%d%% ",
                      sat_wall_clamp ? '+' : '-',
                      sat_wall_dwell, sat_wall_paint,
                      (sat_wall_nodraw > 999 ? 999 : sat_wall_nodraw),
@@ -3023,7 +3095,8 @@ static void fps_update(void)
                      (sat_wall_flip   > 999 ? 999 : sat_wall_flip),
                      sat_wall_lead_x,
                      sat_lead_span_drop ? '!' : "-sf"[sat_lead_mode % 3],
-                     (sat_lead_cols > 9999 ? 9999 : sat_lead_cols));
+                     (sat_lead_cols > 9999 ? 9999 : sat_lead_cols),
+                     sat_fn_min, sat_fn_pct > 99 ? 99 : sat_fn_pct);
             sat_wall_nodraw = 0; vdp1_wall_drop = 0; sat_wall_flip = 0; sat_lead_cols = 0; sat_lead_span_drop = 0; }
             /* row 13: was row 5, but r_parallel's SLVidle ('SLV') p3 row ALSO writes row 5 in
                the shipping (rp_disabled) config -> they collided.  Moved to the free row 13. */
@@ -7586,6 +7659,7 @@ static void vdp1_walls_flush(void)
        nothing behind a near wall -> no bleed).  So the two concerns are now separated: fill
        budget = overrun/famine protection (far walls -> CPU), emit order = painter correctness
        (far last... i.e. near last).  wall_acc is filled near-first by the BSP, so reverse it. */
+    unsigned short pl0 = frt_read();   /* row 14 `pl` -- see the note at sat_p_plot10 */
     for (int i = wall_acc_n - 1; i >= 0; --i)
     {
         /* DROP COUNT (2026-08-03).  The core is committed by now: it handed this wall to VDP1 and
@@ -7605,7 +7679,11 @@ static void vdp1_walls_flush(void)
         if (emitted && vdp1_wnext == wn0 && vdp1_wall_drop < 9999) vdp1_wall_drop++;
     }
 
-    sat_p_emit10 = (unsigned short)(frt_read() - em0) * 10u / 224u;   /* row 20 `f` */
+    {
+        unsigned short now = frt_read();
+        sat_p_plot10 = (unsigned short)(now - pl0) * 10u / 224u;      /* row 14 `pl` (deportable) */
+        sat_p_emit10 = (unsigned short)(now - em0) * 10u / 224u;      /* row 4  `em` (whole loop) */
+    }
     wall_acc_n = 0;
     wall_px_acc = 0;   /* re-arm the per-frame overflow guard */
 }
@@ -9791,6 +9869,19 @@ extern "C" void DG_DrawFrame(void)
        there; without a grant the last level frame's walls would stay displayed).  It subsumes
        the parked field-lock fence (sat_field_fence): every frame is edge-locked by construction. */
     sat_mp_fence();
+    {   /* row 13 `F<min>+<pct>%` -- sample the fields THIS frame occupied, HERE at the fence's
+           CALL SITE.  The first version of this probe bumped its histogram inside sat_field_fence
+           and read a confident `F0+0%` on every capture, because that function has been DEAD CODE
+           since the manual present v2 subsumed it -- the note at sat_field_lock says exactly that,
+           three screens up, and I wired the probe to it anyway.  A probe attached to a function
+           nobody calls does not fail loudly; it reports zero and is believed.
+           d == 0 = a frame the fence returned from early (no kick pending: menu, intermission),
+           which occupied no field of its own and must not enter the histogram. */
+        static unsigned int fn_prev = 0;
+        unsigned int d = vbl_count - fn_prev;
+        if (fn_prev && d >= 1u) { sat_fn_hist[d < 8u ? d : 7u]++; sat_fn_cnt++; }
+        fn_prev = vbl_count;
+    }
 #if VDP2_CELL_SKY
     /* SKY MAP, deferred half (sky_mode >= 1).  HERE, at the top of the field the blit is about to
        paint: the map is VRAM and VDP2 reads it during display, so writing it any earlier would show
@@ -10257,7 +10348,12 @@ static void poll_pad(void)
         /* (Pad R+Z RESIDENT-FLAT-POOL A/B REMOVED 2026-08-26 -- sat_flatcache_on baked ON.
            The slab was CARVED in both states, so "off" only ever meant paying for memory and
            then refusing to read it; the treadmill it answers was measured and closed on
-           2026-08-06.  Row-19 `A<+/->` went with it.  R+Z is free.) */
+           2026-08-06.  Row-19 `A<+/->` went with it.  R+Z was free -- and is taken again below,
+           the same afternoon, by the lever the freed chords existed to make room for.) */
+        /* (Pad R+Z LATE-KICK A/B REMOVED 2026-08-26, hours after it was added and by its own
+           result: 16.0 -> 19.9 fps, MST 62 -> 50, on the same 1p spot.  The kick is now always
+           run after the plane dispatch -- derivation at sat_kick_pending, core/r_main.c.  R+Z is
+           free again.) */
         /* (Z ALONE REMOVED 2026-08-26.  It cycled sat_m_cycle, which has held exactly ONE entry
            -- {M7_LOWRES} -- since M0/M5 were parked: the "cycle" re-selected the mode it was already
            on and called sat_apply_mode() to rewrite identical values.  A no-op wearing a button.

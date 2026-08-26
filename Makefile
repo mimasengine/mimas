@@ -253,8 +253,27 @@ PYTHON  ?= python
 DRP_WAD  = $(ASSETS_DIR)/DOOM1.WAD
 DRP_OUT  = $(ASSETS_DIR)/DOOMRP.DRP
 
-.PHONY: repack
+# 🔴 SATURN 2026-08-25 -- ROT_LEVEL, and the stamp that makes changing it actually rebuild.
+#   TWO defects, and fixing only the first leaves the fix INERT on the very path it was written
+#   for.  (1) This recipe passed no --rot-level while tools/repack_wad.py defaults to 8, so
+#   `make repack` on TNT or Plutonia emitted all-L8 blobs -- and the four maps that cannot fit
+#   the 4 MB cart at L8 (TNT MAP20/21/31/32, verified by parsing the shipped DOOMRP.DRP) then
+#   lose cart staging AND CDDA, silently.  build.ps1 has always defaulted to `auto`; only the
+#   make path was wrong.  (2) The rule's prerequisites are repack_wad.py / the WAD / info.c, so
+#   editing the FLAG would not have invalidated an existing DOOMRP.DRP: the stamp below carries
+#   the level's VALUE as a file, is rewritten only when it changes, and is a prerequisite -- so
+#   a level change is a real rebuild and an unchanged level is still a no-op.
+#   ⚠ A stale DRP fails SILENTLY and costs ~4 min to discover ([[drp-repack-must-be-rebuilt]]).
+ROT_LEVEL ?= auto
+DRP_STAMP  = $(ASSETS_DIR)/.rotlevel
+
+.PHONY: repack $(DRP_STAMP)
 repack: $(DRP_OUT)
 
-$(DRP_OUT): tools/repack_wad.py $(DRP_WAD) core/info.c
-	$(PYTHON) tools/repack_wad.py $(DRP_WAD) core/info.c --emit=$(DRP_OUT)
+$(DRP_STAMP):
+	@mkdir -p $(ASSETS_DIR); \
+	 if [ "$$(cat $@ 2>/dev/null)" != "$(ROT_LEVEL)" ]; then \
+	   echo "$(ROT_LEVEL)" > $@; echo "rot-level -> $(ROT_LEVEL) (DRP will rebuild)"; fi
+
+$(DRP_OUT): tools/repack_wad.py $(DRP_WAD) core/info.c $(DRP_STAMP)
+	$(PYTHON) tools/repack_wad.py $(DRP_WAD) core/info.c --emit=$(DRP_OUT) --rot-level=$(ROT_LEVEL)

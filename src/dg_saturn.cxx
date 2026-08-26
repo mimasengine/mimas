@@ -62,7 +62,7 @@ extern "C" char *gamedescription;
    pad L+R 'wp').  Both are HW-CONFIRMED DEAD-ENDS (docs/RANK3_WALLPREP.md + REC_BENCHMARKS §C.2 H):
    the work-steal regresses at E1M1, and slave wall-prep is +5.8ms (cold cache the slave can't keep
    warm -- it's multiplexed across plane/masked).  Set to 0: the core implementations stay compiled
-   but DORMANT (sat_plane_steal / sat_wallprep_slave default 0 = static split + inline wall-prep, the
+   but DORMANT (sat_wallprep_slave default 0 = inline wall-prep, the   [sat_plane_steal: GHOST, removed 2026-08-26]
    known-good), the pad bindings + 'ws'/'wp' overlay are compiled out, and Y + L+R are free.  Flip to
    1 to revive the live A/B (the modes are kept "sous la main"). */
 #define SAT_DIAG_SLAVE_TOGGLES 0
@@ -114,7 +114,6 @@ extern "C" void RP_AuxWait(void);
    -- its ON state left the walls un-re-cleared (HW-confirmed) and the weapon-fill lever measured
    inert, so it was a glitch with no upside.  Still declared because core owns and reads it. */
 extern "C" int sat_wpn_soft;
-extern "C" int sat_thing_vdp1_fill, sat_thing_vdp1_kept, sat_thing_vdp1_spill;
 /* VDP1 isolation (pad L+Z, 1p): 0 all / 1 no-things / 2 flat-walls.  Applied by sat_apply_iso()
    (drives sat_things_hw + sat_iso_flat); re-applied at the end of sat_apply_mode so a mode cycle
    preserves it.  0 = no change (byte-identical to ship). */
@@ -181,10 +180,8 @@ extern "C" int  *texturewidthmask;   /* core r_data.c: width-1 per texture -- th
                                         way to learn the sky is 1024 wide, not the 256 it assumed */
 extern "C" int   sat_lowres;       /* core r_main.c: 1 = half-h-res (160) packed software render + VDP2 x2 NBG1 zoom (docs/LOWRES_RENDER_STUDY.md) */
 extern "C" void  R_SetLowRes(int); /* core r_main.c: set sat_lowres + setsizeneeded (recompute viewwidth next D_Display) */
-extern "C" int   sightcounts[2];   /* core p_sight.c: [0]=REJECT trivial-rejects, [1]=full BSP LOS walks */
-extern "C" int   sat_sight_cachehit;  /* core p_sight.c: temporal sight-cache hits (row 24 `hc`)      */
 extern "C" int   sat_floor_vq_cur, sat_floor_vq_peak;  /* VDP1-floor inc-0 estimate, shown on row 2 */
-extern "C" unsigned int sat_sky_px, sat_floor_px;  /* sky-vs-floor coverage classifier (row 13) */
+extern "C" unsigned int sat_sky_px;   /* sky coverage (sat_floor_px removed 2026-08-26: no reader) */
 extern "C" int sat_plane_vscale;      /* deported-plane VERTICAL decrochage fill scale (baked at 4; live pad knob cut 2026-07-07) */
 /* INERT since 2026-08-02: both of these only ever fed the deported-plane decrochage fill, which core
    reaches solely under `fclaim` (r_plane.c ~1531) -- and fclaim needs sat_floor_vdp1_hook, which no
@@ -215,10 +212,11 @@ extern "C" unsigned int doom_stack_free(void);  /* main.cxx: doom_stack virgin b
 extern "C" int   sat_tic_decim;             /* core p_tick.c: TIC-governor decimation rung (row 23 `dc`) */
 extern "C" int   dg_heap_size;              /* #4: newlib heap cap (bytes)                    */
 extern "C" int   dg_heap_fail;              /* #4: sbrk REFUSALS -- any non-zero = raise HEAP_SIZE */
-extern "C" int   z_block_count;             /* core z_zone.c: zone blocks walked by the last zone walk */
 extern "C" unsigned int sat_bp_zw;          /* core r_parallel.c: zone blocks walked on the PK-Bp frame */
 /* split-screen perf breakdown (ms per piece of the 2p render block) -- diagnose the slowdown */
 extern "C" unsigned int sat_spl_sw, sat_spl_v0, sat_spl_v1, sat_spl_v2, sat_spl_v3, sat_spl_kick;
+/* core d_main.c: D_Display OUTSIDE the per-view timers, per frame in tenths of a ms (row 14 `dd`). */
+extern "C" unsigned int sat_dd_st10, sat_dd_hu10, sat_dd_ot10;
 extern "C" unsigned int sat_spl_mmap;   /* core d_main.c: the 3p minimap, ms (row 17, 4th slot) */
 extern "C" int   sat_bsp_stage_used, sat_bsp_stage_want;  /* M5 BSP staging, row 1 st readout */
 extern "C" int   sat_bsp_stage_on;                 /* M5 staging live A/B state (pad R+C) */
@@ -746,11 +744,11 @@ extern "C" int sat_lpin_on, r_lpin_kb, r_lpin_yield;   /* PATCH-LUMP pin (2026-0
 extern "C" int r_lpin_evict;                           /* ...ring-full evictions, PER WINDOW           */
 extern "C" void R_LumpPinFlush(void);                  /* release the ring on the pad L+Left A/B       */
 extern "C" int sat_wall_lod_hits;                      /* core r_segs.c: size LOD, row 22 `Lo`        */
-extern "C" int sat_lod_mindist, sat_wall_lod_near;     /* core r_segs.c: LOD distance floor + rescues */
+extern "C" int sat_lod_mindist;     /* core r_segs.c: LOD distance floor */
 extern "C" int sat_lod_eff, sat_lod_auto_step, sat_gov_debt;   /* governor, row 21                    */
 extern "C" int sat_gov_axis, sat_gov_p_step, sat_gov_p_dirty;   /* multi-axis governor: which knob    */
-extern "C" int sat_gov_p_min, sat_gov_p_bites;   /* plane-rung ladder start / is the floor landing now */
-extern "C" int sat_thing_role_cull, sat_thing_cull_dist, sat_thing_role_cut;   /* role cull, row 21   */
+extern "C" int sat_gov_p_min;   /* plane-rung ladder start (sat_gov_p_bites removed 2026-08-26)     */
+extern "C" int sat_thing_role_cull, sat_thing_cull_dist;   /* role cull, row 21   */
 extern "C" void R_CompositeWindowReset (void);   /* one writer for both + the 16-slot distinct set     */
 /* SATURN RESIDENT FLAT POOL (core/r_flatcache.c) -- the fix for the "flat treadmill": before it,
    W_ReleaseLumpNum demoted every visible plane's flat to PU_CACHE after EVERY plane of EVERY frame,
@@ -762,7 +760,6 @@ extern "C" int sat_flatcache_on;       /* live A/B bypass (pad R+Z); slab stays 
 extern "C" int sat_flatcache_slots;    /* slots carved this level (0 = zone too tight -> pool-less)  */
 extern "C" int sat_flatcache_live;     /* slots currently holding a flat                             */
 extern "C" int sat_flatcache_load;     /* cumulative slot fills = the REAL flat disc reads           */
-extern "C" int sat_flatcache_evict;    /* cumulative LRU evictions                                   */
 extern "C" int sat_flatcache_full;     /* views where every slot was busy -> classic zone path       */
 /* SATURN: row-2 `P` split into its parts (core/r_parallel.c).  Row 20 `PSP`; k+n+d+j == `P`. */
 extern "C" unsigned int sat_p_kick10;  /* VDP1 wall kick + R_DrawPlayerSprites (weapon), tenths-ms  */
@@ -777,9 +774,9 @@ extern "C" int R_WallPotatoColorPeek(int tex);  /* core r_data.c: cached dominan
                                                    in through R_GetColumn -- see wall_emit_flat)    */
 #define SAT_WALL_FLAT_UNKNOWN 100      /* neutral palette index, same as the software path uses      */
 static unsigned int sat_p_emit10 = 0;  /* ...in the wall EMIT loop (flush minus the resolve pass)      */
-static unsigned int sat_p_thg10 = 0;   /* ...in the WORLD-THINGS emit (R_EmitWorldThingsVDP1)          */
 /* (sat_p_thgcd10 / _thgcdn -- the CD half of that bracket -- removed with the PSP row 2026-08-07,
-   after they proved c ~= e in 13/13 captures.  sat_p_thg10 is kept: it is the one live number.) */
+   after they proved c ~= e in 13/13 captures.  sat_p_thg10 went the same way on 2026-08-26 -- the
+   claim that it was "the one live number" was wrong: nothing read it either.) */
 /* Window MIN/MAX.  `P` is BIMODAL at a FIXED viewpoint -- the owner's six same-spot captures read
    P = 11.6 / 74.2 / 167.1 / 10.3 / 87.2 / 8.2 with Bw, Bp and M all constant -- so a single sample,
    which is all the once-per-second overlay block could give, is worthless here.  Track the extremes
@@ -959,7 +956,6 @@ extern "C" int sat_visplane_hash;
 /* core/r_parallel.c visplane-split A/B (0 = static half-split [default, good], 1 = two-pointer
    work-steal); pad Y toggles it live -> read row-3 'w' (master wait at the barrier) + 'P' + fps.
    Row 1 shows ws<state>; the profiler window auto-resets on the flip. */
-extern "C" int sat_plane_steal;
 /* core/r_plane.c: RBG0 mark-suppress -- keep the never-drawn dominant floor as ONE visplane
    (no R_CheckPlane split memsets).  Live A/B via pad L+B; window auto-resets on the flip.
    Read Bp (row 2/4) + vp (row 11 LIM) with it on vs off, same scene. */
@@ -1044,7 +1040,6 @@ static void sat_apply_mode(void)
         {
             int base = sq_floor < sq_ceil ? sq_floor : sq_ceil;
             sat_gov_p_min   = (gov_sq[1] > base) ? 1 : 2;
-            sat_gov_p_bites = (ef > sq_floor || ec > sq_ceil);
         }
         sat_potato_floors = (ef == SQ_FLAT);                     /* solid-colour software floors */
         sat_floor_ld      = (ef == SQ_LD);                       /* half-rate floor texel fetch */
@@ -1158,7 +1153,6 @@ extern "C" void sat_view_sq_apply(int v)
        through the governor's max(), so the plane rung does not land on a split view at ANY rung.
        Say so, instead of letting r_plane.c count actions the governor did not cause: with this
        at 0 the axis reads inert in split and GOV_ACTWAIT retires it there, which is the truth. */
-    sat_gov_p_bites = 0;
 }
 extern "C" void sat_view_sq_restore(void)
 {
@@ -1174,7 +1168,6 @@ extern "C" void sat_view_sq_restore(void)
        plane floor either (pre-existing: sat_apply_mode is what re-lands it, on the next
        sat_gov_p_dirty).  So 0 is the honest reading of the flags as they now stand, and it keeps
        r_plane.c from crediting the governor for a plane the owner degraded himself. */
-    sat_gov_p_bites = 0;
 }
 #define GS_LEVEL 0
 #define GS_INTERMISSION 1                   /* gamestate_t: WI owns the 200..223 band (meta line + grain-extended art) */
@@ -1923,7 +1916,6 @@ extern "C" int sat_opt;                  /* core r_segs.c: cumulative perf-lever
 extern "C" int sat_fov_half;             /* core r_main.c: fine-angle HALF-fov, 1024 = 90 deg (pad L+Y) */
 extern "C" void R_SetFovHalf(int half);  /* core r_main.c: the ONLY writer -- it also invalidates BOTH
                                             view-table caches, which a bare assignment would not. */
-static unsigned int dg_frame_count = 0;
 /* (the measured-budget / weapon-reserve / wall-LOD state that lived here moved ABOVE this #if on
    2026-08-19 -- it drives emission, not just the overlay.  vdp1_tx_total stays here: overlay-only.) */
 
@@ -1945,7 +1937,7 @@ static unsigned int mh_ms[MH_MS_BUCKETS];
 static unsigned int mh_things[MH_N_BUCKETS];
 static unsigned int mh_decl[MH_N_BUCKETS];
 static unsigned int mh_frames;
-static unsigned int mh_ms_mx, mh_things_mx, mh_decl_mx, mh_occ_sum;
+static unsigned int mh_ms_mx;   /* mh_things_mx / mh_decl_mx / mh_occ_sum REMOVED 2026-08-26: no reader */
 /* (mh_bake_sum / mh_emit_sum CUT 2026-08-09: two accumulators, two adds per frame and a divide per
    second, whose only consumer computed `sbpc` and then `(void)`-discarded it.  Row 15 `fb` answers
    the same question live.)
@@ -1959,7 +1951,7 @@ static void mh_reset(void)
     memset(mh_ms, 0, sizeof mh_ms);
     memset(mh_things, 0, sizeof mh_things);
     memset(mh_decl, 0, sizeof mh_decl);
-    mh_frames = mh_ms_mx = mh_things_mx = mh_decl_mx = mh_occ_sum = 0;
+    mh_frames = mh_ms_mx = 0;
 }
 static void mh_add(int ms, int things, int decl, int occ, int bake)
 {
@@ -1968,9 +1960,6 @@ static void mh_add(int ms, int things, int decl, int occ, int bake)
     b = things;            if (b < 0) b = 0; if (b >= MH_N_BUCKETS)  b = MH_N_BUCKETS-1;  mh_things[b]++;
     b = decl;              if (b < 0) b = 0; if (b >= MH_N_BUCKETS)  b = MH_N_BUCKETS-1;  mh_decl[b]++;
     if ((unsigned)ms     > mh_ms_mx)     mh_ms_mx     = (unsigned)ms;
-    if ((unsigned)things > mh_things_mx) mh_things_mx = (unsigned)things;
-    if ((unsigned)decl   > mh_decl_mx)   mh_decl_mx   = (unsigned)decl;
-    mh_occ_sum  += (unsigned)occ;
     (void)bake;                      /* consumer cut 2026-08-09; param kept to spare the call sites */
     mh_frames++;
 }
@@ -2055,7 +2044,7 @@ static unsigned int sat_present_frt = 0;         /* VDP1 kick FRT ticks THIS fra
 extern "C" int sat_tic_ms, sat_snd_ms;           /* core d_main.c: game-tic / sound ms this tick   */
 extern "C" int sat_dbg_overlay_mode;             /* 0 full / 1 fps-only / 2 off (core r_parallel.c) */
 extern "C" int sat_prof_planepix;                /* arm the RP_PlanePixels floor sizer (core; def 0; pad L+B) */
-extern "C" int sat_plane_quad_n, sat_plane_quad_pct;   /* core r_parallel.c: straight silhouette runs
+extern "C" int sat_plane_quad_n;   /* core r_parallel.c: straight silhouette runs
                                                           this frame + their % of plane pixels (row 8
                                                           `Q`, resident probe) */
 extern "C" int sat_plane_q4cmd, sat_plane_q4pct;       /* top-4 runs: real banded+tiled VDP1 command
@@ -2136,13 +2125,11 @@ static unsigned int skyup_frame;      /* this frame's share, subtracted out of `
    when the config under test changes.  Defined unconditionally in r_parallel.c so they
    link with RP_PROF off (then 0). */
 extern "C" int sat_prof_rec_max;                                 /* window max (= p100), tenths-ms */
-extern "C" int sat_prof_pk_bw, sat_prof_pk_bp, sat_prof_pk_p, sat_prof_pk_m;  /* per-phase peaks */
 extern "C" int sat_prof_bp_win;   /* peak Bp of the CURRENT 1 s window -- what row 20's split describes */
 extern "C" int sat_prof_mx_map, sat_prof_mx_x, sat_prof_mx_y, sat_prof_mx_ang, sat_prof_mx_t;
 /* worst-REC frame FULL detail, snapshotted at each new peak (row 14) -- phase split + slave b/Pb */
 extern "C" int sat_prof_mx_bw, sat_prof_mx_bp, sat_prof_mx_p, sat_prof_mx_m, sat_prof_mx_b, sat_prof_mx_pb;
 extern "C" int sat_prof_dom_pct, sat_prof_plane_n;               /* RBG0-floor sizer */
-extern "C" int sat_prof_ss_n, sat_prof_ss_q, sat_prof_ss_qpk, sat_prof_ss_q4pct;  /* pari A sizing */
 extern "C" int sat_prof_dropped;                                 /* glitch frames excluded from the window */
 extern "C" int RP_ProfPercentile(int pct);                       /* windowed REC percentile, tenths-ms */
 extern "C" void RP_ProfReset(void);
@@ -2154,10 +2141,7 @@ extern "C" int gamemap;   /* core doomstat: drives the per-map window reset */
    (the Phase-1 world-anchored VDP1 clamp target); mag = face-on magnified residue; starve =
    VDP1 bank full (Phase-1 worsens); px = clampable fill-work proxy (span*cols = the master
    software cost Phase-1 removes).  A big clamp/px => build the clamp; mostly mag/starve => reconsider. */
-extern "C" int sat_fb_clamp_t, sat_fb_mag_t, sat_fb_starve_t, sat_fb_px;
-extern "C" int sat_fb_edge_t;     /* L5: tiers saved by the CPU-borders/VDP1-core near-wall split */
-extern "C" int sat_fb_edge_w;     /* L5: tiers that ASKED for the split (the denominator)          */
-extern "C" int sat_fb_edge_b[4];  /* L5 bail causes: lateral / magnitude / too-thin / refused      */
+extern "C" int sat_fb_mag_t, sat_fb_starve_t;   /* the two that still print (row 8 via fb_pk_*) */
 /* The L5 RATE instrumentation (row-8 `e<r>/<r> m<r> b<L><M><T><R>`) is REMOVED -- it delivered its
    verdict and the pool needed the bytes back for the wall-lag band.  What it established, so nobody
    rebuilds it: over ~5700 frames the split was REQUESTED 0.1x per frame and taken ~0 times, and the
@@ -2255,10 +2239,9 @@ extern "C" int sat_lead_cols;      /* core r_segs.c: extra software column-spans
    residual.  Flat/untextured quads (wall_emit_flat) keep their own grow -- no texels to shift. */
 static int sat_wall_grow = 2;
 
-extern "C" int sat_fb_wclamp_t;   /* Phase-1: tiers KEPT on VDP1 by the cut+wedge clamp */
-static int fb_cur_clamp = 0, fb_cur_mag = 0, fb_cur_px = 0;             /* last rendered frame */
-static int fb_cur_wclamp = 0;
-static int fb_pk_clamp  = 0, fb_pk_mag  = 0, fb_pk_starve = 0, fb_pk_px = 0;  /* windowed peaks (reset on config change) */
+/* The fb_cur_* snapshots and the fb_pk_clamp / fb_pk_px peaks were REMOVED 2026-08-26: every one
+   of them was assigned once a frame and read by nothing.  Only these two are printed. */
+static int fb_pk_mag = 0, fb_pk_starve = 0;   /* windowed peaks (reset on config change) */
 
 /* SATURN PERF (2026-06-24): one-shot memory-latency calibration.  The memory-bound
    ceiling is the root cause of REC cost but is unmeasurable directly (no SH7604 PMU),
@@ -2339,7 +2322,7 @@ static void fps_update(void)
             static int l_lx=-1, l_lm=-1;   /* lead-fill chord (pad R+Right): depth + mode */
             static int l_lp=-1;            /* PATCH-LUMP pin (pad L+Left) -- see below */
 #if SAT_DIAG_SLAVE_TOGGLES
-            static int l_steal=-1, l_wp=-1;
+            static int l_wp=-1;
 #endif
             if (gamemap != l_map || sat_m != l_m || (sq_wall<<6|sq_sprite<<4|sq_floor<<2|sq_ceil) != l_sq || blit_mode != l_blit
                 || sat_mark_suppress != l_ms
@@ -2369,17 +2352,17 @@ static void fps_update(void)
                                                versa), so the one measurement the hardware run exists
                                                to make would have read the wrong side of its own A/B. */
 #if SAT_DIAG_SLAVE_TOGGLES
-                || sat_plane_steal != l_steal || sat_wallprep_slave != l_wp
+                || sat_wallprep_slave != l_wp
 #endif
                ) {
                 RP_ProfReset();
-                fb_pk_clamp = fb_pk_mag = fb_pk_starve = fb_pk_px = 0;   /* Phase-0: clean fallback A/B window */
+                fb_pk_mag = fb_pk_starve = 0;   /* Phase-0: clean fallback A/B window */
                 blit10_sum = blit10_cnt = 0;   /* row-1 'b' precise window: fresh sample on the L+A toggle */
                 l_map=gamemap; l_m=sat_m; l_sq=(sq_wall<<6|sq_sprite<<4|sq_floor<<2|sq_ceil); l_blit=blit_mode; l_ms=sat_mark_suppress;
                 l_cls=sat_clear_slave; l_ns=sat_near_sprites; l_opt=sat_opt; l_wen=sat_wall_entry; l_wb=sat_wall_grow;
                 l_lx=sat_wall_lead_x; l_lm=sat_lead_mode; l_lp=sat_lpin_on;
 #if SAT_DIAG_SLAVE_TOGGLES
-                l_steal=sat_plane_steal; l_wp=sat_wallprep_slave;
+                l_wp=sat_wallprep_slave;
 #endif
             }
         }
@@ -2820,10 +2803,23 @@ static void fps_update(void)
                carries `hd`/`tl` beside it.
                ⚠ `lk` is NOT a subset of `k`: SAT_LEAD_EMIT counts on both the master and the
                slave-list path, SAT_PROF_FILL only on the master one, so `lk > k` is legal. */
-            snprintf(ovbuf, sizeof ovbuf, "SEGn%u c%u f%u k%u lk%u                      ",
+            /* 🔴 `dd` ADDED 2026-08-26 -- D_Display outside the views: st/hu/ot in TENTHS of a
+               ms per frame (see core/d_main.c).  It answers the one term nothing measured: R minus
+               the sum of the per-view times (row-17 `=`) minus the VDP1 kick (row-17 `k`) left ~9 ms
+               unexplained in 4p, and this row now says WHERE.  st = the ST_Drawer/I_UpdateNoBlit
+               preamble, hu = HU_Drawer, ot = M_Drawer/NetUpdate/border/misc.
+               PLACED SECOND, immediately after the label, deliberately: this row pads to 40 and then
+               CUTS, and the worst-case widths of c/f/k/lk can push past 40 -- so the field being read
+               today sits where the cut can never reach it, and it is `lk`'s tail that would go
+               ([[debug-overlay-line-width]]).  `c` and `f` also drop from a 5-digit clamp to 4: they
+               read ~2 000 and 0, and 99 999 was never a reachable value for a per-frame column count. */
+            snprintf(ovbuf, sizeof ovbuf, "SEGn%u dd%u/%u/%u c%u f%u k%u lk%u              ",
                      (unsigned)(sat_local_players < 1 ? 1 : (sat_local_players > 4 ? 4 : sat_local_players)),
-                     sat_seg_cols_f > 99999u ? 99999u : sat_seg_cols_f,
-                     sat_seg_fill_f > 99999u ? 99999u : sat_seg_fill_f,
+                     sat_dd_st10 > 999u ? 999u : sat_dd_st10,
+                     sat_dd_hu10 > 999u ? 999u : sat_dd_hu10,
+                     sat_dd_ot10 > 999u ? 999u : sat_dd_ot10,
+                     sat_seg_cols_f > 9999u ? 9999u : sat_seg_cols_f,
+                     sat_seg_fill_f > 9999u ? 9999u : sat_seg_fill_f,
                      sat_seg_px_f / 1000u > 9999u ? 9999u : sat_seg_px_f / 1000u,
                      sat_lead_px_f / 1000u > 9999u ? 9999u : sat_lead_px_f / 1000u);
             ovbuf[40] = '\0';   /* pad, then cut -- frame sums are ~4x the old per-view values */
@@ -3173,7 +3169,6 @@ static void fps_update(void)
             int t_p50 = mh_pct(mh_things, MH_N_BUCKETS, 50);
             int t_p99 = mh_pct(mh_things, MH_N_BUCKETS, 99);
             int d_p99 = mh_pct(mh_decl, MH_N_BUCKETS, 99);
-            unsigned int occ10 = mh_frames ? (mh_occ_sum * 10u / mh_frames) : 0;
             /* ⚠ 2026-08-07: cutting this row to buy pool for the level-load probe made the pool go
                DOWN, 4.98 -> 4.80 KB (pre-flight FAIL).  The pool is `__heap_end - _end` and `_end`
                moves with SECTION LAYOUT, so it is NOT a monotone function of code size -- the same
@@ -3187,7 +3182,6 @@ static void fps_update(void)
                  b = thd_budget  (bank/queue full at emit time)
                  r = PASS-1 area-floor rejects (core)   g = PASS-1 grant rejects (core, = the
                      per-frame distinct-texture cap upstream of `l`) */
-            (void)occ10;
             /* `x` (2026-08-21) = SPLIT FLUSH DROPS this window -- sprites cut at the bank drain
                AFTER their software fill was skipped = drawn by NOBODY that frame.  This was the
                only decline path with no ventilated counter: the owner's 4p flicker read d5 with
@@ -3456,7 +3450,7 @@ static void fps_update(void)
                          sat_gov_lead_step, sat_gov_inert | (wspan_inert << 3), sat_wall_cpu_span);
                 if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 21, ovbuf);
                 /* the field's own row owns its reset ([[debug-overlay-legend]]) */
-                sat_wall_lod_near = 0; sat_thing_role_cut = 0; sat_seg_budget_cut = 0;
+                sat_seg_budget_cut = 0;
             }
             /* ROW 24 -- THE GAME TIC, BROKEN DOWN.  Row 1 `T` is 69-83 ms on HARDWARE (~40 % of a
                181-222 ms frame) against 8-14 ms for the same build on Ymir, and until now NOTHING
@@ -3612,9 +3606,8 @@ static void fps_update(void)
                 ovbuf[40] = '\0';
                 if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 24, ovbuf);
                 sat_tic_think_frt = 0; sat_tic_sight_frt = 0;
-                sat_tic_runs = 0; sat_tic_avail = 0; sat_tic_built = 0; sat_thing_masked_cut = 0;
+                sat_tic_runs = 0; sat_tic_avail = 0; sat_tic_built = 0;
                 sat_thk_sect_frt = 0;
-                sightcounts[0] = sightcounts[1] = 0; sat_sight_cachehit = 0;
             }
             r_composite_pf = 0;   /* own the reset HERE: row 18's R_CompositeWindowReset runs before
                                      this print, so clearing it there zeroed `pf` unseen */
@@ -8528,7 +8521,6 @@ static void vdp1_wpn_kick(void)
         unsigned int base_ca  = bank_off >> 3;
         unsigned int end_ca   = (bank_off + (unsigned int)vdp1_last_cmds * 32u) >> 3;
         vdp1_lopr  = VDP1_LOPR;
-        vdp1_copr  = VDP1_COPR;
         vdp1_endca = (unsigned short)end_ca;
         {   /* LP = how far LOPR got through the W bank.  BOTH "completed" directions read 100:
                - LOPR ABOVE end  (in the F/floor bank ~0xF800): got>span -> clamp to span -> 100.
@@ -8634,17 +8626,10 @@ static void vdp1_wpn_kick(void)
 #if SHOW_FPS
     /* Phase-0 fallback profiler: snapshot the just-rendered frame's tally into cur + windowed peaks
        (r_segs.c accumulated the counters across this frame's segs), then reset below. */
-    fb_cur_clamp = sat_fb_clamp_t; fb_cur_mag = sat_fb_mag_t; fb_cur_px = sat_fb_px;
-    fb_cur_wclamp = sat_fb_wclamp_t;
-    if (sat_fb_clamp_t  > fb_pk_clamp)  fb_pk_clamp  = sat_fb_clamp_t;
     if (sat_fb_mag_t    > fb_pk_mag)    fb_pk_mag    = sat_fb_mag_t;
     if (sat_fb_starve_t > fb_pk_starve) fb_pk_starve = sat_fb_starve_t;
-    if (sat_fb_px       > fb_pk_px)     fb_pk_px     = sat_fb_px;
-    sat_fb_edge_t = 0; sat_fb_edge_w = 0;
-    sat_fb_edge_b[0] = sat_fb_edge_b[1] = sat_fb_edge_b[2] = sat_fb_edge_b[3] = 0;
 #endif
-    sat_fb_clamp_t = sat_fb_mag_t = sat_fb_starve_t = sat_fb_px = 0;   /* reset each frame (also when SHOW_FPS off) */
-    sat_fb_wclamp_t = 0;
+    sat_fb_mag_t = sat_fb_starve_t = 0;   /* reset each frame (also when SHOW_FPS off) */
     /* Advance the per-seg visit tag ONE step per rendered frame, HERE and nowhere else: the kick is
        past this frame's BSP walk and before the next one, and it is per FRAME, not per split VIEW
        (the views drain into the shared bank above).  A per-view counter -- framecount is one -- would
@@ -9051,10 +9036,10 @@ extern "C" void sat_walls_kick(void)
            commands, `n` = how many.  w_cd_ms10 (core w_wad.c) is updated SYNCHRONOUSLY inside
            sat_cd_load_raw, so the delta is exactly this call's disc time -- which is also why the
            load budget can spend that same clock per frame (core r_segs.c R_LoadBudgetLeft). */
-        { unsigned short g0 = frt_read();
+        /* (the FRT bracket that used to wrap this -- sat_p_thg10 -- was REMOVED 2026-08-26: two
+           register reads per view for a number whose row went away.) */
         if (sat_split_active) vdp1_things_flush();
         else                  R_EmitWorldThingsVDP1();
-        sat_p_thg10 = (unsigned short)(frt_read() - g0) * 10u / 224u; }
 #endif
 #if SAT_WPN_VDP1
         sat_emit_weapon();          /* LAST world command -- above the walls AND above the monsters */
@@ -9557,7 +9542,6 @@ extern "C" void DG_DrawFrame(void)
     }
 
 #if SHOW_FPS
-    dg_frame_count++;
     fps_update();
 #endif
 

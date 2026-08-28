@@ -1969,6 +1969,28 @@ static unsigned int mh_things[MH_N_BUCKETS];
 static unsigned int mh_decl[MH_N_BUCKETS];
 static unsigned int mh_frames;
 static unsigned int mh_ms_mx;   /* mh_things_mx / mh_decl_mx / mh_occ_sum REMOVED 2026-08-26: no reader */
+/* [!] SATURN 2026-08-28 -- `mx` IS NOW THE WORST FRAME OF THE LAST ~1 s, NOT OF THE RUN, AND THE
+   HISTOGRAM DECAYS.  Both halves of row 9-10 were describing the WHOLE SESSION SINCE BOOT: mh_reset
+   fires only on a mode/SQ change, i.e. essentially never, so `mx` was pinned at the LEVEL-LOAD spike
+   (mx6601 in all 23 captures of the 08-28 TNT pass, mx11934 on console) and the percentiles carried
+   every frame ever rendered, load frames included.  That is why widening the buckets 8 -> 16 ms the
+   same morning did NOT unpin p99: with a 6.6 s load frame and hundreds of slow frames permanently in
+   the tail, ANY top bucket is reached by 1 % of a run-long sample -- p99 read 624 (the new ceiling)
+   in 22 of 23 captures exactly as it had read 312 (the old one) before.  The bucket width was never
+   the bug; THE WINDOW WAS.
+   Two cadences, because the two statistics want different ones:
+     `mx`  rolls on ~1 s of accumulated FRAME TIME (self-timed from the samples, no external hook) --
+           short enough to answer "did the last second stutter", which is the actual complaint;
+     the histograms HALVE every MH_DECAY_N samples instead of clearing, so the window is an
+           exponential ~256-frame one with no cold start and no percentile hole after a fold.
+   mh_pct now sums the array it is handed instead of trusting mh_frames: halving rounds each bucket
+   down independently, so the three histograms stop having a common total, and a denominator larger
+   than the real sample count makes the p99 loop fall off the end and return the LAST BUCKET -- the
+   exact false saturation this change exists to remove. */
+#define MH_DECAY_N     256u
+#define MH_MX_WIN_MS   1000u
+static unsigned int mh_ms_mx_cur;   /* worst of the window being filled */
+static unsigned int mh_mx_acc_ms;   /* frame time accumulated into that window */
 /* (mh_bake_sum / mh_emit_sum CUT 2026-08-09: two accumulators, two adds per frame and a divide per
    second, whose only consumer computed `sbpc` and then `(void)`-discarded it.  Row 15 `fb` answers
    the same question live.)
@@ -1982,7 +2004,7 @@ static void mh_reset(void)
     memset(mh_ms, 0, sizeof mh_ms);
     memset(mh_things, 0, sizeof mh_things);
     memset(mh_decl, 0, sizeof mh_decl);
-    mh_frames = mh_ms_mx = 0;
+    mh_frames = mh_ms_mx = mh_ms_mx_cur = mh_mx_acc_ms = 0;
 }
 static void mh_add(int ms, int things, int decl, int occ, int bake)
 {
@@ -1990,17 +2012,34 @@ static void mh_add(int ms, int things, int decl, int occ, int bake)
     b = ms >> MH_MS_SHIFT; if (b < 0) b = 0; if (b >= MH_MS_BUCKETS) b = MH_MS_BUCKETS-1; mh_ms[b]++;
     b = things;            if (b < 0) b = 0; if (b >= MH_N_BUCKETS)  b = MH_N_BUCKETS-1;  mh_things[b]++;
     b = decl;              if (b < 0) b = 0; if (b >= MH_N_BUCKETS)  b = MH_N_BUCKETS-1;  mh_decl[b]++;
-    if ((unsigned)ms     > mh_ms_mx)     mh_ms_mx     = (unsigned)ms;
+    if ((unsigned)ms > mh_ms_mx_cur) mh_ms_mx_cur = (unsigned)ms;
+    mh_mx_acc_ms += (unsigned)ms;
+    if (mh_mx_acc_ms >= MH_MX_WIN_MS)       /* a single 6.6 s load frame rolls immediately: it is */
+    {                                       /* reported once, then it is gone, which is correct */
+        mh_ms_mx = mh_ms_mx_cur;
+        mh_ms_mx_cur = 0;
+        mh_mx_acc_ms = 0;
+    }
     (void)bake;                      /* consumer cut 2026-08-09; param kept to spare the call sites */
-    mh_frames++;
+    if (++mh_frames >= MH_DECAY_N)   /* halve, do not clear: no cold start, no percentile hole */
+    {
+        for (b = 0; b < MH_MS_BUCKETS; b++) mh_ms[b]     >>= 1;
+        for (b = 0; b < MH_N_BUCKETS;  b++) mh_things[b] >>= 1;
+        for (b = 0; b < MH_N_BUCKETS;  b++) mh_decl[b]   >>= 1;
+        mh_frames >>= 1;
+    }
 }
-/* percentile p(0..100): first bucket whose cumulative count reaches p% of mh_frames.  For the ms
-   histogram the caller shifts the returned bucket back to ms (<<MH_MS_SHIFT = the lower edge). */
+/* percentile p(0..100): first bucket whose cumulative count reaches p% of THIS ARRAY's own total.
+   For the ms histogram the caller shifts the returned bucket back to ms (<<MH_MS_SHIFT = the lower
+   edge).  ⚠ It sums `h` rather than reading mh_frames on purpose -- see the decay note above: after a
+   halving the three arrays no longer share a total, and a denominator bigger than the samples makes
+   the loop run off the end and return the last bucket, i.e. a fake saturation. */
 static int mh_pct(const unsigned int *h, int nb, int p)
 {
-    unsigned int target, acc = 0; int b;
-    if (!mh_frames) return 0;
-    target = (mh_frames * (unsigned)p + 99u) / 100u;
+    unsigned int total = 0, target, acc = 0; int b;
+    for (b = 0; b < nb; b++) total += h[b];
+    if (!total) return 0;
+    target = (total * (unsigned)p + 99u) / 100u;
     for (b = 0; b < nb; b++) { acc += h[b]; if (acc >= target) return b; }
     return nb - 1;
 }

@@ -221,6 +221,114 @@ car l'élection se fait sur N-1 et s'applique en N → saut de scroll visible au
 
 ---
 
+## 5bis. Ciel HW sur PLUSIEURS vues — le plan multi-COUCHES (2026-08-28)
+
+> §5 ci-dessus ne traite qu'**une seule vue élue**, et c'est ce qui a shippé. La ligne
+> « Quad (3-4p) : restent 100 % software » du tableau §6 porte sur les **transforms RBG0**
+> (RPA/RPB = 2 max) — elle ne dit rien de l'idée d'utiliser **d'autres couches NBG**. Cette
+> section comble ce trou. Origine : proposition du propriétaire — garder le sol VDP2 en 2p mais
+> avoir **deux** ciels HW, puis en 3p lâcher le sol pour financer un troisième, et en 4p prendre
+> la couche debug NBG3 pour le quatrième (synchronisée sur le toggle overlay).
+
+### 5bis.a Le blocage, trouvé par la bonne question : « quid de la rotation ? »
+
+Le ciel HW en split n'est **pas** un simple défilement. Il est **mis à l'échelle** :
+
+```
+slZoomModeNbg0(ZOOM_HALF)                        dg_saturn.cxx:9342
+slScrScaleNbg0(0x0000A000, 0x00008000)  = 0,625 x 0,5     :9343
+```
+
+Or, Table 1.4 du manuel VDP2 (recopiée dans `../saturn-refs/knowledge/HW_VDP2.md`) :
+
+| couche | échelle | line scroll | bitmap |
+|---|---|---|---|
+| NBG0 / NBG1 | **1/4~256** | **oui** | oui |
+| NBG2 / NBG3 | **AUCUNE** | **non** | non |
+| RBG0 | **Any Ratio** (+ rotation) | — | 512x256 / 512x512 |
+
+**NBG2 et NBG3 ne savent pas se mettre à l'échelle.** Le plan naïf « NBG2 = 2e ciel, NBG3 = 3e »
+ne peut donc pas reproduire la géométrie que NBG0 utilise. Ce point dur ne se voit pas en lisant
+le code du ciel : il se voit dans la table des capacités des couches.
+
+### 5bis.b Ce qui survit — et c'est mieux que le plan naïf
+
+**1. NBG0 + LINE SCROLL = DEUX ciels sur UNE couche.** NBG0 a le défilement par ligne. En 4p les
+quadrants hauts occupent les lignes 0-111 et les bas 112-223 : un scroll par ligne donne donc
+**deux angles de vue différents sur la même couche**, sans rien ajouter. Fenêtré sur la moitié
+gauche, NBG0 sert **les deux quadrants gauches**. Le ciel HW passe de 1 vue à 2 **sans nouvelle
+couche, sans nouvelle window, avec le zoom déjà en place**.
+
+**2. RBG0 sait se mettre à l'échelle** (« Any Ratio ») et il est **déjà éteint en 3/4p**. C'est donc
+le candidat légitime pour une 3e vue — pas NBG2.
+
+**3. NBG2/NBG3 ne sont utilisables que via un JEU DE TUILES PRÉ-MIS À L'ÉCHELLE** : cuire une
+seconde copie du ciel à 0,625 x 0,5 dans ses propres cellules, et laisser la couche ne faire que
+du défilement H/V. Coût : VRAM cellules + une palette CRAM, et une conversion à chaque changement
+de ciel de niveau. Faisable, pas gratuit, et **à ne payer que si les deux premiers paliers ont
+prouvé leur valeur**.
+
+### 5bis.c Le compte des windows — 2 suffisent pour 4 quadrants
+
+Chaque couche choisit indépendamment W0 dedans/dehors, W1 dedans/dehors, et la logique ET/OU
+(WCTLA/B/C/D). Avec **W0 = moitié gauche** et **W1 = moitié haute** :
+
+| quadrant | prédicat |
+|---|---|
+| haut-gauche | dedans W0 ET dedans W1 |
+| haut-droit | **dehors** W0 ET dedans W1 |
+| bas-gauche | dedans W0 ET **dehors** W1 |
+| bas-droit | dehors W0 ET dehors W1 |
+
+Donc « 2 windows » n'est PAS la contrainte pour 4 quadrants — elle l'est pour « 4 quadrants
+**plus** le sol RBG0 », qui voudrait une 3e découpe. En 3/4p le sol est déjà éteint, le problème
+ne se pose pas. **En 2p il se pose** : deux bandes verticales pleine hauteur, et le line scroll ne
+sépare pas la gauche de la droite. Le 2e ciel 2p coûte donc une vraie couche, et RBG0 y porte le
+sol → **en 2p c'est sol HW XOR 2e ciel HW**, un arbitrage, pas un cumul.
+
+### 5bis.d Paliers, du moins cher au plus cher
+
+| palier | vues avec ciel HW | mécanisme | coût |
+|---|---|---|---|
+| **P1** | 4p : **2** (colonne gauche) | NBG0 + line scroll + W0 | aucune couche neuve, zoom déjà posé |
+| **P2** | 3/4p : **3** | + RBG0 (éteint en 3/4p, sait s'échelonner) | transform RBG0 à poser, W1 |
+| **P3** | 4p : **4** | + NBG3 avec tuiles pré-mises à l'échelle | cuisson tuiles + **plus d'overlay** |
+| **P2'** | 2p : **2** | RBG0 en 2e ciel | **perd le sol HW 2p** — arbitrage |
+
+⚠ **P3 et l'instrument sont exclusifs** : NBG3 porte l'overlay de debug. On mesure à 3 ciels avec
+l'overlay, on shippe à 4 sans. Toute photo « 4 ciels » est aveugle par construction.
+
+### 5bis.e Le prix, et comment le lire
+
+Déjà instrumenté : `sat_sky_frt_view[4]` → **ligne 12 `SKY e<élu> <v0> <v1> <v2> <v3> p<px>`**, coût
+SOFTWARE du ciel par vue en dixièmes de ms. La vue élue lit **0,0 par construction**, ce qui
+identifie l'élu sans faire confiance à `e`.
+
+⚠ **Cette ligne était INVISIBLE sur le disque de test jusqu'au 2026-08-28** : la tenancy de la
+ligne 12 se décidait par BUILD (disque CD → `CD`, cartouche ≥4 Mo → `SKY`), et la session console
+ne tourne que sur un `-Repack` CD. Corrigé : `SKY` gagne dès que `sat_local_players > 1`. Coût
+assumé : en co-op sur disque CD on perd `t`/`px`/`ob`/`gy`/`st`, dont le compteur de spans
+lead-fill périmés.
+
+**`v0+v1+v2+v3` moins la vue déjà élue EST le plafond du plan.** Aucune ligne de code ne doit
+s'écrire avant que ce nombre soit lu sur une photo.
+
+### 5bis.f À vérifier avant d'écrire du code
+
+1. **Les cycles VDP2 — c'est LE risque, et il s'appelle neige.** Chaque couche cell ajoute
+   pattern-name + character par banque, B0 est pris par le framebuffer, et « une banque mal
+   ordonnancée = neige » n'est pas un repli propre. Ne jamais hand-pin CYCB1 ; laisser
+   `slScrAutoDisp` allouer. Relire `docs/VDP2_LAYER_BUDGET.md` §2 avant chaque palier.
+2. **Line scroll + zoom composent-ils sur NBG0 ?** LSTA0 et ZMCTL sont des registres distincts,
+   mais la réduction ZMCTL a un coût de lecture char (x1/x2/x4) et **1/4 désactive NBG2+NBG3**.
+   À 0,625 on est sous x2 : à confirmer sur le manuel.
+3. **La loi de scroll du ciel est dérivée de la géométrie 90 degrés** ([[part5-hw-sky-split]],
+   round 4). Deux angles sur une couche = deux entrées de la même loi, pas une loi nouvelle.
+4. **Hystérésis** : l'élection existe déjà (`sat_sky_px_view`, `SKY_ELECT_HYST`). Passer de 1 élu à
+   2 élus, c'est un argmax à 2 places — même hystérésis, pas une politique nouvelle.
+
+---
+
 ## 6. Risques & contraintes
 
 | Risque | Détail | Mitigation |

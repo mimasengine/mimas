@@ -433,3 +433,99 @@ de la fraîcheur IA) ; relevé overlay tx/bk par mode (chiffre les ~300 Ko WTEX 
     un zf).
 12. **Tous les chiffres CD = ODE** (SD/Phoebe/SAROO) — le modèle de coût d'un vrai
     lecteur optique 2× (celui des consoles non modifiées) est inconnu.
+
+---
+
+## 10. Ordonnancement — les deux leviers ouverts (2026-08-28)
+
+Le kick tardif split a prouvé une chose que ce bilan n'avait pas modélisée : **la forme du frame
+est mobile, et déplacer du travail vaut plus que l'accélérer**. 2,25 ms de recouvrement CPU ont
+acheté 10,5 ms de frame, parce que les 8,25 ms restantes sont sorties de la **barrière de
+présentation**. Cette section chiffre les deux items qui restent sur cet axe.
+
+Forme du frame aujourd'hui (Ymir 4p TNT, K1) :
+
+```
+TryRunTics (T5) -> S_UpdateSounds (S0) -> D_Display
+                                          |- 4 vues            (= 78)
+                                          |- kick VDP1         (dans la vue 3 depuis K1)
+                                          |- sat_mp_fence      <- ATTENTE PURE
+                                          '- blit              (b 2,8)
+      MST 105,5   =   R 85,75   +   (MST - R) 19,75
+                                     '- tic + son + blit + dg, ET LA BARRIÈRE DEDANS
+```
+
+### 10.1 — Faire tourner le tic DANS l'attente de la barrière
+
+**Ce qui ne marche pas** : réordonner `TryRunTics` pour le mettre juste avant la barrière. La
+barrière arrondit le **total** au front de vblank suivant : déplacer 5 ms d'un côté à l'autre de
+l'attente ne change pas la somme. Un simple réordonnancement ne vaut rien ici.
+
+**Ce qui marche** : appeler le tic **depuis l'intérieur de la boucle d'attente**. Le spin se
+termine à un instant d'horloge fixe (le front de vblank) ; tout travail fait dedans est gratuit.
+Le tic ne touche aucun framebuffer — le picture N est déjà rendu — donc il est légal là.
+
+| | ms |
+|---|---|
+| plafond du gain | `min(T, attente)` = **jusqu'à 5 ms** sur 105 |
+| pourquoi ça peut valoir plus que 5 | 105 ms = 6,3 champs ; −5 ms = 100 ms = **6 champs pile** |
+| coût d'un dépassement | **16,7 ms** (un champ entier perdu) |
+
+**Le bord coupant, et il est le sujet** : un tic qui déborde le front coûte plus de trois fois ce
+que la manœuvre rapporte. Le garde doit donc être conservateur :
+- estimer le reste : un champ vaut 16,68 ms, `vbl_count` donne le dernier front, l'écoulé se lit
+  au FRT ⇒ reste ≈ 16,68 − écoulé ;
+- ne lancer le tic que si `reste > high-water des N derniers tics + marge` ;
+- **jamais sur `sat_tic_ms` de la dernière frame seule** : row-1 `T` a été vu à 44 ms sur une
+  capture (pic post-chargement), donc un estimateur à un échantillon ferait exactement l'erreur
+  qu'il est censé éviter.
+
+**Ordre** : après la validation console du kick tardif, pas avant — les deux agissent sur le même
+terme (`MST − R`) et se confondraient.
+
+### 10.2 — Déporter la boucle de PLOT VDP1 sur le slave
+
+**Ce verdict est un REVIREMENT et il faut dire pourquoi.** Le levier avait été classé mort en 4p
+au motif que « le kick vit en fin de frame, il n'y a rien à recouvrir ». Le kick tardif a supprimé
+ce motif : le kick tourne maintenant pendant la phase de plans de la vue 3, et dans cette fenêtre
+
+```
+slave  : plans de la vue 3            ~3,6 ms   puis OISIF
+master : émission VDP1               ~10,5 ms
+                                     ========
+                          ~7 ms de slave oisif DANS la fenêtre du kick
+```
+
+| | ms |
+|---|---|
+| boucle de plot (`em` 9,7 x `pl` 79 %) | 7,7 |
+| moitié déportée | −3,85 |
+| taxe bus B (occupation 15 % -> ~22 %, barème mesuré) | +0,7 |
+| **net** | **≈ +2,8** |
+
+Barème de la taxe, mesuré console et pas supposé (voir `sat_wallfill_min`, r_segs.c) : `pr` monte
+**29,8 → 30,3 → 32,7** quand l'occupation slave passe de **4 % → 11 % → 35 %**.
+
+**Structure** : la boucle de DÉCISION reste master pour toujours (elle alloue — `wall_tex_resolve`
+peut cuire une texture depuis le disque). La boucle de PLOT est une transformation **pure** de
+`wall_acc[]` en enregistrements de commande, et les slots sont **pré-réservés** ⇒ partition par
+plage d'indices, pas de liste partagée à verrouiller.
+
+### 10.3 — L'ordre entre les deux, et il n'est pas celui qu'on croit
+
+Question posée : « est-ce que 10.1 donne plus de marge à 10.2 ? » **Non — l'inverse.**
+
+10.2 réduit le travail CPU du master, donc la frame arrive plus tôt à la barrière ; tant que la
+barrière est du **temps mort**, cette avance s'amplifie en champs entiers (c'est exactement ce que
+le kick tardif a mesuré : 2,25 → 10,5). Mais 10.1 **remplit** ce temps mort avec le tic. Après
+10.1, arriver plus tôt ne fait plus que donner davantage de place au tic, et le gain de 10.2
+retombe à sa valeur nominale, ~2,8 ms.
+
+**10.1 d'abord quand même** : il est plus gros (jusqu'à 5 ms), il n'a ni contention de bus ni
+partition de liste, et il ne touche pas au chemin VDP1. Mais il faut savoir qu'il **encaisse** une
+partie de ce que 10.2 aurait rapporté, pas qu'il le prépare.
+
+⚠ **Comment juger les deux** : sur `MST` et `R`, qui sont des moyennes fenêtrées. Ni sur `Bp` (le
+plancher de bruit console y est de **1,1-1,4 ms**, mesuré sur deux paires de captures à
+configuration identique), ni sur `<n>ms` ligne 8 avant le correctif du 2026-08-28 (c'était un
+échantillon d'une seule frame).

@@ -174,6 +174,9 @@ extern "C" int   r_nopatch_col;    /* core r_data.c: textures with a patchless c
    counter next to a frame-scoped row is exactly how this defect got introduced in the first place. */
 extern "C" unsigned int sat_seg_cols_f, sat_seg_fill_f, sat_seg_px_f, sat_lead_px_f; /* row 14 `SEG` */
 extern "C" unsigned int sat_prof_show10;   /* row 14 `ov`: rp_p3_prof_show's own cost, frame sum */
+extern "C" int sat_kick_split;             /* row 7 `K`: in SPLIT, kick at the last view's plane dispatch */
+extern "C" unsigned short sat_wf_hist[4];  /* row 14 `wh`: candidate-height histogram */
+extern "C" int sat_fov_mode[5];            /* per-player-count FOV, fine-angle half (r_main.c) */
 extern "C" unsigned int sat_gc_st_f[4], sat_gc_sn_f[4];                              /* row 16 `GCS` */
 extern "C" unsigned int prof_wallprep, prof_segloop, prof_segrout;  /* core: the Bp split, FRT ticks */
 extern "C" unsigned char r_column_stub[256];
@@ -1791,7 +1794,18 @@ static volatile int vdp1_couple_nbg1     = 0;   /* brick B: defer the NBG1 blit 
 static int sat_mp_active       = 0;   /* FCM entered (first change pulse issued since boot) */
 static int sat_mp_pending      = 0;   /* a kick armed this frame; present due at the fence */
 static int sat_mp_wd           = 0;   /* cumulative timed-out plots (force-swapped, may tear) */
-static int sat_mp_wait_ms      = 0;   /* fence wait last frame, ms = the measured cap cost */
+/* [!] 2026-08-27 -- WINDOWED, WAS A SINGLE FRAME, AND THE OLD FORM MADE ME PUBLISH A WRONG CAUSE.
+   This is the align-to-vblank wait: the frame arrives at the fence at some phase inside the field
+   and blocks to the next IN edge, so ONE sample is very nearly uniform over 0..16,7 ms.  Printed on
+   a 1 Hz row it looks like a measurement and is a coin toss -- I read `16ms` on a K0 capture and
+   `3ms` on a K1 one and named the fence as the late kick's mechanism; the owner's next three K1
+   captures read 3, 18 and 4 on the same build at the same spot.  The conclusion happened to be
+   right (see the note at sat_kick_split, which derives it from MST and R -- both windowed means)
+   but the evidence I quoted for it was noise.  Mean it over the 1 s window, like every other ms
+   field on the overlay.  Same defect class as row-13 `F`'s denominator, found the same hour: a
+   probe whose sampling is not stated is a probe that will be over-read. */
+static unsigned int sat_mp_wait_sum = 0, sat_mp_wait_n = 0;
+static int sat_mp_wait_ms      = 0;   /* fence wait, MEAN over the 1 s window (ms) */
 static int sat_mp_gate_ms      = 0;   /* of which: COPR-gate spin = the plot outlived the frame
                                          (0 when the plot was done first).  THE live overrun
                                          signal for the emission budget (row 8 `g`). */
@@ -2214,6 +2228,9 @@ enum { sky_mode = 1 };   /* BAKED 2026-08-26: the shipped deferred-map boundary 
    Histogram over the 1 s window, then MIN + the percent above it.  `F3+0%` = every frame fits three
    fields, the frame is comfortably inside its budget.  `F3+9%` = the frame is SITTING ON THE LINE
    and nine per cent of it falls off -- which is judder you can see and no ms figure can show. */
+#define SAT_FN_MIN_N  24u   /* row 13 `F`: minimum samples before the spill rate is folded -- see
+                               the fold site.  A per-second window holds ~4 frames on a 4p console
+                               frame, and a proportion over 4 samples is not a measurement. */
 static unsigned char sat_fn_hist[8];
 static unsigned int  sat_fn_cnt   = 0;
 static int           sat_fn_min   = 0;   /* row 13 `F<min>` -- fields the typical frame occupies  */
@@ -2449,15 +2466,34 @@ static void fps_update(void)
            map's.  Zeroed here, outside the mode-0 gate, so the latch keeps following the game even
            while the rows are hidden (returning to mode 0 then shows a fresh sample, not a ghost). */
         sat_prof_bp_win = 0;
-        {   /* row 13 `F<min>+<pct>%` -- fold this window's field histogram.  Outside the mode-0
-               gate for the same reason rp_master_ms is: a window that keeps filling while the rows
-               are hidden would show a ghost on the way back. */
-            unsigned int tot = sat_fn_cnt, i, at_min = 0;
-            int mn = -1;
-            for (i = 0; i < 8u; ++i) if (sat_fn_hist[i]) { mn = (int)i; at_min = sat_fn_hist[i]; break; }
-            if (mn >= 0 && tot) { sat_fn_min = mn; sat_fn_pct = (int)((tot - at_min) * 100u / tot); }
-            for (i = 0; i < 8u; ++i) sat_fn_hist[i] = 0;
-            sat_fn_cnt = 0;
+        {   /* row 13 `F<min>+<pct>%` -- fold the field histogram.  Outside the mode-0 gate for the
+               same reason rp_master_ms is: a window that keeps filling while the rows are hidden
+               would show a ghost on the way back.
+               [!] FOLD ON A SAMPLE COUNT, NOT ON THE CLOCK -- owner, 2026-08-27: *"j'ai F6+30% mais
+               le pourcentage varie entre 20 et 60"*.  That is not instability in the machine, it is
+               MY DENOMINATOR.  The first version folded once per second, and a second holds one
+               frame per frame: ~9 of them in 4p Ymir, ~4 on console.  The standard deviation of a
+               proportion p over n samples is sqrt(p(1-p)/n), so at p=0,3 and n=9 it is +-15 POINTS --
+               a 20..60 swing is exactly what pure sampling noise looks like at that denominator, and
+               the probe was reporting noise with the confidence of a measurement.
+               A RATE probe must not have a denominator that collapses with the frame rate: fold on
+               >= SAT_FN_MIN_N samples instead, so the precision is the same in 1p at 20 fps and on a
+               4 fps console frame -- what changes is how long the window takes to close (~1,2 s in 1p,
+               ~3 s in 4p Ymir, ~6 s on console), which is the right thing to trade for a number that
+               means something.  At n=24 the residual is ~+-9 points: read a 10-point move as the
+               EDGE of significance, not as a result. */
+            /* row 8 `<n>ms` -- fold the fence wait over the same window (see sat_mp_wait_sum). */
+            sat_mp_wait_ms  = sat_mp_wait_n ? (int)(sat_mp_wait_sum / sat_mp_wait_n) : 0;
+            sat_mp_wait_sum = 0; sat_mp_wait_n = 0;
+            if (sat_fn_cnt >= SAT_FN_MIN_N)
+            {
+                unsigned int tot = sat_fn_cnt, i, at_min = 0;
+                int mn = -1;
+                for (i = 0; i < 8u; ++i) if (sat_fn_hist[i]) { mn = (int)i; at_min = sat_fn_hist[i]; break; }
+                if (mn >= 0 && tot) { sat_fn_min = mn; sat_fn_pct = (int)((tot - at_min) * 100u / tot); }
+                for (i = 0; i < 8u; ++i) sat_fn_hist[i] = 0;
+                sat_fn_cnt = 0;
+            }
         }
         if (sat_dbg_overlay_mode == 0)
         {
@@ -2869,19 +2905,53 @@ static void fps_update(void)
                PERCENT on purpose: it costs 4 cells where tenths-ms would cost 7, and `em` is one
                row away, so `em` x `pl` is the millisecond answer.  It sits early for the same
                reason `ov` does -- this row pads to 40 and then cuts, and `lk`'s tail is what gives. */
-            snprintf(ovbuf, sizeof ovbuf, "SEGn%u dd%u/%u/%u ov%u.%u pl%u c%u f%u k%u lk%u              ",
+            /* `ov` RETIRED 2026-08-28 to pay for `wh`, and it is retired BY ITS OWN ANSWER: it was
+               added to ask what rp_p3_prof_show costs, and it answered 1,1-1,2 ms of a 114 ms 4p
+               frame -- so the 788 lines stay exactly as they are.  A closed question does not keep
+               a cell.  `dd` was the other candidate and it SURVIVES deliberately: the console
+               residual subtraction (R - `=` - `k`) is still open and `dd` is what attributes its
+               remainder.
+               `wh<a><b><c><d>` = the candidate-height histogram in TENTHS, buckets <24 / [24,48) /
+               [48,96) / >=96 -- the wall-fill ladder's own rungs, so the digits read straight off
+               as "what each rung would select".  Dots = no candidates this frame, which is also
+               what rung 0 shows (it never arms the producer).  Derivation at sat_wf_hist,
+               core/r_segs.c. */
+            char whs[5];
+            {   unsigned int tot = (unsigned)sat_wf_hist[0] + (unsigned)sat_wf_hist[1]
+                                 + (unsigned)sat_wf_hist[2] + (unsigned)sat_wf_hist[3];
+                for (int wi = 0; wi < 4; ++wi)
+                {
+                    if (!tot) { whs[wi] = '.'; continue; }
+                    unsigned int t = ((unsigned)sat_wf_hist[wi] * 10u + tot / 2u) / tot;
+                    whs[wi] = (char)('0' + (t > 9u ? 9u : t));
+                }
+                whs[4] = 0;
+            }
+            /* [!] `k` CUT 2026-08-28, AND THE REASON IS THAT `lk` WAS SILENTLY LOSING ITS DIGITS.
+               This row pads to 40 and then cuts.  With `wh` in it the render reaches 42 cells, but
+               the check that matters is what the PREVIOUS builds were doing: at 41 cells the tail
+               already fell off, and every 4p capture of the last three days ends in a bare `lk`
+               with no number -- the offload meter, unreadable, in the mode the offload exists for.
+               Nobody noticed because a truncated field looks like a formatting quirk, not a lost
+               measurement ([[debug-overlay-line-width]]).
+               `k` is what pays: master-filled wall pixels in THOUSANDS, and it has read `k0` in
+               every capture ever taken, 1p through 4p -- the master's own fill is under a thousand
+               pixels a frame, so the field cannot move and cannot fall.  A field that is 0 in every
+               photograph is the same defect the settled-toggle sweep cut eight of.  Its question --
+               "does the master's fill drop when the slave takes columns?" -- is answered from the
+               other side by `lk` rising, which now has room to say so. */
+            snprintf(ovbuf, sizeof ovbuf, "SEGn%u dd%u/%u/%u wh%s pl%u c%u f%u lk%u              ",
                      (unsigned)(sat_local_players < 1 ? 1 : (sat_local_players > 4 ? 4 : sat_local_players)),
                      sat_dd_st10 > 999u ? 999u : sat_dd_st10,
                      sat_dd_hu10 > 999u ? 999u : sat_dd_hu10,
                      sat_dd_ot10 > 999u ? 999u : sat_dd_ot10,
-                     (sat_prof_show10 > 999u ? 999u : sat_prof_show10) / 10u,
-                     (sat_prof_show10 > 999u ? 999u : sat_prof_show10) % 10u,
+                     whs,
                      (sat_p_emit10 ? (sat_p_plot10 * 100u / sat_p_emit10) : 0u) > 100u
                          ? 100u : (sat_p_emit10 ? (sat_p_plot10 * 100u / sat_p_emit10) : 0u),
                      sat_seg_cols_f > 9999u ? 9999u : sat_seg_cols_f,
                      sat_seg_fill_f > 9999u ? 9999u : sat_seg_fill_f,
-                     sat_seg_px_f / 1000u > 9999u ? 9999u : sat_seg_px_f / 1000u,
                      sat_lead_px_f / 1000u > 9999u ? 9999u : sat_lead_px_f / 1000u);
+            sat_wf_hist[0] = sat_wf_hist[1] = sat_wf_hist[2] = sat_wf_hist[3] = 0;   /* frame sum */
             ovbuf[40] = '\0';   /* pad, then cut -- frame sums are ~4x the old per-view values */
             if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 14, ovbuf);
             /* row 7: ACTIVE A/B state -- so a photo is never read against the wrong config.  Kept
@@ -2929,15 +2999,17 @@ static void fps_update(void)
             /* `cs` CUT 2026-08-26 with the settled-toggle sweep: sat_clear_slave is baked ON
                (HW-validated -2..-3 ms of `dg` on 2026-07-09, never contested since), so the field
                could only ever print `cs1`.  Same disease as `ns`/`ms`/`pm` before it. */
-            /* (`K` lived here for ONE afternoon -- added with the late-kick A/B and cut with its
-               verdict the same day.  That is the intended lifetime of a field on this row: a knob
-               under test carries a cell, a settled one carries none.) */
-            snprintf(ovbuf, sizeof ovbuf, "M%d %s SQ:%c%c%c%c lr%d/o%d f%d w%d",
+            /* (`K` lived here for ONE afternoon, was cut with the 1p verdict, and came BACK the
+               same day for the split half of the same lever -- sat_kick_split.  That churn is the
+               row working as intended: a knob under test carries a cell, a settled one carries
+               none.  Read it only in split; 1p is byte-identical in both states.) */
+            snprintf(ovbuf, sizeof ovbuf, "M%d %s SQ:%c%c%c%c lr%d/o%d f%d w%d K%d",
                      sat_m, sat_m_name[sat_m],
                      sqch[sqw & 3], sqch[sqf & 3], sqch[sqc & 3], sqch[sqs & 3],
                      sat_lowres, sat_opt,   /* /o = perf-lever level 0-4 (pad L+C) */
                      (sat_fov_half * 45 + 256) / 512,        /* fine-angle half -> whole degrees */
-                     sat_wallfill_min);                      /* pad R+X: 0 / 24 / 48 / 96 rows */
+                     sat_wallfill_min,                       /* pad R+X: 0 / 24 / 48 / 96 rows */
+                     sat_kick_split);                        /* pad R+Z: split kick at the last view's dispatch */
             if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 7, ovbuf);
             /* row 8: RELIABLE VDP1 load (replaces the CEF-aliased Dr%).
                ⚠ 2026-08-10, legend corrected: THE FORMAT PRINTS ONLY `fbw` AND `fbm`.  Everything
@@ -3746,7 +3818,20 @@ static void fps_update(void)
                  lf = largest free block (KB) at the carve attempt -- small lf => zone too tight
                       to carve a useful pool (root cause, not a bug).
                Ymir now models CD latency (~36-41 ms/cmd) so k/t are meaningful here, not HW-only. */
-            if (sat_wad_base == nullptr)   /* CD-streaming mode */
+            /* [!] 2026-08-28 -- SPLIT NOW WINS THIS ROW, AND THE REASON IS THAT THE PROBE WAS
+               UNREADABLE WHERE IT MATTERS.  The tenancy below was decided by BUILD (CD disc -> `CD`,
+               >=4 MB cart -> `SKY`), which meant the `SKY` row -- whose own definition says it exists
+               to price the multi-view HW-sky plan -- was invisible on the ONLY disc the console
+               session ever runs, a -Repack CD build.  A probe written to size a plan, on a row the
+               plan's own test can never reach, is not a probe.
+               Player count is the honest predicate: `SKY`'s four per-view slots are FORCED TO 0
+               below two players (see the stale-guard below), so in 1p it carries nothing, while the
+               `CD` row's streaming gardes are a 1p-streaming story.  Same mutual-exclusion pattern
+               as row 6 (MX in 1p / V1 in split) and row 17.
+               ⚠ THE COST, stated: in SPLIT on a CD disc we lose `t`/`px`/`ob`/`gy`/`st` -- the
+               lead-fill stale counter among them.  `st` must tend to 0 and now cannot be watched in
+               co-op. If a split texture bug ever reappears, drop back to 1p to read this row. */
+            if (sat_wad_base == nullptr && sat_local_players <= 1)   /* CD-streaming mode, 1p */
             {
                 extern unsigned int w_cd_ms10;   /* core w_wad.c -- also the load budget's clock */
                 /* `L<s>s/<n>` = the LAST detected level load: seconds inside CD commands, and how
@@ -7834,7 +7919,8 @@ static void sat_mp_fence(void)
     VDP1_TVMR = 0x0000;                        /* red step 7: no auto V-blank erase next  */
     sat_mp_active  = 1;
     sat_mp_pending = 0;
-    sat_mp_wait_ms = (int)(DG_GetTicksMs() - w0);
+    { unsigned int w = (unsigned int)(DG_GetTicksMs() - w0);   /* row 8 `<n>ms`: folded once a second */
+      sat_mp_wait_sum += w; sat_mp_wait_n++; }
 }
 
 /* (vdp1_vblank_dr CUT 2026-08-10.  It sampled EDSR.CEF at every vblank into mh_vbl_done/tot, whose
@@ -9286,26 +9372,40 @@ extern "C" void DG_DrawFrame(void)
     }
     {
         static int sky_zoomed = -1;     /* last NBG0 scale state: (split<<4)|layer_sh, -1 uninit */
+        static int sky_zoom_fov = -1;   /* ...and the FOV the scale was derived from */
         int wantz = ((hwsky_split ? 1 : 0) << 4) | sky_layer_sh;
-        if (wantz != sky_zoomed)
+        if (wantz != sky_zoomed || sat_fov_half != sky_zoom_fov)
         {
             /* Round 4 EXACT geometry (rounds 2/3 guessed 2.0 then 0.5 -- owner bracketed them:
-               "trop grand / écrasé").  CPU law: 256 texture columns per 90-deg FOV, so a 160-px
-               band shows 1.6 texels/px (scale 1/1.6 = 0.625) and the FULL 320-px 1p view shows
-               0.8 texels/px (scale 1.25 -- the old 1p 1.0 was a latent 25% zoom-out vs vanilla,
-               unifiable now that the mirror fix makes 1p judgeable too).  VERTICAL: every split
-               path steps 2 texture rows per screen px (pspriteiscale law, r_plane.c) => 0.5;
-               1p is 1:1.  <<sky_layer_sh: 1024-wide skies live half-res in the layer, so the
-               horizontal factor doubles (split then = 1.25, no reduction at all).
-               ⚠ CONSOLE RISK (Ymir-invisible): h-scale 0.625 is a REDUCTION; a 256-color cell
-               layer under reduction needs DOUBLE character-read slots in the B1 cycle pattern.
-               slZoomModeNbg0(ZOOM_HALF) declares that to SGL's allocator -- if the elected
-               band's sky snows (or NBG3 text breaks) on hardware, suspect THIS first; L+C is
-               the live kill. */
-            slZoomModeNbg0((hwsky_split && sky_layer_sh == 0) ? ZOOM_HALF : 0);
-            slScrScaleNbg0((FIXED)((hwsky_split ? 0x0000A000 : 0x00014000) << sky_layer_sh),
-                           (FIXED)(hwsky_split ? 0x00008000 : 0x00010000));
-            sky_zoomed = wantz;
+               "trop grand / écrasé"), and 2026-08-28 GENERALISED TO THE LIVE FOV.
+               THE ONE LAW, and every number here falls out of it: a view shows sat_fov_half/4
+               texture columns WHATEVER ITS WIDTH (1024 = 90 deg -> 256, the constant round 4 was
+               baked from), so
+                    h-scale = view_width / (sat_fov_half/4) = 4*view_width / sat_fov_half
+               which reproduces both old literals exactly -- 1p 4*320/1024 = 1.25 (0x14000), split
+               4*160/1024 = 0.625 (0xA000) -- and gives 4*160/740 = 0.865 at the shipped split FOV
+               of 65.  The layer was therefore 38 % TOO WIDE from the moment the split FOV left 90:
+               the elected band's horizon PANNED 38 % FASTER THAN ITS OWN WALLS.  Ymir cannot show
+               that (it is a match between two layers, not a count), which is exactly why it
+               survived the whole FOV session.
+               <<sky_layer_sh: 1024-wide skies live half-res in the layer, so the factor doubles.
+               VERTICAL IS NOT A FUNCTION OF THE FOV and must not be scaled here: every split path
+               steps 2 texture rows per screen px (the pspriteiscale law in r_plane.c, and
+               pspriteiscale is built from viewwidth alone) => 0.5; 1p is 1:1.
+               ⚠ CONSOLE RISK (Ymir-invisible): ANY h-scale below 1.0 is a reduction, and a
+               256-color cell layer under reduction needs DOUBLE character-read slots in the B1
+               cycle pattern.  slZoomModeNbg0(ZOOM_HALF) declares that to SGL's allocator, and the
+               test is now the honest one -- "is this actually a reduction?" -- instead of the old
+               proxy "is this split at sh=0?".  0.865 still needs it, and ZOOM_HALF covers down to
+               0.5 while the widest arc anyone can ask for in a band (90 deg) only reaches 0.625,
+               so the declaration can never come up short.  If the elected band's sky snows (or
+               NBG3 text breaks) on hardware, suspect THIS first. */
+            int   vw = hwsky_split ? 160 : 320;                      /* this view's width in px */
+            FIXED hs = (FIXED)((((long)vw) << 18) / sat_fov_half);   /* 4*vw/fov in 16.16 */
+            hs <<= sky_layer_sh;
+            slZoomModeNbg0(hs < 0x10000 ? ZOOM_HALF : 0);
+            slScrScaleNbg0(hs, (FIXED)(hwsky_split ? 0x00008000 : 0x00010000));
+            sky_zoomed = wantz; sky_zoom_fov = sat_fov_half;
         }
         static int sky_win_view = -2;   /* last NBG0-window state: -2 uninit, -1 full screen, 0..3 band */
         int want = hwsky_split ? sat_sky_view : -1;
@@ -9328,16 +9428,38 @@ extern "C" void DG_DrawFrame(void)
 #if VDP2_SPLIT_HW_SKY
         if (hwsky_split) skyang = sat_sky_view_angle;
 #endif
-        /* Round 4 -- ONE law for every view, now that the cells are MIRRORED (sky_cell_upload):
-           the texel at any view's LEFT edge is the view direction +45deg = texture column A+128
-           (A = viewangle>>22, CPU-exact).  On the mirrored plane that is
-           SCX = 511 - (128>>sh) - (A>>sh); the round-3 per-band centre term VANISHES, because
-           half a 90-deg FOV is always 128 texture columns and z*centre_x == 128 mod 256 for
-           every window (0.8*160 = 1.6*80 = 128; 1.6*240 = 384).  sh=0 collapses to 127 - A
-           modulo the 256-px content period -- the same value serves 1p, both 2p halves and all
-           four quadrants with no per-view branch. */
+        /* Round 4 -- the mirrored-plane law (the cells are MIRRORED at upload, sky_cell_upload):
+           the texel at a view's LEFT edge is its own direction + HALF THE FOV = texture column
+           A + (sat_fov_half>>3), which on the mirrored plane is SCX = 511 - (hf>>sh) - (A>>sh).
+           [!] 2026-08-28 -- BOTH BAKED 90-DEGREE CONSTANTS ARE GONE.
+           (a) The literal 128 was "half a 90-deg FOV is always 128 texture columns".  Half the
+               SHIPPED split FOV is 92, so from the day the split FOV left 90 the elected band's
+               sky sat 36 texels = 12.6 DEGREES off its own world -- a seam against the software
+               sky of the view right next to it.
+           (b) The round-3 per-band term "VANISHES" was true at 90 degrees AND ONLY AT sh=0: a
+               160-px band then spans exactly 256 texels = the content period, so band 1 lands
+               back on the same phase (0.8*160 = 1.6*80 = 128; 1.6*240 = 384 == 128 mod 256).  At
+               65 a band spans 185 texels, the phase does not close, and bands 1/3 come out 71
+               texels = 25 DEGREES wrong.  So the term comes back, written out.
+               ⚠ AND IT WAS ALREADY WRONG AT 90 FOR WIDE SKIES.  At sh=1 -- a 1024-wide sky,
+               i.e. TNT SKY1/2/3, i.e. the disc every recent capture was taken on -- the content
+               fills the 512-px plane ONCE, so the period is 512 layer px while a band steps only
+               128.  Every right-column election on TNT has been showing the sky a QUARTER TURN
+               out since round 4, invisible because election usually settles on view 0.  One term
+               fixes both.
+           The band term SUBTRACTS because screen x grows as the view angle SHRINKS (xtoviewangle
+           decreases with x), so the layer coordinate grows with x and the scroll has to walk back
+           one whole view to put the same texel at the next band's left edge.
+           At 90 deg / sh=0 the new expression differs from the old by exactly 256 -- one content
+           period -- so the round-4 console validation still stands, byte for byte. */
         int A  = (int)(skyang >> (SKY_ANGLESHIFT + SKY_PARALLAX_SHIFT));
-        int sx = 511 - (128 >> sky_layer_sh) - (A >> sky_layer_sh);
+        int hf = sat_fov_half >> 3;                  /* view centre -> view edge, in texture columns */
+        int sx = 511 - (hf >> sky_layer_sh) - (A >> sky_layer_sh);
+#if VDP2_SPLIT_HW_SKY
+        if (hwsky_split && (sat_sky_view & 1))       /* right-hand band: one whole view further along */
+            sx -= (sat_fov_half >> 2) >> sky_layer_sh;
+#endif
+        sx &= 511;
         int scy = -VIEW_Y_OFFSET;
 #if VDP2_SPLIT_HW_SKY
         /* VERTICAL anchor (round 4, owner: "il s'étend jusqu'en haut de la fenêtre du joueur").
@@ -10288,6 +10410,16 @@ static void poll_pad(void)
                coverage counter mark-suppress perturbs -> keep 2p at the safe off default until A/B'd).
                Re-asserted on each count change; L+B still overrides within a count for A/B. */
             sat_mark_suppress = (sat_local_players >= 3) ? 1 : 0;
+            /* [!] 2026-08-28 -- PER-MODE FOV, applied HERE because this block is already the single
+               writer of count-dependent state, the pattern sat_apply_mode set.  It is now the ONLY
+               writer of sat_fov_half (the R+C chord was removed the same day), so the split FOV and
+               the NBG0 sky geometry that derives from it change exactly once per count change.
+               (The wall-fill rung was applied here too for half a day; `wh` refuted the per-mode
+               table and it went back to one global value -- core/r_segs.c.) */
+            {
+                int lp = sat_local_players; if (lp < 1) lp = 1; else if (lp > 4) lp = 4;
+                R_SetFovHalf (sat_fov_mode[lp]);
+            }
         }
     }
 
@@ -10351,9 +10483,21 @@ static void poll_pad(void)
            2026-08-06.  Row-19 `A<+/->` went with it.  R+Z was free -- and is taken again below,
            the same afternoon, by the lever the freed chords existed to make room for.) */
         /* (Pad R+Z LATE-KICK A/B REMOVED 2026-08-26, hours after it was added and by its own
-           result: 16.0 -> 19.9 fps, MST 62 -> 50, on the same 1p spot.  The kick is now always
-           run after the plane dispatch -- derivation at sat_kick_pending, core/r_main.c.  R+Z is
-           free again.) */
+           result: 16.0 -> 19.9 fps, MST 62 -> 50, on the same 1p spot.  The 1p kick is now always
+           run after the plane dispatch -- derivation at sat_kick_pending, core/r_main.c.) */
+        /* 🔴 Pad R+Z (R held, L released), SAME AFTERNOON, SAME CHORD, SPLIT HALF: sat_kick_split.
+           The 1p verdict freed this chord and the SPLIT question immediately took it back -- the
+           owner's own correction ("le z-order serait bon par vue, c'est tout ce qui importe ici"),
+           which is right: the four views own disjoint quadrants, so cross-view command order is
+           unobservable.  This ships the cheap half -- ONE kick still, moved from d_main's post-loop
+           site to the LAST view's plane dispatch, so ~3,6 ms of it overlaps the slave instead of
+           following it.  Full derivation and the ~5,4 ms per-view variant it defers: the note at
+           sat_kick_split, core/r_main.c.
+           ⚠ JUDGE IT ON MST AND ON ROW-13 `F`, NOT ON `P`: the 4p frame sits at 15 NTSC fields with
+           `F+40%` already spilling, so a 3 ms lever shows up as steadiness before it shows as fps.
+           ⚠ 1p is BYTE-IDENTICAL either way -- the gate is `sat_split_active`. */
+        else if (!(cur & PER_DGT_TR) && (cur & PER_DGT_TL))
+        {   extern int sat_kick_split; sat_kick_split ^= 1; }
         /* (Z ALONE REMOVED 2026-08-26.  It cycled sat_m_cycle, which has held exactly ONE entry
            -- {M7_LOWRES} -- since M0/M5 were parked: the "cycle" re-selected the mode it was already
            on and called sat_apply_mode() to rewrite identical values.  A no-op wearing a button.
@@ -10571,39 +10715,29 @@ static void poll_pad(void)
         && (changed & PER_DGT_TB) && !(cur & PER_DGT_TB))
         sat_prof_planepix ^= 1;
 
-    /* 🔴 MOVED TO PAD R+C ON 2026-08-26 -- L+Y WAS NOT FREE.  The claim below ("the only other
-       Y site is the R-held FBK cycle") was checked against the wrong thing: the R-held wall-SQ
-       cycle indeed cannot collide, but the CEILING SQ cycle further down takes L held + R
-       released + Y, which is this predicate byte for byte apart from its `!menuactive`.  So every
-       L+Y press moved the FOV **and** the ceiling quality -- two axes at once, on the one lever
-       whose whole validity rests on an IDENTITY test at f90.  R+C came free the same day when the
-       clear-slave A/B was baked, and it collides with nothing: L+C is the perf ladder (L held),
-       R+Y is the wall SQ (Y, not C).  Chord audits must match on the PREDICATE, never on prose.
-       Pad R+C (R held, L released -- ALL player counts): cycle the FIELD OF VIEW
-       90 -> 75 -> 65 -> 90 degrees.  Row 7 shows `f<deg>`.
-       WHY IT IS WORTH A CHORD, and it is the whole argument for the lever: FIELDOFVIEW is
-       a compile-time constant and focallength is built on centerxfrac = viewwidth/2, so a
-       160-px SPLIT QUADRANT still shows a full 90 degrees -- four views accept four
-       complete 90-degree arcs to paint 1.00x the pixels of the 1p view.  Narrowing the arc
-       narrows `clipangle` and the BSP accepts fewer segs.
-       ⚠ READ IT AS A COUNT, NOT AS MILLISECONDS.  The decisive number is row-2 `d`
-       (drawsegs, frame sum), and a count is exactly what Ymir IS authoritative for -- the
-       ms it prints beside it are not.  Same spot, same map, 4 players, do not move:
-         PREDICTED d(65)/d(90) = 0.70-0.75.
-         KILL CRITERION: a ratio above 0.85 means the WALLS are doing the culling, not the
-         angle, and the lever collapses before anyone touches the console.
-       ⚠ SECOND TEST, AND RUN IT FIRST -- AN IDENTITY: at f90 every counter must be
-       IDENTICAL to a build without this patch.  sat_fov_mul is a RATIO of tangents, so it
-       is exactly FRACUNIT at the default and every consumer is bit-identical (see the long
-       note at core/r_main.c:47).  If f90 moves anything, the refactor is wrong and no 65
-       reading means a thing.
-       ⚠ The HW sky mis-tracks below 90: its scroll law is derived from the 90-degree
-       geometry and is deliberately NOT scaled here.  Cosmetic, does not touch `d`. */
-    if (!(cur & PER_DGT_TR) && (cur & PER_DGT_TL)                 /* R held, L released */
-        && (changed & PER_DGT_TC) && !(cur & PER_DGT_TC))
-        R_SetFovHalf (sat_fov_half > 1000 ? 853        /* 90 -> 75 */
-                    : sat_fov_half >  800 ? 740        /* 75 -> 65 */
-                                          : 1024);     /* 65 -> 90 */
+    /* 🔴 THE FOV CHORD (pad R+C) AND THE 45-DEGREE RUNG ARE BOTH GONE -- 2026-08-28, owner:
+       "supprime 45 et le toggle.  On garde ces defauts jusqu'a nouvel ordre."  The lever it existed
+       to settle IS settled: sat_fov_mode[] (core/r_main.c) is 90 in 1p and 65 in every split mode,
+       written by the per-player-count block above, and R+C now collides with nothing.
+       WHAT THE CHORD BOUGHT, so nobody re-adds it to re-learn it: FIELDOFVIEW was a compile-time
+       constant and focallength is built on centerxfrac = viewwidth/2, so a 160-px split quadrant
+       showed a FULL 90 degrees -- four views accepting four complete 90-degree arcs to paint 1.00x
+       the pixels of the 1p view.  Narrowing the arc narrows clipangle and the BSP accepts fewer
+       segs.  Measured on Ymir, same spot, d(65)/d(90): 1p 0.685, 2p 0.692, 4p 0.717 -- inside the
+       predicted 0.70-0.75 band, so the ANGLE is doing the culling and not the walls.  fps 1p
+       19.7->25.2, 2p 14.0->15.0, 4p 9.4->10.3.  The f90 IDENTITY test passed first (sat_fov_mul is
+       a ratio of tangents = exactly FRACUNIT at the default), which is the only reason the 65
+       readings mean anything.  Row 7 `f<deg>` still prints the live value: it is now the RECEIPT
+       that the per-count applier ran, not a knob.
+       45 dies with the chord.  Hor+ puts the 2p side-by-side view at ~44 degrees geometrically,
+       but shipping a different arc per split mode hands a competitive advantage to whoever sits in
+       the widest one, so every split mode takes the same 65 (owner: "c'est un peu triche, mais ca
+       ne choquera pas").  A rung no default can ever select only costs code.
+       AND THE SKY NOW FOLLOWS.  The caveat that stood here -- "the HW sky mis-tracks below 90, its
+       scroll law is derived from the 90-degree geometry and is deliberately NOT scaled" -- was true
+       and is now FIXED: the NBG0 scale AND scroll are derived from sat_fov_half (the round-4 block
+       in DG_DrawFrame).  A cosmetic caveat parked next to a toggle dies WITH the toggle, or it
+       becomes a permanent defect nobody owns. */
 
     /* (Pad L+Right — the FAR-DEGRADATION LADDER — REMOVED 2026-08-16, one session after it was
        added: rung 1 rejected on sight, rungs 2 and 3 killed by their own counters. */
@@ -10804,6 +10938,12 @@ static void poll_pad(void)
        split: L+X is sat_wall_paint, the X-alone split_vdp1 toggle needs BOTH shoulders released,
        and the X->KEY_TAB forward is already eaten while a shoulder is held (:10831).  The
        incidental '.' (R) tap to Doom is the usual chord cost. */
+    /* [!] 2026-08-28 -- BACK TO ONE GLOBAL RUNG.  The per-player-count table added this morning
+       lasted one session: `wh` measured the whole candidate curve in a single frame and the
+       twenty-eight captures that followed showed the spread WITHIN 4p (wh9000 to wh0414) is wider
+       than the spread between modes, so a per-mode constant only freezes one scene's answer.  The
+       derivation is at sat_wallfill_min in core/r_segs.c.  R+X stays: it is the live A/B and the
+       lever is still on trial. */
     if (!(cur & PER_DGT_TR) && (cur & PER_DGT_TL)
         && (changed & PER_DGT_TX) && !(cur & PER_DGT_TX))
         sat_wallfill_min = (sat_wallfill_min == 0)  ? 24

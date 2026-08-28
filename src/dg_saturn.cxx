@@ -1950,8 +1950,19 @@ extern "C" void R_SetFovHalf(int half);  /* core r_main.c: the ONLY writer -- it
    its vblank sampler on 08-10 -- CEF latches 30-60% on real HW, so the rate was never trustworthy.
    Read row 17 `LP%` instead.)
    ============================================================================ */
-#define MH_MS_BUCKETS  40          /* 8ms buckets -> 0..320ms frame time */
-#define MH_MS_SHIFT    3
+#define MH_MS_BUCKETS  40          /* 16ms buckets -> 0..640ms frame time (was 8 -> 320, saturated) */
+/* [!] 2026-08-28: 3 -> 4.  THE p99 WAS PINNED AT THE TOP BUCKET IN EVERY CAPTURE EVER TAKEN.
+   40 buckets x 8 ms capped the histogram at 320 ms, so `FMp <p50>/<p90>/<p99>` read 312 in all 21
+   frames of the owner's stutter session -- not because the tail sits at 312, but because the
+   instrument cannot look further, and the same session photographed MST 588, 526, 500 and 322 by
+   hand.  `mx` could not stand in: it is a session max and is pinned at the LEVEL-LOAD spike
+   (mx6586), so everything between 312 ms and 6,6 s was invisible -- in the ONE field that measures
+   the complaint "il y a toujours des ralentissements".
+   16 ms buckets -> 0..640 ms, which covers the worst frame actually observed with margin.  The
+   resolution given up is a quantisation of 16 ms on a p50 of ~50, i.e. one NTSC field -- the unit
+   MST is quantised in anyway ([[four-display-clocks]]).  Every consumer shifts back by
+   MH_MS_SHIFT, so this is the whole change. */
+#define MH_MS_SHIFT    4
 #define MH_N_BUCKETS   64          /* things count 0..63 (direct index) */
 static unsigned int mh_ms[MH_MS_BUCKETS];
 static unsigned int mh_things[MH_N_BUCKETS];
@@ -3504,13 +3515,28 @@ static void fps_update(void)
                    same one. */
                 int zf = (int)(Z_TrueFree() >> 10);            if (zf > 999) zf = 999;
                 int lg = (int)(Z_LargestAllocatable() >> 10);  if (lg > 999) lg = 999;
+                /* [!] `ca` = THE RESIDENT LUMP CACHE, in KB -- Z_FreeMemory (free + purgeable)
+                   minus Z_TrueFree (free only).  It ships WITH the recency purge because it is the
+                   number that says whether that purge can possibly work: an approximate LRU beats
+                   address order only when the cache is comparable to the working set, and when it
+                   is much smaller EVERY eviction policy performs the same.  Nothing on screen
+                   could say which world we are in -- and this morning I made it worse by turning
+                   `zf` into true-free, which removed the only witness to free+purgeable.
+                   READ IT WITH `zf`: `zf` = room to allocate without evicting anything, `ca` =
+                   how much cache is standing, `lg` = the largest contiguous run purging could
+                   produce.  A big `ca` with re-faults still climbing on row 0 means the POLICY is
+                   wrong (recency should fix it); a small `ca` means there is no cache to manage
+                   and the lever is capacity, not policy -- the zone census in this file's header
+                   (st438K + lv377K on TNT MAP11) names where that capacity went. */
+                int ca = (int)((Z_FreeMemory() - Z_TrueFree()) >> 10);
+                if (ca < 0) ca = 0; else if (ca > 999) ca = 999;
                 int po = r_visplane_pool_ovf_pk / 2;           if (po > 99)  po = 99;
                 int op = (r_opening_peak + 319) / 320;   /* SCREENWIDTH is core-only; 320 literal here */
                 if (op > 999) op = 999;
-                snprintf(ovbuf, sizeof ovbuf, "LIM vp%d.%d ds%d ss%d%s o%d zf%d lg%d             ",   /* SATURN: ss = solidsegs peak vs MAXSEGS 32, '!' = overflow guard fired (M7 freeze root-cause) */
+                snprintf(ovbuf, sizeof ovbuf, "LIM vp%d.%d ds%d ss%d%s o%d zf%d lg%d ca%d       ",   /* SATURN: ss = solidsegs peak vs MAXSEGS 32, '!' = overflow guard fired (M7 freeze root-cause) */
                          r_visplane_peak, po,
                          r_drawseg_peak, r_solidseg_peak, r_solidseg_ovf ? "!" : "",
-                         op, zf, lg);
+                         op, zf, lg, ca);
             }
             ovbuf[40] = '\0';   /* pad, then cut -- this row has overrun 40 twice before */
             if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 11, ovbuf);

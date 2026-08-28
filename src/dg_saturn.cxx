@@ -653,6 +653,7 @@ extern "C" int            sat_frame_has_sky;/* core: a sky visplane was in view 
 extern "C" int            sat_sky_view;         /* core Part 5: elected split view for the HW sky (-1 = none => all software) */
 extern "C" unsigned int   sat_sky_px_view[4];   /* core Part 5: per-view SKY pixel coverage (election metric) */
 extern "C" unsigned int   sat_sky_frt_view[4];  /* SATURN 2026-08-25: per-view SOFTWARE-sky cost, FRT ticks (row 12 `SKY`) -- what the 3-quadrant HW-sky plan is worth */
+extern "C" unsigned int sat_sky_cols_view[4]; /* SATURN 2026-08-28: per-view sky COLUMNS -- the unit the drawer's cost actually has (row 12 `c`) */
 extern "C" unsigned int   sat_sky_view_angle;   /* core Part 5: elected view's viewangle (angle_t) for the NBG0 scroll */
 extern "C" int            sat_rbg0_view;        /* core: the split view whose floor is punched to RBG0 (round-4 sky map cut) */
 extern "C" int            sat_vdp2_floor;   /* core: skip software floor (=> VDP2 RBG0) */
@@ -3947,13 +3948,48 @@ static void fps_update(void)
                     sm[vv] = sat_sky_frt_view[vv] * 10u / 224u;
                     if (sm[vv] > 999u) sm[vv] = 999u;
                 }
-                unsigned int px = 0;
-                for (vv = 0; vv < nv; vv++) px += sat_sky_px_view[vv];
-                if (px > 99999u) px = 99999u;
-                snprintf(ovbuf, sizeof ovbuf, "SKY e%2d %2u.%u %2u.%u %2u.%u %2u.%u p%5u      ",
-                         nv ? sat_sky_view : -1,
+                /* 🔴 2026-08-28 -- `p<px>` OUT, `c<cols>` AND `!<gardes>` IN.
+                   `p` GOES BECAUSE IT IS THE WRONG UNIT, and that IS the finding: R_DrawSkyColumn
+                   costs a FIXED amount per COLUMN (the 128-byte copy on a cart, the grain/clamp
+                   setup either way) plus a short per-pixel loop, so a one-pixel sky sliver bills
+                   almost as much as a full-height one.  This row's own legend already said px
+                   "cannot be converted to ms -- the factor swings 2-4x with scene geometry"; that
+                   swing IS the columns/pixels ratio, and it is now printed instead of inferred.
+                   `c` is a COUNT, which is what Ymir is authoritative for -- so the labour splits
+                   cleanly and neither half lies: **Ymir sizes the JOB** (how many sky columns does
+                   a 4p outdoor spot really have), **console prices the RATE** (ms per column).
+                   `ms/c` is also the only honest CROSS-BUILD reading of the drawer change landing
+                   with this row, because it normalises the scene out -- [[interbuild-perf-noise]]
+                   forbids comparing the absolutes.  (`sat_sky_px_view` still drives the election;
+                   it is consumed, not thrown away.  If the drawer change leaves the per-pixel loop
+                   as the residual, px comes back then and not before.)
+                   `!<gardes>` = r_patch_ovf + r_composite_oob + sat_lead_stale, THE THREE COUNTERS
+                   THAT MUST READ ZERO -- and this fixes a hole THIS ROW OPENED two days ago.  Row
+                   12's tenancy was handed to SKY for `sat_local_players > 1`, which is right for
+                   the sky plan and wrong for everything else: it took the garde-patch hit (a
+                   converted CRASH), the composite out-of-bounds (the owner's "wrong texture for one
+                   frame") and the stale lead-fill span (a wrong texture drawn by the slave) off
+                   screen in CO-OP -- the mode with the MOST zone pressure, and the mode the console
+                   session runs in.  A capture with a non-zero garde is not a valid measurement, so
+                   the field that says so has to be present in every mode a capture is taken in.
+                   Summed because they share one meaning ("this photo is suspect"), and placed
+                   IMMEDIATELY after `e` so the pad-and-cut can never be the thing that hides it --
+                   the row-14 `lk` and row-1 `ld` truncations both happened at the tail.
+                   `gy` stays on the 1p CD row: unlike the other three it is EXPECTED non-zero, and
+                   in split it is already visible from two other sides -- V1 `fl<slot>` (the
+                   wtex-slot flatten cause) and VRM `lb..<nocol>` (flats with no cached colour).
+                   `t<s>` likewise stays 1p-only; row 1's `ld<chunks>/<refaults>` is the primary
+                   streaming instrument now and it IS printed in split. */
+                extern int r_patch_ovf, r_composite_oob, sat_lead_stale;
+                unsigned int gd = (unsigned)(r_patch_ovf + r_composite_oob + sat_lead_stale);
+                if (gd > 99u) gd = 99u;
+                unsigned int cols = 0;
+                for (vv = 0; vv < nv; vv++) cols += sat_sky_cols_view[vv];
+                if (cols > 999u) cols = 999u;
+                snprintf(ovbuf, sizeof ovbuf, "SKY e%d !%u %u.%u %u.%u %u.%u %u.%u c%u        ",
+                         nv ? sat_sky_view : -1, gd,
                          sm[0]/10u, sm[0]%10u, sm[1]/10u, sm[1]%10u,
-                         sm[2]/10u, sm[2]%10u, sm[3]/10u, sm[3]%10u, px);
+                         sm[2]/10u, sm[2]%10u, sm[3]/10u, sm[3]%10u, cols);
                 ovbuf[40] = '\0';
                 SRL::Debug::Print(0, 12, ovbuf);
             }

@@ -206,6 +206,7 @@ extern "C" int   r_visplane_pool_ovf_pk;    /* ...and its ~1 s HIGH-WATER: the p
 extern "C" int   sat_tex_numtex, sat_tex_sumwidth, sat_tex_dirbytes,
                  sat_tex_mptex, sat_tex_mpwidth;  /* Phase-0 texture-floor measurement (r_data.c) */
 extern "C" int   Z_FreeMemory(void);          /* total reclaimable (free + purgeable) bytes */
+extern "C" int   Z_TrueFree(void);            /* PU_FREE only -- row 11 `zf` since 2026-08-28 */
 extern "C" int   Z_LargestAllocatable(void);  /* largest contiguous run after purging */
 extern "C" int   dg_heap_peak;              /* #4: peak newlib sbrk usage (bytes)             */
 extern "C" unsigned int doom_stack_free(void);  /* main.cxx: doom_stack virgin bytes (row 10 `sk`) */
@@ -3490,7 +3491,18 @@ static void fps_update(void)
                The two Z_ calls are hoisted into locals: written as ternaries they would each run
                TWICE, and each is an O(blocks) walk (~0.83 ms). */
             {
-                int zf = (int)(Z_FreeMemory() >> 10);          if (zf > 999) zf = 999;
+                /* \[!] 2026-08-28: `zf` IS NOW TRULY FREE (PU_FREE only), not free+purgeable.
+                   It read Z_FreeMemory, which counts the whole lump cache as available -- so `zf`
+                   and `lg` were two views of the SAME assumption (that the cache is expendable)
+                   and neither could say how much of the zone is actually unused.  That became a
+                   real error the day the re-fault witness proved the cache IS being evicted:
+                   "zf441" was read here as "the zone has room, so this is not starvation", and it
+                   was nothing of the kind -- it was free PLUS cache.  Now `zf` vs `lg` reads as
+                   TRULY FREE vs OBTAINABLE BY PURGING and the GAP IS THE RESIDENT CACHE, which is
+                   also how Z_Malloc's new non-purging pass is judged: if it fires, the cache grows
+                   and `zf` falls.  Same width, same cap, one honest number instead of two of the
+                   same one. */
+                int zf = (int)(Z_TrueFree() >> 10);            if (zf > 999) zf = 999;
                 int lg = (int)(Z_LargestAllocatable() >> 10);  if (lg > 999) lg = 999;
                 int po = r_visplane_pool_ovf_pk / 2;           if (po > 99)  po = 99;
                 int op = (r_opening_peak + 319) / 320;   /* SCREENWIDTH is core-only; 320 literal here */

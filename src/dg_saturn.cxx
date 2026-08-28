@@ -2420,7 +2420,13 @@ static void fps_update(void)
            cd = CD read-retries (whackCD): 0 = clean disc, climbing = flaky reads. */
         extern int sat_cd_read_retries;   /* w_file_saturn.cxx */
         extern int sat_cd_loads;          /* R1: cumulative GFS_Load chunk commands (watch the warp jump) */
-        extern int sat_cd_persector;      /* R1: what the old per-sector path would have issued (baseline) */
+        extern int sat_cd_persector;      /* R1: what the old per-sector path would have issued (baseline)
+                                             -- NO LONGER PRINTED (2026-08-28, `ld`'s denominator went to
+                                             the re-fault witness).  The counter STAYS: it is two int
+                                             increments on a path that costs 29 ms per command, and it is
+                                             the receipt for a shipped optimisation -- deleting it would
+                                             mean a rebuild to re-verify R1, for no measurable gain. */
+        extern unsigned int w_lump_refaults;   /* core w_wad.c: row 1 `ld<chunks>/<refaults>` */
         /* row 0 HEADLINE: inst fps, EMA(~4s) avg (the build-comparison number), MST (=1000/fps, the
            master frame ms), to = slave-timeout count (must stay 0), cd = CD read-retries.  Shown in
            every overlay mode except OFF(2); the fps-only mode(1) shows ONLY this row, so the
@@ -2436,12 +2442,43 @@ static void fps_update(void)
         int to_rate = rp_timeout_count - to_prev;
         to_prev = rp_timeout_count;
         if (to_rate > 9) to_rate = 9;
-        sprintf(ovbuf, "%u.%ufps a%u.%u MST%u to%d:%d%d%d%d cd%d ld%d/%d ",
+        /* 🔴 2026-08-28 -- `ld`'s DENOMINATOR IS NOW THE RE-FAULT WITNESS, and the row PADS AND
+           CUTS for the first time.
+           THE DEFECT IT FIXES: this row rendered at exactly 40 content cells in a calm 4p frame
+           ("5.5fps a9.3 MST181 to0:0000 cd0 ld2075/4"), so the OLD denominator was already being
+           sliced -- the `4` in that capture is the first digit of a longer number.  Same class as
+           the row-14 `lk` truncation found two days ago, and just as invisible.
+           THE QUESTION IT ANSWERS, which is the whole streaming chantier: `ld` climbed 583 -> 2075
+           across one owner session and `CD t` moved 61 s -> 64 s over 103 loads between two 1p
+           captures -- 29 ms per load, 3 seconds of disc between two screenshots.  The memory says
+           `ld` MUST PLATEAU ([[streaming-load-budget-and-flat-treadmill]]); it does not.  The two
+           worlds behind that have OPPOSITE cures and nothing on screen could separate them:
+             refaults FLAT while ld climbs  => CHURN: every load is a lump never seen before, no
+                                               cache can help, the cure is R2.3 (async read).
+             refaults CLIMBS with ld        => THRASH: the zone is evicting lumps under the render
+                                               and they are being pulled twice, the cure is R4
+                                               (residency), and R2.3 would only hide it.
+           ⚠ READ IT AS "DOES IT MOVE", NOT AS A RATIO: the numerator counts GFS *chunk commands*
+           (several per big lump, platform-side) and the denominator counts LUMP re-faults (core).
+           Different granularities on purpose -- the numerator keeps its meaning so every capture
+           already taken stays comparable.
+           `to`'s four per-site digits become ONE dominant-site letter (A/P/M/W, `-` when the rate
+           is zero): they have read 0000 in every capture ever taken, they carry information only
+           when the rate is non-zero, and the letter still says WHICH site when it is. */
+        char to_ch = '-';
+        if (to_rate)
+        {
+            int tsi = 0;
+            for (int i = 1; i < 4; ++i) if (rp_to_site[i] > rp_to_site[tsi]) tsi = i;
+            to_ch = ((const char *)"APMW")[tsi];
+        }
+        sprintf(ovbuf, "%u.%ufps a%u.%u MST%u to%d:%c cd%d ld%d/%u                    ",
                 inst10 / 10, inst10 % 10, avg10 / 10, avg10 % 10,
-                mst, to_rate,
-                rp_to_site[0] > 9 ? 9 : rp_to_site[0], rp_to_site[1] > 9 ? 9 : rp_to_site[1],
-                rp_to_site[2] > 9 ? 9 : rp_to_site[2], rp_to_site[3] > 9 ? 9 : rp_to_site[3],
-                sat_cd_read_retries, sat_cd_loads, sat_cd_persector);
+                mst, to_rate, to_ch,
+                sat_cd_read_retries,
+                sat_cd_loads > 9999 ? 9999 : sat_cd_loads,
+                w_lump_refaults > 9999u ? 9999u : w_lump_refaults);
+        ovbuf[40] = '\0';   /* pad, then cut -- this row was rendering AT 40 and slicing `ld` */
         if (sat_dbg_overlay_mode != 2) SRL::Debug::Print(0, 0, ovbuf);
         /* SATURN 2026-08-22 (owner): the reduced modes (1 fps-only / 2 off) must disable the
            CALCULATIONS too, not just the prints -- the row marshalling (percentile folds +
@@ -3237,8 +3274,12 @@ static void fps_update(void)
                             (the MP case: 4 views + up to 3 other-player colours share 4 slots).
                    budget = command bank / split queue full => raise VDP1_BANK_CMDS.
                  lb<budget>:<wall>/<plane>/<sprite>.<nocol> = the per-frame TEXTURE LOAD BUDGET, in
-                   MILLISECONDS OF DISC (pad R+X cycles 10/20/40/0; 0 = off = the old ungated
-                   behaviour; DEFAULT 20 since 2026-08-07 -- it used to be a count of reads AND
+                   MILLISECONDS OF DISC.  [!] 2026-08-28: this legend claimed "pad R+X cycles
+                   10/20/40/0" and NO SUCH PREDICATE EXISTS -- R+X was reassigned to the wall-fill
+                   rung long ago and removed entirely today, and sat_tex_load_budget has had no
+                   writer in this file for weeks.  It is BAKED at 20 (core/r_segs.c).  A legend
+                   that names a dead chord sends the next reader hunting for a knob.
+                   0 = off = the old ungated behaviour; DEFAULT 20 since 2026-08-07 -- it used to be a count of reads AND
                    default-off, i.e. armed only by the chord).  ⚠ 2026-08-10: this legend said
                    `<flat>`, ONE counter; the format has printed THREE since the plane and sprite
                    gates landed.  <wall>/<plane>/<sprite> = tiers drawn flat / planes drawn potato /
@@ -10938,17 +10979,18 @@ static void poll_pad(void)
        split: L+X is sat_wall_paint, the X-alone split_vdp1 toggle needs BOTH shoulders released,
        and the X->KEY_TAB forward is already eaten while a shoulder is held (:10831).  The
        incidental '.' (R) tap to Doom is the usual chord cost. */
-    /* [!] 2026-08-28 -- BACK TO ONE GLOBAL RUNG.  The per-player-count table added this morning
-       lasted one session: `wh` measured the whole candidate curve in a single frame and the
-       twenty-eight captures that followed showed the spread WITHIN 4p (wh9000 to wh0414) is wider
-       than the spread between modes, so a per-mode constant only freezes one scene's answer.  The
-       derivation is at sat_wallfill_min in core/r_segs.c.  R+X stays: it is the live A/B and the
-       lever is still on trial. */
-    if (!(cur & PER_DGT_TR) && (cur & PER_DGT_TL)
-        && (changed & PER_DGT_TX) && !(cur & PER_DGT_TX))
-        sat_wallfill_min = (sat_wallfill_min == 0)  ? 24
-                         : (sat_wallfill_min == 24) ? 48
-                         : (sat_wallfill_min == 48) ? 96 : 0;
+    /* 🔴 PAD R+X (the wall-fill rung ladder) IS REMOVED -- 2026-08-28.  The rung is BAKED at 48
+       (core/r_segs.c) and the console session reads the lever's SIZE instead of A/B-ing it, which
+       is the right shape now that the four rungs have already been priced on hardware (slave busy
+       4 / 11 / 35 %, `pr` 29,8 / 30,3 / 32,7 for OFF / 48 / 24, five videos, 2026-08-26).  What is
+       still unknown is not the tax, it is the PRIZE: row-14 `wh`/`f`/`lk` measure the addressable
+       pool in one frame, at the shipped rung, with no chord to hold and no state to photograph.
+       A knob whose remaining question is a MEASUREMENT, not a comparison, does not need a chord.
+       ⚠ SIDE EFFECT, AND IT IS A GOOD ONE: `wh` printed dots at rung 0 (R_WallFillArm returns
+       early there, so the producer never armed).  With the rung baked non-zero the histogram
+       always reads -- the probe can no longer be left switched off by accident.
+       R+X is now FREE.  L+X (sat_wall_paint) and bare X in split (sat_split_vdp1) are untouched:
+       their predicates are `!TL && TR` and `TL && TR`, neither of which this one matched. */
 
     /* Split-screen wall-path A/B (live, mid-game): in local multiplayer, pad-1 X toggles the
        half-views' walls between VDP1 (sat_split_vdp1=1, the new mode) and pure software

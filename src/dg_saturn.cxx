@@ -3991,9 +3991,48 @@ static void fps_update(void)
                    Cumulative like its neighbours; it must TEND TO 0 in a calm scene, and a steady
                    climb means the zone is purging under the render, not that the fix is failing. */
                 extern int r_patch_ovf, r_composite_oob, sat_lead_stale;
-                snprintf(ovbuf, sizeof ovbuf, "CD t%us px%d ob%d gy%d st%d ",
-                         w_cd_ms10 / 10000, r_patch_ovf, r_composite_oob, vdp1_wall_nocol,
-                         (sat_lead_stale > 9999 ? 9999 : sat_lead_stale));
+                /* [!] `sp` ADDED 2026-08-29 = THE ZONE SPLITTER, and it goes FIRST, immediately
+                   after "CD ", so the cut can never reach it -- same discipline the row-12 `!`
+                   guard took, and for the same reason: it is the field under investigation while
+                   px/ob/st are long-settled cumulative guards that the next calm frame re-shows.
+                   `sp<gainKB><T><sizeKB>`: relocating ONE unpurgeable block of <size> KB, of class
+                   <T>, would take the largest contiguous run to <gain> KB.  Read it against `lg` on
+                   the row above -- `gain` is what `lg` WOULD be.  T: S=static O=sound M=music
+                   L=level V=levspec ?=other.  Match <size> against the zone census in z_zone.c's
+                   header (LineDefs 101 K, lumpinfo 72 K, visplane span pool 60 K, lead-fill ring
+                   36 K, DRP table 26 K) to NAME it.
+                   WHY IT EXISTS: the owner's 65 shareware captures of 2026-08-28 show `lg` decaying
+                   224 -> 220 -> 189 -> 159 -> 70 KB across one session and never recovering, while
+                   `ca` stays at 347-560 KB -- and the marginal re-fault rate tracks it exactly
+                   (~32 % at lg 224, 70-87 % at lg 70).  It even crossed a LEVEL LOAD getting worse
+                   (159 -> 70 with `zf` going UP), so the fragmenters survive P_SetupLevel.  `lg`
+                   said we were fragmented; nothing said BY WHAT.
+                   ⚠ Computed by Z_LargestAllocatable, which row 11 above calls in the same pass --
+                   so it is this frame's, not last frame's.  Both rows are gated on overlay mode 0. */
+                extern int z_split_gain, z_split_size, z_split_tag, z_split_off;
+                (void)z_split_off;              /* on-screen identity is <size>+<T>; the offset is
+                                                   for a future dump, not for a 40-cell row */
+                int spg = z_split_gain >> 10; if (spg > 999) spg = 999;
+                int sps = z_split_size >> 10; if (sps > 999) sps = 999;
+                /* z_zone.h is a core header and is deliberately not included here, so the tags
+                   are literals: 1 STATIC / 2 SOUND / 3 MUSIC / 4 FREE / 5 LEVEL / 6 LEVSPEC.
+                   ⚠ NOT vanilla Doom's 50/51 -- this enum has no explicit values past PU_STATIC. */
+                char spt = z_split_tag == 1 ? 'S'
+                         : z_split_tag == 2 ? 'O'
+                         : z_split_tag == 3 ? 'M'
+                         : z_split_tag == 5 ? 'L'
+                         : z_split_tag == 6 ? 'V' : '?';
+                unsigned cds = w_cd_ms10 / 10000;      if (cds > 9999u) cds = 9999u;
+                int po = r_patch_ovf     > 99 ? 99 : r_patch_ovf;
+                int oo = r_composite_oob > 99 ? 99 : r_composite_oob;
+                int gy = vdp1_wall_nocol > 99 ? 99 : vdp1_wall_nocol;
+                int st = sat_lead_stale  > 999 ? 999 : sat_lead_stale;
+                /* Worst case is exactly 40 cells with every clamp at its ceiling:
+                   "CD sp999?999 t9999s px99 ob99 gy99 st999" -- so nothing is EVER cut in practice
+                   and the trailing cut below is a belt, not the design. */
+                snprintf(ovbuf, sizeof ovbuf, "CD sp%d%c%d t%us px%d ob%d gy%d st%d          ",
+                         spg, spt, sps, cds, po, oo, gy, st);
+                ovbuf[40] = ' ';
                 if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 12, ovbuf);
             }
             /* SATURN 2026-08-25 -- ROW 12's SECOND TENANT.  The two are mutually exclusive by the

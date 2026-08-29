@@ -46,8 +46,12 @@ vif), puis MSB shadow ; (d) Route P percussions (le seul chantier audio qui trai
 (107 lumps DS, DSBOSSIT en tête) — piège `build-stale-stash-wad-swap` ; toute mesure « shareware »
 faite dessus est fausse. `build/Mimas.map` (26-08) donne un pool TLSF de 66 944 o contre
 7 552 o dans RESOURCE_BUDGETS (08-20) — écart non réconcilié, pré-vol obligatoire avant toute
-promesse mémoire. Le doublon d'erase plein écran (dg_saturn.cxx:8276 + :8294 sous
-`vdp1_present_manual`) semble émettre deux polygones par plot — à vérifier à l'exécution.
+promesse mémoire. Le « doublon d'erase plein écran » soulevé par le dossier 3 est **réfuté à la
+lecture (2026-08-29 soir)** : le second polygone (dg_saturn.cxx:8298-8315) est sous
+`#if VDP1_MANUAL_CHANGE`, dont la valeur est **0** (:135, parké depuis le 2026-07-02) — il n'est
+pas compilé ; un seul polygone couleur-0 par plot, comme le dossier 7 l'établit. Reste une
+incohérence de COMMENTAIRE, pas de code : « ~10x deficit » de l'erase VBE (:8282) contre 1,22×
+dans HW_VDP1.md:485-487.
 
 ---
 

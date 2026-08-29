@@ -2196,6 +2196,7 @@ static unsigned int skyup_frame;      /* this frame's share, subtracted out of `
    link with RP_PROF off (then 0). */
 extern "C" int sat_prof_rec_max;                                 /* window max (= p100), tenths-ms */
 extern "C" int sat_prof_bp_win;   /* peak Bp of the CURRENT 1 s window -- what row 20's split describes */
+extern "C" int sat_prof_bp_hit;   /* set to that frame's bp10 the instant it takes the peak (r_parallel) */
 extern "C" int sat_prof_mx_map, sat_prof_mx_x, sat_prof_mx_y, sat_prof_mx_ang, sat_prof_mx_t;
 /* worst-REC frame FULL detail, snapshotted at each new peak (row 14) -- phase split + slave b/Pb */
 extern "C" int sat_prof_mx_bw, sat_prof_mx_bp, sat_prof_mx_p, sat_prof_mx_m, sat_prof_mx_b, sat_prof_mx_pb;
@@ -10425,19 +10426,55 @@ extern "C" void DG_DrawFrame(void)
            999.9 -- a 1000 ms Bp term is a hang, not a measurement.
            Read `em` against row-1 `pr` in 1p and row-17 `k` in split -- those are the whole kick,
            `em` is the loop inside it.  ⚠ this `pr` is NOT row 1's `pr`. */
-        if (sat_dbg_overlay_mode == 0)
+        /* [!] SATURN 2026-08-29 -- ROW 4 NOW DESCRIBES THE WORST-Bp FRAME OF THE WINDOW, THE SAME
+           ONE ROW 20 DESCRIBES.  It used to print the LAST frame while row 20 printed the WORST, so
+           every attempt to say "that 190 ms `lp` is what made that frame slow" was comparing two
+           frames up to a second apart.  That is not a subtlety, it is the defect this row's own
+           legend already records for `wp` vs `Bp`: |wp - Bp| over 25 % on 7 of 23 console frames,
+           "they were not disagreeing, they were describing frames up to a second apart".  It was
+           the last thing blocking the fluidity work -- the owner's 2026-08-29 captures show `lp`
+           from 5,9 to 283,7 ms and `em` from 1,4 to 101,3, and nothing on screen could say which
+           of them owned any given slow frame.
+           r_parallel sets `sat_prof_bp_hit` to the frame's bp10 inside the SAME `if` that latches
+           row 20's sub-split, so the two rows agree BY CONSTRUCTION rather than by cadence luck.
+           The copy happens HERE, at end of frame, and not in r_parallel: `em` (sat_p_emit10) is
+           written by the VDP1 kick, which is not necessarily finished when the profiler runs --
+           latching it there could pair the PREVIOUS frame's emit with this frame's Bp, a silent
+           one-frame skew and worse than the misalignment being fixed.
+           🔴 `tl` RETIRED, `Bp` TAKES ITS CELL.  `tl` (the R_StoreWallRange tail: four openings
+           memcpy + the drawseg store) read **0.0-0.2 ms on every capture of 2026-08-29** -- it is
+           settled, it is not the hole, and a field that cannot move does not deserve 7 of 40 cells.
+           `Bp` is worth far more: it is the DENOMINATOR that makes hd/pr/lp readable, and with all
+           five latched on one frame the partition is SELF-CHECKING -- `Bp - hd - pr - lp` is the
+           unnamed residual (measured 2.5 ms in 1p, 11.2 in 4p) plus tl's ~0.1, with no cross-row
+           cadence to trust.  sat_bps_tl10 is still computed; put it back on the row only if that
+           residual ever needs splitting again.
+           ⚠ Row 2 still describes the LAST frame.  Do NOT difference row 4 against row-2 `Bp` any
+           more -- that identity is what this change deliberately breaks, and row 4's own `Bp` is
+           the one to use. */
         {
-            static char r4buf[48];
-            unsigned int e10 = sat_p_emit10, h10 = sat_bps_hd10, p10 = sat_bps_pr10;
-            unsigned int l10 = sat_bps_lp10, t10 = sat_bps_tl10;
-            if (e10 > 9999u) e10 = 9999u;   if (h10 > 9999u) h10 = 9999u;
-            if (p10 > 9999u) p10 = 9999u;   if (l10 > 9999u) l10 = 9999u;
-            if (t10 > 9999u) t10 = 9999u;
-            snprintf(r4buf, sizeof r4buf, "BPS em%3u.%uhd%3u.%upr%3u.%ulp%3u.%utl%3u.%u ",
-                     e10 / 10u, e10 % 10u, h10 / 10u, h10 % 10u,
-                     p10 / 10u, p10 % 10u, l10 / 10u, l10 % 10u,
-                     t10 / 10u, t10 % 10u);
-            SRL::Debug::Print(0, 4, r4buf);
+            static unsigned int pk_bp10 = 0, pk_em10 = 0, pk_hd10 = 0, pk_pr10 = 0, pk_lp10 = 0;
+            if (sat_prof_bp_hit)            /* consumed every frame, in every overlay mode */
+            {
+                pk_bp10 = (unsigned int)sat_prof_bp_hit;
+                pk_em10 = sat_p_emit10;   pk_hd10 = sat_bps_hd10;
+                pk_pr10 = sat_bps_pr10;   pk_lp10 = sat_bps_lp10;
+                sat_prof_bp_hit = 0;
+            }
+            if (sat_dbg_overlay_mode == 0)
+            {
+                static char r4buf[48];
+                unsigned int b10 = pk_bp10, e10 = pk_em10, h10 = pk_hd10;
+                unsigned int p10 = pk_pr10, l10 = pk_lp10;
+                if (b10 > 9999u) b10 = 9999u;   if (e10 > 9999u) e10 = 9999u;
+                if (h10 > 9999u) h10 = 9999u;   if (p10 > 9999u) p10 = 9999u;
+                if (l10 > 9999u) l10 = 9999u;
+                snprintf(r4buf, sizeof r4buf, "BPS Bp%3u.%uem%3u.%uhd%3u.%upr%3u.%ulp%3u.%u ",
+                         b10 / 10u, b10 % 10u, e10 / 10u, e10 % 10u,
+                         h10 / 10u, h10 % 10u, p10 / 10u, p10 % 10u,
+                         l10 / 10u, l10 % 10u);
+                SRL::Debug::Print(0, 4, r4buf);
+            }
         }
 
         /* SESSION percentile metrics: one sample per frame.  RESET on a MODE change (sat_m / SQ) so

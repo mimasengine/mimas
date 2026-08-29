@@ -154,6 +154,28 @@ static void drp_lzss_decode(const unsigned char *src, unsigned char *dst, int us
 #define DRP_MAP_SZ   24                     /* v1 map record (pre per-map rot levels) */
 #define DRP_MAP_SZ_V2 28                    /* v2: + u32 map_flags (bits 0-1 = rot code) */
 #define DRP_ENT_SZ   16
+
+/* [!] SATURN 2026-08-29 -- THE LZSS SCRATCH IS NOW ONE PERSISTENT BUFFER, NOT ONE Z_MALLOC PER
+   COMPRESSED LUMP.  Row-12 `ip` named this file on its first outing: `@5dc04` resolves inside
+   sat_drp_read_lump_n, and it did **454 of 659** in-play long-lived allocations on E1M1 and
+   **523 of 759** on E1M2 -- sixty-nine per cent of them, by one call site, in a session where the
+   owner was watching the zone die.
+   WHY IT HURT SO MUCH FOR A BLOCK THAT IS FREED IMMEDIATELY: it is PU_STATIC, so Z_Malloc must
+   make room for it, and vanilla's rover PURGES EVERY PU_PURGELEVEL BLOCK IT WALKS PAST while
+   looking (z_zone.c).  Four hundred and fifty of those sweeps per level is not a scratch buffer,
+   it is an eviction engine -- and each eviction is the ~29 ms CD read that comes back as the
+   owner's "freeze at every first door".  It also parks a wedge in the middle of the free run for
+   the ~30 ms the read takes.
+   THE PATTERN IS ALREADY IN THIS FILE, two hundred lines up: the per-map entry table was moved to
+   one boot allocation for exactly this reason, and that note already called a per-level
+   alloc/free cycle "its own fragmentation engine".  This is the same fix applied to the hotter
+   loop.
+   Sized at map-select from the entry table's largest COMPRESSED size (stored lumps read straight
+   into dest and need no scratch), and it NEVER SHRINKS -- map 1 normally sets the high-water and
+   it is never touched again.  Fails soft: no scratch, or a lump bigger than it, and the original
+   transient path runs unchanged. */
+static unsigned char *drp_scratch    = nullptr;
+static int            drp_scratch_sz = 0;
 #define DRP_MAGIC    0x31505244u            /* "DRP1" little-endian */
 #define DRP_CODEC_LZSS 1
 #define DRP_FLG_V2MAPS 0x4u                 /* (codec>>8) bit: 28-byte map records */
@@ -602,6 +624,30 @@ extern "C" void sat_drp_select_map(const char *lumpname)
             return;
         }
         drp_n_entries = (int)n_entries;
+
+        /* SATURN 2026-08-29: size the LZSS scratch for THIS map, once, here -- see drp_scratch.
+           Only compressed entries need it; a STORED lump is read straight into dest.  Grow-only,
+           so after the first map this is normally a no-op.  Same keep-free guard as the entry
+           table above: an optional buffer asks, it does not demand. */
+        {
+            uint32_t mx = 0;
+            for (int i = 0; i < (int)n_entries; i++)
+            {
+                const unsigned char *me = drp_entries + i * DRP_ENT_SZ;
+                uint32_t cs = rd32(me + 8), us = rd32(me + 12);
+                if (cs != us && cs > mx) mx = cs;
+            }
+            if ((int)mx > drp_scratch_sz)
+            {
+                if (drp_scratch) { Z_Free(drp_scratch); drp_scratch = nullptr; drp_scratch_sz = 0; }
+                if (Z_LargestAllocatable() > (int)mx + 256*1024)
+                {
+                    drp_scratch    = (unsigned char *)Z_Malloc((int)mx, PU_STATIC, NULL);
+                    drp_scratch_sz = (int)mx;
+                }
+            }
+        }
+
         drp_blob_ofs  = blob_ofs;
         drp_stage_to_cart(blob_ofs, blob_size);   /* Step 4b: CD->cart once (no-op if no cart) */
         return;
@@ -676,10 +722,22 @@ extern "C" int sat_drp_read_lump_n(unsigned int lump, void *dest, int size, int 
     /* LZSS: read the compressed stream into a transient buffer, decode into dest.  The READ stays
     ** full -- we cannot know how much of the stream `need` output bytes consume without decoding it,
     ** and a shorter read saves no seek.  Only the DECODE is shortened. */
-    unsigned char *tmp = (unsigned char *)Z_Malloc((int)csize, PU_STATIC, NULL);
-    if (drp_read(at, tmp, (int)csize) < (int)csize) { Z_Free(tmp); return 0; }
+    /* SATURN 2026-08-29: the persistent scratch (see drp_scratch) -- this used to Z_Malloc and
+       Z_Free PU_STATIC on EVERY compressed lump, 454 of E1M1's 659 in-play allocations, each one
+       running the rover and purging the cache it walked past.  Not reentrant, and it does not need
+       to be: nothing between the read and the decode allocates. */
+    unsigned char *tmp;
+    int tmp_owned = 0;
+    if (drp_scratch && (int)csize <= drp_scratch_sz)
+        tmp = drp_scratch;
+    else
+    {
+        tmp = (unsigned char *)Z_Malloc((int)csize, PU_STATIC, NULL);
+        tmp_owned = 1;
+    }
+    if (drp_read(at, tmp, (int)csize) < (int)csize) { if (tmp_owned) Z_Free(tmp); return 0; }
     drp_lzss_decode(tmp, (unsigned char *)dest, (int)need);
-    Z_Free(tmp);
+    if (tmp_owned) Z_Free(tmp);
     sat_drp_served++;
     return 1;
 }

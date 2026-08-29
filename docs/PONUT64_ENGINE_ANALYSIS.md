@@ -20,14 +20,23 @@ frame. **Pas de BSP, pas de WAD, pas de colonne software** : `DOOM.GVP` est un
 moteur généraliste 3D dans lequel E1M1 entre comme un modèle, pas un port de
 Doom.
 
-État réel, documenté par l'auteur lui-même (`main.c:18-53`) :
-- « *loading Doom E1M1 — Memory corruption occurs. Likely out of RAM* » — le
-  niveau **ne charge pas encore** (tas modèles de 200 Ko débordé par
-  l'expansion tuiles/buffers par secteur).
+**État réel constaté (correction 2026-08-29)** : E1M1 **boote et se joue**,
+à **~17 fps sur émulateur** (constaté par Romain ; cible moteur = 30 fps,
+`SynchConst=2`). La note de dev `main.c:18-19` (« *loading Doom E1M1 — Memory
+corruption occurs. Likely out of RAM* ») est donc **périmée ou non fatale** —
+ne pas la citer comme état courant. Les autres notes de l'auteur
+(`main.c:33-53`) restent son propre diagnostic des limites :
 - « *A single light costs 1-2ms. Oof* » ; « *on the edge of in-budget ; I wish
   I could get just another two hundred polygons* ».
 - « *only 1-3 enemies can be on screen at once… difficult to conceive of a
   game whose art style will carry a strict DOOM-clone approach* ».
+
+Mise en perspective : ~17 fps émulateur pour un remesh de 782 quads sans le
+gameplay Doom (pas de monstres Doom, pas de thinkers, pas de WAD), contre
+Mimas à 7-16 fps **console** sur les données réelles et le jeu complet. Et
+l'émulateur n'est pas un oracle : sur Mimas, l'écart Ymir/console mesuré est
+énorme (tic 8-14 ms Ymir vs 69-83 ms console) — son 17 fps émulateur est
+probablement optimiste vs vrai HW.
 
 Base SDK : Jo Engine **non compilé** — simple distribution (toolchain GCC 8.2 +
 LIBSGL.A stock + linker stock). Trois patches seulement : `workarea.c` custom
@@ -74,8 +83,9 @@ dont tous les portails sont hors écran, backface par plan).
 notre mur n°1 (transfer-over). L'hybride Mimas (sol dominant RBG0 gratuit +
 sols secondaires VDP1 + fallback spans) est structurellement en avance. Sa
 pré-tessellation au chargement est exactement ce que notre verdict
-« pré-tessellation MORTE » a enterré — et chez lui elle fait déborder la RAM
-avec un E1M1 *remodelé low-poly*.
+« pré-tessellation MORTE » a enterré — et chez lui, même sur un E1M1
+*remodelé low-poly* de 35 Ko, elle a mis la RAM assez sous pression pour
+qu'il note « out of RAM » pendant le dev (note depuis dépassée : ça charge).
 
 ## 3. Le brouillard de distance (question centrale)
 
@@ -193,9 +203,9 @@ SCSP_poneSound — à lire avant de promettre la fin des percussions jetées.
 
 | Verdict Mimas | Confirmation Ponut64 |
 |---|---|
-| Pré-tessellation MORTE | Son E1M1 low-poly pré-tessellé déborde 200 Ko et ne boote pas |
+| Pré-tessellation coûteuse en RAM | Même son E1M1 low-poly de 35 Ko a provoqué une note « out of RAM » en dev (main.c:18-19, depuis résolue) — la pression mémoire de l'expansion est réelle, à l'échelle d'un tas de 200 Ko |
 | Flats tout-VDP1 = plot-bound | Il paie chaque texel de sol en plot ; nous avons mesuré le transfer-over |
-| Frontière polygonal vs colonne | 1-3 ennemis à l'écran, +200 polys manquants, level design restreint — un E1M1 remodelé sature un portal engine VDP1 |
+| Frontière polygonal vs colonne | ~17 fps émulateur (cible 30) sur un remesh 782 quads sans gameplay Doom ; ses notes : 1-3 ennemis à l'écran, +200 polys manquants, level design restreint |
 | Pin SRL Zbuffer 2048 o | Sa workarea.c alloue 512 longwords, dérivé indépendamment (+ offset buckets +128 non documenté) |
 | `vdp1-erase-under-slsynch` | Il réécrit EWLR/EWRR chaque vblank lui-même |
 | Les quatre horloges / pokes VDP2 | « SGL has set these and likely sets them at VBLANK, so be careful » (vdp2.c:33) |
@@ -245,7 +255,8 @@ zTable 256 Ko, host-loop audio, DSP pour le sight, buckets de tri (notre
    dès z=1096, mais le CC ne s'arme qu'à z>1200 — ses 8 ratios n'en font
    qu'un. Fix 1 ligne : cutoff ≤ 1096, ou offset/pas élargis pour que la
    rampe couvre [cutoff, far] — il récupère un vrai dégradé de brume gratuit.
-2. **Son OOM E1M1** : le tas HWRAM 200 Ko déborde à l'expansion
+2. **Sa marge mémoire** : E1M1 charge désormais, mais sa note « out of RAM »
+   (main.c:18-19) dit que le tas HWRAM de 200 Ko est au taquet à l'expansion
    (tuiles + buffers view/screen par secteur). Pistes : n'allouer les buffers
    de transform que pour les secteurs du PVS actif (pas les 25) ; auditer le
    .map au build (notre leçon « pré-vol obligatoire » : le pool se lit dans le

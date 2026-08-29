@@ -4029,25 +4029,38 @@ static void fps_update(void)
                    on every header and would shift every allocation in the zone -- it would perturb
                    the exact layout being measured.
                    `lg` on row 11 stays the VERDICT; this is only the diagnosis. */
-                extern int z_ip_n, z_ip_bytes, z_ip_top;
-                extern void *z_ip_ra;
-                int ipt = z_ip_top > 999 ? 999 : z_ip_top;
-                int ipn = z_ip_n   > 999 ? 999 : z_ip_n;
-                int ipk = z_ip_bytes >> 10; if (ipk > 999) ipk = 999;
-                unsigned ipr = (unsigned)(unsigned long)z_ip_ra & 0xFFFFFu;
+                /* [!] `ip` REPLACED BY `pn` 2026-08-29 -- IT ANSWERED TWICE AND HAS NO QUESTION LEFT.
+                   First it named the DRP LZSS scratch (454 of E1M1's 659 in-play long-lived
+                   allocations; fixed with one persistent buffer, and the site vanished from every
+                   later capture).  After that it reported nothing but R_GenerateLookup's two column
+                   directories, which that function retags PU_CACHE before returning -- exactly the
+                   over-count this legend already warned about.  A field whose only remaining output
+                   is its own documented artefact does not keep twelve cells.
+                   `pn<total>/<max>` = the pinned bytes (every tag < PU_PURGELEVEL) and the biggest
+                   single one, in KB.  WHY NOW: re-anchoring the rover at each level load moved
+                   row-11 `lg` 336 -> 491 on E1M1 and 128 -> 279 on E1M2 -- +46 % and +118 % of
+                   contiguity -- AND THE RE-FAULT RATE DID NOT MOVE (27 % / 50 % against 26 % / 45 %).
+                   Contiguity has stopped being what binds.  What binds is on the row above: `zf`
+                   reads 3-33 KB across the whole of E1M2 while `ca` holds ~400.  The zone is
+                   SATURATED, so every new texture evicts an old one however tidily the space is
+                   arranged, and the only lever left is to pin less.  Nothing on screen has ever said
+                   how much IS pinned.  Read `pn` + `ca` + `zf` together: they account for the whole
+                   1016 KB zone, and `max` says whether one block dominates. */
+                extern int z_pinned_bytes, z_pinned_max;
+                int pnk = z_pinned_bytes >> 10; if (pnk > 999) pnk = 999;
+                int pnm = z_pinned_max   >> 10; if (pnm > 999) pnm = 999;
+                unsigned cds = w_cd_ms10 / 10000;      if (cds > 999u) cds = 999u;
                 /* px/ob/gy are MUST-BE-ZERO guards: one digit is enough, because any value above
                    zero already voids the photo and the exact count above 9 changes nothing. */
                 int po = r_patch_ovf     > 9 ? 9 : r_patch_ovf;
                 int oo = r_composite_oob > 9 ? 9 : r_composite_oob;
                 int gy = vdp1_wall_nocol > 9 ? 9 : vdp1_wall_nocol;
                 int st = sat_lead_stale  > 999 ? 999 : sat_lead_stale;
-                /* Worst case with every clamp at its ceiling is exactly 40 cells:
-                   "CD ip999/999k999@fffff px9 ob9 gy9 st999".  ⚠ `t<s>` (cumulative CD time) was
-                   RETIRED 2026-08-29 to pay for the site count: row 0 `ld<chunks>/<refaults>`
-                   carries the disc story in every mode, and this legend had already called `t`
-                   secondary once `ld` gained the re-fault witness. */
-                snprintf(ovbuf, sizeof ovbuf, "CD ip%d/%dk%d@%05x px%d ob%d gy%d st%d       ",
-                         ipt, ipn, ipk, ipr, po, oo, gy, st);
+                /* Worst case with every clamp at its ceiling is 37 of 40 cells:
+                   "CD pn999/999 t999s px9 ob9 gy9 st999" -- and `t<s>` comes back with the three
+                   cells `ip`'s return address gave up. */
+                snprintf(ovbuf, sizeof ovbuf, "CD pn%d/%d t%us px%d ob%d gy%d st%d          ",
+                         pnk, pnm, cds, po, oo, gy, st);
                 ovbuf[40] = ' ';
                 if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 12, ovbuf);
             }

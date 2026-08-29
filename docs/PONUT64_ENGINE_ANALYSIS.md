@@ -115,9 +115,15 @@ morts. Leçon générale : gate et rampe doivent se recouvrir. Autre trou : les
 billboards/particules passent `colorBank` brut — pas de fog sur les sprites.
 
 **vs Doom** : colormap = 32 niveaux payés par pixel en CPU, fondu au noir.
-Ponut = 8 niveaux par polygone, coût par pixel nul, fondu au ciel. C'est
-l'exact complément du manque de Mimas : **nos murs/things VDP1 n'ont aucun
-light diminishing** (les colormaps ne s'appliquent qu'aux colonnes software).
+Ponut = 8 niveaux par polygone, coût par pixel nul, fondu au ciel.
+**Correction (dossiers du soir, `PONUT64_STEALS.md` §1)** : la première
+version de ce paragraphe affirmait que « nos murs/things VDP1 n'ont aucun
+light diminishing » — c'est FAUX. Mimas l'a déjà, par le même mécanisme :
+bank 1 vive + 6 banques CRAM = copies de PLAYPAL passées par les colormaps
+Doom exacts (niveaux 5/10/16/21/26/31), sélectionnées par `wall_light_colr`
+dans CMDCOLR sur murs, things et sols VDP1 (dg_saturn.cxx:6035-6098). Le
+seul delta vs Ponut est le doublement par MSB shadow (7 → 11-12 crans, moitié
+sombre) et la partie « fade » par bits CC — voir les dossiers 1 et 2.
 
 ## 4. Gestion VDP1
 
@@ -190,14 +196,20 @@ mixage CDDA (vol/pan par canal)**. Classes de comportement par slot
 `pcm_reset` qui préserve N sons résidents au changement de niveau. Le driver
 ne réserve que ~48 Ko de sound RAM → **~464 Ko libres pour les samples**.
 
-C'est frontal avec notre chantier vivant : le driver SGL/SRL **jette 34-39 %
-des percussions**, et notre plan « precache SCSP dérivé du spawn » demande
-exactement ce que ponèSound offre (samples résidents en sound RAM, zéro octet
-du pool WRAM). Dépendances remplaçables (loaders GFS → notre lecteur WAD) ;
-le host-loop de streaming (`pcm_stream_host` possède le main loop) est un
-NOPE — on garde CDDA. **Point aveugle à lever avant d'y croire** : la
-politique du 68K quand >32 slots HW sont demandés est dans la source du repo
-SCSP_poneSound — à lire avant de promettre la fin des percussions jetées.
+**Correction (dossier 5 de `PONUT64_STEALS.md`, source 68K lue)** : la
+première version de ce paragraphe imputait le drop de 34-39 % des percussions
+au « driver SGL/SRL » — c'est FAUX. En mode MUS le 68K est **halté**
+(i_sound_saturn.cxx:527) ; les percussions sont jetées par notre propre
+séquenceur `mus_step`, qui saute le canal 15 faute de timbres de batterie
+(i_sound_saturn.cxx:408/:413). ponèSound n'embarque ni séquenceur MUS ni
+banque de drums : son adoption ne joue pas une percussion de plus, et sa
+réservation de 47 Ko **réduit** la RAM samples de ~53 Ko (471 000 o contre
+523 936 aujourd'hui, pour 532 927 o de SFX shareware). Sa politique au-delà
+de 32 slots HW = refus + retry sans priorité (PROJ/main.c:532-546), les
+volatile (nos SFX) passant en dernier. Le chantier audio valide est la
+Route P du dossier 2026-08-25 : banque de 8 drums sur les 9 slots HW libres
+23-31 de la chaîne direct-slot existante. Ce qui reste vrai de ponèSound :
+une belle référence de contrat SH2↔68K (struct partagée + tick vblank), MIT.
 
 ## 8. Ce que ça valide chez Mimas (contre-preuves externes)
 
@@ -212,40 +224,35 @@ SCSP_poneSound — à lire avant de promettre la fin des percussions jetées.
 | LWRAM = données froides | « LWRAM is SLOW!!!! » (bounder.c:407) |
 | Grille uniforme pour le rendu | Vestigiale chez lui aussi (CELL_SIZE défini, zéro usage rendu) |
 
-## 9. À récupérer pour Mimas — classement
+## 9. À récupérer pour Mimas — classement (RÉVISÉ après instruction)
 
-**STEAL (coût faible, gain plausible, à prototyper)**
-1. **Light diminishing VDP1 par banques CRAM + MSB shadow** (§3) : 3-4 bits de
-   CMDCOLR → copies pré-assombries de PLAYPAL en CRAM, ×2 par MSB = jusqu'à
-   8 niveaux de distance/secteur sur murs+things VDP1, zéro texel réécrit,
-   zéro CPU par pixel. Vérifier : sprite type actuel, budget CRAM (NBG1 8bpp +
-   RBG0 y puisent), et le code réservé normal-shadow (HW_VDP2 §5).
-2. **`preclipping-disable` + rotation v0** : nos AABB par fenêtre existent
-   déjà ; poser le bit 11 PMOD sur toute commande entièrement dans le clip et
-   faire pivoter v0 à l'écran sinon — réduit le temps de plot, notre goulot.
-3. **DIVU entrelacé start-early/read-late** sur les sites de division
-   restants (setup colonne r_parallel, échelles de murs).
-4. **ponèSound** (§7) — l'étude d'adoption mérite sa propre session.
+Les 9 pistes de la première version ont été instruites une par une contre le
+code as-built : **[PONUT64_STEALS.md](PONUT64_STEALS.md)** (dossiers complets,
+fichier:ligne, arithmétique, plan d'expérience, colonne « Apport »). Résumé
+des verdicts — la première liste avait **quatre prémisses fausses** :
 
-**INVESTIGATE (à chiffrer avant)**
-5. **Fade-out matériel des things lointains** (bits CC + bascule de priorité)
-   à la place du pop du drop far-first — la couche de fondu serait NBG1
-   (scène), pas un ciel : à valider visuellement.
-6. **Texturer les sols VDP1 secondaires** avec des flats 64×64 pré-coupés
-   ≤32×32 (aujourd'hui teinte plate R_MapPlane) — contre budget VRAM VDP1 et
-   transfer-over.
-7. **Fenêtre d'effacement EWLR/EWRR restreinte** au viewport 3D dans le
-   present v2 (bandeaux HUD 3/4p exclus) — idée valable même si code mort
-   chez lui ; attention au piège d'unités ×8 (HW_VDP1).
-8. **LUT réciproque étroite** (8-16 Ko, domaine z clampé, style distscale)
-   pour les chemins par-colonne/par-cellule restants — 256 Ko impayables.
-9. **Baker des lumps Saturn-natifs** dans strip_wad.py (pré-swap +
-   pré-structuration de ce que P_SetupLevel reconstruit) — lignée de
-   l'alignement-4 cartouche.
+| # | Piste | Apport | Verdict |
+|---|---|---|---|
+| 1 | Banques CRAM (+ MSB shadow) | qualité (seam ±9 % → ±6 %) | **déjà shippé** sauf le MSB : CONDITIONNEL (sonde SPCTL + toggle) |
+| 2 | Fade-out things (bits CC + prio) | qualité + feature, 0 CPU | CONDITIONNEL (type 3 confirmé, veil survit CC_TOP) |
+| 3 | Pre-clipping bit 11 | perf VDP1 0,2-1,2 ms, **+0,1 ms master** | CONDITIONNEL étape 1 ; rotation v0 NO-GO |
+| 4 | DIVU entrelacé | perf MSH2 < 1,2 ms | **NO-GO** — déjà réfuté console (dv1, 07-15) |
+| 5 | ponèSound | audio : 0 sur le symptôme, −53 Ko samples | **NO-GO** → Route P (drums, slots 23-31) |
+| 6 | Sols VDP1 texturés (uv_cut) | perf plot d'un mode parké | **NO-GO** — déjà texturés, mode parké 08-24 |
+| 7 | Fenêtre d'effacement | 0 ms (A) / 0,4-0,9 ms plot (B) | **NO-GO valeur** (marge plot 7-8×) |
+| 8 | LUT réciproque étroite | perf MSH2 0,8-5 ms selon C inconnu | CONDITIONNEL (compter C d'abord ; DIVU = concurrent à 0 RAM) |
+| 9 | Lumps Saturn-natifs | temps de chargement | **NO-GO** — bake_levels.py mesuré et rejeté 08-18 ; résiduel SIDEDEFS |
+
+**Déport MSH2 : aucune piste n'en fait.** Ce qui reste vraiment à prendre :
+deux expériences de qualité visuelle à coût CPU nul (MSB shadow, fade des
+things — toutes deux gated par une sonde SPCTL de 3 lignes, le type sprite réel
+n'ayant jamais été lu) et une sonde de comptage (`dv`/`dm`) pour trancher la
+LUT. Le mécanisme de tri à écrivain unique (buckets chaînés, plages de slots
+disjointes) reste la référence si l'émission murs passait un jour au slave en
+split — à chiffrer contre un slave qui monte déjà à 35 % en 4p.
 
 **NOPE (acté, ne pas rouvrir)** : architecture portal/PVS, pré-tessellation,
-zTable 256 Ko, host-loop audio, DSP pour le sight, buckets de tri (notre
-émission far→near couvre), grille uniforme.
+zTable 256 Ko, host-loop audio, DSP pour le sight, grille uniforme.
 
 ## 10. Idées pour aider Ponut64 (dans l'autre sens)
 

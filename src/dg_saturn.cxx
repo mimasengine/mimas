@@ -4009,29 +4009,45 @@ static void fps_update(void)
                    said we were fragmented; nothing said BY WHAT.
                    ⚠ Computed by Z_LargestAllocatable, which row 11 above calls in the same pass --
                    so it is this frame's, not last frame's.  Both rows are gated on overlay mode 0. */
-                extern int z_split_gain, z_split_size, z_split_tag, z_split_off;
-                (void)z_split_off;              /* on-screen identity is <size>+<T>; the offset is
-                                                   for a future dump, not for a 40-cell row */
-                int spg = z_split_gain >> 10; if (spg > 999) spg = 999;
-                int sps = z_split_size >> 10; if (sps > 999) sps = 999;
-                /* z_zone.h is a core header and is deliberately not included here, so the tags
-                   are literals: 1 STATIC / 2 SOUND / 3 MUSIC / 4 FREE / 5 LEVEL / 6 LEVSPEC.
-                   ⚠ NOT vanilla Doom's 50/51 -- this enum has no explicit values past PU_STATIC. */
-                char spt = z_split_tag == 1 ? 'S'
-                         : z_split_tag == 2 ? 'O'
-                         : z_split_tag == 3 ? 'M'
-                         : z_split_tag == 5 ? 'L'
-                         : z_split_tag == 6 ? 'V' : '?';
-                unsigned cds = w_cd_ms10 / 10000;      if (cds > 9999u) cds = 9999u;
-                int po = r_patch_ovf     > 99 ? 99 : r_patch_ovf;
-                int oo = r_composite_oob > 99 ? 99 : r_composite_oob;
-                int gy = vdp1_wall_nocol > 99 ? 99 : vdp1_wall_nocol;
+                /* [!] `sp` REPLACED BY `ip` 2026-08-29, ONE DAY OLD, HAVING ANSWERED.  Over the
+                   owner's 54 shareware 1p captures `sp` said, in order: early in a level the best
+                   single relocation is worth **+208 KB** (`sp442L2` against `lg234` -- a 2 KB
+                   PU_LEVEL block splitting 234 | 206); then `lg` falls **424 -> 267 in ONE step**
+                   (two lumps loaded, +2 chunks, +2 re-faults); and from that moment the best block
+                   is a 4 KB PU_STATIC worth only `lg`+4.  `gain - lg == the block's own size` means
+                   the free run AFTER it is ZERO -- it is flanked by ANOTHER unpurgeable block.
+                   THEY COME IN CLUSTERS, so no single relocation recovers the run, and "relocate
+                   the splitter" died as a plan the moment it was measured.  That was the stated
+                   failure mode, checked for on purpose, and it fired.
+                   The question is no longer WHICH block but WHO KEEPS ALLOCATING THEM, and this is
+                   the field that answers it: `ip<n>/<KB>@<ra>` = long-lived allocations made since
+                   P_SetupLevel finished, their total, and the low 20 bits of the return address of
+                   the BIGGEST -- resolve it against build/Mimas-<Wad>.map for a function name.
+                   ⚠ 20 bits, not 32: the ELF loads at 0x060xxxxx and is a few hundred KB, so the
+                   low five hex digits are unique and the row keeps five cells.
+                   ⚠ ONE latched `ra`, NOT the per-block SAT_ZONE_RA field: that one costs 4 bytes
+                   on every header and would shift every allocation in the zone -- it would perturb
+                   the exact layout being measured.
+                   `lg` on row 11 stays the VERDICT; this is only the diagnosis. */
+                extern int z_ip_n, z_ip_bytes, z_ip_max;
+                extern void *z_ip_ra;
+                (void)z_ip_max;                 /* n and bytes give the shape (many small vs few
+                                                   large); the max is what `ra` belongs to */
+                int ipn = z_ip_n > 999 ? 999 : z_ip_n;
+                int ipk = z_ip_bytes >> 10; if (ipk > 999) ipk = 999;
+                unsigned ipr = (unsigned)(unsigned long)z_ip_ra & 0xFFFFFu;
+                unsigned cds = w_cd_ms10 / 10000;      if (cds > 999u) cds = 999u;
+                /* px/ob/gy are MUST-BE-ZERO guards: one digit is enough, because any value above
+                   zero already voids the photo and the exact count above 9 changes nothing. */
+                int po = r_patch_ovf     > 9 ? 9 : r_patch_ovf;
+                int oo = r_composite_oob > 9 ? 9 : r_composite_oob;
+                int gy = vdp1_wall_nocol > 9 ? 9 : vdp1_wall_nocol;
                 int st = sat_lead_stale  > 999 ? 999 : sat_lead_stale;
-                /* Worst case is exactly 40 cells with every clamp at its ceiling:
-                   "CD sp999?999 t9999s px99 ob99 gy99 st999" -- so nothing is EVER cut in practice
+                /* Worst case with every clamp at its ceiling is 39 cells:
+                   "CD ip999/999@fffff t999s px9 ob9 gy9 st999" -- nothing is ever cut in practice
                    and the trailing cut below is a belt, not the design. */
-                snprintf(ovbuf, sizeof ovbuf, "CD sp%d%c%d t%us px%d ob%d gy%d st%d          ",
-                         spg, spt, sps, cds, po, oo, gy, st);
+                snprintf(ovbuf, sizeof ovbuf, "CD ip%d/%d@%05x t%us px%d ob%d gy%d st%d       ",
+                         ipn, ipk, ipr, cds, po, oo, gy, st);
                 ovbuf[40] = ' ';
                 if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 12, ovbuf);
             }

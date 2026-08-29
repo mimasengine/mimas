@@ -4029,25 +4029,25 @@ static void fps_update(void)
                    on every header and would shift every allocation in the zone -- it would perturb
                    the exact layout being measured.
                    `lg` on row 11 stays the VERDICT; this is only the diagnosis. */
-                extern int z_ip_n, z_ip_bytes, z_ip_max;
+                extern int z_ip_n, z_ip_bytes, z_ip_top;
                 extern void *z_ip_ra;
-                (void)z_ip_max;                 /* n and bytes give the shape (many small vs few
-                                                   large); the max is what `ra` belongs to */
-                int ipn = z_ip_n > 999 ? 999 : z_ip_n;
+                int ipt = z_ip_top > 999 ? 999 : z_ip_top;
+                int ipn = z_ip_n   > 999 ? 999 : z_ip_n;
                 int ipk = z_ip_bytes >> 10; if (ipk > 999) ipk = 999;
                 unsigned ipr = (unsigned)(unsigned long)z_ip_ra & 0xFFFFFu;
-                unsigned cds = w_cd_ms10 / 10000;      if (cds > 999u) cds = 999u;
                 /* px/ob/gy are MUST-BE-ZERO guards: one digit is enough, because any value above
                    zero already voids the photo and the exact count above 9 changes nothing. */
                 int po = r_patch_ovf     > 9 ? 9 : r_patch_ovf;
                 int oo = r_composite_oob > 9 ? 9 : r_composite_oob;
                 int gy = vdp1_wall_nocol > 9 ? 9 : vdp1_wall_nocol;
                 int st = sat_lead_stale  > 999 ? 999 : sat_lead_stale;
-                /* Worst case with every clamp at its ceiling is 39 cells:
-                   "CD ip999/999@fffff t999s px9 ob9 gy9 st999" -- nothing is ever cut in practice
-                   and the trailing cut below is a belt, not the design. */
-                snprintf(ovbuf, sizeof ovbuf, "CD ip%d/%d@%05x t%us px%d ob%d gy%d st%d       ",
-                         ipn, ipk, ipr, cds, po, oo, gy, st);
+                /* Worst case with every clamp at its ceiling is exactly 40 cells:
+                   "CD ip999/999k999@fffff px9 ob9 gy9 st999".  ⚠ `t<s>` (cumulative CD time) was
+                   RETIRED 2026-08-29 to pay for the site count: row 0 `ld<chunks>/<refaults>`
+                   carries the disc story in every mode, and this legend had already called `t`
+                   secondary once `ld` gained the re-fault witness. */
+                snprintf(ovbuf, sizeof ovbuf, "CD ip%d/%dk%d@%05x px%d ob%d gy%d st%d       ",
+                         ipt, ipn, ipk, ipr, po, oo, gy, st);
                 ovbuf[40] = ' ';
                 if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 12, ovbuf);
             }

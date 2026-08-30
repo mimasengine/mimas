@@ -39,6 +39,12 @@ extern "C" {
 #include "z_zone.h"
 }
 
+/* SATURN 2026-08-30: row-20 `lz` -- bracket the LZSS decode ALONE, so `c` (W_CacheLumpNum =
+   read + decode + zone alloc, one bracket) can finally be split.  The FRT lives in r_parallel,
+   which is where every other bracket reads it; these are no-ops unless RP_PROF. */
+extern "C" void RP_LzssBegin(void);
+extern "C" void RP_LzssLeave(void);
+
 extern "C" unsigned char *sat_wad_base;     /* cart base (NULL in CD-streaming mode) */
 extern "C" int            sat_streaming_mode;
 
@@ -176,6 +182,29 @@ static void drp_lzss_decode(const unsigned char *src, unsigned char *dst, int us
    transient path runs unchanged. */
 static unsigned char *drp_scratch    = nullptr;
 static int            drp_scratch_sz = 0;
+/* [!] SATURN 2026-08-29 -- WHICH lump's COMPRESSED stream is sitting in the scratch (-1 = none),
+   so the same stream is never pulled off the disc twice in a row.
+   drp_read below fetches the WHOLE compressed stream on every call and only the DECODE is
+   shortened -- which is correct and unavoidable (LZSS is not addressable), and which makes a
+   "prefix" a FULL CD READ.  Four call sites assume the opposite and ask twice for the same lump,
+   back to back:
+     R_GenerateLookup's patch loop (r_data.c:749,754) -- W_CacheLumpPrefix(p,8) then (p,8+4*width)
+     R_WallPotatoSeed             (r_data.c:1222,1228) -- the same pair
+   and R_GetColumn (r_data.c:990) then does a THIRD full read of the same patch through
+   W_CacheLumpNum.  A 4-patch texture cost ~14 full reads where 4 would do.
+   MEASURED, Ymir E1M1/E1M2 2026-08-29, rows 4 and 20 latched on ONE frame for the first time:
+   the worst frame is ALWAYS a single R_GetColumn -- `Bp` ~= `lp` ~= `g` ~= `x` on all nine slow
+   captures, residual 0.3-0.7 ms -- with row-20 `a`/`e` at 27-100 ms (the patch loop) or `c` at
+   40-92 ms (the single-patch fetch), and one capture at `pr` 172.8 ms (the seed, in the routing
+   preamble).  Ordinary frames read `g0 n0 x0 a0 e0 k0 q0 c0`: this is the SPIKE mechanism, not
+   the base framerate, which stays compute-bound.
+   SAFE BY CONSTRUCTION: this buffer has exactly one writer, nothing between the read and the
+   decode allocates, and a lump index resolves to one entry hence one csize -- so a hit can only
+   ever re-decode bytes that are already complete and correct.  Invalidated before any overwrite,
+   on a short read, and at map select (the entry table changes under it, and a lump can leave the
+   next map's subset).
+   NOT a cart-mode concern: drp_cart_staged decodes straight out of cart RAM and never gets here. */
+static int            drp_scratch_lump = -1;
 #define DRP_MAGIC    0x31505244u            /* "DRP1" little-endian */
 #define DRP_CODEC_LZSS 1
 #define DRP_FLG_V2MAPS 0x4u                 /* (codec>>8) bit: 28-byte map records */
@@ -627,8 +656,44 @@ extern "C" void sat_drp_select_map(const char *lumpname)
 
         /* SATURN 2026-08-29: size the LZSS scratch for THIS map, once, here -- see drp_scratch.
            Only compressed entries need it; a STORED lump is read straight into dest.  Grow-only,
-           so after the first map this is normally a no-op.  Same keep-free guard as the entry
-           table above: an optional buffer asks, it does not demand. */
+           so after the first map this is normally a no-op.
+           [!] SATURN 2026-08-30 -- THE KEEP-FREE MARGIN WAS 256 KB AND IT WAS ALMOST CERTAINLY
+           REFUSING THE BUFFER.  It was copied from the entry table above under the principle "an
+           optional buffer asks, it does not demand", and the principle is right, but the number
+           was never checked against what is actually being asked for.  Measured on the SHIPPED
+           containers (parsed with tools, not guessed): the largest COMPRESSED lump is **41 787 B**
+           and 98 % of entries are LZSS (946 of 966 on MAP01), so the old guard demanded ~297 KB of
+           contiguous free to claim a 41 KB buffer -- a 7x margin -- while the owner's Ymir session
+           read row-11 `lg` at **336 / 313 / 194** on E1M1 and **112** on E1M2.
+           WHY IT MATTERS AND WHAT MEASURED IT: row-20 `lz` (the LZSS decode, bracketed alone the
+           same day) says the decompressor is NOT the cost.  On the nine `a0 e0` captures the
+           decode is **9-18 % of `c`**, and on the `a`/`e` shape the most decisive photo reads
+           `a >= 99.9 ms` against **`lz2.0`** for the whole frame.  Row-22 `zw` (0..1742 blocks
+           walked) rules out the zone walk.  So the bill is the READ -- which is exactly what the
+           memo removes, and the memo only runs when this buffer exists.
+           THE NEW FLOOR: the scratch is `mx`, and the largest single lump the game can ask for
+           afterwards is that same `mx`, so leaving one more of them plus slack is the honest
+           number.  64 KB against a 41.8 KB `mx` is `mx` + 22 KB.
+           [!] AND THE HYPOTHESIS ABOVE WAS REFUTED BY THE VERY NEXT CAPTURE -- READ THIS BEFORE
+           BUILDING ON IT.  The stated criterion was "row-20 `c` collapses if the scratch was being
+           refused".  `c` did not move: the `a0 e0` shape read 89.0/66.2/59.6/46.2/45.3/37.2/36.5/
+           32.7/26.3 before and 68.3/60.8/54.1/35.3 after -- means 48.8 vs 54.6, nothing.  So the
+           buffer was NOT being refused and the margin was never the problem.  What the same
+           captures did show is the real driver: the MARGINAL refault rate (row 0
+           `ld<chunks>/<refaults>`, differenced between photos) sits at 60-85 %, and a refault is a
+           lump that was purged and must be read AGAIN -- which no read-side memo can ever help.
+           That is an eviction-policy problem and it is answered in core/z_zone.c (SAT_ZONE_LRU),
+           not here.
+           THE CHANGE STAYS ANYWAY, on its own merits and not on the refuted story: demanding
+           ~297 KB of contiguous free to claim a 41 KB buffer had no justification, the buffer
+           itself is measured (2026-08-29: `ip` 659 -> 147 allocations, 831 KB -> 36 KB), and a
+           lower floor can only make it more available.  Nothing here is a live experiment.
+           /!\ NOT FIXED HERE, and worth knowing: the free-then-realloc order below can leave the
+           game with NO scratch where it had a working one, if `mx` grows on a later map and the
+           guard then fails.  In the shipped containers `mx` is the same 41 787 on every map, so
+           the regrow branch does not run after the first success -- which is why it stays as it
+           is rather than growing a fallback nobody can exercise. */
+#define DRP_SCRATCH_KEEPFREE (64*1024)
         {
             uint32_t mx = 0;
             for (int i = 0; i < (int)n_entries; i++)
@@ -640,12 +705,18 @@ extern "C" void sat_drp_select_map(const char *lumpname)
             if ((int)mx > drp_scratch_sz)
             {
                 if (drp_scratch) { Z_Free(drp_scratch); drp_scratch = nullptr; drp_scratch_sz = 0; }
-                if (Z_LargestAllocatable() > (int)mx + 256*1024)
+                if (Z_LargestAllocatable() > (int)mx + DRP_SCRATCH_KEEPFREE)
                 {
                     drp_scratch    = (unsigned char *)Z_Malloc((int)mx, PU_STATIC, NULL);
                     drp_scratch_sz = (int)mx;
                 }
+                else
+                    /* Loud, because it used to be silent: with no scratch the memo never runs and
+                       every prefix pays a full read again.  Mirrors the rot-level line above. */
+                    printf("DRP: no LZSS scratch (%u B, lg %d)\n",
+                           (unsigned)mx, Z_LargestAllocatable());
             }
+            drp_scratch_lump = -1;   /* the entry table just changed under it -- see the memo */
         }
 
         drp_blob_ofs  = blob_ofs;
@@ -705,7 +776,11 @@ extern "C" int sat_drp_read_lump_n(unsigned int lump, void *dest, int size, int 
         if (csize == usize)
             memcpy(dest, blob, need);            /* STORED */
         else
+        {
+            RP_LzssBegin();
             drp_lzss_decode(blob, (unsigned char *)dest, (int)need);    /* LZSS */
+            RP_LzssLeave();
+        }
         sat_drp_served++;
         return 1;
     }
@@ -735,8 +810,18 @@ extern "C" int sat_drp_read_lump_n(unsigned int lump, void *dest, int size, int 
         tmp = (unsigned char *)Z_Malloc((int)csize, PU_STATIC, NULL);
         tmp_owned = 1;
     }
-    if (drp_read(at, tmp, (int)csize) < (int)csize) { if (tmp_owned) Z_Free(tmp); return 0; }
+    /* SATURN 2026-08-29: skip the disc entirely when the scratch already holds THIS lump's
+       stream -- see drp_scratch_lump.  The DECODE still runs every time: `need` differs between
+       the header prefix and the offset-table prefix, and decoding is what the caller asked for. */
+    if (tmp != drp_scratch || drp_scratch_lump != (int)lump)
+    {
+        if (tmp == drp_scratch) drp_scratch_lump = -1;          /* about to overwrite it */
+        if (drp_read(at, tmp, (int)csize) < (int)csize) { if (tmp_owned) Z_Free(tmp); return 0; }
+        if (tmp == drp_scratch) drp_scratch_lump = (int)lump;
+    }
+    RP_LzssBegin();
     drp_lzss_decode(tmp, (unsigned char *)dest, (int)need);
+    RP_LzssLeave();
     if (tmp_owned) Z_Free(tmp);
     sat_drp_served++;
     return 1;

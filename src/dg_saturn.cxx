@@ -4051,15 +4051,29 @@ static void fps_update(void)
                 int pnk = z_pinned_bytes >> 10; if (pnk > 999) pnk = 999;
                 int pnm = z_pinned_max   >> 10; if (pnm > 999) pnm = 999;
                 unsigned cds = w_cd_ms10 / 10000;      if (cds > 999u) cds = 999u;
-                /* px/ob/gy are MUST-BE-ZERO guards: one digit is enough, because any value above
-                   zero already voids the photo and the exact count above 9 changes nothing. */
+                /* px/ob are MUST-BE-ZERO guards: one digit is enough, because any value above
+                   zero already voids the photo and the exact count above 9 changes nothing.
+                   [!] SATURN 2026-08-29 -- `gy` IS NOT ONE OF THEM, AND THE ONE-DIGIT CLAMP IT
+                   INHERITED FROM THEM MADE IT LIE.  px and ob count FAILURES (a converted crash,
+                   a read off the end of a composite): zero-or-not is the whole question, so a
+                   saturating single digit is the right instrument.  A grey quad is a DESIGNED
+                   FALLBACK -- this row's own legend says its trigger is "a wall-dense view
+                   exhausting the wtex slots" -- so `gy` is a RATE, and cumulative-since-boot with
+                   a ceiling of 9 it pins at 9 for ever after the ninth event and never moves
+                   again.  The owner's 2026-08-29 session read `gy9` across the whole of E1M2 and
+                   `gy0 -> gy9` across E1M1, which says only "at least nine since power-on" and
+                   cannot tell 9 from 9000 -- and I had read those photos as VOIDED on the
+                   strength of a rule that does not apply to this field.  Three digits, like `st`,
+                   which is its real neighbour: also cumulative, also a rate, already readable.
+                   (Widening, not windowing: this row is a cumulative-guard row by design and `st`
+                   is documented as such two comments up.  Nothing else about `gy` changes.) */
                 int po = r_patch_ovf     > 9 ? 9 : r_patch_ovf;
                 int oo = r_composite_oob > 9 ? 9 : r_composite_oob;
-                int gy = vdp1_wall_nocol > 9 ? 9 : vdp1_wall_nocol;
+                int gy = vdp1_wall_nocol > 999 ? 999 : vdp1_wall_nocol;
                 int st = sat_lead_stale  > 999 ? 999 : sat_lead_stale;
-                /* Worst case with every clamp at its ceiling is 37 of 40 cells:
-                   "CD pn999/999 t999s px9 ob9 gy9 st999" -- and `t<s>` comes back with the three
-                   cells `ip`'s return address gave up. */
+                /* Worst case with every clamp at its ceiling is 38 of 40 cells:
+                   "CD pn999/999 t999s px9 ob9 gy999 st999" -- and `t<s>` comes back with the
+                   three cells `ip`'s return address gave up. */
                 snprintf(ovbuf, sizeof ovbuf, "CD pn%d/%d t%us px%d ob%d gy%d st%d          ",
                          pnk, pnm, cds, po, oo, gy, st);
                 ovbuf[40] = ' ';
@@ -10452,26 +10466,86 @@ extern "C" void DG_DrawFrame(void)
            ⚠ Row 2 still describes the LAST frame.  Do NOT difference row 4 against row-2 `Bp` any
            more -- that identity is what this change deliberately breaks, and row 4's own `Bp` is
            the one to use. */
+        /* [!] SATURN 2026-08-30 -- `hd` RETIRED, `re` TAKES ITS CELLS, AND THE LABEL BECAME A
+           WRAP FLAG.  Two things the owner's first console session (doomdisc-2/3, E1M1, no cart)
+           made unavoidable:
+
+           (1) `re` = THE EMIT'S RESOLVE HALF, in ms.  vdp1_walls_flush is two loops: a DECISION
+           pass (surplus allocator, wall_tex_resolve -- which bakes a whole texture through
+           R_GetColumn per column and can therefore hit the DISC) and a PLOT pass (the three
+           wall_emit_*, a pure transform into VDP1 command records).  `re` = em - plot, i.e. the
+           decision pass; `em - re` is the plot pass.  NOTHING NEW IS MEASURED: sat_p_plot10 has
+           existed all along and row 14 already prints their ratio as `pl`.  What was missing is
+           that `pl` describes the LAST frame while `em` describes the LATCHED one, so the two
+           could not be multiplied -- and on the two catastrophic frames of that session they
+           disagreed COMPLETELY: `pl87` beside `em166.1` on the MST500 frame (plot-bound, B-bus)
+           and `pl2` beside `em243.3` on the MST1250 one (resolve-bound, disc).  Opposite fixes,
+           and no way to tell which frame either number belonged to.  Same defect, same cure, as
+           rows 4 and 20 on 2026-08-29: put them on ONE frame.
+
+           (2) `BPS` -> `BP!` WHEN A FRAME IN THE WINDOW BLEW THE FRT RANGE.  Every bracket behind
+           this row is an `unsigned short` FRT delta and the tick is 4.47 us, so 65536 ticks =
+           **293 ms** and anything longer ALIASES MODULO 293.  The MST1111 and MST1250 photos of
+           that session are unattributable for exactly this reason and I read them anyway before
+           noticing.  `mh_ms_mx` (the windowed worst FRAME, already computed) answers "could that
+           have happened here" for free, and the row now says so in its own label -- the same
+           spelling row 20 uses for `B!`.  ⚠ It is a SUSPICION flag, deliberately conservative:
+           the worst-frame and worst-Bp frames need not be the same one, so `BP!` means "some
+           frame in this window wrapped, do not trust these numbers", not "this one did".
+
+           `hd` is what pays.  It read 0.3-5.4 ms on every console capture and 0.6-5.3 on Ymir --
+           settled, never the hole, exactly the argument that retired `tl` yesterday.  It folds
+           into the residual `Bp - pr - lp`, which now carries hd + tl and should read ~3-6 ms;
+           if that residual ever grows, `hd` comes back and something else goes.
+           ⚠ Row 2 still describes the LAST frame.  Do NOT difference row 4 against row-2 `Bp`. */
+        /* [!] SATURN 2026-08-30, SAME DAY, FIRST CAPTURE BACK -- `BP!` NOW DATES THE LATCHED FRAME
+           ITSELF, AND ITS SCOPE IS NARROWER THAN I WROTE IT.
+           The first version fired on `mh_ms_mx`, the windowed worst FRAME -- which is not the frame
+           this row describes, so it cried on 7 of the owner's 28 captures including several that
+           were perfectly readable.  `df3` is taken at the top of this same block, so the delta
+           between consecutive frames' `df3` IS the duration of the frame that is ending now, i.e.
+           EXACTLY the latched one.  Same basis as mh_add's `fms` further down; one static, no new
+           clock.
+           AND THE CEILING DOES NOT COVER THE WHOLE ROW.  One `unsigned short` FRT delta wraps at
+           65536 x 4.47 us = 293 ms, but `prof_wallprep` / `prof_segrout` / `prof_segloop`
+           ACCUMULATE per-seg deltas into 32-bit sums (r_parallel.c:1826,1969,1977) -- an Ymir
+           capture read `Bp304.0` with `lp299.3`, both above the ceiling I had just claimed applied
+           to them, which is the proof.  So:
+             SAFE, at any frame time:  `Bp`, `pr`, `lp`  (and row 5's `Pv` SECOND half, prof_flatres,
+                                       accumulated per visplane)
+             ALIASED past 293 ms:      `em`, `re`        (and row 5's `Pv` FIRST half) -- sat_p_emit10,
+                                       sat_p_plot10 and sat_p_build10 are each ONE bracket around a
+                                       whole pass
+           `BP!` therefore means "`em`/`re` on THIS row, and `Pv`'s build half on row 5, are
+           aliased modulo 293 ms -- the rest of the row is exact".  It is no longer a blanket
+           "do not trust this photo". */
         {
-            static unsigned int pk_bp10 = 0, pk_em10 = 0, pk_hd10 = 0, pk_pr10 = 0, pk_lp10 = 0;
+            static unsigned int pk_bp10 = 0, pk_em10 = 0, pk_re10 = 0, pk_pr10 = 0, pk_lp10 = 0;
+            static unsigned int pk_wrap = 0;
+            static uint32_t     pk_prev_end = 0;
+            unsigned int this_ms = pk_prev_end ? (unsigned int)(df3 - pk_prev_end) : 0u;
+            pk_prev_end = df3;
             if (sat_prof_bp_hit)            /* consumed every frame, in every overlay mode */
             {
                 pk_bp10 = (unsigned int)sat_prof_bp_hit;
-                pk_em10 = sat_p_emit10;   pk_hd10 = sat_bps_hd10;
+                pk_em10 = sat_p_emit10;
+                pk_re10 = (sat_p_emit10 > sat_p_plot10) ? (sat_p_emit10 - sat_p_plot10) : 0u;
                 pk_pr10 = sat_bps_pr10;   pk_lp10 = sat_bps_lp10;
+                pk_wrap = (this_ms >= 280u);   /* the LATCHED frame's own duration, not the window's */
                 sat_prof_bp_hit = 0;
             }
             if (sat_dbg_overlay_mode == 0)
             {
                 static char r4buf[48];
-                unsigned int b10 = pk_bp10, e10 = pk_em10, h10 = pk_hd10;
+                unsigned int b10 = pk_bp10, e10 = pk_em10, r10 = pk_re10;
                 unsigned int p10 = pk_pr10, l10 = pk_lp10;
                 if (b10 > 9999u) b10 = 9999u;   if (e10 > 9999u) e10 = 9999u;
-                if (h10 > 9999u) h10 = 9999u;   if (p10 > 9999u) p10 = 9999u;
+                if (r10 > 9999u) r10 = 9999u;   if (p10 > 9999u) p10 = 9999u;
                 if (l10 > 9999u) l10 = 9999u;
-                snprintf(r4buf, sizeof r4buf, "BPS Bp%3u.%uem%3u.%uhd%3u.%upr%3u.%ulp%3u.%u ",
+                snprintf(r4buf, sizeof r4buf, "%s Bp%3u.%uem%3u.%ure%3u.%upr%3u.%ulp%3u.%u ",
+                         pk_wrap ? "BP!" : "BPS",
                          b10 / 10u, b10 % 10u, e10 / 10u, e10 % 10u,
-                         h10 / 10u, h10 % 10u, p10 / 10u, p10 % 10u,
+                         r10 / 10u, r10 % 10u, p10 / 10u, p10 % 10u,
                          l10 / 10u, l10 % 10u);
                 SRL::Debug::Print(0, 4, r4buf);
             }

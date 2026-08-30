@@ -759,6 +759,7 @@ extern "C" unsigned int sat_bps_pr10, sat_bps_lp10, sat_bps_hd10, sat_bps_tl10; 
 /* (sat_p_net10 / _draw10 / _join10 removed with the row that printed them -- settled at ~0.) */
 extern "C" int R_TextureIOFree(int tex);  /* core r_data.c: 1 = resolving this texture hits no disc */
 extern "C" int R_LoadBudgetLeft(void); /* core r_segs.c: 1 = the frame can still afford a fault     */
+extern "C" int z_frame;                /* core z_zone.c: the recency clock, advanced once per frame */
 extern "C" int sat_budget_refused;     /* core r_segs.c: 1 once the budget has refused something    */
 extern "C" int R_WallPotatoColorPeek(int tex);  /* core r_data.c: cached dominant colour, -1 = none,
                                                    NEVER loads (R_WallPotatoColor faults the texture
@@ -10404,6 +10405,10 @@ extern "C" void DG_DrawFrame(void)
            present is the VDP1 kick FRT accumulated during render + this DG call.  sat_present_frt is
            reset AFTER banking so next frame's early kick (sat_walls_kick, during render) accumulates
            cleanly into it before the next bank. */
+        /* SATURN 2026-08-30: the zone's recency clock.  ONE increment per rendered frame,
+           here and nowhere else -- Z_Malloc's scan spares a purgeable block re-used within
+           Z_KEEP_FRAMES of it (core/z_zone.c, SAT_ZONE_LRU). */
+        z_frame++;
         uint32_t df3 = DG_GetTicksMs();
         df_pre_sum  += df1 - df0;
         df_blit_sum += df2 - df1;

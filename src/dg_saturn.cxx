@@ -672,6 +672,8 @@ extern "C" void (*sat_psw_sub_hook)(int subnum, int fh, int ch, int fpic,
 static void sat_psw_sub_note(int subnum, int fh, int ch, int fpic,
                              int flump, int clump, int light);
 static int  psw_flat_last = 0;             /* flat quads emitted last frame (row 13 `f`) */
+static int  psw_flat_denied_last = 0;      /* flat quads DROPPED last frame (row 13 `d`):
+                                              slot famine AND the flat not peekable */
 #endif
 extern "C" int            sat_sky_view;         /* core Part 5: elected split view for the HW sky (-1 = none => all software) */
 extern "C" unsigned int   sat_sky_px_view[4];   /* core Part 5: per-view SKY pixel coverage (election metric) */
@@ -3301,10 +3303,11 @@ static void fps_update(void)
                lead-fill/clamp fields are all dead in that mode): t = tier quads accepted
                last frame, r = shed (wall_acc/px budget full = the FAR remainder). */
             if (sat_psw_active)
-                snprintf(ovbuf, sizeof ovbuf, "PSW t%d r%d f%d                    ",
+                snprintf(ovbuf, sizeof ovbuf, "PSW t%d r%d f%d d%d               ",
                          sat_psw_t_last > 999 ? 999 : sat_psw_t_last,
                          sat_psw_r_last > 999 ? 999 : sat_psw_r_last,
-                         psw_flat_last  > 999 ? 999 : psw_flat_last);
+                         psw_flat_last  > 999 ? 999 : psw_flat_last,
+                         psw_flat_denied_last > 99 ? 99 : psw_flat_denied_last);
 #endif
             if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 13, ovbuf);
             /* row 15 (SCU-DSP feasibility, deliverable #1): per-frame sprite cost split.
@@ -7900,9 +7903,12 @@ static void vdp1_floors_flush(void) {}
    previous bank may read (same acceptance as the parked design; LRU keeps
    resident flats stable below 3 distinct lumps/frame). */
 #define PSW_SUB_MAX      192
-#define PSW_FLAT_SLOTS   3
-#define PSW_FLAT_BASE    0x25C7D000u
-#define PSW_FLAT_SLOTSZ  0x1000u
+#define PSW_FLAT_SLOTS   4
+/* 3 slots fill the freed F-bank top (0x25C7D000..0x25C80000); the 4th takes the
+   KB below (0x25C7C000), which only the worst-case 2p HUD stack can reach -- and
+   PSW is 1p-locked by the frame-boundary latch, so it is free in every PSW frame. */
+static const unsigned int psw_slot_vram[PSW_FLAT_SLOTS] =
+    { 0x25C7D000u, 0x25C7E000u, 0x25C7F000u, 0x25C7C000u };
 #define PSW_FLAT_CAP     96          /* whole-frame floor+ceiling command budget */
 #define PSW_TZ_NEAR      (24 << 16)
 #define PSW_FAN_MAX      24          /* poly verts after the near clip (core caps at 20) */
@@ -8023,7 +8029,7 @@ static int psw_slot_get(int lumpnum)
 	}
 	{
 	    volatile unsigned short *d =
-		(volatile unsigned short *)(PSW_FLAT_BASE + (unsigned int)v * PSW_FLAT_SLOTSZ);
+		(volatile unsigned short *)psw_slot_vram[v];
 	    for (i = 0; i < 2048; ++i)
 		d[i] = (unsigned short)(((unsigned int)src[2*i] << 8) | src[2*i + 1]);
 	}
@@ -8047,9 +8053,13 @@ static void psw_emit_flatquad(int slot, unsigned short colr, const int *qx, cons
     cmd[0] = 0x0002;                                  /* DISTORSP */
     cmd[2] = 0x00E0;                                  /* no clip | 8bpp bank | SPD | ECD */
     cmd[3] = colr;
-    cmd[4] = (unsigned short)((PSW_FLAT_BASE + (unsigned int)slot * PSW_FLAT_SLOTSZ
-                               - VDP1_VRAM_BASE) >> 3);
-    cmd[5] = 0x0840;                                  /* 64 x 64 */
+    if (slot >= 0)
+    {
+	cmd[4] = (unsigned short)((psw_slot_vram[slot] - VDP1_VRAM_BASE) >> 3);
+	cmd[5] = 0x0840;                              /* 64 x 64 */
+    }
+    else
+	cmd[0] = 0x0004;   /* slot famine: solid POLYGON, colr = light bank | flat texel */
     if (sat_wall_paint & 1)
     {   /* DEBUG PAINT: flats solid RED (walls green, things blue -- the L+X triad) */
 	cmd[0] = 0x0004;
@@ -8064,8 +8074,28 @@ static void psw_emit_flatquad(int slot, unsigned short colr, const int *qx, cons
     psw_flat_cmds++;
 }
 
+/* the two flat lumps subsector record k wants this frame (-1 = skip): the floor
+   skips above-eye / missing / the RBG0 dominant triple; the ceiling skips
+   below-eye / sky.  Shared by the flush's NEAR->FAR slot reservation and the
+   emitter so both agree on who needs a slot. */
+static void psw_sub_lumps(int k, int *fl, int *cl)
+{
+    *fl = *cl = -1;
+    if (psw_sub[k].fh < viewz && psw_sub[k].flump >= 0
+        && !(psw_sub[k].fh == sat_vdp2_floor_h
+             && (int)psw_sub[k].fpic == sat_vdp2_floor_pic
+             && ((int)psw_sub[k].light >> 4) == sat_vdp2_floor_band))
+	*fl = psw_sub[k].flump;
+    if (psw_sub[k].ch > viewz && psw_sub[k].clump >= 0)
+	*cl = psw_sub[k].clump;
+}
+
 /* emit one recorded subsector's floor + ceiling (skips: sky, dominant triple,
-   wrong side of the eye, no slot).  Fan by 2: quads (0,i,i+1,i+2). */
+   wrong side of the eye).  Slot famine degrades to a solid lit POLYGON in the
+   flat's centre-texel colour (a wrong-ish tint beats a hole -- the wall path's
+   "at least a flat" philosophy); the drop counter only ticks when even the
+   texel peek fails.  Fan by 2: quads (0,i,i+1,i+2). */
+static int psw_flat_denied = 0;
 static void psw_emit_subflats(int k)
 {
     int px[PSW_FAN_MAX], py[PSW_FAN_MAX];
@@ -8078,28 +8108,32 @@ static void psw_emit_subflats(int k)
     for (i = 0; i < n0; ++i) { px[i] = psw_pvx[psw_pvi[sn] + i]; py[i] = psw_pvy[psw_pvi[sn] + i]; }
     n = psw_nearclip(px, py, n0, cx, cy);
     if (n < 3) return;
+    {
+    int fl, cl;
+    psw_sub_lumps(k, &fl, &cl);
     for (int pass = 0; pass < 2; ++pass)
     {
 	int ph, psign, lump;
 	if (pass == 0)                                  /* FLOOR */
 	{
-	    if (psw_sub[k].fh >= viewz || psw_sub[k].flump < 0) continue;
-	    if (psw_sub[k].fh == sat_vdp2_floor_h
-	        && (int)psw_sub[k].fpic == sat_vdp2_floor_pic
-	        && ((int)psw_sub[k].light >> 4) == sat_vdp2_floor_band)
-		continue;                               /* the dominant lives on RBG0 */
-	    ph = viewz - psw_sub[k].fh; psign = 1; lump = psw_sub[k].flump;
+	    if (fl < 0) continue;
+	    ph = viewz - psw_sub[k].fh; psign = 1; lump = fl;
 	}
 	else                                            /* CEILING */
 	{
-	    if (psw_sub[k].ch <= viewz || psw_sub[k].clump < 0) continue;   /* -1 = sky */
-	    ph = psw_sub[k].ch - viewz; psign = -1; lump = psw_sub[k].clump;
+	    if (cl < 0) continue;
+	    ph = psw_sub[k].ch - viewz; psign = -1; lump = cl;
 	}
 	{
 	    int slot = psw_slot_get(lump);
-	    int nr, li, zi, ok = 1;
+	    int nr, li, zi, ok = 1, fb = -1;
 	    unsigned short colr;
-	    if (slot < 0) continue;
+	    if (slot < 0)
+	    {   /* famine (>PSW_FLAT_SLOTS distinct flats this frame): solid fallback */
+		const unsigned char *src = R_FlatCachePeek(lump);
+		if (!src) { psw_flat_denied++; continue; }
+		fb = src[32*64 + 32];
+	    }
 	    for (i = 0; i < n; ++i)
 		if (!psw_project(cx[i], cy[i], ph, psign, &sxv[i], &syv[i])) { ok = 0; break; }
 	    if (!ok) continue;
@@ -8121,9 +8155,12 @@ static void psw_emit_subflats(int k)
 		qx[1] = sxv[i];     qy[1] = syv[i];
 		qx[2] = sxv[i + 1]; qy[2] = syv[i + 1];
 		qx[3] = sxv[i2];    qy[3] = syv[i2];
-		psw_emit_flatquad(slot, colr, qx, qy);
+		psw_emit_flatquad(slot,
+		                  slot < 0 ? (unsigned short)(colr | fb) : colr,
+		                  qx, qy);
 	    }
 	}
+    }
     }
 }
 #endif /* SAT_PSW */
@@ -8301,8 +8338,20 @@ static void vdp1_walls_flush(void)
            to FARTHER subsectors -> emitted first, without flats.  Watermarks are
            clamped: a HOLD frame can leave them stale for one frame. */
         int tail = (psw_sub_tail < wall_acc_n) ? psw_sub_tail : wall_acc_n;
-        psw_flat_cmds = 0;
+        psw_flat_cmds = 0; psw_flat_denied = 0;
         for (int s = 0; s < PSW_FLAT_SLOTS; ++s) psw_slot[s].used = 0;
+        /* slot reservation NEAR->FAR: the painter emits far-first, so without this
+           a 4th distinct flat (far) would claim the slots and the NEAR quads --
+           the most visible ones -- would degrade.  A reserved slot is 'used' and
+           cannot be evicted for the rest of the frame; far flats beyond the slots
+           fall back to the solid-colour polygon in the emitter. */
+        for (int k = 0; k < psw_sub_n; ++k)
+        {
+            int fl, cl;
+            psw_sub_lumps(k, &fl, &cl);
+            if (fl >= 0) psw_slot_get(fl);
+            if (cl >= 0) psw_slot_get(cl);
+        }
         for (int i = wall_acc_n - 1; i >= tail; --i) VDP1_PLOT_WALL(i);
         for (int k = psw_sub_n - 1; k >= 0; --k)
         {
@@ -8313,7 +8362,7 @@ static void vdp1_walls_flush(void)
             psw_emit_subflats(k);
             for (int i = wend - 1; i >= wbeg; --i) VDP1_PLOT_WALL(i);
         }
-        psw_flat_last = psw_flat_cmds;
+        psw_flat_last = psw_flat_cmds; psw_flat_denied_last = psw_flat_denied;
     }
     else
 #endif

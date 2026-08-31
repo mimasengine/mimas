@@ -63,6 +63,10 @@ StoreWallRange, curline/frontsector/backsector/rw_angle1 vivants).
 > disparaissent = famine des 3 slots flats sous ordre peintre loin-d'abord → 4 slots +
 > réservation proche→loin + fallback POLYGON plein-teinte (81f06f8, re-test console attendu).
 > Row 13 = `PSW t r f d`. Capture ON de référence : Bp 1,4, MST 50, t26 r0 f6.
+> Étape **3a CONSTRUITE** (1be0ea3/6c9e19e, pool 44,25 Ko) : things drainés au rang peintre
+> de leur sous-secteur (queue thing_acc + watermark vissprite `s0`, restore UserClip par
+> batch, shave 3 cmds/thing, drops → THp `x`) — non testée console. Reste : 3b midtex
+> masqués, grille-64 flats, étape 4 verdict.
 
 ## Étape 2 — sols non-dominants + plafonds (quads de sous-secteurs)
 

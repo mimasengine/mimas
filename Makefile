@@ -144,6 +144,15 @@ ifneq ($(SAT_TEST_GOD),)
   TEST_GOD_FLAG = -DSAT_TEST_GOD=$(SAT_TEST_GOD)
 endif
 
+# PSW painter-world experiment (branch psw-world, docs/PSW_WORLD_PLAN.md): compiles the
+# all-VDP1 painter renderer (core/r_segs.c R_PswWallRange, core/r_plane.c election-only
+# R_DrawPlanes, dg_saturn.cxx R+C live toggle + view-blit cut) into the binary.  Empty
+# (default) = ZERO PSW bytes -- the normal build is unchanged.  build.ps1 -Psw sets it.
+SAT_PSW ?=
+ifneq ($(SAT_PSW),)
+  PSW_FLAG = -DSAT_PSW=$(SAT_PSW)
+endif
+
 # SRL puts modules/dummy/ in the path which stubs out stdio.h (no FILE type).
 # Put the compiler's real newlib headers first so Doom's uses of FILE* work.
 # -Isrc: Doom sources include each other with relative paths.
@@ -194,7 +203,8 @@ SRL_CUSTOM_CCFLAGS = -w -fsigned-char \
     $(WARP_FLAG) \
     $(POTATO_SPANS_FLAG) \
     $(BSP_STAGE_FLAG) \
-    $(TEST_GOD_FLAG)
+    $(TEST_GOD_FLAG) \
+    $(PSW_FLAG)
 
 # -----------------------------------------------------------------------
 # Include SRL shared makefile

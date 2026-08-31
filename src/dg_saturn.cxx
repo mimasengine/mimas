@@ -651,6 +651,22 @@ extern "C" int            menuactive;       /* boolean: menu overlay up */
 extern "C" int            automapactive;    /* boolean: automap up */
 extern "C" int            sat_vdp2_sky;     /* core: skip software sky (=> VDP2) */
 extern "C" int            sat_frame_has_sky;/* core: a sky visplane was in view this frame */
+#ifndef SAT_PSW
+#define SAT_PSW 0
+#endif
+#if SAT_PSW
+/* SATURN PSW (psw-world experiment, docs/PSW_WORLD_PLAN.md): painter-mode world.
+   sat_psw_req = pad R+C latch; sat_psw_active = applied ONLY at the end of
+   DG_DrawFrame (frame boundary -- the mode-switch corruption class), 1p + VDP1
+   walls mode required.  Core reads sat_psw_active in RP_QueueWall (r_segs.c,
+   painter wall producer, replaces R_StoreWallRange) and in R_DrawPlanes
+   (r_plane.c, election-only early-out: no spans, no punch). */
+extern "C" int sat_psw_active = 0;
+static int sat_psw_req = 0;
+extern "C" int sat_psw_tiers;   /* core r_segs.c: tier quads accepted this frame */
+extern "C" int sat_psw_ref;     /* core r_segs.c: tier quads shed (budget/list full) */
+static int sat_psw_t_last = 0, sat_psw_r_last = 0;  /* frame-boundary snapshot (overlay row 13) */
+#endif
 extern "C" int            sat_sky_view;         /* core Part 5: elected split view for the HW sky (-1 = none => all software) */
 extern "C" unsigned int   sat_sky_px_view[4];   /* core Part 5: per-view SKY pixel coverage (election metric) */
 extern "C" unsigned int   sat_sky_frt_view[4];  /* SATURN 2026-08-25: per-view SOFTWARE-sky cost, FRT ticks (row 12 `SKY`) -- what the 3-quadrant HW-sky plan is worth */
@@ -3274,6 +3290,15 @@ static void fps_update(void)
             sat_wall_nodraw = 0; vdp1_wall_drop = 0; sat_wall_flip = 0; sat_lead_cols = 0; sat_lead_span_drop = 0; }
             /* row 13: was row 5, but r_parallel's SLVidle ('SLV') p3 row ALSO writes row 5 in
                the shipping (rp_disabled) config -> they collided.  Moved to the free row 13. */
+#if SAT_PSW
+            /* PSW tenant of row 13 (replaces LOS while the painter world is ON -- LOS's
+               lead-fill/clamp fields are all dead in that mode): t = tier quads accepted
+               last frame, r = shed (wall_acc/px budget full = the FAR remainder). */
+            if (sat_psw_active)
+                snprintf(ovbuf, sizeof ovbuf, "PSW t%d r%d                       ",
+                         sat_psw_t_last > 999 ? 999 : sat_psw_t_last,
+                         sat_psw_r_last > 999 ? 999 : sat_psw_r_last);
+#endif
             if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 13, ovbuf);
             /* row 15 (SCU-DSP feasibility, deliverable #1): per-frame sprite cost split.
                pj = R_ProjectSprite time (the arithmetic a DSP could offload); fl = master
@@ -10336,6 +10361,28 @@ extern "C" void DG_DrawFrame(void)
         /* Single-CPU blit: master copies the picture.  W5: 3D-view
            rows always, HUD band only when changed. */
         cache_purge();
+#if SAT_PSW
+        /* PSW painter world: NBG1's view rows carry no world (VDP1 draws it all) -> the
+           view blit is CUT, which is the point (5-11 ms).  The VRAM view rows are wiped
+           to index 0 ONCE per entry/overlay transition -- stale NBG1 pixels sit at
+           priority 6, ABOVE every VDP1 quad, and would mask the whole world.  2D states
+           (menu / automap / intermission) fall back to the full blit: their picture
+           lives in the framebuffer (drawn over index 0 -> the live world shows behind,
+           same look as the software path). */
+        int psw_world = sat_psw_active && gamestate == GS_LEVEL && !menuactive && !automapactive;
+        {
+            static int psw_view_clean = 0;
+            if (psw_world && !psw_view_clean)
+            {
+                for (int y = 0; y < hud_top; ++y)
+                    memset(DOOM_VRAM + (y + VIEW_Y_OFFSET) * DOOM_VRAM_STRIDE, 0, 320);
+                psw_view_clean = 1;
+            }
+            if (!psw_world) psw_view_clean = 0;
+        }
+#else
+        const int psw_world = 0;
+#endif
         if (sat_lr)
         {
             /* LOWRES: the 3D view is packed in the LEFT 160 columns -> copy 160 B/row (half the
@@ -10348,6 +10395,7 @@ extern "C" void DG_DrawFrame(void)
                "software HUD doubled in x" seen on HW whenever the crisp VDP1 band is dropped under a
                full VDP1 command budget in 4p).  Framebuffer stays intact (decimate only reads it). */
             int is34 = (sat_local_players >= 3);
+            if (!psw_world)
             for (int y = 0; y < hud_top; ++y)
             {
                 unsigned char       *d = DOOM_VRAM + (y + VIEW_Y_OFFSET) * DOOM_VRAM_STRIDE;
@@ -10367,6 +10415,7 @@ extern "C" void DG_DrawFrame(void)
         }
         else
         {
+            if (!psw_world)
             for (int y = 0; y < hud_top; ++y)
                 memcpy(DOOM_VRAM + (y + VIEW_Y_OFFSET) * DOOM_VRAM_STRIDE, framebuffer + y * 320, 320);
             if (hud_blit)
@@ -10620,6 +10669,18 @@ extern "C" void DG_DrawFrame(void)
             if (fms > 0) mh_add(fms, sat_things_n, sat_things_decl, sat_things_occ, thing_bake_n);
         }
     }
+#if SAT_PSW
+    /* PSW latch -- the ONLY writer of sat_psw_active, at the frame boundary: the frame just
+       composed above was rendered AND blitted under the old mode; the next render and its
+       DG_DrawFrame both see the new one.  Guards: 1p + the VDP1-walls mode (sat_wall_skip)
+       -- PSW without the wall hook path would draw nothing.  The per-frame core counters
+       are snapshotted here so row 13 prints last frame's numbers whatever the overlay mode. */
+    {
+        sat_psw_t_last = sat_psw_tiers; sat_psw_r_last = sat_psw_ref;
+        sat_psw_tiers = 0; sat_psw_ref = 0;
+        sat_psw_active = (sat_psw_req && sat_local_players <= 1 && sat_wall_skip) ? 1 : 0;
+    }
+#endif
     return;
 }
 
@@ -10924,6 +10985,16 @@ static void poll_pad(void)
        L+X AIMD cycle was cut on 2026-07-16 (see :7488).  Read instead: row 7 `cs`, row 17 `ec`. */
     /* (Pad R+C CLEAR-ON-SLAVE A/B REMOVED 2026-08-26 -- baked ON, HW-validated at -2..-3 ms of
        `dg` on 2026-07-09 and never contested.  Row-7 `cs` went with it.  R+C is free.) */
+#if SAT_PSW
+    /* Pad R+C (R held, L released, C edge, 1p): PSW painter-world toggle (branche psw-world,
+       docs/PSW_WORLD_PLAN.md).  LATCHED here, applied at the next DG_DrawFrame boundary --
+       never mid-frame (mode-switch corruption class).  Same posture rule as L+C: C is the
+       run button, both-shoulders-released is the play stance, so this cannot fire from
+       neutral.  Row 13 becomes the PSW row while active. */
+    if (sat_local_players <= 1 && !(cur & PER_DGT_TR) && (cur & PER_DGT_TL)   /* R held, L released */
+        && (changed & PER_DGT_TC) && !(cur & PER_DGT_TC))
+        sat_psw_req ^= 1;
+#endif
     /* Pad L+C (L held, R released, 1p only): cycle the CUMULATIVE perf-lever level 0->1->2->3->4->0
        (core sat_opt, defined + fully documented in core/r_segs.c).
          0 = all off (the 2026-07-29 reference)   1 = +L1 span fill (r_plane.c)

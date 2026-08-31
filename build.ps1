@@ -65,6 +65,8 @@ param(
     [string]$WarpSkill = "4",
     [switch]$SegsFirst,
     [switch]$TestGod,
+    [switch]$Psw,               # PSW painter-world experiment (branch psw-world): SAT_PSW=1 + R+C toggle
+
     [string]$Name = "",
     [string]$MusicSrc = "",   # NB: not -MusicDir -- PowerShell names are case-INSENSITIVE and
                               # $musicDir already means ./cd/music below, so the param would be
@@ -332,6 +334,7 @@ try {
     }
 
     $makeTarget = "build"
+    if ($Psw) { $cdName = "$cdName-Psw" }   # PSW experiment disc: own output set, never clobbers the normal .bin
     # CD_NAME override = the per-IWAD disc name (shared.mk names .elf/.map/.bin/.cue/.iso from it).
     # Each WAD therefore links into its OWN output set: no cross-WAD stale-output aliasing, and the
     # .o files stay shared so switching WADs is still an incremental build.
@@ -351,6 +354,12 @@ try {
     # not track CFLAGS changes, so toggling it off would otherwise leave a godded .o).  Pair -WarpMap.
     $touchExtra = ""
     if ($TestGod) { $makeArgs += " SAT_TEST_GOD=1"; $touchExtra = " core/g_game.c" }
+    # -Psw (Makefile SAT_PSW -> core/r_segs.c + core/r_plane.c + dg_saturn.cxx): the painter-world
+    # experiment build (docs/PSW_WORLD_PLAN.md).  The disc gets its own name so the normal .bin is
+    # never overwritten.  The two gated core files are in the ALWAYS-touched list below: make does
+    # not track CFLAGS, so leaving their .o from the other variant breaks the link either way
+    # (undefined sat_psw_active on the way down, missing PSW code on the way up).
+    if ($Psw) { $makeArgs += " SAT_PSW=1" }
 
     Write-Host "Building $cdName$(if ($cddaAppend) {' (CDDA)'})..."
     # Touch the file carrying the on-screen build stamp (dg_saturn.cxx -> row 18
@@ -359,7 +368,7 @@ try {
     # files changed (which otherwise leaves dg_saturn.o, and its __TIME__, stale).
     # core/p_setup.c is touched too: the M5 staging-order define lives there and make does
     # not track CFLAGS changes, so toggling -SegsFirst would otherwise leave a stale .o.
-    Invoke-Msys2 "cd '$rootMsys' && touch src/dg_saturn.cxx core/p_setup.c$touchExtra && make $makeTarget $makeArgs"
+    Invoke-Msys2 "cd '$rootMsys' && touch src/dg_saturn.cxx core/p_setup.c core/r_segs.c core/r_plane.c$touchExtra && make $makeTarget $makeArgs"
 
     # TLSF pre-flight: the HWRAM TLSF pool (_end..__heap_end in build/<CD_NAME>.map)
     # must keep >= 4 KB or SRL's tlsf_add_pool rejects it at boot -> black

@@ -759,7 +759,6 @@ extern "C" unsigned int sat_bps_pr10, sat_bps_lp10, sat_bps_hd10, sat_bps_tl10; 
 /* (sat_p_net10 / _draw10 / _join10 removed with the row that printed them -- settled at ~0.) */
 extern "C" int R_TextureIOFree(int tex);  /* core r_data.c: 1 = resolving this texture hits no disc */
 extern "C" int R_LoadBudgetLeft(void); /* core r_segs.c: 1 = the frame can still afford a fault     */
-extern "C" int z_frame;                /* core z_zone.c: the recency clock, advanced once per frame */
 extern "C" int sat_budget_refused;     /* core r_segs.c: 1 once the budget has refused something    */
 extern "C" int R_WallPotatoColorPeek(int tex);  /* core r_data.c: cached dominant colour, -1 = none,
                                                    NEVER loads (R_WallPotatoColor faults the texture
@@ -1638,6 +1637,8 @@ static int load_wad(void)
 /* ------------------------------------------------------------------ */
 
 #define FRT_TCR  (*(volatile unsigned char *)0xFFFFFE16)
+extern int sat_mp_poll_to[3];   /* SATURN 2026-08-31: the three bounded TVSTAT polls of
+                                   sat_mp_fence -- row 8 `p<a>/<b>/<c>`.  Defined there. */
 #define FRT_FRCH (*(volatile unsigned char *)0xFFFFFE12)
 #define FRT_FRCL (*(volatile unsigned char *)0xFFFFFE13)
 
@@ -3165,9 +3166,19 @@ static void fps_update(void)
                photographed -- and it sits INSIDE row 5 `Pv`.  Row 5 subtracts it; this is where
                you read how much was subtracted.  A probe whose cost hides inside the phase it
                measures is not a measurement. */
-            snprintf(ovbuf, sizeof ovbuf, "VD1 fb%d/%d MP%d w%d %dms g%d Q%d/%u.%u E%d/%d   ",
+            /* [!] SATURN 2026-08-31 -- `p<a>/<b>/<c>` ADDED next to `w`, and it belongs next to it:
+               `w` (sat_mp_wd) is the overrun counter of the ONE bounded poll in sat_mp_fence, and
+               these are the three that had no counter at all because they had no bound at all.
+               a = "arrived inside a vblank, waited it out", b = "waited for a fresh IN edge",
+               c = "rode to the OUT edge".  Cumulative, clamped 9999.
+               READ IT AS: all three 0 = the present fence is not where the freeze is, and a whole
+               family of hypotheses is dead.  Any of them non-zero = that poll hit its 100 ms FRT
+               bound, the swap was forced, and the frame may have torn once -- which is exactly the
+               hang, caught. */
+            snprintf(ovbuf, sizeof ovbuf, "VD1 fb%d/%d MP%d w%d p%d/%d/%d %dms g%d Q%d/%u.%u E%d/%d ",
                      fb_pk_starve, fb_pk_mag,
                      sat_mp_active, (sat_mp_wd > 999 ? 999 : sat_mp_wd),
+                     sat_mp_poll_to[0], sat_mp_poll_to[1], sat_mp_poll_to[2],
                      (sat_mp_wait_ms > 99 ? 99 : sat_mp_wait_ms),
                      (sat_mp_gate_ms > 99 ? 99 : sat_mp_gate_ms),
                      (sat_plane_quad_n > 999 ? 999 : sat_plane_quad_n),
@@ -8110,6 +8121,49 @@ static void sat_field_fence(void)
    VBE erase this triggers on the retiring buffer is partial on NTSC (x10 deficit) and
    harmless -- the in-list colour-0 polygon owns the real erase.  Wait = align-to-vblank
    (avg ~half a field) + the vblank itself; measured into sat_mp_wait_ms (row 8). */
+/* [!] SATURN 2026-08-31 -- THE THREE BARE TVSTAT POLLS BELOW ARE NOW BOUNDED AND COUNTED.
+   They were `while ( (TVSTAT & 8)) { }`, `while (!(TVSTAT & 8)) { }`, `while ( (TVSTAT & 8)) { }`
+   with NO watchdog, NO vbl_count bound, NO timer, and NO counter -- three unbounded hardware
+   polls on a function this file calls UNCONDITIONALLY, every frame, since 2026-08-19 (:10230).
+   Loop 1 above has always had its bound (sat_mp_wd, row 8 `w`); these three never did, which is
+   why `w0` on every capture proves nothing about them.
+   WHAT IT IS FOR: three hard freezes in three sessions, all on Ymir, twice while opening the
+   first door on E1M1.  Owner's description: the picture is frozen on the last rendered frame,
+   NOTHING moves -- no counter on the overlay, no controls -- and no FATAL text.  That is a main
+   loop that stopped, not a slow one.  And the two freeze captures read `to0:-` with row-5
+   `w0.0/0`: no rp_wait expired and the longest master wait on the slave was under one FRT tick,
+   so it is not a slave join.  These loops are the only unbounded waits left on the per-frame
+   master path.
+   /!\ NOT PROVEN TO BE THE FREEZE.  What is measured is that they exist, are unbounded, and run
+   every frame.  If the hang is here, it now becomes a counter plus ONE torn field instead of a
+   dead console -- and the counter says WHICH of the three.  If the counters stay 0 through a
+   freeze, they are cleared and the hunt moves on with one whole family eliminated.
+   WHY THE BOUND IS THE FRT AND NOT vbl_count: vbl_count is advanced by the VBlank ISR, so a bound
+   built on it cannot fire in the one scenario I cannot rule out -- a dead ISR.  The FRT is a
+   free-running hardware timer; it keeps counting whatever the interrupt controller is doing.
+   COST: one 8-bit register pair read and a compare per iteration, on loops that already poll a
+   bus register in a tight spin and that normally exit within one field.  Nothing measurable.
+   On timeout we fall through and do the write anyway -- exactly the contract loop 1 documents:
+   "may tear once, never freezes". */
+#define MP_POLL_TIMEOUT_FRT 22400u   /* ~100 ms at phi/128; one field is 16.7 ms, so 6x generous */
+int sat_mp_poll_to[3] = { 0, 0, 0 };   /* row 8 `p<a>/<b>/<c>` -- one per bare poll, cumulative */
+static inline unsigned short mp_frt(void)
+{
+    unsigned char h = FRT_FRCH, l = FRT_FRCL;   /* H then L latches the pair (as vblank_handler) */
+    return (unsigned short)((h << 8) | l);
+}
+/* Spin until the VBLANK flag matches `want`, or the FRT bound expires (then count it). */
+static inline void mp_poll_vb(int want, int idx)
+{
+    unsigned short t0 = mp_frt();
+    for (;;)
+    {
+        if (((TVSTAT & 8) ? 1 : 0) == want) return;
+        if ((unsigned short)(mp_frt() - t0) >= MP_POLL_TIMEOUT_FRT)
+        { if (sat_mp_poll_to[idx] < 9999) sat_mp_poll_to[idx]++; return; }
+    }
+}
+
 static void sat_mp_fence(void)
 {
     uint32_t w0 = DG_GetTicksMs();
@@ -8140,8 +8194,8 @@ static void sat_mp_fence(void)
                                                            at the next kick (row 8 `g`). */
     }
     /* 2: VBE erase & change at a fresh vblank-IN edge (p.40 window; SlaveDriver 0xfffe). */
-    while ( (TVSTAT & 8)) { }                  /* arrived inside a vblank: wait it out    */
-    while (!(TVSTAT & 8)) { }                  /* fresh IN edge                           */
+    mp_poll_vb(0, 0);                          /* arrived inside a vblank: wait it out    */
+    mp_poll_vb(1, 1);                          /* fresh IN edge                           */
     VDP1_TVMR = 0x0008;                        /* VBE=1 (TVM=000 unchanged)               */
     VDP1_FBCR = 0x0003;                        /* erase & change: swap at THIS vblank's END */
 #if VDP2_CELL_SKY
@@ -8153,7 +8207,7 @@ static void sat_mp_fence(void)
 #endif
     /* 3: ride to the OUT edge -- the swap has just executed (both machines).  The caller
        blits right after, racing the beam from the top of the field (Fl1 phase, ~2.5x). */
-    while ( (TVSTAT & 8)) { }
+    mp_poll_vb(0, 2);
     VDP1_TVMR = 0x0000;                        /* red step 7: no auto V-blank erase next  */
     sat_mp_active  = 1;
     sat_mp_pending = 0;
@@ -10405,10 +10459,6 @@ extern "C" void DG_DrawFrame(void)
            present is the VDP1 kick FRT accumulated during render + this DG call.  sat_present_frt is
            reset AFTER banking so next frame's early kick (sat_walls_kick, during render) accumulates
            cleanly into it before the next bank. */
-        /* SATURN 2026-08-30: the zone's recency clock.  ONE increment per rendered frame,
-           here and nowhere else -- Z_Malloc's scan spares a purgeable block re-used within
-           Z_KEEP_FRAMES of it (core/z_zone.c, SAT_ZONE_LRU). */
-        z_frame++;
         uint32_t df3 = DG_GetTicksMs();
         df_pre_sum  += df1 - df0;
         df_blit_sum += df2 - df1;

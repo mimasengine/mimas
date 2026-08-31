@@ -57,6 +57,10 @@ StoreWallRange, curline/frontsector/backsector/rw_angle1 vivants).
 8. **Overlay** : rows 13/14 (r_plane, mortes quand les plans sont coupés) = tenant PSW
    `PSW s<subs> w<emis>/<acc> re<refus> [ms]` ; légende ATLAS.md même session.
 
+> **STATUT 2026-08-31 soir** : étape 1 **VALIDÉE CONSOLE** (captures owner : Bp 11,7-25,4 →
+> 1,2-1,8 ms, MST 33 verrouillé = 30 fps). Étape 2 **CONSTRUITE** (commits 2d8034f/2d60939,
+> build vert, pool 46,9 Ko) — non validée console. Row 13 = `PSW t r f`.
+
 ## Étape 2 — sols non-dominants + plafonds (quads de sous-secteurs)
 
 - **Polygones de sous-secteurs au level-load** (p_setup.c après :1234, PU_LEVEL zone

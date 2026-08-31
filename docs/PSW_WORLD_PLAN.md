@@ -58,8 +58,11 @@ StoreWallRange, curline/frontsector/backsector/rw_angle1 vivants).
    `PSW s<subs> w<emis>/<acc> re<refus> [ms]` ; légende ATLAS.md même session.
 
 > **STATUT 2026-08-31 soir** : étape 1 **VALIDÉE CONSOLE** (captures owner : Bp 11,7-25,4 →
-> 1,2-1,8 ms, MST 33 verrouillé = 30 fps). Étape 2 **CONSTRUITE** (commits 2d8034f/2d60939,
-> build vert, pool 46,9 Ko) — non validée console. Row 13 = `PSW t r f`.
+> 1,2-1,8 ms, MST 33 verrouillé = 30 fps). Étape 2 **TESTÉE CONSOLE** (« ok, mieux ») après
+> deux fixes : traits = overflow 64-bit du clip d'intersection (core 28a8751) ; plafonds qui
+> disparaissent = famine des 3 slots flats sous ordre peintre loin-d'abord → 4 slots +
+> réservation proche→loin + fallback POLYGON plein-teinte (81f06f8, re-test console attendu).
+> Row 13 = `PSW t r f d`. Capture ON de référence : Bp 1,4, MST 50, t26 r0 f6.
 
 ## Étape 2 — sols non-dominants + plafonds (quads de sous-secteurs)
 

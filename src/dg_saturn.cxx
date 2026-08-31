@@ -668,9 +668,9 @@ extern "C" int sat_psw_ref;     /* core r_segs.c: tier quads shed (budget/list f
 static int sat_psw_t_last = 0, sat_psw_r_last = 0;  /* frame-boundary snapshot (overlay row 13) */
 /* step 2: per-subsector flats (recorder installed at init; machinery near vdp1_walls_flush) */
 extern "C" void (*sat_psw_sub_hook)(int subnum, int fh, int ch, int fpic,
-                                    int flump, int clump, int light);   /* core r_bsp.c */
+                                    int flump, int clump, int light, int vis0);   /* core r_bsp.c */
 static void sat_psw_sub_note(int subnum, int fh, int ch, int fpic,
-                             int flump, int clump, int light);
+                             int flump, int clump, int light, int vis0);
 static int  psw_flat_last = 0;             /* flat quads emitted last frame (row 13 `f`) */
 static int  psw_flat_denied_last = 0;      /* flat quads DROPPED last frame (row 13 `d`):
                                               slot famine AND the flat not peekable */
@@ -5962,9 +5962,12 @@ static unsigned int thing_lru_tick;        /* monotonic use counter -> evict the
    1p keeps the direct path (its emission already happens at the kick, after the walls). */
 #define THING_ACC_MAX      (4 * THING_ADAPT_MAX)  /* 4 views x per-view AIMD ceiling */
 #define THING_FLUSH_MARGIN 16                     /* bank tail kept free: 4 views' weapon(2) + HUD + end */
+extern "C" int sat_thing_cur_vis;                 /* core r_things.c: vissprite index of the sprite
+                                                     currently offered to the hook (PSW rank key) */
 static struct { unsigned short texoff, csize, colr;  /* precomputed CMDSRCA / CMDSIZE / CMDCOLR */
                 short x0, y0, x1, y1;             /* quad rect (screen, view offset baked in) */
                 short cx0, cy0, cx1, cy1;         /* FUNC_UserClip visible box */
+                short vis;                        /* PSW: vissprite index (painter rank key); -1 in split */
                 unsigned char flip;
                 unsigned char view; } thing_acc[THING_ACC_MAX];   /* owning split view (0..3) -> fair drop bins */
 static int thing_acc_n;                    /* queued entries this split frame */
@@ -7918,17 +7921,20 @@ static struct {
     int   flump, clump;              /* flat lumps; clump -1 = sky ceiling        */
     short subnum, fpic;              /* polygon index; floorpic (dominant match)  */
     short light, w0;                 /* lightlevel; wall_acc watermark at visit   */
+    short s0;                        /* vissprite watermark at visit (step 3)     */
 } psw_sub[PSW_SUB_MAX];
 static int psw_sub_n = 0;
 static int psw_sub_tail = 0x7fff;    /* wall watermark at the FIRST overflow (0x7fff = none) */
+static int psw_spr_tail = 0x7fff;    /* vissprite watermark at the FIRST overflow */
 static int psw_flat_cmds = 0;
 
 static void sat_psw_sub_note(int subnum, int fh, int ch, int fpic,
-                             int flump, int clump, int light)
+                             int flump, int clump, int light, int vis0)
 {
     if (psw_sub_n >= PSW_SUB_MAX)
     {
-	if (psw_sub_tail == 0x7fff) psw_sub_tail = wall_acc_n;   /* tail walls = farther subs */
+	if (psw_sub_tail == 0x7fff) { psw_sub_tail = wall_acc_n;   /* tail walls = farther subs */
+	                              psw_spr_tail = vis0; }
 	return;
     }
     psw_sub[psw_sub_n].fh = fh;       psw_sub[psw_sub_n].ch = ch;
@@ -7937,6 +7943,7 @@ static void sat_psw_sub_note(int subnum, int fh, int ch, int fpic,
     psw_sub[psw_sub_n].fpic  = (short)fpic;
     psw_sub[psw_sub_n].light = (short)light;
     psw_sub[psw_sub_n].w0    = (short)wall_acc_n;
+    psw_sub[psw_sub_n].s0    = (short)vis0;
     psw_sub_n++;
 }
 
@@ -8163,6 +8170,67 @@ static void psw_emit_subflats(int k)
     }
     }
 }
+
+/* step 3: drain the queued things whose vissprite index falls in [v0,v1) -- called at
+   the owning subsector's painter rank, after its flats and walls (a thing inside a
+   convex subsector is in FRONT of all its walls; nearer subsectors overpaint it).
+   Same 2-cmd recipe as vdp1_things_flush.  A batch leaves the FULL-VIEW UserClip
+   behind it: the clip box is MODAL VDP1 state and the later (nearer) Window_In walls
+   would inherit the last thing's box otherwise.  Queue order is PASS 2's far->near,
+   preserved within the range. */
+#if SAT_WORLD_THINGS_VDP1
+static int psw_thing_cmds = 0;   /* commands this drain wrote this flush (things + restores) */
+static int psw_thing_drop = 0;   /* queued things dropped at the bank guard (vanish 1 frame) */
+static void psw_emit_subthings(int v0, int v1)
+{
+    unsigned short cmd[16];
+    int i, any = 0;
+    for (i = 0; i < thing_acc_n; ++i)
+    {
+	int v = (int)thing_acc[i].vis;
+	if (v < v0 || v >= v1) continue;
+	if (vdp1_wnext >= vdp1_wall_cap - THING_FLUSH_MARGIN) { psw_thing_drop++; continue; }
+	memset(cmd, 0, sizeof cmd);
+	cmd[0]  = 0x0008;                          /* FUNC_UserClip = visible box */
+	cmd[6]  = thing_acc[i].cx0; cmd[7]  = thing_acc[i].cy0;
+	cmd[10] = thing_acc[i].cx1; cmd[11] = thing_acc[i].cy1;
+	vdp1_cmd_at(VDP1_BANK[vdp1_wbank], vdp1_wnext++, cmd);
+	memset(cmd, 0, sizeof cmd);
+	{
+	    short xl = thing_acc[i].flip ? thing_acc[i].x1 : thing_acc[i].x0;
+	    short xr = thing_acc[i].flip ? thing_acc[i].x0 : thing_acc[i].x1;
+	    cmd[0] = 0x0002;                       /* distorted sprite */
+	    cmd[2] = 0x04A0;                       /* 256-bank | ECD-off | SPD CLEAR | Window_In */
+	    cmd[3] = thing_acc[i].colr;
+	    cmd[4] = thing_acc[i].texoff;
+	    cmd[5] = thing_acc[i].csize;
+	    if (sat_wall_paint & 1)
+	    {
+		cmd[0] = 0x0004;                   /* POLYGON: L+X paints VDP1 things BLUE */
+		cmd[3] = (unsigned short)(0x0100u | 198u);
+	    }
+	    cmd[6]  = xl; cmd[7]  = thing_acc[i].y0;
+	    cmd[8]  = xr; cmd[9]  = thing_acc[i].y0;
+	    cmd[10] = xr; cmd[11] = thing_acc[i].y1;
+	    cmd[12] = xl; cmd[13] = thing_acc[i].y1;
+	    vdp1_cmd_at(VDP1_BANK[vdp1_wbank], vdp1_wnext++, cmd);
+	}
+	psw_thing_cmds += 2;
+	any = 1;
+    }
+    if (any)
+    {   /* restore the full-view window (the sat_vdp1_wpn_clip recipe, kept local) */
+	memset(cmd, 0, sizeof cmd);
+	cmd[0]  = 0x0008;
+	cmd[6]  = (short)viewwindowx;
+	cmd[7]  = (short)viewwindowy;
+	cmd[10] = (short)(viewwindowx + scaledviewwidth - 1);
+	cmd[11] = (short)(viewwindowy + viewheight - 1);
+	vdp1_cmd_at(VDP1_BANK[vdp1_wbank], vdp1_wnext++, cmd);
+	psw_thing_cmds++;
+    }
+}
+#endif /* SAT_WORLD_THINGS_VDP1 */
 #endif /* SAT_PSW */
 
 /* drain accumulated walls into the current bank (from vdp1_wpn_begin, behind the weapon).
@@ -8353,6 +8421,10 @@ static void vdp1_walls_flush(void)
             if (cl >= 0) psw_slot_get(cl);
         }
         for (int i = wall_acc_n - 1; i >= tail; --i) VDP1_PLOT_WALL(i);
+#if SAT_WORLD_THINGS_VDP1
+        if (psw_spr_tail != 0x7fff)
+            psw_emit_subthings(psw_spr_tail, 0x7fff);   /* things of overflowed (farther) subs */
+#endif
         for (int k = psw_sub_n - 1; k >= 0; --k)
         {
             int wend = (k + 1 < psw_sub_n) ? (int)psw_sub[k + 1].w0 : tail;
@@ -8361,8 +8433,22 @@ static void vdp1_walls_flush(void)
             if (wbeg > wend) wbeg = wend;
             psw_emit_subflats(k);
             for (int i = wend - 1; i >= wbeg; --i) VDP1_PLOT_WALL(i);
+#if SAT_WORLD_THINGS_VDP1
+            psw_emit_subthings((int)psw_sub[k].s0,
+                               (k + 1 < psw_sub_n) ? (int)psw_sub[k + 1].s0 : psw_spr_tail);
+#endif
         }
         psw_flat_last = psw_flat_cmds; psw_flat_denied_last = psw_flat_denied;
+#if SAT_WORLD_THINGS_VDP1
+        if (psw_thing_drop > 0)
+        {   /* a dropped queued thing is drawn by NOBODY this frame (the vanish class):
+               feed the same accounting as the split drain so THp `x` shows it */
+            sat_things_decl += psw_thing_drop;
+            sat_things_n    -= psw_thing_drop;
+            thing_drop_win  += psw_thing_drop;
+        }
+        thing_acc_n = 0;
+#endif
     }
     else
 #endif
@@ -8987,6 +9073,12 @@ extern "C" int sat_vdp1_thing_draw(patch_t *patch, int lump, const unsigned char
 {
     int padW, H, W;
     int split = sat_split_active;      /* split = per-view PRE-kick call -> queue (see thing_acc) */
+#if SAT_PSW
+    int pswq = sat_psw_active;         /* PSW painter: queue like split (kick calls the core emit
+                                          BEFORE the walls flush; the flush drains at rank) */
+#else
+    const int pswq = 0;
+#endif
 
     if (split && !thing_acc_open)
     {   /* first thing of this split frame: open the queue.  The per-frame housekeeping that 1p
@@ -8999,7 +9091,7 @@ extern "C" int sat_vdp1_thing_draw(patch_t *patch, int lump, const unsigned char
         sat_things_n = sat_things_decl = thing_bake_n = 0;
         for (int i = 0; i < THINGS_TEX_SLOTS; ++i) thing_cache[np][i].used = 0;
     }
-    if (split ? (thing_acc_n >= THING_ACC_MAX)
+    if ((split || pswq) ? (thing_acc_n >= THING_ACC_MAX)
               : (vdp1_wnext >= vdp1_wall_cap - 1))   /* direct path needs 2 cmds (clip + quad) */
     { sat_things_decl++; thd_budget++; return 0; }
 
@@ -9088,9 +9180,10 @@ extern "C" int sat_vdp1_thing_draw(patch_t *patch, int lump, const unsigned char
         }
     }
 
-    if (split)
+    if (split || pswq)
     {   /* QUEUE: the walls have not flushed yet -- park the two commands' fields; the kick's
-           vdp1_things_flush() emits them right after vdp1_walls_flush (painter order kept). */
+           vdp1_things_flush() emits them right after vdp1_walls_flush (painter order kept).
+           PSW: the walls flush itself drains them at each subsector's painter rank instead. */
         thing_acc[thing_acc_n].texoff = (unsigned short)((texaddr - VDP1_VRAM_BASE) >> 3);
         thing_acc[thing_acc_n].csize  = (unsigned short)(((padW >> 3) << 8) | H);
         thing_acc[thing_acc_n].colr   = (unsigned short)((WPN_CMDCOLR & 0xE000u)
@@ -9100,8 +9193,14 @@ extern "C" int sat_vdp1_thing_draw(patch_t *patch, int lump, const unsigned char
         thing_acc[thing_acc_n].cx0 = (short)cx0; thing_acc[thing_acc_n].cy0 = (short)cy0;
         thing_acc[thing_acc_n].cx1 = (short)cx1; thing_acc[thing_acc_n].cy1 = (short)cy1;
         thing_acc[thing_acc_n].flip = (unsigned char)(flip != 0);
+        if (split)
         { extern int sat_split_view;                    /* owning view -> the flush's fair-drop bin */
-          thing_acc[thing_acc_n].view = (unsigned char)(sat_split_view & 3); }
+          thing_acc[thing_acc_n].view = (unsigned char)(sat_split_view & 3);
+          thing_acc[thing_acc_n].vis  = -1; }
+        else
+        {   /* PSW 1p: sat_thing_cur_vis (core r_things.c) = this sprite's vissprite index */
+          thing_acc[thing_acc_n].view = 0;
+          thing_acc[thing_acc_n].vis  = (short)sat_thing_cur_vis; }
         thing_acc_n++;
         sat_things_n++;
         return 1;
@@ -9662,7 +9761,30 @@ extern "C" void sat_walls_kick(void)
            queue's bill (2 cmds/thing, capped at 24 things; 4p: 237-48=189 >= 144 floor) out of
            the WALLS' share only, and restore the full cap before the things flush + budget law.
            Far walls go flat (visible, degraded); sprites stop vanishing.  THp `x` must read ~0. */
+#if SAT_PSW
+        /* PSW painter things (step 3): run the core emit BEFORE the walls flush so the
+           sprites land in the queue (thing_acc, vis = painter rank key); the flush then
+           drains each subsector's batch at its rank.  sat_thing_emit_cap is one frame
+           stale here -- the split branch has lived with exactly that since 2026-08-21. */
+        if (sat_psw_active)
+        {
+            thing_acc_n = 0; thing_acc_open = 0;
+            psw_thing_cmds = 0; psw_thing_drop = 0;
+            R_EmitWorldThingsVDP1();
+        }
+#endif
         int wall_cap_full = vdp1_wall_cap;
+#if SAT_PSW
+        if (sat_psw_active && thing_acc_n > 0)
+        {   /* same structural inversion as the split shave below: walls+flats stop below
+               the DRAIN guard by the queue's bill -- 2 cmds/thing + 1 full-view clip
+               restore per batch (worst case 1 per thing). */
+            int res = thing_acc_n; if (res > 24) res = 24;
+            int c = vdp1_wall_cap - THING_FLUSH_MARGIN - 3 * res;
+            if (c < WALL_ACC_MAX + 16) c = WALL_ACC_MAX + 16;
+            vdp1_wall_cap = c;
+        }
+#endif
         if (sat_split_active && thing_acc_n > 0)
         {
             int res = thing_acc_n; if (res > 24) res = 24;
@@ -9811,7 +9933,13 @@ extern "C" void sat_walls_kick(void)
             /* vdp1_wpn_reserve is withheld FIRST: the gun is emitted after the things, so anything
                the things allocate here is spent ahead of it in the plot.  THING_FLUSH_MARGIN keeps
                its SLOTS free; the reserve keeps its plot TIME free (the resource that actually cuts). */
-            int room = cap_cmds - vdp1_wnext - THING_FLUSH_MARGIN - vdp1_wpn_reserve;
+            int wnext_walls = vdp1_wnext;
+#if SAT_PSW
+            if (sat_psw_active) wnext_walls -= psw_thing_cmds;  /* things already drained inside the
+                                                                   flush: size NEXT frame's cap from
+                                                                   the walls+flats bill alone */
+#endif
+            int room = cap_cmds - wnext_walls - THING_FLUSH_MARGIN - vdp1_wpn_reserve;
             int budget_cap = (room > 0) ? (room >> 1) : 0;      /* ~2 VDP1 cmds per emitted thing */
             if (budget_cap > THING_ADAPT_MAX) budget_cap = THING_ADAPT_MAX;
             /* SOFTENED SNAP (2026-08-19, step 1): room<=0 used to zero the cap -- every monster
@@ -9879,6 +10007,9 @@ extern "C" void sat_walls_kick(void)
         /* (the FRT bracket that used to wrap this -- sat_p_thg10 -- was REMOVED 2026-08-26: two
            register reads per view for a number whose row went away.) */
         if (sat_split_active) vdp1_things_flush();
+#if SAT_PSW
+        else if (sat_psw_active) { /* step 3: already emitted pre-flush + drained at rank */ }
+#endif
         else                  R_EmitWorldThingsVDP1();
 #endif
 #if SAT_WPN_VDP1
@@ -11012,6 +11143,7 @@ extern "C" void DG_DrawFrame(void)
         sat_psw_tiers = 0; sat_psw_ref = 0;
         psw_sub_n = 0; psw_sub_tail = 0x7fff;   /* step 2: fresh recorder for the next walk
                                                    (this frame's records were consumed at the kick) */
+        psw_spr_tail = 0x7fff;                  /* step 3: sprite-watermark tail, same lifecycle */
         sat_psw_active = (sat_psw_req && sat_local_players <= 1 && sat_wall_skip) ? 1 : 0;
     }
 #endif

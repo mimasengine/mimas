@@ -666,6 +666,12 @@ static int sat_psw_req = 0;
 extern "C" int sat_psw_tiers;   /* core r_segs.c: tier quads accepted this frame */
 extern "C" int sat_psw_ref;     /* core r_segs.c: tier quads shed (budget/list full) */
 static int sat_psw_t_last = 0, sat_psw_r_last = 0;  /* frame-boundary snapshot (overlay row 13) */
+/* step 2: per-subsector flats (recorder installed at init; machinery near vdp1_walls_flush) */
+extern "C" void (*sat_psw_sub_hook)(int subnum, int fh, int ch, int fpic,
+                                    int flump, int clump, int light);   /* core r_bsp.c */
+static void sat_psw_sub_note(int subnum, int fh, int ch, int fpic,
+                             int flump, int clump, int light);
+static int  psw_flat_last = 0;             /* flat quads emitted last frame (row 13 `f`) */
 #endif
 extern "C" int            sat_sky_view;         /* core Part 5: elected split view for the HW sky (-1 = none => all software) */
 extern "C" unsigned int   sat_sky_px_view[4];   /* core Part 5: per-view SKY pixel coverage (election metric) */
@@ -3295,9 +3301,10 @@ static void fps_update(void)
                lead-fill/clamp fields are all dead in that mode): t = tier quads accepted
                last frame, r = shed (wall_acc/px budget full = the FAR remainder). */
             if (sat_psw_active)
-                snprintf(ovbuf, sizeof ovbuf, "PSW t%d r%d                       ",
+                snprintf(ovbuf, sizeof ovbuf, "PSW t%d r%d f%d                    ",
                          sat_psw_t_last > 999 ? 999 : sat_psw_t_last,
-                         sat_psw_r_last > 999 ? 999 : sat_psw_r_last);
+                         sat_psw_r_last > 999 ? 999 : sat_psw_r_last,
+                         psw_flat_last  > 999 ? 999 : psw_flat_last);
 #endif
             if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 13, ovbuf);
             /* row 15 (SCU-DSP feasibility, deliverable #1): per-frame sprite cost split.
@@ -5502,6 +5509,10 @@ extern "C" void DG_Init(void)
     /* kick VDP1 right after the BSP walk (parallel with the CPU floors/sprites) so the
        walls present the SAME frame as the framebuffer (no 1-frame lag / sky-at-the-seam). */
     sat_walls_done_hook = sat_walls_kick;
+#if SAT_PSW
+    /* PSW step 2: subsector visit recorder (r_bsp.c calls it only when sat_psw_active) */
+    sat_psw_sub_hook = sat_psw_sub_note;
+#endif
 #if SAT_WPN_VDP1
     /* Route the player weapon to VDP1 at prio 7: the core R_DrawPSprite calls sat_psprite_hook
        (opaque case) instead of the software fill, and sat_psprite_early makes the platform draw
@@ -7873,6 +7884,250 @@ static void vdp1_floors_flush(void) {}
 #define sat_vdp1_floor_claim NULL
 #endif
 
+#if SAT_PSW
+/* ======================= PSW STEP 2 -- subsector flats =======================
+   Non-dominant floors + ceilings as STRETCHED full-flat DISTORSP quads over the
+   subsector polygons (core r_bsp.c psw_pv*), interleaved with the walls in
+   painter order at flush time: per subsector, flats FIRST then its wall slice
+   (walls win the seams; nearer subsectors overpaint farther ones -- the
+   SlaveDriver per-sector order).  Self-contained copies of the parked
+   SAT_VDP1_FLOORS bricks (that machinery is compiled out and STAYS parked):
+   DIVU projection, 3 flat slots at 0x25C7D000 (VRAM free in this build -- the
+   parked user is out; safe in ALL modes, the 2p HUD stack stops at 0x25C7D000),
+   the emit-tile cmd recipe with the full 64x64 window (0x0840).  The stretch =
+   the step-2 look to judge; exact 64-grid tiling is the step after.
+   KNOWN one-frame artifact: a slot eviction re-uploads texels the still-plotting
+   previous bank may read (same acceptance as the parked design; LRU keeps
+   resident flats stable below 3 distinct lumps/frame). */
+#define PSW_SUB_MAX      192
+#define PSW_FLAT_SLOTS   3
+#define PSW_FLAT_BASE    0x25C7D000u
+#define PSW_FLAT_SLOTSZ  0x1000u
+#define PSW_FLAT_CAP     96          /* whole-frame floor+ceiling command budget */
+#define PSW_TZ_NEAR      (24 << 16)
+#define PSW_FAN_MAX      24          /* poly verts after the near clip (core caps at 20) */
+
+static struct {
+    int   fh, ch;                    /* sector heights (fixed)                    */
+    int   flump, clump;              /* flat lumps; clump -1 = sky ceiling        */
+    short subnum, fpic;              /* polygon index; floorpic (dominant match)  */
+    short light, w0;                 /* lightlevel; wall_acc watermark at visit   */
+} psw_sub[PSW_SUB_MAX];
+static int psw_sub_n = 0;
+static int psw_sub_tail = 0x7fff;    /* wall watermark at the FIRST overflow (0x7fff = none) */
+static int psw_flat_cmds = 0;
+
+static void sat_psw_sub_note(int subnum, int fh, int ch, int fpic,
+                             int flump, int clump, int light)
+{
+    if (psw_sub_n >= PSW_SUB_MAX)
+    {
+	if (psw_sub_tail == 0x7fff) psw_sub_tail = wall_acc_n;   /* tail walls = farther subs */
+	return;
+    }
+    psw_sub[psw_sub_n].fh = fh;       psw_sub[psw_sub_n].ch = ch;
+    psw_sub[psw_sub_n].flump = flump; psw_sub[psw_sub_n].clump = clump;
+    psw_sub[psw_sub_n].subnum = (short)subnum;
+    psw_sub[psw_sub_n].fpic  = (short)fpic;
+    psw_sub[psw_sub_n].light = (short)light;
+    psw_sub[psw_sub_n].w0    = (short)wall_acc_n;
+    psw_sub_n++;
+}
+
+extern "C" int             psw_polys_ok;     /* core r_bsp.c: polygon pools valid */
+extern "C" int            *psw_pvx, *psw_pvy;
+extern "C" unsigned short *psw_pvi;
+extern "C" unsigned char  *psw_pvn;
+
+/* SH-2 DIVU FixedDiv, IPL15 across the 3-write/1-read window (the fvdp1_fdiv recipe). */
+static inline int psw_fdiv(int a, int b)
+{
+    volatile int *dvsr   = (volatile int *)0xFFFFFF00;
+    volatile int *dvdnth = (volatile int *)0xFFFFFF10;
+    volatile int *dvdntl = (volatile int *)0xFFFFFF14;
+    int q; unsigned int sr;
+    __asm__ volatile ("stc sr,%0" : "=r"(sr));
+    { unsigned int srm = sr | 0x000000F0u;
+      __asm__ volatile ("ldc %0,sr" :: "r"(srm) : "memory"); }
+    *dvsr = b; *dvdnth = a >> 16; *dvdntl = (int)((unsigned int)a << 16);
+    q = *dvdntl;
+    __asm__ volatile ("ldc %0,sr" :: "r"(sr) : "memory");
+    return q;
+}
+
+/* world -> view column/row (the fvdp1_project transform; psign +1 floor / -1 ceiling).
+   0 = nearer than the guard (unreachable after the near clip -- belt only). */
+static int psw_project(int wx, int wy, int ph, int psign, int *psx, int *psy)
+{
+    extern int detailshift;
+    int trx = wx - viewx, tryy = wy - viewy;
+    int tz = FixedMul(trx, viewcos) + FixedMul(tryy, viewsin);
+    int tx, xs, sx, sy, hw2;
+    if (tz < PSW_TZ_NEAR) return 0;
+    tx  = FixedMul(trx, viewsin) - FixedMul(tryy, viewcos);
+    xs  = psw_fdiv(centerxfrac, tz);
+    sx  = (centerxfrac + FixedMul(tx, xs)) >> 16;
+    hw2 = (viewwidth << detailshift) >> 1;
+    sy  = centery + psign * (int)(((long long)psw_fdiv(ph, tz) * hw2) >> 16);
+    if (sx < -1024) sx = -1024; else if (sx > 1023) sx = 1023;
+    if (sy < -512)  sy = -512;  else if (sy > 1000) sy = 1000;
+    *psx = sx; *psy = sy;
+    return 1;
+}
+
+/* clip the world polygon against the near plane (dot(p - eye, viewdir) >= NEAR+8u) */
+static int psw_nearclip(const int *ax, const int *ay, int n, int *bx, int *by)
+{
+    int i, m = 0;
+    int lim = PSW_TZ_NEAR + (8 << 16);
+    int fa  = FixedMul(ax[0] - viewx, viewcos) + FixedMul(ay[0] - viewy, viewsin) - lim;
+    for (i = 0; i < n; ++i)
+    {
+	int j  = (i + 1 == n) ? 0 : i + 1;
+	int fb = FixedMul(ax[j] - viewx, viewcos) + FixedMul(ay[j] - viewy, viewsin) - lim;
+	if (fa >= 0 && m < PSW_FAN_MAX) { bx[m] = ax[i]; by[m] = ay[i]; m++; }
+	if ((fa >= 0) != (fb >= 0) && m < PSW_FAN_MAX)
+	{
+	    int t = psw_fdiv(fa, fa - fb);            /* 16.16, 0..1 (signs differ) */
+	    bx[m] = ax[i] + (int)(((long long)(ax[j] - ax[i]) * t) >> 16);
+	    by[m] = ay[i] + (int)(((long long)(ay[j] - ay[i]) * t) >> 16);
+	    m++;
+	}
+	fa = fb;
+    }
+    return m;
+}
+
+/* flat slots: the fvdp1_slot_get recipe (NO disc I/O ever -- pool hit or resident lump) */
+static struct { int lumpnum; unsigned int lru; unsigned char used; } psw_slot[PSW_FLAT_SLOTS];
+static unsigned int psw_slot_tick;
+static int psw_slot_get(int lumpnum)
+{
+    int i, v = -1;
+    unsigned int best = 0xffffffffu;
+    for (i = 0; i < PSW_FLAT_SLOTS; ++i)
+	if (psw_slot[i].lumpnum == lumpnum)
+	{ psw_slot[i].lru = ++psw_slot_tick; psw_slot[i].used = 1; return i; }
+    for (i = 0; i < PSW_FLAT_SLOTS; ++i)
+	if (!psw_slot[i].used && psw_slot[i].lru < best)
+	{ best = psw_slot[i].lru; v = i; }
+    if (v < 0) return -1;
+    {
+	const unsigned char *src = R_FlatCachePeek(lumpnum);
+	int locked = 0;
+	if (!src)
+	{
+	    if (!W_LumpResident(lumpnum)) return -1;
+	    src = (const unsigned char *)W_CacheLumpNum(lumpnum, 1 /* PU_STATIC */);
+	    locked = 1;
+	}
+	{
+	    volatile unsigned short *d =
+		(volatile unsigned short *)(PSW_FLAT_BASE + (unsigned int)v * PSW_FLAT_SLOTSZ);
+	    for (i = 0; i < 2048; ++i)
+		d[i] = (unsigned short)(((unsigned int)src[2*i] << 8) | src[2*i + 1]);
+	}
+	if (locked) W_ReleaseLumpNum(lumpnum);
+    }
+    psw_slot[v].lumpnum = lumpnum;
+    psw_slot[v].lru = ++psw_slot_tick;
+    psw_slot[v].used = 1;
+    return v;
+}
+
+/* one fan quad (full 64x64 flat stretched onto it -- the fvdp1_emit_tile cmd recipe) */
+static void psw_emit_flatquad(int slot, unsigned short colr, const int *qx, const int *qy)
+{
+    unsigned short cmd[16];
+    extern int detailshift, viewwindowx, viewwindowy;
+    int vx = viewwindowx, vy = viewwindowy, i;
+    if (vdp1_wnext >= vdp1_wall_cap) return;
+    if (psw_flat_cmds >= PSW_FLAT_CAP) return;
+    memset(cmd, 0, sizeof cmd);
+    cmd[0] = 0x0002;                                  /* DISTORSP */
+    cmd[2] = 0x00E0;                                  /* no clip | 8bpp bank | SPD | ECD */
+    cmd[3] = colr;
+    cmd[4] = (unsigned short)((PSW_FLAT_BASE + (unsigned int)slot * PSW_FLAT_SLOTSZ
+                               - VDP1_VRAM_BASE) >> 3);
+    cmd[5] = 0x0840;                                  /* 64 x 64 */
+    if (sat_wall_paint & 1)
+    {   /* DEBUG PAINT: flats solid RED (walls green, things blue -- the L+X triad) */
+	cmd[0] = 0x0004;
+	cmd[3] = (unsigned short)(0x0100u | 88u);
+    }
+    for (i = 0; i < 4; ++i)
+    {
+	cmd[6 + 2*i] = (short)((qx[i] << detailshift) + vx);
+	cmd[7 + 2*i] = (short)(qy[i] + vy);
+    }
+    vdp1_cmd_at(VDP1_BANK[vdp1_wbank], vdp1_wnext++, cmd);
+    psw_flat_cmds++;
+}
+
+/* emit one recorded subsector's floor + ceiling (skips: sky, dominant triple,
+   wrong side of the eye, no slot).  Fan by 2: quads (0,i,i+1,i+2). */
+static void psw_emit_subflats(int k)
+{
+    int px[PSW_FAN_MAX], py[PSW_FAN_MAX];
+    int cx[PSW_FAN_MAX], cy[PSW_FAN_MAX];
+    int sxv[PSW_FAN_MAX], syv[PSW_FAN_MAX];
+    int n0, n, i, sn = psw_sub[k].subnum;
+    if (!psw_polys_ok || sn < 0) return;
+    n0 = psw_pvn[sn];
+    if (n0 < 3) return;
+    for (i = 0; i < n0; ++i) { px[i] = psw_pvx[psw_pvi[sn] + i]; py[i] = psw_pvy[psw_pvi[sn] + i]; }
+    n = psw_nearclip(px, py, n0, cx, cy);
+    if (n < 3) return;
+    for (int pass = 0; pass < 2; ++pass)
+    {
+	int ph, psign, lump;
+	if (pass == 0)                                  /* FLOOR */
+	{
+	    if (psw_sub[k].fh >= viewz || psw_sub[k].flump < 0) continue;
+	    if (psw_sub[k].fh == sat_vdp2_floor_h
+	        && (int)psw_sub[k].fpic == sat_vdp2_floor_pic
+	        && ((int)psw_sub[k].light >> 4) == sat_vdp2_floor_band)
+		continue;                               /* the dominant lives on RBG0 */
+	    ph = viewz - psw_sub[k].fh; psign = 1; lump = psw_sub[k].flump;
+	}
+	else                                            /* CEILING */
+	{
+	    if (psw_sub[k].ch <= viewz || psw_sub[k].clump < 0) continue;   /* -1 = sky */
+	    ph = psw_sub[k].ch - viewz; psign = -1; lump = psw_sub[k].clump;
+	}
+	{
+	    int slot = psw_slot_get(lump);
+	    int nr, li, zi, ok = 1;
+	    unsigned short colr;
+	    if (slot < 0) continue;
+	    for (i = 0; i < n; ++i)
+		if (!psw_project(cx[i], cy[i], ph, psign, &sxv[i], &syv[i])) { ok = 0; break; }
+	    if (!ok) continue;
+	    /* light: the R_MapPlane formula at the quad's NEAR row (the fvdp1 recipe) */
+	    nr = syv[0];
+	    for (i = 1; i < n; ++i)
+		if (psign > 0 ? (syv[i] > nr) : (syv[i] < nr)) nr = syv[i];
+	    if (nr < 0) nr = 0; else if (nr >= viewheight) nr = viewheight - 1;
+	    li = ((int)psw_sub[k].light >> 4) + extralight;
+	    if (li < 0) li = 0; else if (li > 15) li = 15;
+	    zi = FixedMul(ph, yslope[nr]) >> 20;
+	    if (zi < 0) zi = 0; else if (zi > 127) zi = 127;
+	    colr = wall_light_colr(zlight[li][zi]);
+	    for (i = 1; i + 1 < n; i += 2)
+	    {
+		int qx[4], qy[4];
+		int i2 = (i + 2 < n) ? i + 2 : i + 1;   /* odd tail: repeat = triangle */
+		qx[0] = sxv[0];     qy[0] = syv[0];
+		qx[1] = sxv[i];     qy[1] = syv[i];
+		qx[2] = sxv[i + 1]; qy[2] = syv[i + 1];
+		qx[3] = sxv[i2];    qy[3] = syv[i2];
+		psw_emit_flatquad(slot, colr, qx, qy);
+	    }
+	}
+    }
+}
+#endif /* SAT_PSW */
+
 /* drain accumulated walls into the current bank (from vdp1_wpn_begin, behind the weapon).
    ZERO CLIPPING: EVERY accumulated wall draws AT LEAST a 1-command FLAT (never dropped to sky);
    the nearest are UPGRADED to textured tiles while the budget allows -- but each upgrade RESERVES
@@ -8019,24 +8274,52 @@ static void vdp1_walls_flush(void)
        budget = overrun/famine protection (far walls -> CPU), emit order = painter correctness
        (far last... i.e. near last).  wall_acc is filled near-first by the BSP, so reverse it. */
     unsigned short pl0 = frt_read();   /* row 14 `pl` -- see the note at sat_p_plot10 */
-    for (int i = wall_acc_n - 1; i >= 0; --i)
+    /* DROP COUNT (2026-08-03).  The core is committed by now: it handed this wall to VDP1 and
+       the software column loop skipped it (that handoff is sound -- sat_wall_vdp1 returns 1 to
+       reject and r_segs falls back to software BEFORE the loop, and the orphan counter reads
+       N0).  So the ONLY way a claimed wall can still vanish is a silent early return in here --
+       the wall-cap guard, a texture slot that will not resolve, a degenerate quad.  Rather than
+       audit every `return` in three emit functions, watch the command pointer: if it did not
+       move, nothing was written and this wall is a hole.  Row 13 `N<orphan>/<drop>`. */
+#define VDP1_PLOT_WALL(i) do {                                                       \
+        unsigned int wn0 = vdp1_wnext;                                               \
+        int emitted = 1;                                                             \
+        if      (sat_wall_paint & 1)      wall_emit_flat(i);   /* DEBUG PAINT green */\
+        else if (wall_acc[i].mode == 1)   wall_emit(i);                              \
+        else if (wall_acc[i].mode == 3)   wall_emit_banded(i);                       \
+        else if (wall_acc[i].mode == 2)   wall_emit_flat(i);                         \
+        else                              emitted = 0;   /* mode 0: not a drop */    \
+        if (emitted && vdp1_wnext == wn0 && vdp1_wall_drop < 9999) vdp1_wall_drop++; \
+    } while (0)
+#if SAT_PSW
+    if (sat_psw_active)
     {
-        /* DROP COUNT (2026-08-03).  The core is committed by now: it handed this wall to VDP1 and
-           the software column loop skipped it (that handoff is sound -- sat_wall_vdp1 returns 1 to
-           reject and r_segs falls back to software BEFORE the loop, and the orphan counter reads
-           N0).  So the ONLY way a claimed wall can still vanish is a silent early return in here --
-           the wall-cap guard, a texture slot that will not resolve, a degenerate quad.  Rather than
-           audit every `return` in three emit functions, watch the command pointer: if it did not
-           move, nothing was written and this wall is a hole.  Row 13 `N<orphan>/<drop>`. */
-        unsigned int wn0 = vdp1_wnext;
-        int emitted = 1;
-        if      (sat_wall_paint & 1)    wall_emit_flat(i);   /* DEBUG PAINT: every VDP1 wall green */
-        else if (wall_acc[i].mode == 1) wall_emit(i);
-        else if (wall_acc[i].mode == 3) wall_emit_banded(i);
-        else if (wall_acc[i].mode == 2) wall_emit_flat(i);
-        else                            emitted = 0;         /* mode 0 = nothing to draw, not a drop */
-        if (emitted && vdp1_wnext == wn0 && vdp1_wall_drop < 9999) vdp1_wall_drop++;
+        /* PAINTER INTERLEAVE (step 2): walk the recorded subsectors far->near; per
+           subsector, its flats FIRST then its wall slice (walls win the seams; the
+           nearer subsector's quads overpaint both -- the SlaveDriver per-sector
+           order).  Walls queued after the recorder overflowed (psw_sub_tail) belong
+           to FARTHER subsectors -> emitted first, without flats.  Watermarks are
+           clamped: a HOLD frame can leave them stale for one frame. */
+        int tail = (psw_sub_tail < wall_acc_n) ? psw_sub_tail : wall_acc_n;
+        psw_flat_cmds = 0;
+        for (int s = 0; s < PSW_FLAT_SLOTS; ++s) psw_slot[s].used = 0;
+        for (int i = wall_acc_n - 1; i >= tail; --i) VDP1_PLOT_WALL(i);
+        for (int k = psw_sub_n - 1; k >= 0; --k)
+        {
+            int wend = (k + 1 < psw_sub_n) ? (int)psw_sub[k + 1].w0 : tail;
+            int wbeg = (int)psw_sub[k].w0;
+            if (wend > wall_acc_n) wend = wall_acc_n;
+            if (wbeg > wend) wbeg = wend;
+            psw_emit_subflats(k);
+            for (int i = wend - 1; i >= wbeg; --i) VDP1_PLOT_WALL(i);
+        }
+        psw_flat_last = psw_flat_cmds;
     }
+    else
+#endif
+    for (int i = wall_acc_n - 1; i >= 0; --i)
+        VDP1_PLOT_WALL(i);
+#undef VDP1_PLOT_WALL
 
     {
         unsigned short now = frt_read();
@@ -10678,6 +10961,8 @@ extern "C" void DG_DrawFrame(void)
     {
         sat_psw_t_last = sat_psw_tiers; sat_psw_r_last = sat_psw_ref;
         sat_psw_tiers = 0; sat_psw_ref = 0;
+        psw_sub_n = 0; psw_sub_tail = 0x7fff;   /* step 2: fresh recorder for the next walk
+                                                   (this frame's records were consumed at the kick) */
         sat_psw_active = (sat_psw_req && sat_local_players <= 1 && sat_wall_skip) ? 1 : 0;
     }
 #endif

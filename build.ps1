@@ -368,7 +368,7 @@ try {
     # files changed (which otherwise leaves dg_saturn.o, and its __TIME__, stale).
     # core/p_setup.c is touched too: the M5 staging-order define lives there and make does
     # not track CFLAGS changes, so toggling -SegsFirst would otherwise leave a stale .o.
-    Invoke-Msys2 "cd '$rootMsys' && touch src/dg_saturn.cxx core/p_setup.c core/r_segs.c core/r_plane.c$touchExtra && make $makeTarget $makeArgs"
+    Invoke-Msys2 "cd '$rootMsys' && touch src/dg_saturn.cxx core/p_setup.c core/r_segs.c core/r_plane.c core/r_bsp.c$touchExtra && make $makeTarget $makeArgs"
 
     # TLSF pre-flight: the HWRAM TLSF pool (_end..__heap_end in build/<CD_NAME>.map)
     # must keep >= 4 KB or SRL's tlsf_add_pool rejects it at boot -> black

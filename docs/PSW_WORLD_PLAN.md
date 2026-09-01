@@ -75,8 +75,14 @@ StoreWallRange, curline/frontsector/backsector/rw_angle1 vivants).
 > Pool 43,2 Ko. **Round 2 console (2026-09-01)** : perf PROUVÉE (spawn MST66→24-33, VD1
 > 38→6-11 ms) mais estimateur centroïde ×40 trop haut sur le proche ⇒ f1/k32-45 = plafonds
 > absents partout. Fix 8c3203b/baa31d1 : estimateur = bbox écran réellement projetée par
-> plan (psw_plane_px), pools aire/centroïde retirés. Reste : re-test spawn (f ~20-50
-> attendu, k = vrai lointain seulement), calibrage du budget, 3b midtex, grille-64, verdict.
+> plan (psw_plane_px), pools aire/centroïde retirés.
+> **Round 3 console (2026-09-01)** : bbox brute encore trop haute (clamps ±1024 facturés
+> ⇒ f1-f8/k29-43) ; murs manquants par angle/distance = refus WALL_PX_BUDGET (row 13 r6,
+> fallback software inexistant en PSW) ; sol VDP1 étiré par-dessus RBG0 = jumeau de bande
+> du dominant. Fix 71877b8 : (1) refus px murs skippé sous PSW, (2) bbox clampée à la vue
+> + budget 56000 px-colonnes ≈ 2 vues lowres + cull des plans hors écran, (3) match
+> dominant sans la bande. Reste : re-test (attendu f ~15-40, k lointain, r0), calibrage,
+> 3b midtex, grille-64, verdict.
 
 ## Étape 2 — sols non-dominants + plafonds (quads de sous-secteurs)
 

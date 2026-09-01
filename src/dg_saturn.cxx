@@ -7922,9 +7922,9 @@ static const unsigned int psw_slot_vram[PSW_FLAT_SLOTS] =
    scene emitted 69 full-polygon quads -> VDP1 plot 38 ms vs 12 in a corridor -- the L5
    plot-time law; the command-count budgets are blind to fill).  Spent NEAR->FAR in the
    reservation pre-pass, so the loss is always the FARTHEST rooms' floors/ceilings (RBG0
-   or garbage bleed at distance), never the near field.  The estimate (world area *
-   (px/unit at centroid)^2) ignores the vertical foreshortening of near-horizontal
-   planes, so it OVERESTIMATES -> the budget is conservative; tune on console. */
+   or garbage bleed at distance), never the near field.  Estimator = the projected
+   screen BBOX per plane (psw_plane_px -- the real projection, clamps included: what
+   the VDP1 walk actually covers); tune the constant on console. */
 #define PSW_FLAT_PX_BUDGET 96000     /* ~1.5 screens of 320x200 */
 
 static struct {
@@ -7964,8 +7964,6 @@ extern "C" int             psw_polys_ok;     /* core r_bsp.c: polygon pools vali
 extern "C" int            *psw_pvx, *psw_pvy;
 extern "C" unsigned short *psw_pvi;
 extern "C" unsigned char  *psw_pvn;
-extern "C" int            *psw_pva;          /* polygon world area (map-units^2)  */
-extern "C" int            *psw_pcx, *psw_pcy;/* polygon centroid (world, 16.16)   */
 
 /* SH-2 DIVU FixedDiv, IPL15 across the 3-write/1-read window (the fvdp1_fdiv recipe). */
 static inline int psw_fdiv(int a, int b)
@@ -8094,6 +8092,24 @@ static void psw_emit_flatquad(int slot, unsigned short colr, const int *qx, cons
     }
     vdp1_cmd_at(VDP1_BANK[vdp1_wbank], vdp1_wnext++, cmd);
     psw_flat_cmds++;
+}
+
+/* projected screen-bbox area of one plane over the near-clipped polygon -- the
+   fill budget's PLOT-COST proxy.  The first (centroid-based) estimator was ~40x
+   off on the player's own subsector (tz clamped under his feet, no vertical
+   foreshortening): console read f1/k32 -- ceilings gone everywhere.  The bbox of
+   the REAL projection is what the VDP1 walk actually covers (clamped verts
+   included: offscreen tails still cost plot time). */
+static long long psw_plane_px(const int *cx, const int *cy, int n, int ph, int psign)
+{
+    int xl = 0x7fff, xr = -0x7fff, yt = 0x7fff, yb = -0x7fff, i, sx, sy;
+    for (i = 0; i < n; ++i)
+    {
+	if (!psw_project(cx[i], cy[i], ph, psign, &sx, &sy)) return 0;
+	if (sx < xl) xl = sx; if (sx > xr) xr = sx;
+	if (sy < yt) yt = sy; if (sy > yb) yb = sy;
+    }
+    return (long long)(xr - xl) * (yb - yt);
 }
 
 /* the two flat lumps subsector record k wants this frame (-1 = skip): the floor
@@ -8444,15 +8460,26 @@ static void vdp1_walls_flush(void)
                 if (fpx >= PSW_FLAT_PX_BUDGET)
                 { psw_sub_kill[k] = 1; psw_kill_n++; continue; }
                 if (psw_polys_ok && psw_sub[k].subnum >= 0)
-                {   /* screen-px estimate: world area * (px/unit at the centroid)^2 */
-                    int sn  = (int)psw_sub[k].subnum;
-                    int trx = psw_pcx[sn] - viewx, tryy = psw_pcy[sn] - viewy;
-                    int tz  = FixedMul(trx, viewcos) + FixedMul(tryy, viewsin);
-                    if (tz < PSW_TZ_NEAR) tz = PSW_TZ_NEAR;
-                    int xs8 = psw_fdiv(centerxfrac, tz) >> 8;      /* px/unit, 8.8 */
-                    long long px = ((long long)psw_pva[sn] * xs8 * xs8) >> 16;
-                    if (fl >= 0 && cl >= 0) px <<= 1;              /* both planes pay */
-                    fpx += px;
+                {   /* plot-cost estimate = projected screen bbox per wanted plane
+                       (near-clip once, project each plane; runs only while the
+                       budget lives, so the cost is bounded by the survivors) */
+                    int sn = (int)psw_sub[k].subnum;
+                    int n0 = psw_pvn[sn];
+                    if (n0 >= 3)
+                    {
+                        int wx[PSW_FAN_MAX], wy[PSW_FAN_MAX];
+                        int cxv[PSW_FAN_MAX], cyv[PSW_FAN_MAX], nn, i;
+                        for (i = 0; i < n0; ++i)
+                        { wx[i] = psw_pvx[psw_pvi[sn] + i]; wy[i] = psw_pvy[psw_pvi[sn] + i]; }
+                        nn = psw_nearclip(wx, wy, n0, cxv, cyv);
+                        if (nn >= 3)
+                        {
+                            if (fl >= 0)
+                                fpx += psw_plane_px(cxv, cyv, nn, viewz - psw_sub[k].fh, 1);
+                            if (cl >= 0)
+                                fpx += psw_plane_px(cxv, cyv, nn, psw_sub[k].ch - viewz, -1);
+                        }
+                    }
                 }
                 if (fl >= 0) psw_slot_get(fl);
                 if (cl >= 0) psw_slot_get(cl);

@@ -6311,7 +6311,16 @@ extern "C" int sat_wall_vdp1(int x1, int yl1, int yh1, int x2, int yl2, int yh2,
         int h1 = yh1 - yl1 + 1; if (h1 < 0) h1 = 0;
         int h2 = yh2 - yl2 + 1; if (h2 < 0) h2 = 0;
         int a  = aw * ((h1 + h2) >> 1);
-        if (wall_px_acc + a > WALL_PX_BUDGET) return 1;   /* overflow guard -> CPU software fallback (far walls shed) */
+        if (wall_px_acc + a > WALL_PX_BUDGET
+#if SAT_PSW
+            /* PSW: there is NO software fallback -- a refusal here is a HOLE, and the
+               per-wall test can refuse a BIG NEAR wall while smaller far ones keep
+               passing (console 2026-09-01: walls vanishing by angle/distance, row 13
+               r6).  Walls ARE the world geometry; the flat fill budget is what bounds
+               the plot in this mode.  Keep accounting, drop only the refusal. */
+            && !sat_psw_active
+#endif
+            ) return 1;   /* overflow guard -> CPU software fallback (far walls shed) */
         wall_px_acc += a;
     }
     int vx = viewwindowx, vy = viewwindowy;
@@ -7923,9 +7932,10 @@ static const unsigned int psw_slot_vram[PSW_FLAT_SLOTS] =
    plot-time law; the command-count budgets are blind to fill).  Spent NEAR->FAR in the
    reservation pre-pass, so the loss is always the FARTHEST rooms' floors/ceilings (RBG0
    or garbage bleed at distance), never the near field.  Estimator = the projected
-   screen BBOX per plane (psw_plane_px -- the real projection, clamps included: what
-   the VDP1 walk actually covers); tune the constant on console. */
-#define PSW_FLAT_PX_BUDGET 96000     /* ~1.5 screens of 320x200 */
+   screen BBOX per plane, CLAMPED TO THE VIEW RECT (psw_plane_px) -- software-column
+   units (lowres view = 160x168 = ~27k), so the budget reads in MULTIPLES OF THE
+   VIEW: 56000 = ~2 views' worth of visible flat fill.  THE calibration knob. */
+#define PSW_FLAT_PX_BUDGET 56000
 
 static struct {
     int   fh, ch;                    /* sector heights (fixed)                    */
@@ -8109,6 +8119,16 @@ static long long psw_plane_px(const int *cx, const int *cy, int n, int ph, int p
 	if (sx < xl) xl = sx; if (sx > xr) xr = sx;
 	if (sy < yt) yt = sy; if (sy > yb) yb = sy;
     }
+    /* VISIBLE pixels only: the raw bbox of a near plane runs to the projection
+       clamps (+/-1024, -512..1000) and billed the budget for acres of offscreen
+       tail -- console round 2 still read f1-f8/k29-43 (ceilings AND floors gone).
+       The offscreen walk cost is real but small next to the mis-kills; the view
+       rect is what the budget constant is calibrated against. */
+    if (xl < 0) xl = 0;
+    if (xr > viewwidth - 1) xr = viewwidth - 1;
+    if (yt < 0) yt = 0;
+    if (yb > viewheight - 1) yb = viewheight - 1;
+    if (xl >= xr || yt >= yb) return 0;
     return (long long)(xr - xl) * (yb - yt);
 }
 
@@ -8119,10 +8139,14 @@ static long long psw_plane_px(const int *cx, const int *cy, int n, int ph, int p
 static void psw_sub_lumps(int k, int *fl, int *cl)
 {
     *fl = *cl = -1;
+    /* dominant match on HEIGHT+PIC only -- the light band is deliberately NOT part
+       of it: a band-variant twin (same floor, light gradient sector) used to slip
+       through and paint a stretched VDP1 patch OVER the RBG0 dominant (console
+       2026-09-01, "sol vdp1 mal texture par-dessus le sol vdp2").  RBG0 already
+       draws that surface; its single light band is the lesser artefact. */
     if (psw_sub[k].fh < viewz && psw_sub[k].flump >= 0
         && !(psw_sub[k].fh == sat_vdp2_floor_h
-             && (int)psw_sub[k].fpic == sat_vdp2_floor_pic
-             && ((int)psw_sub[k].light >> 4) == sat_vdp2_floor_band))
+             && (int)psw_sub[k].fpic == sat_vdp2_floor_pic))
 	*fl = psw_sub[k].flump;
     if (psw_sub[k].ch > viewz && psw_sub[k].clump >= 0)
 	*cl = psw_sub[k].clump;
@@ -8176,6 +8200,14 @@ static void psw_emit_subflats(int k)
 	    for (i = 0; i < n; ++i)
 		if (!psw_project(cx[i], cy[i], ph, psign, &sxv[i], &syv[i])) { ok = 0; break; }
 	    if (!ok) continue;
+	    {   /* fully offscreen (e.g. the ceiling while looking down): VDP1 would
+		   still pay the walk for it -- cull for free */
+		int xl = sxv[0], xr = sxv[0], yt = syv[0], yb = syv[0];
+		for (i = 1; i < n; ++i)
+		{ if (sxv[i] < xl) xl = sxv[i]; if (sxv[i] > xr) xr = sxv[i];
+		  if (syv[i] < yt) yt = syv[i]; if (syv[i] > yb) yb = syv[i]; }
+		if (xr < 0 || xl > viewwidth - 1 || yb < 0 || yt > viewheight - 1) continue;
+	    }
 	    /* light: the R_MapPlane formula at the quad's NEAR row (the fvdp1 recipe) */
 	    nr = syv[0];
 	    for (i = 1; i < n; ++i)

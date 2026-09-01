@@ -81,8 +81,14 @@ StoreWallRange, curline/frontsector/backsector/rw_angle1 vivants).
 > fallback software inexistant en PSW) ; sol VDP1 étiré par-dessus RBG0 = jumeau de bande
 > du dominant. Fix 71877b8 : (1) refus px murs skippé sous PSW, (2) bbox clampée à la vue
 > + budget 56000 px-colonnes ≈ 2 vues lowres + cull des plans hors écran, (3) match
-> dominant sans la bande. Reste : re-test (attendu f ~15-40, k lointain, r0), calibrage,
-> 3b midtex, grille-64, verdict.
+> dominant sans la bande.
+> **Round 4 console (2026-09-01)** : r0 ✔, patch RBG0 disparu ✔ ; restaient f64/k0 avec
+> VD1 36 ms (le walk paie le quad ENTIER, queues hors écran comprises — le budget
+> « visible » était aveugle) et d40 (dalle de flats plus jamais remplie en PSW). Fix
+> 61dfd18/69f826d : psw_plane_poly = clip MONDE par plan (near à ph·hw2/rows + 2 bords de
+> frustum 90°) ⇒ plus de queue hors écran, walk ≈ visible ; prefetch des flats des
+> visplanes via R_FlatCacheGet dans le bloc PSW de R_DrawPlanes. Reste : re-test (attendu
+> d~0, VD1 ≤ ~20 ms à f60+), calibrage 56000, 3b midtex, grille-64, verdict.
 
 ## Étape 2 — sols non-dominants + plafonds (quads de sous-secteurs)
 

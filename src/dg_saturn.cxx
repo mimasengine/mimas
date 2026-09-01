@@ -674,6 +674,8 @@ static void sat_psw_sub_note(int subnum, int fh, int ch, int fpic,
 static int  psw_flat_last = 0;             /* flat quads emitted last frame (row 13 `f`) */
 static int  psw_flat_denied_last = 0;      /* flat quads DROPPED last frame (row 13 `d`):
                                               slot famine AND the flat not peekable */
+static int  psw_kill_last = 0;             /* subsectors whose flats the FILL budget cut
+                                              last frame (row 13 `k`) -- far-first loss */
 #endif
 extern "C" int            sat_sky_view;         /* core Part 5: elected split view for the HW sky (-1 = none => all software) */
 extern "C" unsigned int   sat_sky_px_view[4];   /* core Part 5: per-view SKY pixel coverage (election metric) */
@@ -3303,11 +3305,12 @@ static void fps_update(void)
                lead-fill/clamp fields are all dead in that mode): t = tier quads accepted
                last frame, r = shed (wall_acc/px budget full = the FAR remainder). */
             if (sat_psw_active)
-                snprintf(ovbuf, sizeof ovbuf, "PSW t%d r%d f%d d%d               ",
+                snprintf(ovbuf, sizeof ovbuf, "PSW t%d r%d f%d d%d k%d           ",
                          sat_psw_t_last > 999 ? 999 : sat_psw_t_last,
                          sat_psw_r_last > 999 ? 999 : sat_psw_r_last,
                          psw_flat_last  > 999 ? 999 : psw_flat_last,
-                         psw_flat_denied_last > 99 ? 99 : psw_flat_denied_last);
+                         psw_flat_denied_last > 99 ? 99 : psw_flat_denied_last,
+                         psw_kill_last  > 99  ? 99  : psw_kill_last);
 #endif
             if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 13, ovbuf);
             /* row 15 (SCU-DSP feasibility, deliverable #1): per-frame sprite cost split.
@@ -7915,6 +7918,14 @@ static const unsigned int psw_slot_vram[PSW_FLAT_SLOTS] =
 #define PSW_FLAT_CAP     96          /* whole-frame floor+ceiling command budget */
 #define PSW_TZ_NEAR      (24 << 16)
 #define PSW_FAN_MAX      24          /* poly verts after the near clip (core caps at 20) */
+/* Flat FILL budget, in estimated screen PIXELS (spawn-scene verdict 2026-08-31: an open
+   scene emitted 69 full-polygon quads -> VDP1 plot 38 ms vs 12 in a corridor -- the L5
+   plot-time law; the command-count budgets are blind to fill).  Spent NEAR->FAR in the
+   reservation pre-pass, so the loss is always the FARTHEST rooms' floors/ceilings (RBG0
+   or garbage bleed at distance), never the near field.  The estimate (world area *
+   (px/unit at centroid)^2) ignores the vertical foreshortening of near-horizontal
+   planes, so it OVERESTIMATES -> the budget is conservative; tune on console. */
+#define PSW_FLAT_PX_BUDGET 96000     /* ~1.5 screens of 320x200 */
 
 static struct {
     int   fh, ch;                    /* sector heights (fixed)                    */
@@ -7927,6 +7938,8 @@ static int psw_sub_n = 0;
 static int psw_sub_tail = 0x7fff;    /* wall watermark at the FIRST overflow (0x7fff = none) */
 static int psw_spr_tail = 0x7fff;    /* vissprite watermark at the FIRST overflow */
 static int psw_flat_cmds = 0;
+static unsigned char psw_sub_kill[PSW_SUB_MAX];   /* 1 = this sub's flats cut by the fill budget */
+static int psw_kill_n = 0;           /* subs killed this flush (row 13 `k`) */
 
 static void sat_psw_sub_note(int subnum, int fh, int ch, int fpic,
                              int flump, int clump, int light, int vis0)
@@ -7951,6 +7964,8 @@ extern "C" int             psw_polys_ok;     /* core r_bsp.c: polygon pools vali
 extern "C" int            *psw_pvx, *psw_pvy;
 extern "C" unsigned short *psw_pvi;
 extern "C" unsigned char  *psw_pvn;
+extern "C" int            *psw_pva;          /* polygon world area (map-units^2)  */
+extern "C" int            *psw_pcx, *psw_pcy;/* polygon centroid (world, 16.16)   */
 
 /* SH-2 DIVU FixedDiv, IPL15 across the 3-write/1-read window (the fvdp1_fdiv recipe). */
 static inline int psw_fdiv(int a, int b)
@@ -8110,6 +8125,7 @@ static void psw_emit_subflats(int k)
     int sxv[PSW_FAN_MAX], syv[PSW_FAN_MAX];
     int n0, n, i, sn = psw_sub[k].subnum;
     if (!psw_polys_ok || sn < 0) return;
+    if (psw_sub_kill[k]) return;             /* cut by the fill budget (far-first) */
     n0 = psw_pvn[sn];
     if (n0 < 3) return;
     for (i = 0; i < n0; ++i) { px[i] = psw_pvx[psw_pvi[sn] + i]; py[i] = psw_pvy[psw_pvi[sn] + i]; }
@@ -8408,17 +8424,39 @@ static void vdp1_walls_flush(void)
         int tail = (psw_sub_tail < wall_acc_n) ? psw_sub_tail : wall_acc_n;
         psw_flat_cmds = 0; psw_flat_denied = 0;
         for (int s = 0; s < PSW_FLAT_SLOTS; ++s) psw_slot[s].used = 0;
-        /* slot reservation NEAR->FAR: the painter emits far-first, so without this
-           a 4th distinct flat (far) would claim the slots and the NEAR quads --
-           the most visible ones -- would degrade.  A reserved slot is 'used' and
-           cannot be evicted for the rest of the frame; far flats beyond the slots
-           fall back to the solid-colour polygon in the emitter. */
-        for (int k = 0; k < psw_sub_n; ++k)
+        /* NEAR->FAR pre-pass, two budgets at once:
+           - FILL: spend PSW_FLAT_PX_BUDGET estimated pixels; once it is gone the
+             remaining (farther) subs' flats are KILLED for this frame (row 13 `k`)
+             -- the painter has no occlusion for flats, and an open scene otherwise
+             emits dozens of fully-overpainted polygons (spawn: f69 -> plot 38 ms).
+           - SLOTS: reserve the texture slots for the nearest surviving flats; a
+             reserved slot is 'used' and cannot be evicted for the rest of the
+             frame; far flats beyond the slots fall back to the solid polygon. */
         {
-            int fl, cl;
-            psw_sub_lumps(k, &fl, &cl);
-            if (fl >= 0) psw_slot_get(fl);
-            if (cl >= 0) psw_slot_get(cl);
+            long long fpx = 0;
+            psw_kill_n = 0;
+            for (int k = 0; k < psw_sub_n; ++k)
+            {
+                int fl, cl;
+                psw_sub_kill[k] = 0;
+                psw_sub_lumps(k, &fl, &cl);
+                if (fl < 0 && cl < 0) continue;
+                if (fpx >= PSW_FLAT_PX_BUDGET)
+                { psw_sub_kill[k] = 1; psw_kill_n++; continue; }
+                if (psw_polys_ok && psw_sub[k].subnum >= 0)
+                {   /* screen-px estimate: world area * (px/unit at the centroid)^2 */
+                    int sn  = (int)psw_sub[k].subnum;
+                    int trx = psw_pcx[sn] - viewx, tryy = psw_pcy[sn] - viewy;
+                    int tz  = FixedMul(trx, viewcos) + FixedMul(tryy, viewsin);
+                    if (tz < PSW_TZ_NEAR) tz = PSW_TZ_NEAR;
+                    int xs8 = psw_fdiv(centerxfrac, tz) >> 8;      /* px/unit, 8.8 */
+                    long long px = ((long long)psw_pva[sn] * xs8 * xs8) >> 16;
+                    if (fl >= 0 && cl >= 0) px <<= 1;              /* both planes pay */
+                    fpx += px;
+                }
+                if (fl >= 0) psw_slot_get(fl);
+                if (cl >= 0) psw_slot_get(cl);
+            }
         }
         for (int i = wall_acc_n - 1; i >= tail; --i) VDP1_PLOT_WALL(i);
 #if SAT_WORLD_THINGS_VDP1
@@ -8439,6 +8477,7 @@ static void vdp1_walls_flush(void)
 #endif
         }
         psw_flat_last = psw_flat_cmds; psw_flat_denied_last = psw_flat_denied;
+        psw_kill_last = psw_kill_n;
 #if SAT_WORLD_THINGS_VDP1
         if (psw_thing_drop > 0)
         {   /* a dropped queued thing is drawn by NOBODY this frame (the vanish class):

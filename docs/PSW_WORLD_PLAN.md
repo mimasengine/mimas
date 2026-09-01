@@ -72,7 +72,11 @@ StoreWallRange, curline/frontsector/backsector/rw_angle1 vivants).
 > plot-time ; les budgets par-commande sont aveugles au fill). Réponse : **budget de FILL
 > flats** (96b9346/a8aa38b) — 96 000 px estimés dépensés PROCHE→LOIN dans la pré-passe,
 > coupe = row 13 `k` (perte = flats des salles les plus lointaines, fuite RBG0/ciel).
-> Pool 43,2 Ko. Reste : re-test spawn, calibrage du budget, 3b midtex, grille-64, verdict.
+> Pool 43,2 Ko. **Round 2 console (2026-09-01)** : perf PROUVÉE (spawn MST66→24-33, VD1
+> 38→6-11 ms) mais estimateur centroïde ×40 trop haut sur le proche ⇒ f1/k32-45 = plafonds
+> absents partout. Fix 8c3203b/baa31d1 : estimateur = bbox écran réellement projetée par
+> plan (psw_plane_px), pools aire/centroïde retirés. Reste : re-test spawn (f ~20-50
+> attendu, k = vrai lointain seulement), calibrage du budget, 3b midtex, grille-64, verdict.
 
 ## Étape 2 — sols non-dominants + plafonds (quads de sous-secteurs)
 

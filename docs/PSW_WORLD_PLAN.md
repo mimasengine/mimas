@@ -87,8 +87,16 @@ StoreWallRange, curline/frontsector/backsector/rw_angle1 vivants).
 > « visible » était aveugle) et d40 (dalle de flats plus jamais remplie en PSW). Fix
 > 61dfd18/69f826d : psw_plane_poly = clip MONDE par plan (near à ph·hw2/rows + 2 bords de
 > frustum 90°) ⇒ plus de queue hors écran, walk ≈ visible ; prefetch des flats des
-> visplanes via R_FlatCacheGet dans le bloc PSW de R_DrawPlanes. Reste : re-test (attendu
-> d~0, VD1 ≤ ~20 ms à f60+), calibrage 56000, 3b midtex, grille-64, verdict.
+> visplanes via R_FlatCacheGet dans le bloc PSW de R_DrawPlanes.
+> **GRILLE-64 (décision owner 2026-09-01, « partir du format PowerSlave », 58c22e0)** :
+> les flats émettent en TUILES 64×64 ancrées grille MONDE — tuile intérieure = caractère
+> entier 1:1 (u=wx&63, v=(−wy)&63, la phase R_MapPlane exacte ⇒ raccord parfait entre
+> tuiles et avec le RBG0), tuile de bord = polygone∩tuile (intersections SNAPPÉES sur la
+> ligne de grille ⇒ coutures bit-exactes), fan du caractère entier = warp borné à 64u aux
+> frontières de secteur. Budget = COMPTE DE TUILES (PSW_TILE_BUDGET 140 near→far ; un plan
+> > PSW_TILE_PLANE_MAX 48 retombe sur UN fan étiré). L'étirement pleine-salle est mort par
+> construction. Reste : test console, 3b midtex, sous-rects 8-texels pour les tuiles de
+> bord si le warp gêne, verdict.
 
 ## Étape 2 — sols non-dominants + plafonds (quads de sous-secteurs)
 

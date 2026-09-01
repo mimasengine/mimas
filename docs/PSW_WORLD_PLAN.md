@@ -65,8 +65,14 @@ StoreWallRange, curline/frontsector/backsector/rw_angle1 vivants).
 > Row 13 = `PSW t r f d`. Capture ON de référence : Bp 1,4, MST 50, t26 r0 f6.
 > Étape **3a CONSTRUITE** (1be0ea3/6c9e19e, pool 44,25 Ko) : things drainés au rang peintre
 > de leur sous-secteur (queue thing_acc + watermark vissprite `s0`, restore UserClip par
-> batch, shave 3 cmds/thing, drops → THp `x`) — non testée console. Reste : 3b midtex
-> masqués, grille-64 flats, étape 4 verdict.
+> batch, shave 3 cmds/thing, drops → THp `x`).
+> **A/B console 3a (2026-08-31 soir)** : couloir ON 50 fps vs OFF 30 (+66 %) ; scène du
+> spawn ON **15 fps** (MST66, f69, VD1 38 ms, g35) vs OFF 20 — le peintre n'a AUCUNE
+> occlusion de flats, une scène ouverte émet des dizaines de polygones recouverts (loi L5
+> plot-time ; les budgets par-commande sont aveugles au fill). Réponse : **budget de FILL
+> flats** (96b9346/a8aa38b) — 96 000 px estimés dépensés PROCHE→LOIN dans la pré-passe,
+> coupe = row 13 `k` (perte = flats des salles les plus lointaines, fuite RBG0/ciel).
+> Pool 43,2 Ko. Reste : re-test spawn, calibrage du budget, 3b midtex, grille-64, verdict.
 
 ## Étape 2 — sols non-dominants + plafonds (quads de sous-secteurs)
 

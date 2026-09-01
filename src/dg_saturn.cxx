@@ -7924,18 +7924,22 @@ static void vdp1_floors_flush(void) {}
    PSW is 1p-locked by the frame-boundary latch, so it is free in every PSW frame. */
 static const unsigned int psw_slot_vram[PSW_FLAT_SLOTS] =
     { 0x25C7D000u, 0x25C7E000u, 0x25C7F000u, 0x25C7C000u };
-#define PSW_FLAT_CAP     96          /* whole-frame floor+ceiling command budget */
+#define PSW_FLAT_CAP     192         /* belt: whole-frame flat command hard cap
+                                        (the TILE budget below is the real law) */
 #define PSW_TZ_NEAR      (24 << 16)
-#define PSW_FAN_MAX      24          /* poly verts after the near clip (core caps at 20) */
+#define PSW_FAN_MAX      28          /* poly verts: core caps at 20, +3 view clips, +4 tile cuts */
 /* Flat FILL budget, in estimated screen PIXELS (spawn-scene verdict 2026-08-31: an open
    scene emitted 69 full-polygon quads -> VDP1 plot 38 ms vs 12 in a corridor -- the L5
    plot-time law; the command-count budgets are blind to fill).  Spent NEAR->FAR in the
    reservation pre-pass, so the loss is always the FARTHEST rooms' floors/ceilings (RBG0
-   or garbage bleed at distance), never the near field.  Estimator = the projected
-   screen BBOX per plane, CLAMPED TO THE VIEW RECT (psw_plane_px) -- software-column
-   units (lowres view = 160x168 = ~27k), so the budget reads in MULTIPLES OF THE
-   VIEW: 56000 = ~2 views' worth of visible flat fill.  THE calibration knob. */
-#define PSW_FLAT_PX_BUDGET 56000
+   or garbage bleed at distance), never the near field.  GRID-64 (owner decision
+   2026-09-01, "partir du format PowerSlave"): flats emit as 64x64 world-grid
+   tiles, the world-clip already bounds fill ~= visible, so the ONLY scarce
+   resource left is COMMAND SLOTS (256/bank shared with walls+things+weapon+HUD)
+   and emission CPU -- the budget is a TILE COUNT, spent NEAR->FAR. */
+#define PSW_TILE_BUDGET    140       /* whole-frame flat tile allowance (bank is 256) */
+#define PSW_TILE_PLANE_MAX 48        /* a single plane above this emits ONE stretched
+                                        fan instead (rare pathological giant) */
 
 static struct {
     int   fh, ch;                    /* sector heights (fixed)                    */
@@ -8148,29 +8152,123 @@ static int psw_plane_poly(int sn, int ph, int psign, int *ox, int *oy)
     return n;
 }
 
-/* projected screen-bbox area of one world-clipped plane polygon -- the fill
-   budget's PLOT-COST proxy, now honest by construction (the clip removed the
-   tails; the view-rect clamp below is a belt). */
-static long long psw_plane_px(const int *cx, const int *cy, int n, int ph, int psign)
+/* GRID-64 (the PowerSlave data model): how many 64x64 world tiles the clipped
+   plane polygon's bbox spans -- the budget unit AND the tiles-vs-fan branch. */
+static int psw_tile_est(const int *cx, const int *cy, int n)
 {
-    int xl = 0x7fff, xr = -0x7fff, yt = 0x7fff, yb = -0x7fff, i, sx, sy;
+    int x0 = cx[0], x1 = cx[0], y0 = cy[0], y1 = cy[0], i;
+    for (i = 1; i < n; ++i)
+    {
+	if (cx[i] < x0) x0 = cx[i]; if (cx[i] > x1) x1 = cx[i];
+	if (cy[i] < y0) y0 = cy[i]; if (cy[i] > y1) y1 = cy[i];
+    }
+    return (((x1 - 1) >> 22) - (x0 >> 22) + 1)
+         * (((y1 - 1) >> 22) - (y0 >> 22) + 1);
+}
+
+/* Sutherland against an axis-aligned line: keep sgn*(coord - lim) >= 0.
+   Crossings SNAP exactly onto the line, so the two tiles sharing it get
+   bit-identical seam vertices (no cracks). */
+static int psw_clip_axis(const int *ax, const int *ay, int n, int *bx, int *by,
+                         int axis, int sgn, int lim)
+{
+    int i, m = 0;
+    int fa = sgn * ((axis ? ay[0] : ax[0]) - lim);
     for (i = 0; i < n; ++i)
     {
-	if (!psw_project(cx[i], cy[i], ph, psign, &sx, &sy)) return 0;
-	if (sx < xl) xl = sx; if (sx > xr) xr = sx;
-	if (sy < yt) yt = sy; if (sy > yb) yb = sy;
+	int j  = (i + 1 == n) ? 0 : i + 1;
+	int fb = sgn * ((axis ? ay[j] : ax[j]) - lim);
+	if (fa >= 0 && m < PSW_FAN_MAX) { bx[m] = ax[i]; by[m] = ay[i]; m++; }
+	if ((fa >= 0) != (fb >= 0) && m < PSW_FAN_MAX)
+	{
+	    int t = psw_fdiv(fa, fa - fb);
+	    bx[m] = ax[i] + (int)(((long long)(ax[j] - ax[i]) * t) >> 16);
+	    by[m] = ay[i] + (int)(((long long)(ay[j] - ay[i]) * t) >> 16);
+	    if (axis) by[m] = lim; else bx[m] = lim;
+	    m++;
+	}
+	fa = fb;
     }
-    /* VISIBLE pixels only: the raw bbox of a near plane runs to the projection
-       clamps (+/-1024, -512..1000) and billed the budget for acres of offscreen
-       tail -- console round 2 still read f1-f8/k29-43 (ceilings AND floors gone).
-       The offscreen walk cost is real but small next to the mis-kills; the view
-       rect is what the budget constant is calibrated against. */
-    if (xl < 0) xl = 0;
-    if (xr > viewwidth - 1) xr = viewwidth - 1;
-    if (yt < 0) yt = 0;
-    if (yb > viewheight - 1) yb = viewheight - 1;
-    if (xl >= xr || yt >= yb) return 0;
-    return (long long)(xr - xl) * (yb - yt);
+    return m;
+}
+
+/* Emit one plane as 64x64 WORLD-GRID tiles (the PowerSlave format, imported).
+   An INTERIOR tile maps the whole flat character 1:1 -- u = wx&63, v = (-wy)&63,
+   the exact software R_MapPlane phase, so VDP1 tiles line up with each other AND
+   with the RBG0 dominant: the stretch artefact class dies at the root.  An EDGE
+   tile is the polygon clipped to the tile square (snapped seams), drawn as a fan
+   of the full character = a texture warp BOUNDED to 64 world units at sector
+   borders (vs the old whole-room stretch).  Cost is uniform per tile. */
+static void psw_emit_plane_tiles(int slot, unsigned short colr,
+                                 const int *cx, const int *cy, int n,
+                                 int ph, int psign)
+{
+    int bx0 = cx[0], bx1 = cx[0], by0 = cy[0], by1 = cy[0], i;
+    for (i = 1; i < n; ++i)
+    {
+	if (cx[i] < bx0) bx0 = cx[i]; if (cx[i] > bx1) bx1 = cx[i];
+	if (cy[i] < by0) by0 = cy[i]; if (cy[i] > by1) by1 = cy[i];
+    }
+    {
+	int txa = bx0 >> 22, txb = (bx1 - 1) >> 22;
+	int tya = by0 >> 22, tyb = (by1 - 1) >> 22;
+	for (int ty = tya; ty <= tyb; ++ty)
+	for (int tx = txa; tx <= txb; ++tx)
+	{
+	    int ax[PSW_FAN_MAX], ay[PSW_FAN_MAX];
+	    int bxv[PSW_FAN_MAX], byv[PSW_FAN_MAX];
+	    int x0 = tx << 22, y0 = ty << 22;
+	    int x1 = x0 + (64 << 16), y1 = y0 + (64 << 16);
+	    int m, full;
+	    long long area2;
+	    if (psw_flat_cmds >= PSW_FLAT_CAP) return;
+	    m = psw_clip_axis(cx, cy, n, ax, ay, 0, +1, x0);
+	    if (m < 3) continue;
+	    m = psw_clip_axis(ax, ay, m, bxv, byv, 0, -1, x1);
+	    if (m < 3) continue;
+	    m = psw_clip_axis(bxv, byv, m, ax, ay, 1, +1, y0);
+	    if (m < 3) continue;
+	    m = psw_clip_axis(ax, ay, m, bxv, byv, 1, -1, y1);
+	    if (m < 3) continue;
+	    area2 = 0;                     /* shoelace x2, tile-local (coords <= 2^22) */
+	    for (i = 0; i < m; ++i)
+	    {
+		int j = (i + 1 == m) ? 0 : i + 1;
+		area2 += (long long)(bxv[i] - x0) * (byv[j] - y0)
+		       - (long long)(bxv[j] - x0) * (byv[i] - y0);
+	    }
+	    if (area2 < 0) area2 = -area2;
+	    if ((area2 >> 33) < 2) continue;             /* sliver < ~2 units^2 */
+	    full = ((area2 >> 33) >= 64 * 64 - 32);      /* ~the whole tile */
+	    if (full)
+	    {   /* exact texture: char (0,0) at world (x0,y1), rows run toward -y */
+		int qx[4], qy[4];
+		if (!psw_project(x0, y1, ph, psign, &qx[0], &qy[0])) continue;
+		if (!psw_project(x1, y1, ph, psign, &qx[1], &qy[1])) continue;
+		if (!psw_project(x1, y0, ph, psign, &qx[2], &qy[2])) continue;
+		if (!psw_project(x0, y0, ph, psign, &qx[3], &qy[3])) continue;
+		psw_emit_flatquad(slot, colr, qx, qy);
+	    }
+	    else
+	    {   /* edge tile: fan of the full character (warp bounded to the tile) */
+		int sxv[PSW_FAN_MAX], syv[PSW_FAN_MAX], ok = 1;
+		for (i = 0; i < m; ++i)
+		    if (!psw_project(bxv[i], byv[i], ph, psign, &sxv[i], &syv[i]))
+		    { ok = 0; break; }
+		if (!ok) continue;
+		for (i = 1; i + 1 < m; i += 2)
+		{
+		    int qx[4], qy[4];
+		    int i2 = (i + 2 < m) ? i + 2 : i + 1;
+		    qx[0] = sxv[0];     qy[0] = syv[0];
+		    qx[1] = sxv[i];     qy[1] = syv[i];
+		    qx[2] = sxv[i + 1]; qy[2] = syv[i + 1];
+		    qx[3] = sxv[i2];    qy[3] = syv[i2];
+		    psw_emit_flatquad(slot, colr, qx, qy);
+		}
+	    }
+	}
+    }
 }
 
 /* the two flat lumps subsector record k wants this frame (-1 = skip): the floor
@@ -8255,17 +8353,23 @@ static void psw_emit_subflats(int k)
 	    zi = FixedMul(ph, yslope[nr]) >> 20;
 	    if (zi < 0) zi = 0; else if (zi > 127) zi = 127;
 	    colr = wall_light_colr(zlight[li][zi]);
-	    for (i = 1; i + 1 < n; i += 2)
 	    {
-		int qx[4], qy[4];
-		int i2 = (i + 2 < n) ? i + 2 : i + 1;   /* odd tail: repeat = triangle */
-		qx[0] = sxv[0];     qy[0] = syv[0];
-		qx[1] = sxv[i];     qy[1] = syv[i];
-		qx[2] = sxv[i + 1]; qy[2] = syv[i + 1];
-		qx[3] = sxv[i2];    qy[3] = syv[i2];
-		psw_emit_flatquad(slot,
-		                  slot < 0 ? (unsigned short)(colr | fb) : colr,
-		                  qx, qy);
+		unsigned short pc = slot < 0 ? (unsigned short)(colr | fb) : colr;
+		if (psw_tile_est(cx, cy, n) <= PSW_TILE_PLANE_MAX)
+		    psw_emit_plane_tiles(slot, pc, cx, cy, n, ph, psign);
+		else
+		    /* pathological giant (huge non-dominant, non-sky plane): ONE
+		       stretched fan beats hundreds of tile commands */
+		    for (i = 1; i + 1 < n; i += 2)
+		    {
+			int qx[4], qy[4];
+			int i2 = (i + 2 < n) ? i + 2 : i + 1;
+			qx[0] = sxv[0];     qy[0] = syv[0];
+			qx[1] = sxv[i];     qy[1] = syv[i];
+			qx[2] = sxv[i + 1]; qy[2] = syv[i + 1];
+			qx[3] = sxv[i2];    qy[3] = syv[i2];
+			psw_emit_flatquad(slot, pc, qx, qy);
+		    }
 	    }
 	}
     }
@@ -8510,15 +8614,17 @@ static void vdp1_walls_flush(void)
         psw_flat_cmds = 0; psw_flat_denied = 0;
         for (int s = 0; s < PSW_FLAT_SLOTS; ++s) psw_slot[s].used = 0;
         /* NEAR->FAR pre-pass, two budgets at once:
-           - FILL: spend PSW_FLAT_PX_BUDGET estimated pixels; once it is gone the
-             remaining (farther) subs' flats are KILLED for this frame (row 13 `k`)
-             -- the painter has no occlusion for flats, and an open scene otherwise
-             emits dozens of fully-overpainted polygons (spawn: f69 -> plot 38 ms).
+           - TILES: spend PSW_TILE_BUDGET grid tiles (the world-clip bounds fill
+             ~= visible by construction, so the scarce resources left are command
+             SLOTS and emission CPU -- both proportional to tiles); once it is
+             gone the remaining (farther) subs' flats are KILLED for this frame
+             (row 13 `k`).  A single plane above PSW_TILE_PLANE_MAX bills the 2
+             commands of its stretched-fan fallback, matching the emitter.
            - SLOTS: reserve the texture slots for the nearest surviving flats; a
              reserved slot is 'used' and cannot be evicted for the rest of the
              frame; far flats beyond the slots fall back to the solid polygon. */
         {
-            long long fpx = 0;
+            int ftile = 0;
             psw_kill_n = 0;
             for (int k = 0; k < psw_sub_n; ++k)
             {
@@ -8526,25 +8632,29 @@ static void vdp1_walls_flush(void)
                 psw_sub_kill[k] = 0;
                 psw_sub_lumps(k, &fl, &cl);
                 if (fl < 0 && cl < 0) continue;
-                if (fpx >= PSW_FLAT_PX_BUDGET)
+                if (ftile >= PSW_TILE_BUDGET)
                 { psw_sub_kill[k] = 1; psw_kill_n++; continue; }
                 if (psw_polys_ok && psw_sub[k].subnum >= 0)
-                {   /* plot-cost estimate = projected bbox of each plane's WORLD-
-                       CLIPPED polygon (runs only while the budget lives, so the
-                       cost is bounded by the survivors) */
-                    int cxv[PSW_FAN_MAX], cyv[PSW_FAN_MAX], nn;
+                {
+                    int cxv[PSW_FAN_MAX], cyv[PSW_FAN_MAX], nn, e;
                     int sn = (int)psw_sub[k].subnum;
                     if (fl >= 0)
                     {
                         nn = psw_plane_poly(sn, viewz - psw_sub[k].fh, 1, cxv, cyv);
                         if (nn >= 3)
-                            fpx += psw_plane_px(cxv, cyv, nn, viewz - psw_sub[k].fh, 1);
+                        {
+                            e = psw_tile_est(cxv, cyv, nn);
+                            ftile += (e > PSW_TILE_PLANE_MAX) ? 2 : e;
+                        }
                     }
                     if (cl >= 0)
                     {
                         nn = psw_plane_poly(sn, psw_sub[k].ch - viewz, -1, cxv, cyv);
                         if (nn >= 3)
-                            fpx += psw_plane_px(cxv, cyv, nn, psw_sub[k].ch - viewz, -1);
+                        {
+                            e = psw_tile_est(cxv, cyv, nn);
+                            ftile += (e > PSW_TILE_PLANE_MAX) ? 2 : e;
+                        }
                     }
                 }
                 if (fl >= 0) psw_slot_get(fl);

@@ -142,6 +142,13 @@ StoreWallRange, curline/frontsector/backsector/rw_angle1 vivants).
 > quad bande pleine largeur + fenêtre UserClip) ; diagonales gardent le fan borné. (6) gate
 > wall_hypermag (texw·xspan > 640·du ou du==0) ⇒ mur FLAT (pas de fallback SW en PSW).
 > Pool -Psw 34,64 Ko ; build normal intact. Reste : test console, 3b midtex, verdict.
+> **Round 10 console (2026-09-02, 82b7639)** : « beaucoup mieux » — restaient des sols/
+> plafonds manquants quand PARTIELLEMENT couverts = la sonde par POINT généralisée à
+> l'AIRE. Fix : full-cull plan = TOUS les sommets prouvés cachés (un visible ⇒ raffinement
+> par tuile) ; skip tuile = les DEUX coins diagonaux cachés (tuile visible = toujours 1
+> sonde, court-circuit). À surveiller : MST79-84 / 12,6 fps dans la salle aux caisses
+> (k52-54 = budget tuiles saturé — beaucoup de subs) → prochaine cible perf après la
+> validation correction.
 
 ## Étape 2 — sols non-dominants + plafonds (quads de sous-secteurs)
 

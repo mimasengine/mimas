@@ -97,6 +97,13 @@ StoreWallRange, curline/frontsector/backsector/rw_angle1 vivants).
 > > PSW_TILE_PLANE_MAX 48 retombe sur UN fan étiré). L'étirement pleine-salle est mort par
 > construction. Reste : test console, 3b midtex, sous-rects 8-texels pour les tuiles de
 > bord si le warp gêne, verdict.
+> **Round 6 (2026-09-02, ddf77aa)** : (1) TOGGLE R+C SUPPRIMÉ — -Psw boote peintre-ON en
+> permanence (demande owner : transitions = classe corruption, captures ambiguës) ; A/B =
+> les deux disques. (2) **POINÇON RBG0** : un sol plus bas que le dominant, caché derrière
+> son rebord, s'affichait SUR le sol VDP2 (le dominant n'émettait rien ⇒ rien ne recouvrait
+> les tuiles fantômes, VDP1 > RBG0 en couche) — les sous-secteurs dominants émettent leur
+> polygone en POLYGON couleur-0 SPD (recette erase) à leur rang peintre, uniquement les
+> frames où un sol plus bas est en vue. Row 13 += `u<n>` ; L+X = poinçons JAUNES.
 
 ## Étape 2 — sols non-dominants + plafonds (quads de sous-secteurs)
 

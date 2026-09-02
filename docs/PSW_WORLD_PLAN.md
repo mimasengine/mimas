@@ -111,6 +111,16 @@ StoreWallRange, curline/frontsector/backsector/rw_angle1 vivants).
 > clip ; le poinçon ne s'arme que si un sol bas survit. Occulteur fin raté = overdraw
 > d'avant (jamais pire) ; sur-cull possible d'une frange de fosse (proxy coin-le-plus-loin).
 > Plafonds symétriques non faits. Reste : test console, 3b midtex, verdict.
+> **Round 8 (2026-09-02, d996700/6a6698b)** : (1) cull PLAFONDS symétrique (sondes miroir ;
+> R_PswCeilingAt fait occlure le CIEL à sa hauteur = la convention sky-hack gratuite) ;
+> (2) **OCCLUSION MURS façon portails** : 40 buckets écran de 8 px, une bande verticale
+> ouverte [t,b] chacun — la pré-passe near→far teste plans (bbox projetée) et murs contre
+> les bandes des occulteurs strictement plus proches, puis PLIE les murs survivants ; les
+> tiers upper/lower d'une fenêtre rétrécissent la bande = le portail PowerSlave émergent ;
+> murs lointains 100 % cachés cullés aussi (wall_cull[], row 13 `c<n>`). Pli = lignes
+> INTÉRIEURES sur buckets couverts, test = lignes EXTÉRIEURES sur buckets touchés,
+> middle-splits ignorés ⇒ conservateur des deux côtés. Verdicts plans dans psw_sub_flag[]
+> (pré-passe calcule, émetteur applique). Row 13 = `PSW t r f d k u c`.
 
 ## Étape 2 — sols non-dominants + plafonds (quads de sous-secteurs)
 

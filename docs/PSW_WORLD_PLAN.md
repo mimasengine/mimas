@@ -121,6 +121,27 @@ StoreWallRange, curline/frontsector/backsector/rw_angle1 vivants).
 > INTÉRIEURES sur buckets couverts, test = lignes EXTÉRIEURES sur buckets touchés,
 > middle-splits ignorés ⇒ conservateur des deux côtés. Verdicts plans dans psw_sub_flag[]
 > (pré-passe calcule, émetteur applique). Row 13 = `PSW t r f d k u c`.
+> **Round 9 console (2026-09-02)** : 6 symptômes — trous murs/plafonds (ciel/RBG0 au
+> travers), plafonds/sols entiers manquants, textures désalignées entre cellules, things
+> qui disparaissent / affichés SUR les murs, porte plein écran ×3, coin de quad qui déborde
+> sur le sol voisin. Diagnostic : (a) FAMINE DE BANQUE — flats f91-133 sur 256 cmds
+> partagées, émission far→near ⇒ le PROCHE sautait ; (b) cull LOS trop dur (sommet lointain
+> seul tuait le plan entier) ; (c) buckets murs c0 = jamais un cull par construction (sans
+> pli des flats, une bande pleine hauteur n'est jamais touchée en milieu d'écran) ; (d)
+> seuil tuile-pleine −32 unités² ⇒ carré débordant ; (e) hyper-magnification ⇒ squish
+> pleine-texture par pièce de subdivision. Fix efbc42d (core) + c7926bd : (1) **BANDES
+> PORTALES PAR COLONNE dans le core** — [bt,bb] par colonne, pli par seg dans
+> R_PswWallRange (one-sided scelle ; two-sided rétrécit au portail via tiers + régions
+> plafond/sol du secteur avant = la sémantique ceilingclip/floorclip vanilla) ; tiers
+> testés/cullés dans R_PswEmitTier AVANT le hook (`c` = sat_psw_wcull) ; plans testés au
+> moment de la NOTE (état strictement plus proche — au flush les bandes seraient fausses)
+> via R_PswBandBoxHidden ; verdicts stockés psw_sub_flag/fe/ce, pré-passe = pur budget.
+> (2) banque 304 cmds (PSW seul, 0x4100-0x4FFF libre) + budget flats réel = banque − coût
+> murs − réserve things, near→far. (3) full-cull LOS = lointain ET proche cachés. (4) seuil
+> plein 4094. (5) tuile de bord RECTANGLE AXIAL = texels exacts (sous-bande v du char +
+> quad bande pleine largeur + fenêtre UserClip) ; diagonales gardent le fan borné. (6) gate
+> wall_hypermag (texw·xspan > 640·du ou du==0) ⇒ mur FLAT (pas de fallback SW en PSW).
+> Pool -Psw 34,64 Ko ; build normal intact. Reste : test console, 3b midtex, verdict.
 
 ## Étape 2 — sols non-dominants + plafonds (quads de sous-secteurs)
 

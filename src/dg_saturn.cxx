@@ -8390,13 +8390,20 @@ static void psw_emit_plane_tiles(int slot, unsigned short colr,
 	    long long area2;
 	    if (psw_flat_cmds >= psw_flat_cap_dyn) return;
 	    if (cull_h != 0x7fffffff)
-	    {   /* mixed-visibility plane: probe the farthest tile corner (the
-	           most likely visible one) -- proven blocked => skip the tile
-	           before any clip work */
+	    {   /* mixed-visibility plane: probe the farthest tile corner, and --
+	           round 10 -- confirm on the OPPOSITE (nearest) corner before
+	           skipping: the far corner alone culled tiles whose near half
+	           was plainly visible behind a crate edge / ceiling lip
+	           (console 2026-09-02, the partial-coverage patches).  Visible
+	           tiles still pay ONE probe (short-circuit). */
 		int fx = (viewx < x0 + (32 << 16)) ? x1 : x0;
 		int fy = (viewy < y0 + (32 << 16)) ? y1 : y0;
-		if (psign > 0 ? psw_floor_pt_hidden(fx, fy, cull_h)
-		              : psw_ceil_pt_hidden(fx, fy, cull_h)) continue;
+		int nx = (fx == x0) ? x1 : x0;
+		int ny = (fy == y0) ? y1 : y0;
+		if (psign > 0 ? (psw_floor_pt_hidden(fx, fy, cull_h)
+		                 && psw_floor_pt_hidden(nx, ny, cull_h))
+		              : (psw_ceil_pt_hidden(fx, fy, cull_h)
+		                 && psw_ceil_pt_hidden(nx, ny, cull_h))) continue;
 	    }
 	    m = psw_clip_axis(cx, cy, n, ax, ay, 0, +1, x0);
 	    if (m < 3) continue;
@@ -8612,7 +8619,26 @@ static int psw_plane_los_cull(const int *cx, const int *cy, int n, int h,
 	    fhid = psw_ceil_pt_hidden(xf, yf, h);
 	    nhid = psw_ceil_pt_hidden(xn, yn, h);
 	}
-	if (fhid && nhid) return 1;
+	if (fhid && nhid)
+	{   /* round 10 (console 2026-09-02, "il manque des sols et plafonds
+	       quand ils ne sont pas integralement couverts"): far+near hidden
+	       could still hide a plane whose MIDDLE shows (window sill, crate
+	       gap).  Full cull now demands EVERY vertex proven hidden; one
+	       visible vertex downgrades to the per-tile refinement.  The extra
+	       probes are only paid by planes already past the far+near gate =
+	       mostly genuinely hidden ones. */
+	    int allhid = 1;
+	    for (i = 0; i < n && allhid; ++i)
+	    {
+		if ((cx[i] == xf && cy[i] == yf) || (cx[i] == xn && cy[i] == yn))
+		    continue;
+		allhid = (psign > 0) ? psw_floor_pt_hidden(cx[i], cy[i], h)
+		                     : psw_ceil_pt_hidden(cx[i], cy[i], h);
+	    }
+	    if (allhid) return 1;
+	    *tile_test = 1;
+	    return 0;
+	}
 	*tile_test = fhid || nhid;
     }
     return 0;

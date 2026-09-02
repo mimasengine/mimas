@@ -231,6 +231,25 @@ StoreWallRange, curline/frontsector/backsector/rw_angle1 vivants).
 > trous » : des plans fantômes (mixtes entièrement cachés aux sondes) facturés pleins et
 > jetés sur le papier sans perte visuelle — désormais facturés 1, toujours accordés.
 > Pool 28,09 Ko (masques 1,9 Ko + code sondes). Attendu : k0 STABLE en se déplaçant.
+> **Round 18 console (2026-09-02)** : couloirs GUÉRIS (k0 stable) mais la salle acide tient
+> k11-16 avec `c193-251` — la facture sondée a libéré l'émission et la famine est devenue
+> RÉELLE (murs tuilés ~100-120 cmds + demande flats > banque). Réponse structurelle (owner :
+> « c'est si compliqué de ne pas avoir de trous ? ») : la PRÉSENCE avant la QUALITÉ.
+> (1) **Allocation à garantie minimum** — tour A near→far : chaque passe éligible facturée
+> min(4, e) seulement (personne ne tombe tant que la garantie tient) ; tour B near→far :
+> le reliquat upgrade vers les tuiles (charge e−4) + attribue les 4 slots texture. La
+> qualité dégrade du lointain d'abord, les trous ne peuvent naître que si TOUT-en-aplats
+> déborde la banque (et le repêchage ramasse encore). (2) **Les murs cèdent aux flats**
+> (précédent murs-cèdent-aux-things) : la demande GARANTIE des flats (min(4,e)/passe +
+> 4/poinçon + réserve things + marge) est soustraite du surplus d'upgrade des murs AVANT
+> tout mur tuilé — un mur dégradé reste un mur plat 1 cmd, un plafond jeté est un trou.
+> `fl` (V1) va monter = le levier tire. (3) La ceinture d'émission relit la facture
+> STOCKÉE (fe/ce sondés) au lieu de psw_tile_est brut — elle forçait des plans mixtes
+> PROCHES en aplat magenta à tort en fin de frame (une part de la « zone rose »).
+> NB « zone rose > réel » (owner) : géométrie identique dans les deux modes — en rendu
+> normal les aplats sont couleur-texel (vert nukage sur RBG0 acide = camouflés) et
+> partiellement repeints par les poinçons couleur-0 ; L+X révèle leur étendue réelle =
+> le champ lointain dégradé. Attendu salle acide : murs plus plats, plans TOUS présents.
 
 ## Étape 2 — sols non-dominants + plafonds (quads de sous-secteurs)
 

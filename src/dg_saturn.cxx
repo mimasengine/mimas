@@ -7971,6 +7971,16 @@ static const unsigned int psw_slot_vram[PSW_FLAT_SLOTS] =
                                         (the DYNAMIC budget is the real law) */
 #define PSW_TZ_NEAR      (24 << 16)
 #define PSW_FAN_MAX      28          /* poly verts: core caps at 20, +3 view clips, +4 tile cuts */
+/* DISTANCE LOD (round 16).  Console 2026-09-02: k8-18 with the bank HALF EMPTY
+   (c113-154 / B296) -- the touched-tiles paper still ran 2-3x the real spend
+   (LOS-skipped tiles on mixed planes, sliver/clip zero-emissions, and far
+   planes billing dozens of tiles that project onto a dozen PIXEL rows).  A
+   plane whose projected bbox is this small carries no readable texture at 64u
+   grid anyway: force it SOLID at NOTE time -- billed 4, emitted as <=4
+   decimated quads.  Kills the far field's paper AND its real cost at once
+   (the same trade as the wall potato LOD, keyed on projection not distance). */
+#define PSW_SOLID_HPX    16          /* projected height at/below which a plane goes solid */
+#define PSW_SOLID_AREA   1024        /* projected bbox area (px^2) gate, same LOD */
 /* Flat FILL budget, in estimated screen PIXELS (spawn-scene verdict 2026-08-31: an open
    scene emitted 69 full-polygon quads -> VDP1 plot 38 ms vs 12 in a corridor -- the L5
    plot-time law; the command-count budgets are blind to fill).  Spent NEAR->FAR in the
@@ -8014,11 +8024,21 @@ static int psw_flat_cap_dyn = PSW_FLAT_CAP;  /* round 9: per-frame REAL flat roo
                                                 shared bank dropped the NEAREST walls) */
 static unsigned char psw_sub_flag[PSW_SUB_MAX];   /* NOTE-time verdicts: b0 floor hidden,
                                                      b1 floor per-tile probe, b2/b3 = ceiling;
-                                                     pre-pass budget degrade: b4 floor->fan,
-                                                     b5 ceiling->fan (round 11) */
+                                                     b4 floor SOLID (note-time distance LOD,
+                                                     or pre-pass budget degrade), b5 = ceiling;
+                                                     b6/b7 floor/ceiling STANDBY (round 16:
+                                                     paper famine -- emit-time slack rescue) */
 static unsigned char psw_sub_fe[PSW_SUB_MAX];     /* note-time tile estimate, floor (255-clamped) */
 static unsigned char psw_sub_ce[PSW_SUB_MAX];     /* note-time tile estimate, ceiling */
-static int psw_kill_n = 0;           /* subs killed this flush (row 13 `k`) */
+static int psw_kill_n = 0;           /* subs killed this flush (row 13 `k`; NET of rescues) */
+static int psw_paper_left = 0;       /* round 16 rescue ledger: paper (upper-bound cost) of
+                                        every COMMITTED item not yet emitted.  Decremented per
+                                        sub as its flats emit; walls/things are never released
+                                        (their real spend already sits in vdp1_wnext -> the
+                                        double count only UNDERSTATES the slack = safe).  A
+                                        standby plane may emit a 4-cmd solid iff real wnext +
+                                        4 + this ledger still fits the bank: the near field's
+                                        reservations are provably untouched. */
 
 extern "C" int             psw_polys_ok;     /* core r_bsp.c: polygon pools valid */
 extern "C" int             R_PswFloorAt(int x, int y);   /* core: floor height at a 2D point (BSP walk) */
@@ -8097,6 +8117,17 @@ static void sat_psw_sub_note(int subnum, int fh, int ch, int fpic,
 		}
 		if (okp && R_PswBandBoxHidden(xl, xr, yt, yb))
 		{ psw_sub_flag[k] |= bit; continue; }
+		if (okp && !tt && (yb - yt <= PSW_SOLID_HPX
+		            || (xr - xl) * (yb - yt) <= PSW_SOLID_AREA))
+		{   /* DISTANCE LOD (round 16): too small on screen to carry a
+		       readable 64u texture -- solid from the start, billed 4.
+		       This is where the k8-18 far-field paper went.  MIXED (tt)
+		       planes are exempt: the solid fan skips the per-tile LOS
+		       probes, and a sky-hack-hidden ceiling region would paint
+		       an unerasable patch OVER the VDP2 sky (below VDP1). */
+		    psw_sub_flag[k] |= (pass == 0) ? 0x10 : 0x20;
+		    continue;
+		}
 	    }
 	    e = psw_tile_est(cxv, cyv, nn);
 	    if (e > 255) e = 255;
@@ -8812,16 +8843,26 @@ static void psw_emit_subflats(int k)
 			    if (!psw_project(cx[i], cy[i], viewz - psw_sub[k].fh, 1,
 			                     &sxv[i], &syv[i])) { pok = 0; break; }
 			if (pok)
-			    for (i = 1; i + 1 < n; i += 2)
+			{   /* round 16: DECIMATED like the solids (<=4 quads from
+			       <=9 evenly-chosen verts).  The full fan emitted up to
+			       13 quads while the pre-pass billed 1 (console u26 for
+			       ~10 billed) -- a silent billing-law violation that ate
+			       the rescue slack.  Shaved verts are mostly collinear
+			       view-clip artifacts; worst case a 1-2px RBG0 sliver
+			       at a shaved corner of a NEAR dominant ledge. */
+			    int idx[9], nn = (n < 9) ? n : 9, s;
+			    for (s = 0; s < nn; ++s) idx[s] = (s * (n - 1)) / (nn - 1);
+			    for (i = 1; i + 1 < nn; i += 2)
 			    {
 				int qx[4], qy[4];
-				int i2 = (i + 2 < n) ? i + 2 : i + 1;
-				qx[0] = sxv[0];     qy[0] = syv[0];
-				qx[1] = sxv[i];     qy[1] = syv[i];
-				qx[2] = sxv[i + 1]; qy[2] = syv[i + 1];
-				qx[3] = sxv[i2];    qy[3] = syv[i2];
+				int i2 = (i + 2 < nn) ? i + 2 : i + 1;
+				qx[0] = sxv[idx[0]];     qy[0] = syv[idx[0]];
+				qx[1] = sxv[idx[i]];     qy[1] = syv[idx[i]];
+				qx[2] = sxv[idx[i + 1]]; qy[2] = syv[idx[i + 1]];
+				qx[3] = sxv[idx[i2]];    qy[3] = syv[idx[i2]];
 				psw_emit_punchquad(qx, qy);
 			    }
+			}
 		    }
 		}
 		continue;
@@ -8840,15 +8881,41 @@ static void psw_emit_subflats(int k)
 	    if (pass == 0)
 	    {   /* trust the pre-pass verdicts (LOS + wall-occlusion buckets) */
 		if (psw_sub_flag[k] & 1) continue;
+		if (psw_sub_flag[k] & 0x40)
+		{   /* STANDBY (paper famine): rescue as a 4-cmd SOLID iff the
+		       bank's REAL slack provably covers it beyond every not-yet-
+		       emitted commitment (round 16) -- the near field's paper
+		       stays reserved, so this can never re-create the round-9
+		       near truncation.  Rescued => k stops counting it. */
+		    if ((int)vdp1_wnext + 4 + psw_paper_left > vdp1_wall_cap) continue;
+		    psw_kill_n--;
+		}
 		if (psw_sub_flag[k] & 2) cull_h = psw_sub[k].fh;
 	    }
 	    else
 	    {
 		if (psw_sub_flag[k] & 4) continue;
+		if (psw_sub_flag[k] & 0x80)
+		{   /* MIXED ceiling (b3): no solid rescue -- the fan skips the
+		       per-tile probes, and its sky-hack-hidden region would paint
+		       an unerasable patch OVER the VDP2 sky.  Stays a hole, still
+		       counted in k.  (Floors are safe: ledge ghosts are covered
+		       by the punch + nearer subs overpaint the rest.) */
+		    if (psw_sub_flag[k] & 8) continue;
+		    if ((int)vdp1_wnext + 4 + psw_paper_left > vdp1_wall_cap) continue;
+		    psw_kill_n--;
+		}
 		if (psw_sub_flag[k] & 8) cull_h = psw_sub[k].ch;
 	    }
 	{
-	    int slot = psw_slot_get(lump);
+	    /* solid verdict FIRST (round 16): a solid plane needs the centre-texel
+	       peek, not a texture slot -- grabbing one anyway toothed the 4-slot
+	       LRU away from the near tiled flats.  fanbit folds the standby-rescue
+	       bit in: a rescued plane is a solid by definition. */
+	    int fanbit = (pass == 0) ? (0x10 | 0x40) : (0x20 | 0x80);
+	    int solid = (psw_sub_flag[k] & fanbit)
+	           || (psw_flat_cmds + 2 * psw_tile_est(cx, cy, n) + 1 > psw_flat_cap_dyn);
+	    int slot = solid ? -1 : psw_slot_get(lump);
 	    int nr, li, zi, ok = 1, fb = 0;
 	    unsigned short colr, scolr;
 	    {   /* centre texel: the SOLID colour for slot famine, the budget
@@ -8887,9 +8954,6 @@ static void psw_emit_subflats(int k)
 		   MOVING view-clip verts restretches every frame.  A solid
 		   cannot swim; the lost texture at degrade distance is the
 		   potato trade. */
-		int fanbit = (pass == 0) ? 0x10 : 0x20;
-		int solid = (psw_sub_flag[k] & fanbit)
-		       || (psw_flat_cmds + 2 * psw_tile_est(cx, cy, n) + 1 > psw_flat_cap_dyn);
 		if (!solid)
 		    psw_emit_plane_tiles(slot, pc, cx, cy, n, ph, psign, cull_h, scolr);
 		else
@@ -8916,6 +8980,16 @@ static void psw_emit_subflats(int k)
 	}
 	}
     }
+    /* round 16: release this sub's committed paper into the rescue slack --
+       AFTER both passes (a floor rescue must still see the ceiling's un-emitted
+       reservation).  The masks mirror the pre-pass exactly: a pass committed
+       paper iff its lump is live and it is neither note-hidden nor standby;
+       4 for a solid (LOD or degrade), 2e+1 for a tiled plane, 4 per punch. */
+    psw_paper_left -= ((fdom && psw_punch_frame) ? 4 : 0)
+	+ ((fl >= 0 && !(psw_sub_flag[k] & 0x41))
+	       ? ((psw_sub_flag[k] & 0x10) ? 4 : 2 * (int)psw_sub_fe[k] + 1) : 0)
+	+ ((cl >= 0 && !(psw_sub_flag[k] & 0x84))
+	       ? ((psw_sub_flag[k] & 0x20) ? 4 : 2 * (int)psw_sub_ce[k] + 1) : 0);
     }
 }
 
@@ -9204,34 +9278,51 @@ static void vdp1_walls_flush(void)
                cap ran dry).  Bill 2e+1 for a tiled plane, 4 for a solid
                degrade; the budget DEGRADES before it kills, near->far. */
             int limit = fbudget;
+            /* punch pre-scan (round 16): psw_punch_frame used to be built IN the
+               billing loop, so dominant subs visited before the discovery were
+               billed as if no punch would fire.  Resolve it first; the billing
+               loop then charges every dominant sub its real punch paper. */
+            for (int k = 0; k < psw_sub_n; ++k)
+            {
+                int fl, cl, fdom;
+                psw_sub_lumps(k, &fl, &cl, &fdom);
+                if (fl >= 0 && !(psw_sub_flag[k] & 1)
+                    && psw_sub[k].fh < sat_vdp2_floor_h)
+                { psw_punch_frame = 1; break; }
+            }
             for (int k = 0; k < psw_sub_n; ++k)
             {
                 int fl, cl, fdom, dropped = 0;
                 psw_sub_lumps(k, &fl, &cl, &fdom);
-                /* punch: a lower-than-dominant floor SURVIVED its note verdict */
-                if (fl >= 0 && !(psw_sub_flag[k] & 1)
-                    && psw_sub[k].fh < sat_vdp2_floor_h)
-                    psw_punch_frame = 1;
                 if (fl < 0 && cl < 0 && !fdom) continue;
-                if (fdom && ftile + 1 <= limit) ftile += 1;   /* punch room at this rank */
+                /* punch paper: UNCONDITIONAL 4 (round 16) -- the emitter never
+                   consults the budget flags for punches, and the old fan emitted
+                   up to 13 quads while billed 1 (a silent billing-law violation,
+                   console u26).  The punch fan is now DECIMATED to <=4 quads. */
+                if (fdom && psw_punch_frame) ftile += 4;
                 if (fl >= 0 && !(psw_sub_flag[k] & 1))
-                {
-                    int e = 2 * (int)psw_sub_fe[k] + 1;       /* band+window per tile */
-                    if (ftile + e <= limit)      { ftile += e; psw_slot_get(fl); }
-                    else if (ftile + 4 <= limit) { ftile += 4; psw_slot_get(fl);
-                                                   psw_sub_flag[k] |= 0x10; }
-                    else { psw_sub_flag[k] |= 1; dropped = 1; }
+                {   /* note-time solid LOD (0x10): billed at its 4-cmd cost; only
+                       the TILED arm reserves one of the 4 texture slots (a solid
+                       needs the centre-texel peek, not a slot -- round 16). */
+                    int e = (psw_sub_flag[k] & 0x10) ? 4 : 2 * (int)psw_sub_fe[k] + 1;
+                    if (ftile + e <= limit)      { ftile += e;
+                                                   if (!(psw_sub_flag[k] & 0x10)) psw_slot_get(fl); }
+                    else if (ftile + 4 <= limit) { ftile += 4; psw_sub_flag[k] |= 0x10; }
+                    else { psw_sub_flag[k] |= 0x40; dropped = 1; }   /* STANDBY: rescue at emit */
                 }
                 if (cl >= 0 && !(psw_sub_flag[k] & 4))
                 {
-                    int e = 2 * (int)psw_sub_ce[k] + 1;
-                    if (ftile + e <= limit)      { ftile += e; psw_slot_get(cl); }
-                    else if (ftile + 4 <= limit) { ftile += 4; psw_slot_get(cl);
-                                                   psw_sub_flag[k] |= 0x20; }
-                    else { psw_sub_flag[k] |= 4; dropped = 1; }
+                    int e = (psw_sub_flag[k] & 0x20) ? 4 : 2 * (int)psw_sub_ce[k] + 1;
+                    if (ftile + e <= limit)      { ftile += e;
+                                                   if (!(psw_sub_flag[k] & 0x20)) psw_slot_get(cl); }
+                    else if (ftile + 4 <= limit) { ftile += 4; psw_sub_flag[k] |= 0x20; }
+                    else { psw_sub_flag[k] |= 0x80; dropped = 1; }
                 }
                 if (dropped) psw_kill_n++;
             }
+            /* rescue ledger: every commitment not yet emitted (walls + things
+               reserve + margin + the flats' committed paper).  See the decl. */
+            psw_paper_left = wall_cmds + treserve + 4 + ftile;
         }
         for (int i = wall_acc_n - 1; i >= tail; --i) VDP1_PLOT_WALL(i);
 #if SAT_WORLD_THINGS_VDP1

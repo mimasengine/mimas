@@ -183,6 +183,16 @@ StoreWallRange, curline/frontsector/backsector/rw_angle1 vivants).
 > ajoutée (tuile : 2 coins + centre ; plan : tous sommets + centroïde). (3) trous à
 > distance : PSW_TILE_BUDGET 140→220 (vestige pré-cull), FLAT_CAP 232, SUB_MAX 240 (tail
 > = murs sans flats). L+X : MAGENTA = les aplats désormais. Pool 32,05 Ko.
+> **Round 14 console (2026-09-02, 2df88aa)** : « beaucoup mieux ; trous restants entre
+> magenta et blanc ; jamais de rouge ». Jamais de rouge = les tuiles pleines n'existent
+> quasiment pas (fragments BSP < carré 64 aligné) ⇒ ~chaque tuile = bande+fenêtre à
+> 2 CMDS, facturée 1 par la pré-passe ⇒ dépense ~2× le facturé ⇒ le cap d'émission
+> (far→near) tronquait le PROCHE = les trous à la frontière magenta/blanc (la famine du
+> round 9 ressuscitée dans le budget flats). Fix : pré-passe en COMMANDES contre fbudget
+> seul (PSW_TILE_BUDGET supprimé — une fenêtre ne coûte aucun walk), plan tuilé = 2e+1,
+> aplat = 4 ; fan d'aplat DÉCIMÉ ≤4 quads (13 quads facturés 2 se faisaient tronquer en
+> plein milieu) ; trigger d'émission aligné. NB multijoueur : PSW reste verrouillé 1p
+> (latch) ; le MP du disque -Psw = chemin classique + banque 304 ; disque normal intact.
 
 ## Étape 2 — sols non-dominants + plafonds (quads de sous-secteurs)
 

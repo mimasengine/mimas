@@ -7976,8 +7976,11 @@ static const unsigned int psw_slot_vram[PSW_FLAT_SLOTS] =
    resource left is COMMAND SLOTS (256/bank shared with walls+things+weapon+HUD)
    and emission CPU -- the budget is a TILE COUNT, spent NEAR->FAR. */
 #define PSW_TILE_BUDGET    140       /* whole-frame flat tile allowance (bank is 256) */
-#define PSW_TILE_PLANE_MAX 48        /* a single plane above this emits ONE stretched
-                                        fan instead (rare pathological giant) */
+/* (PSW_TILE_PLANE_MAX deleted in round 11: the ">48 tiles => ONE stretched fan"
+   shortcut re-created the whole-room stretch on every LARGE ceiling -- console
+   2026-09-02 "les textures des grands plans ne respectent pas leur alignement".
+   Giants tile like everyone; the stretched fan survives only as the BUDGET
+   degrade, where the misalignment is a few far pixels.) */
 
 static struct {
     int   fh, ch;                    /* sector heights (fixed)                    */
@@ -7995,9 +7998,10 @@ static int psw_flat_cap_dyn = PSW_FLAT_CAP;  /* round 9: per-frame REAL flat roo
                                                 the things reserve (famine unification --
                                                 console 2026-09-02: flats overflowing the
                                                 shared bank dropped the NEAREST walls) */
-static unsigned char psw_sub_kill[PSW_SUB_MAX];   /* 1 = this sub's flats cut by the fill budget */
 static unsigned char psw_sub_flag[PSW_SUB_MAX];   /* NOTE-time verdicts: b0 floor hidden,
-                                                     b1 floor per-tile probe, b2/b3 = ceiling */
+                                                     b1 floor per-tile probe, b2/b3 = ceiling;
+                                                     pre-pass budget degrade: b4 floor->fan,
+                                                     b5 ceiling->fan (round 11) */
 static unsigned char psw_sub_fe[PSW_SUB_MAX];     /* note-time tile estimate, floor (255-clamped) */
 static unsigned char psw_sub_ce[PSW_SUB_MAX];     /* note-time tile estimate, ceiling */
 static int psw_kill_n = 0;           /* subs killed this flush (row 13 `k`) */
@@ -8366,11 +8370,42 @@ static int psw_clip_axis(const int *ax, const int *ay, int n, int *bx, int *by,
    borders (vs the old whole-room stretch).  Cost is uniform per tile. */
 static int psw_floor_pt_hidden(int fx, int fy, int fh);   /* sightline probes (below) */
 static int psw_ceil_pt_hidden(int fx, int fy, int ch);
+
+/* round 11: bitmask of the view-clip lines a world point lies on (near plane at
+   `nlim` = bit0, the two 90-deg frustum edges at -8u = bits 1/2), within 1/8
+   world unit -- the crossings psw_clip_dir creates satisfy their line equation
+   to ~1/60 u, so the test recognizes them reliably. */
+static int psw_view_line_mask(int wx, int wy, int nlim)
+{
+    int dx = wx - viewx, dy = wy - viewy, mk = 0, v;
+    v = FixedMul(dx, viewcos) + FixedMul(dy, viewsin) - nlim;
+    if (v < 0) v = -v;
+    if (v < (1 << 13)) mk |= 1;
+    v = FixedMul(dx, viewcos + viewsin) + FixedMul(dy, viewsin - viewcos) + (8 << 16);
+    if (v < 0) v = -v;
+    if (v < (1 << 13)) mk |= 2;
+    v = FixedMul(dx, viewcos - viewsin) + FixedMul(dy, viewsin + viewcos) + (8 << 16);
+    if (v < 0) v = -v;
+    if (v < (1 << 13)) mk |= 4;
+    return mk;
+}
+
 static void psw_emit_plane_tiles(int slot, unsigned short colr,
                                  const int *cx, const int *cy, int n,
                                  int ph, int psign, int cull_h)
 {
     int bx0 = cx[0], bx1 = cx[0], by0 = cy[0], by1 = cy[0], i;
+    int nlim = PSW_TZ_NEAR + (8 << 16);   /* the near-clip line psw_plane_poly used */
+    {
+	extern int detailshift;
+	int hw2  = (viewwidth << detailshift) >> 1;
+	int rows = (psign > 0) ? (viewheight - centery + 2) : (centery + 2);
+	if (rows > 0)
+	{
+	    int l2 = (int)(((long long)ph * hw2) / rows);
+	    if (l2 > nlim) nlim = l2;
+	}
+    }
     for (i = 1; i < n; ++i)
     {
 	if (cx[i] < bx0) bx0 = cx[i]; if (cx[i] > bx1) bx1 = cx[i];
@@ -8439,75 +8474,88 @@ static void psw_emit_plane_tiles(int slot, unsigned short colr,
 	    else
 	    {
 		int done = 0;
-		if (m == 4 && slot >= 0 && !(sat_wall_paint & 1))
-		{   /* AXIS-ALIGNED RECT (the common Doom border, round 9): EXACT
-		       texels.  The v sub-range is a contiguous char slice; a
-		       horizontal sub-range is NOT addressable in a VDP1 char, so
-		       a narrow rect draws the FULL-WIDTH band quad world-anchored
-		       plus a UserClip window cutting it to the rect (the wall
-		       emitter's recipe).  Kills the "textures pas alignees entre
-		       cellules" class for orthogonal geometry; diagonal borders
-		       keep the bounded fan warp below. */
-		    int rect = 1, rx0, rx1, ry0, ry1;
-		    for (i = 0; i < 4; ++i)
+		int sxv[PSW_FAN_MAX], syv[PSW_FAN_MAX], okv = 1;
+		for (i = 0; i < m; ++i)
+		    if (!psw_project(bxv[i], byv[i], ph, psign, &sxv[i], &syv[i]))
+		    { okv = 0; break; }
+		if (!okv) continue;
+		if (slot >= 0 && !(sat_wall_paint & 1))
+		{   /* CLEAN PIECE (round 11, generalizes the round-9 axis rect):
+		       every non-axis edge lies on a VIEW-CLIP line, so whatever
+		       the full-width band paints beyond the true piece is
+		       OFF-SCREEN by construction (a near-cut leak projects below
+		       the bottom edge, a frustum leak beyond the sides).  Such a
+		       piece emits WORLD-ANCHORED: the char's v sub-band SNAPPED
+		       to texel rows + the full tile width + a UserClip window at
+		       the piece's projected bbox.  No texel is restretched onto
+		       the MOVING clip boundary any more -- that restretch was the
+		       swim ("les quads qui debordent de l'ecran swim").  Only a
+		       diagonal SECTOR border (leak would land on-screen) keeps
+		       the bounded fan below. */
+		    int clean = 1;
+		    for (i = 0; i < m && clean; ++i)
 		    {
-			int j = (i + 1) & 3;
-			if (bxv[i] != bxv[j] && byv[i] != byv[j]) { rect = 0; break; }
+			int j = (i + 1 == m) ? 0 : i + 1;
+			if (bxv[i] == bxv[j] || byv[i] == byv[j]) continue;  /* axis edge */
+			clean = (psw_view_line_mask(bxv[i], byv[i], nlim)
+			         & psw_view_line_mask(bxv[j], byv[j], nlim)) != 0;
 		    }
-		    rx0 = rx1 = bxv[0]; ry0 = ry1 = byv[0];
-		    for (i = 1; i < 4; ++i)
+		    if (clean)
 		    {
-			if (bxv[i] < rx0) rx0 = bxv[i]; if (bxv[i] > rx1) rx1 = bxv[i];
-			if (byv[i] < ry0) ry0 = byv[i]; if (byv[i] > ry1) ry1 = byv[i];
-		    }
-		    if (rect && rx1 > rx0 && ry1 > ry0)
-		    {
-			int v0 = (y1 - ry1) >> 16;
-			int vh = (ry1 - ry0 + 0x8000) >> 16;
-			int fullw = (rx0 == x0 && rx1 == x1);
-			int qx[4], qy[4], okq;
-			if (v0 < 0) v0 = 0; else if (v0 > 63) v0 = 63;
-			if (vh < 1) vh = 1;
-			if (v0 + vh > 64) vh = 64 - v0;
-			okq  = psw_project(x0, ry1, ph, psign, &qx[0], &qy[0]);
-			okq &= psw_project(x1, ry1, ph, psign, &qx[1], &qy[1]);
-			okq &= psw_project(x1, ry0, ph, psign, &qx[2], &qy[2]);
-			okq &= psw_project(x0, ry0, ph, psign, &qx[3], &qy[3]);
-			if (okq && fullw)
+			int pbx0 = bxv[0], pbx1 = bxv[0], pby0 = byv[0], pby1 = byv[0];
+			for (i = 1; i < m; ++i)
 			{
-			    psw_emit_rectquad(slot, colr, qx, qy, v0, vh, 0);
-			    done = 1;
+			    if (bxv[i] < pbx0) pbx0 = bxv[i]; if (bxv[i] > pbx1) pbx1 = bxv[i];
+			    if (byv[i] < pby0) pby0 = byv[i]; if (byv[i] > pby1) pby1 = byv[i];
 			}
-			else if (okq && vdp1_wnext + 1 < vdp1_wall_cap
-			         && psw_flat_cmds + 1 < psw_flat_cap_dyn)
 			{
-			    int wx[4], wy[4], okw;
-			    okw  = psw_project(rx0, ry1, ph, psign, &wx[0], &wy[0]);
-			    okw &= psw_project(rx1, ry1, ph, psign, &wx[1], &wy[1]);
-			    okw &= psw_project(rx1, ry0, ph, psign, &wx[2], &wy[2]);
-			    okw &= psw_project(rx0, ry0, ph, psign, &wx[3], &wy[3]);
-			    if (okw)
-			    {
-				int wxl = wx[0], wxr = wx[0], wyt = wy[0], wyb = wy[0];
-				for (i = 1; i < 4; ++i)
+			    int v0   = (y1 - pby1) >> 16;
+			    int vend = (y1 - pby0 + 0xFFFF) >> 16;
+			    if (v0 < 0) v0 = 0;
+			    if (vend > 64) vend = 64;
+			    if (vend > v0)
+			    {   /* band corners snapped to the texel rows they map:
+				   the texture is exact and world-pinned */
+				int qx[4], qy[4], okq;
+				int by1s = y1 - (v0 << 16), by0s = y1 - (vend << 16);
+				okq  = psw_project(x0, by1s, ph, psign, &qx[0], &qy[0]);
+				okq &= psw_project(x1, by1s, ph, psign, &qx[1], &qy[1]);
+				okq &= psw_project(x1, by0s, ph, psign, &qx[2], &qy[2]);
+				okq &= psw_project(x0, by0s, ph, psign, &qx[3], &qy[3]);
+				if (okq)
 				{
-				    if (wx[i] < wxl) wxl = wx[i]; if (wx[i] > wxr) wxr = wx[i];
-				    if (wy[i] < wyt) wyt = wy[i]; if (wy[i] > wyb) wyb = wy[i];
+				    int allaxis = (m == 4);
+				    for (i = 0; i < 4 && allaxis; ++i)
+				    {
+					int j = (i + 1) & 3;
+					if (bxv[i] != bxv[j] && byv[i] != byv[j]) allaxis = 0;
+				    }
+				    if (allaxis && pbx0 == x0 && pbx1 == x1)
+				    {   /* full-width axis rect: window-free */
+					psw_emit_rectquad(slot, colr, qx, qy, v0, vend - v0, 0);
+					done = 1;
+				    }
+				    else if (vdp1_wnext + 1 < vdp1_wall_cap
+				             && psw_flat_cmds + 1 < psw_flat_cap_dyn)
+				    {
+					int wxl = sxv[0], wxr = sxv[0], wyt = syv[0], wyb = syv[0];
+					for (i = 1; i < m; ++i)
+					{
+					    if (sxv[i] < wxl) wxl = sxv[i]; if (sxv[i] > wxr) wxr = sxv[i];
+					    if (syv[i] < wyt) wyt = syv[i]; if (syv[i] > wyb) wyb = syv[i];
+					}
+					psw_emit_clipwin(wxl, wyt, wxr, wyb);
+					psw_emit_rectquad(slot, colr, qx, qy, v0, vend - v0, 1);
+					done = 1;
+				    }
 				}
-				psw_emit_clipwin(wxl, wyt, wxr, wyb);
-				psw_emit_rectquad(slot, colr, qx, qy, v0, vh, 1);
-				done = 1;
 			    }
 			}
 		    }
 		}
 		if (!done)
-		{   /* edge tile: fan of the full character (warp bounded to the tile) */
-		    int sxv[PSW_FAN_MAX], syv[PSW_FAN_MAX], ok = 1;
-		    for (i = 0; i < m; ++i)
-			if (!psw_project(bxv[i], byv[i], ph, psign, &sxv[i], &syv[i]))
-			{ ok = 0; break; }
-		    if (!ok) continue;
+		{   /* diagonal sector border: fan of the full character (warp
+		       bounded to the tile) */
 		    for (i = 1; i + 1 < m; i += 2)
 		    {
 			int qx[4], qy[4];
@@ -8722,7 +8770,6 @@ static void psw_emit_subflats(int k)
     int sxv[PSW_FAN_MAX], syv[PSW_FAN_MAX];
     int n, i, sn = psw_sub[k].subnum;
     if (!psw_polys_ok || sn < 0) return;
-    if (psw_sub_kill[k]) return;             /* cut by the fill budget (far-first) */
     {
     int fl, cl, fdom;
     psw_sub_lumps(k, &fl, &cl, &fdom);
@@ -8812,11 +8859,20 @@ static void psw_emit_subflats(int k)
 	    colr = wall_light_colr(zlight[li][zi]);
 	    {
 		unsigned short pc = slot < 0 ? (unsigned short)(colr | fb) : colr;
-		if (psw_tile_est(cx, cy, n) <= PSW_TILE_PLANE_MAX)
+		/* round 11: giants TILE like everyone (the >48 stretched-fan
+		   shortcut was the "grands plans desalignes").  The fan is now
+		   only the graceful DEGRADE: chosen by the budget pre-pass
+		   (b4/b5, far subs), or here when the command room cannot cover
+		   the whole tile walk (2 cmds/tile worst case) -- a stretched
+		   far plane beats a HALF-TEXTURED near one (the mid-plane
+		   truncation was the "grands plafonds pas entierement textures"
+		   hole class). */
+		int fanbit = (pass == 0) ? 0x10 : 0x20;
+		int fan = (psw_sub_flag[k] & fanbit)
+		       || (psw_flat_cmds + 2 * psw_tile_est(cx, cy, n) > psw_flat_cap_dyn);
+		if (!fan)
 		    psw_emit_plane_tiles(slot, pc, cx, cy, n, ph, psign, cull_h);
 		else
-		    /* pathological giant (huge non-dominant, non-sky plane): ONE
-		       stretched fan beats hundreds of tile commands */
 		    for (i = 1; i + 1 < n; i += 2)
 		    {
 			int qx[4], qy[4];
@@ -9106,31 +9162,40 @@ static void vdp1_walls_flush(void)
             if (fbudget < 0) fbudget = 0;
             if (fbudget > PSW_FLAT_CAP) fbudget = PSW_FLAT_CAP;
             psw_flat_cap_dyn = fbudget;
+            /* round 11: the budget DEGRADES before it kills ("les plans semblent
+               limites a une certaine distance" -- the hard kill left RBG0/sky
+               holes at range while the walls kept going).  A plane whose tiles
+               no longer fit falls back to the 2-cmd stretched fan (b4/b5 --
+               misalignment is a few pixels at that distance); only a plane that
+               cannot even afford its fan is dropped (row 13 k). */
+            int limit = (PSW_TILE_BUDGET < fbudget) ? PSW_TILE_BUDGET : fbudget;
             for (int k = 0; k < psw_sub_n; ++k)
             {
-                int fl, cl, fdom;
-                psw_sub_kill[k] = 0;
+                int fl, cl, fdom, dropped = 0;
                 psw_sub_lumps(k, &fl, &cl, &fdom);
                 /* punch: a lower-than-dominant floor SURVIVED its note verdict */
                 if (fl >= 0 && !(psw_sub_flag[k] & 1)
                     && psw_sub[k].fh < sat_vdp2_floor_h)
                     psw_punch_frame = 1;
                 if (fl < 0 && cl < 0 && !fdom) continue;
-                if (ftile >= PSW_TILE_BUDGET || ftile >= fbudget)
-                { psw_sub_kill[k] = 1; psw_kill_n++; continue; }
-                if (fdom) ftile += 1;             /* punch room at this sub's rank */
+                if (fdom && ftile + 1 <= limit) ftile += 1;   /* punch room at this rank */
                 if (fl >= 0 && !(psw_sub_flag[k] & 1))
                 {
-                    int e = psw_sub_fe[k];
-                    ftile += (e > PSW_TILE_PLANE_MAX) ? 2 : e + 1;  /* +1 = edge slack */
-                    psw_slot_get(fl);
+                    int e = psw_sub_fe[k] + 1;                /* +1 = edge slack */
+                    if (ftile + e <= limit)      { ftile += e; psw_slot_get(fl); }
+                    else if (ftile + 2 <= limit) { ftile += 2; psw_slot_get(fl);
+                                                   psw_sub_flag[k] |= 0x10; }
+                    else { psw_sub_flag[k] |= 1; dropped = 1; }
                 }
                 if (cl >= 0 && !(psw_sub_flag[k] & 4))
                 {
-                    int e = psw_sub_ce[k];
-                    ftile += (e > PSW_TILE_PLANE_MAX) ? 2 : e + 1;
-                    psw_slot_get(cl);
+                    int e = psw_sub_ce[k] + 1;
+                    if (ftile + e <= limit)      { ftile += e; psw_slot_get(cl); }
+                    else if (ftile + 2 <= limit) { ftile += 2; psw_slot_get(cl);
+                                                   psw_sub_flag[k] |= 0x20; }
+                    else { psw_sub_flag[k] |= 4; dropped = 1; }
                 }
+                if (dropped) psw_kill_n++;
             }
         }
         for (int i = wall_acc_n - 1; i >= tail; --i) VDP1_PLOT_WALL(i);

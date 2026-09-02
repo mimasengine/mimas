@@ -7980,12 +7980,10 @@ static const unsigned int psw_slot_vram[PSW_FLAT_SLOTS] =
    tiles, the world-clip already bounds fill ~= visible, so the ONLY scarce
    resource left is COMMAND SLOTS (256/bank shared with walls+things+weapon+HUD)
    and emission CPU -- the budget is a TILE COUNT, spent NEAR->FAR. */
-#define PSW_TILE_BUDGET    220       /* whole-frame flat tile allowance.  140 dated from
-                                        the pre-cull era (it bounded painter OVERDRAW);
-                                        with LOS + portal bands trimming hidden planes,
-                                        emitted area ~= visible area, and 140 starved the
-                                        horizon (console 2026-09-02: "trous a distance").
-                                        The command budget still rules the bank. */
+/* (PSW_TILE_BUDGET deleted in round 14: the pre-pass now budgets in COMMANDS
+   against fbudget directly.  The tile count doubled as a FILL bound, but with
+   LOS + portal bands the emitted area ~= the visible area, and command count
+   is the honest proxy: window commands cost no walk at all.) */
 /* (PSW_TILE_PLANE_MAX deleted in round 11: the ">48 tiles => ONE stretched fan"
    shortcut re-created the whole-room stretch on every LARGE ceiling -- console
    2026-09-02 "les textures des grands plans ne respectent pas leur alignement".
@@ -8876,20 +8874,26 @@ static void psw_emit_subflats(int k)
 		   potato trade. */
 		int fanbit = (pass == 0) ? 0x10 : 0x20;
 		int solid = (psw_sub_flag[k] & fanbit)
-		       || (psw_flat_cmds + 2 * psw_tile_est(cx, cy, n) > psw_flat_cap_dyn);
+		       || (psw_flat_cmds + 2 * psw_tile_est(cx, cy, n) + 1 > psw_flat_cap_dyn);
 		if (!solid)
 		    psw_emit_plane_tiles(slot, pc, cx, cy, n, ph, psign, cull_h, scolr);
 		else
-		{
+		{   /* round 14: the solid fan is DECIMATED to <= 4 quads (a many-
+		       vert clipped poly fanned 13 quads while billed 2, and the cap
+		       guard truncated it mid-plane = chunks missing).  Skipped
+		       verts are the near-collinear clip artifacts; the corner
+		       shave is invisible at degrade distance.  Billed 4. */
+		    int idx[9], nn = (n < 9) ? n : 9, s;
 		    psw_paint_idx = 250; psw_fanq_n++;  /* L+X: solids MAGENTA */
-		    for (i = 1; i + 1 < n; i += 2)
+		    for (s = 0; s < nn; ++s) idx[s] = (s * (n - 1)) / (nn - 1);
+		    for (i = 1; i + 1 < nn; i += 2)
 		    {
 			int qx[4], qy[4];
-			int i2 = (i + 2 < n) ? i + 2 : i + 1;
-			qx[0] = sxv[0];     qy[0] = syv[0];
-			qx[1] = sxv[i];     qy[1] = syv[i];
-			qx[2] = sxv[i + 1]; qy[2] = syv[i + 1];
-			qx[3] = sxv[i2];    qy[3] = syv[i2];
+			int i2 = (i + 2 < nn) ? i + 2 : i + 1;
+			qx[0] = sxv[idx[0]];     qy[0] = syv[idx[0]];
+			qx[1] = sxv[idx[i]];     qy[1] = syv[idx[i]];
+			qx[2] = sxv[idx[i + 1]]; qy[2] = syv[idx[i + 1]];
+			qx[3] = sxv[idx[i2]];    qy[3] = syv[idx[i2]];
 			psw_emit_flatquad(-1, scolr, qx, qy);
 		    }
 		}
@@ -9173,13 +9177,18 @@ static void vdp1_walls_flush(void)
             if (fbudget < 0) fbudget = 0;
             if (fbudget > PSW_FLAT_CAP) fbudget = PSW_FLAT_CAP;
             psw_flat_cap_dyn = fbudget;
-            /* round 11: the budget DEGRADES before it kills ("les plans semblent
-               limites a une certaine distance" -- the hard kill left RBG0/sky
-               holes at range while the walls kept going).  A plane whose tiles
-               no longer fit falls back to the 2-cmd stretched fan (b4/b5 --
-               misalignment is a few pixels at that distance); only a plane that
-               cannot even afford its fan is dropped (row 13 k). */
-            int limit = (PSW_TILE_BUDGET < fbudget) ? PSW_TILE_BUDGET : fbudget;
+            /* round 14 -- HONEST billing, in COMMANDS.  Console (L+X): full
+               tiles almost never exist (Doom subsectors are BSP fragments too
+               small/irregular to contain an aligned 64x64 square -- "je ne
+               vois JAMAIS de rouge"), so nearly every tile emits as a 2-cmd
+               band+window; the old 1-cmd/tile billing under-charged by ~2x,
+               the emit-time cap became the binding constraint, and far->near
+               emission made it truncate the NEAREST planes (the round-9
+               famine inversion reborn inside the flat budget -- console:
+               "trous entre magenta et blanc" = the transition zone where the
+               cap ran dry).  Bill 2e+1 for a tiled plane, 4 for a solid
+               degrade; the budget DEGRADES before it kills, near->far. */
+            int limit = fbudget;
             for (int k = 0; k < psw_sub_n; ++k)
             {
                 int fl, cl, fdom, dropped = 0;
@@ -9192,17 +9201,17 @@ static void vdp1_walls_flush(void)
                 if (fdom && ftile + 1 <= limit) ftile += 1;   /* punch room at this rank */
                 if (fl >= 0 && !(psw_sub_flag[k] & 1))
                 {
-                    int e = psw_sub_fe[k] + 1;                /* +1 = edge slack */
+                    int e = 2 * (int)psw_sub_fe[k] + 1;       /* band+window per tile */
                     if (ftile + e <= limit)      { ftile += e; psw_slot_get(fl); }
-                    else if (ftile + 2 <= limit) { ftile += 2; psw_slot_get(fl);
+                    else if (ftile + 4 <= limit) { ftile += 4; psw_slot_get(fl);
                                                    psw_sub_flag[k] |= 0x10; }
                     else { psw_sub_flag[k] |= 1; dropped = 1; }
                 }
                 if (cl >= 0 && !(psw_sub_flag[k] & 4))
                 {
-                    int e = psw_sub_ce[k] + 1;
+                    int e = 2 * (int)psw_sub_ce[k] + 1;
                     if (ftile + e <= limit)      { ftile += e; psw_slot_get(cl); }
-                    else if (ftile + 2 <= limit) { ftile += 2; psw_slot_get(cl);
+                    else if (ftile + 4 <= limit) { ftile += 4; psw_slot_get(cl);
                                                    psw_sub_flag[k] |= 0x20; }
                     else { psw_sub_flag[k] |= 4; dropped = 1; }
                 }

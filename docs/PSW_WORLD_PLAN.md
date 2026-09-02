@@ -173,6 +173,16 @@ StoreWallRange, curline/frontsector/backsector/rw_angle1 vivants).
 > L+X peint par CHEMIN (ROUGE tuile pleine / BLANC bande+fenêtre / MAGENTA fan ; murs
 > verts, things bleus, poinçons jaunes), row 13 += `b<bandes> n<fans>`. Question console :
 > les quads qui swiment sont de quelle couleur ? Pool 33,22 Ko.
+> **Round 13 console (2026-09-02, 16749b9)** : réponse = « c'est le MAGENTA qui swim »
+> (les fans) + trous restants derrière des obstacles et à distance. Fix : (1) **le fan
+> texturé n'existe plus** — toute pièce de bord = bande+fenêtre ancrée monde (gate clean
+> supprimée ; prix = fuite bornée ≤64u sur arête diagonale : invisible sur splitlines BSP,
+> couverte par le mur de marche sur dénivelé ; à surveiller sur trim diagonal même hauteur
+> et bord de ciel diagonal) ; dégradé budget = APLAT couleur-texel (un aplat ne swim pas) ;
+> bande improjetable/famine = aplat aussi. (2) trous derrière obstacles : sonde du CENTRE
+> ajoutée (tuile : 2 coins + centre ; plan : tous sommets + centroïde). (3) trous à
+> distance : PSW_TILE_BUDGET 140→220 (vestige pré-cull), FLAT_CAP 232, SUB_MAX 240 (tail
+> = murs sans flats). L+X : MAGENTA = les aplats désormais. Pool 32,05 Ko.
 
 ## Étape 2 — sols non-dominants + plafonds (quads de sous-secteurs)
 

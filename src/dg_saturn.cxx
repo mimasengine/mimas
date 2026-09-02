@@ -6098,7 +6098,18 @@ static inline unsigned short pal_rgb555(int idx)
    case -- a scene that wants only 16 KB textures -- degrades to exactly the old behaviour, never
    worse.  Watch `bk` on overlay row 18: it is the thrash signal and the gate on this whole cut. */
 #define WTEX_BASE      0x25C05000u
+#if SAT_PSW
+#define WTEX_SMALL_N   14  /* round 20: 2 small wall slots ceded to 4 MORE FLAT slots
+                              (console "POURQUOI AUTANT DE ROSE ?": with the bank
+                              extended, the magenta came from the 4-slot flat texture
+                              LRU -- an open scene shows 6-10 distinct flats, and every
+                              lump past the 4th emitted its whole plane as solids.  The
+                              wall pool ran tx11/26 = half empty on those captures.)
+                              PSW relayout: pool ends 0x25C59E00, flats 4..7 fill
+                              0x25C59E00..0x25C5DE00, below the bank ext (0x25C5E000). */
+#else
 #define WTEX_SMALL_N   16
+#endif
 #define WTEX_SMALL_SZ  0x2100u                                      /* 8448 B -> 64x(128+4) @ 8bpp */
 #define WTEX_NARROW_N  6    /* 15 -> 6: the 16 KB pool now only serves what does NOT fit 8448 B
                                (~24% of textures).  Watch `bk` (row 18) if a texture-varied level
@@ -7987,12 +7998,15 @@ static void vdp1_floors_flush(void) {}
    resident flats stable below 3 distinct lumps/frame). */
 #define PSW_SUB_MAX      240   /* round 13: 192 overflowed on wide views (tail subs
                                   have walls but NO flats = distance holes) */
-#define PSW_FLAT_SLOTS   4
+#define PSW_FLAT_SLOTS   8
 /* 3 slots fill the freed F-bank top (0x25C7D000..0x25C80000); the 4th takes the
    KB below (0x25C7C000), which only the worst-case 2p HUD stack can reach -- and
-   PSW is 1p-locked by the frame-boundary latch, so it is free in every PSW frame. */
+   PSW is 1p-locked by the frame-boundary latch, so it is free in every PSW frame.
+   Slots 4..7 (round 20): the two ceded WTEX small slots (WTEX_SMALL_N 16->14 in
+   PSW builds) -- 4 more distinct flats per frame, the magenta famine lever. */
 static const unsigned int psw_slot_vram[PSW_FLAT_SLOTS] =
-    { 0x25C7D000u, 0x25C7E000u, 0x25C7F000u, 0x25C7C000u };
+    { 0x25C7D000u, 0x25C7E000u, 0x25C7F000u, 0x25C7C000u,
+      0x25C59E00u, 0x25C5AE00u, 0x25C5BE00u, 0x25C5CE00u };
 #define PSW_FLAT_CAP     420         /* belt: whole-frame flat command hard cap
                                         (the DYNAMIC budget is the real law).
                                         Round 19: raised 232 -> 420 with the bank
@@ -8021,6 +8035,19 @@ static const unsigned int psw_slot_vram[PSW_FLAT_SLOTS] =
    (unprobed tail billed full; bit clear == proven-not-hidden by the identical
    deterministic test, so the emitter skips the re-probe both ways). */
 #define PSW_PROBE_TILES  32          /* prefix mask width (one unsigned int) */
+/* EDGE FIDELITY (round 20, console "TU M'EXPLIQUES CET EFFET D'ESCALIER ?"):
+   a band's top/bottom edge is FLAT per tile (the piece bbox), so a diagonal
+   sector border renders as 64u stairs.  Near edge pieces are now split into
+   8-TEXEL SUB-BANDS along the axis the diagonal varies most (u-strips when the
+   edge runs along world-x, v-bands + per-band windows when along world-y):
+   the step period drops 64 -> 8 world units = the drawn edge hugs the true
+   line.  Gated by projected size (a far tile's step is sub-pixel already) and
+   by a global per-frame cap: the fine spend is REAL cost above the billed
+   2/tile, and emission is far->near, so an unbounded overshoot would push the
+   belts into the NEAR field (the round-14 law).  The cap serves near pieces
+   naturally: only they pass the size gate. */
+#define PSW_FINE_PX      24          /* projected bbox size at/above which a piece is refined */
+#define PSW_FINE_CAP     64          /* whole-frame extra commands allowed for refinement */
 /* Flat FILL budget, in estimated screen PIXELS (spawn-scene verdict 2026-08-31: an open
    scene emitted 69 full-polygon quads -> VDP1 plot 38 ms vs 12 in a corridor -- the L5
    plot-time law; the command-count budgets are blind to fill).  Spent NEAR->FAR in the
@@ -8060,6 +8087,8 @@ static int psw_fanq_n = 0;       /* fan pieces/planes this flush (row 13 `n`) */
 static unsigned int psw_cur_mask = 0;   /* round 17: the emitting plane's cached tile-LOS
                                            prefix (psw_sub_fmask/cmask), read only when
                                            cull_h is armed (mixed plane) */
+static int psw_fine_cmds = 0;    /* round 20: edge-refinement commands spent this flush
+                                    (capped at PSW_FINE_CAP -- see the defines) */
 static int psw_flat_cap_dyn = PSW_FLAT_CAP;  /* round 9: per-frame REAL flat room = bank
                                                 minus the walls' decided command cost minus
                                                 the things reserve (famine unification --
@@ -8158,8 +8187,14 @@ static void sat_psw_sub_note(int subnum, int fh, int ch, int fpic,
 	    }
 	    nn = psw_plane_poly(subnum, psn > 0 ? viewz - h : h - viewz, psn, cxv, cyv);
 	    if (nn < 3) { psw_sub_flag[k] |= bit; continue; }
-	    if (psw_plane_los_cull(cxv, cyv, nn, h, psn, &tt))
-	    { psw_sub_flag[k] |= bit; continue; }
+	    /* round 20: FLOORS take no LOS ladder at all -- overdrawn floor
+	       pixels are overpainted by nearer subs (painter) or punched back
+	       to RBG0 (dominant ledges), so the probes could only ever CREATE
+	       holes there, never correctness.  Ceilings keep the ladder for
+	       the MIXED classification (the per-tile sky-hack guard is what
+	       stops a far ceiling ghosting over the VDP2 sky). */
+	    tt = 0;
+	    if (psn < 0) psw_plane_los_cull(cxv, cyv, nn, h, psn, &tt);
 	    if (tt) psw_sub_flag[k] |= bit << 1;
 	    {   /* projected bbox vs the core's portal bands (view-relative) */
 		int sx, sy, okp = 1;
@@ -8389,7 +8424,10 @@ static void psw_emit_clipwin(int xl, int yt, int xr, int yb)
    world-anchored band + window = exact texels for a rect narrower than the
    tile -- a horizontal char sub-range is not addressable on VDP1). */
 static void psw_emit_rectquad(int slot, unsigned short colr,
-                              const int *qx, const int *qy, int v0, int vh, int win)
+                              const int *qx, const int *qy, int v0, int vh,
+                              int u0, int uw, int win)   /* round 20: u sub-range,
+                                                            8-texel granular (CMDSRCA
+                                                            is 8-byte units @ 8bpp) */
 {
     unsigned short cmd[16];
     extern int detailshift, viewwindowx, viewwindowy;
@@ -8401,8 +8439,8 @@ static void psw_emit_rectquad(int slot, unsigned short colr,
     cmd[2] = (unsigned short)(win ? 0x04E0 : 0x00E0); /* (Window_In) | 8bpp bank | SPD | ECD */
     cmd[3] = colr;
     cmd[4] = (unsigned short)((psw_slot_vram[slot] + (unsigned int)v0 * 64u
-                               - VDP1_VRAM_BASE) >> 3);
-    cmd[5] = (unsigned short)(0x0800 | vh);           /* 64 x vh texels */
+                               + (unsigned int)u0 - VDP1_VRAM_BASE) >> 3);
+    cmd[5] = (unsigned short)(((uw >> 3) << 8) | vh); /* uw x vh texels */
     if (sat_wall_paint & 1)
     {   /* DEBUG PAINT: band+window pieces solid ORANGE (owner: white drowned
 	   the overlay text).  The window still masks, so the painted shape IS
@@ -8651,21 +8689,123 @@ static void psw_emit_plane_tiles(int slot, unsigned short colr,
 				    }
 				    if (allaxis && pbx0 == x0 && pbx1 == x1)
 				    {   /* full-width axis rect: window-free */
-					psw_emit_rectquad(slot, colr, qx, qy, v0, vend - v0, 0);
+					psw_emit_rectquad(slot, colr, qx, qy, v0, vend - v0, 0, 64, 0);
 					done = 1; psw_band_n++;
 				    }
-				    else if (vdp1_wnext + 1 < vdp1_wall_cap
-				             && psw_flat_cmds + 1 < psw_flat_cap_dyn)
+				    else
 				    {
 					int wxl = sxv[0], wxr = sxv[0], wyt = syv[0], wyb = syv[0];
+					int sdx = 0, sdy = 0;
 					for (i = 1; i < m; ++i)
 					{
 					    if (sxv[i] < wxl) wxl = sxv[i]; if (sxv[i] > wxr) wxr = sxv[i];
 					    if (syv[i] < wyt) wyt = syv[i]; if (syv[i] > wyb) wyb = syv[i];
 					}
-					psw_emit_clipwin(wxl, wyt, wxr, wyb);
-					psw_emit_rectquad(slot, colr, qx, qy, v0, vend - v0, 1);
-					done = 1; psw_band_n++;
+					for (i = 0; i < m; ++i)
+					{   /* diagonal content: axis edges (tile cuts, axis
+					       BSP lines) are exact under a rect window --
+					       only diagonal edges make stairs */
+					    int j = (i + 1 == m) ? 0 : i + 1;
+					    int ddx = bxv[j] - bxv[i], ddy = byv[j] - byv[i];
+					    if (ddx && ddy)
+					    {
+						sdx += (ddx < 0) ? -ddx : ddx;
+						sdy += (ddy < 0) ? -ddy : ddy;
+					    }
+					}
+					if ((sdx | sdy)
+					    && (wxr - wxl >= PSW_FINE_PX || wyb - wyt >= PSW_FINE_PX)
+					    && psw_fine_cmds < PSW_FINE_CAP
+					    && vdp1_wnext + 10 < vdp1_wall_cap
+					    && psw_flat_cmds + 10 < psw_flat_cap_dyn)
+					{   /* FINE: 8-texel sub-bands along the axis the
+					       diagonal varies most (round 20 -- the stairs) */
+					    int cxs[PSW_FAN_MAX], cys[PSW_FAN_MAX];
+					    int dxs[PSW_FAN_MAX], dys[PSW_FAN_MAX];
+					    if (sdx >= sdy)
+					    {   /* U-STRIPS: one shared window + <=8 quads */
+						psw_emit_clipwin(wxl, wyt, wxr, wyb);
+						psw_fine_cmds++;
+						for (int s = 0; s < 8; ++s)
+						{
+						    int gx0 = x0 + (s << 19), gx1 = gx0 + (1 << 19);
+						    int ms = psw_clip_axis(bxv, byv, m, cxs, cys, 0, +1, gx0);
+						    if (ms < 3) continue;
+						    ms = psw_clip_axis(cxs, cys, ms, dxs, dys, 0, -1, gx1);
+						    if (ms < 3) continue;
+						    {
+							int sy0 = dys[0], sy1 = dys[0];
+							int v0s, vends, gy1s, gy0s, oks;
+							int sqx[4], sqy[4];
+							for (i = 1; i < ms; ++i)
+							{ if (dys[i] < sy0) sy0 = dys[i];
+							  if (dys[i] > sy1) sy1 = dys[i]; }
+							v0s   = (y1 - sy1) >> 16;
+							vends = (y1 - sy0 + 0xFFFF) >> 16;
+							if (v0s < 0) v0s = 0;
+							if (vends > 64) vends = 64;
+							if (vends <= v0s) continue;
+							gy1s = y1 - (v0s << 16); gy0s = y1 - (vends << 16);
+							oks  = psw_project(gx0, gy1s, ph, psign, &sqx[0], &sqy[0]);
+							oks &= psw_project(gx1, gy1s, ph, psign, &sqx[1], &sqy[1]);
+							oks &= psw_project(gx1, gy0s, ph, psign, &sqx[2], &sqy[2]);
+							oks &= psw_project(gx0, gy0s, ph, psign, &sqx[3], &sqy[3]);
+							if (!oks) continue;
+							psw_emit_rectquad(slot, colr, sqx, sqy,
+							                  v0s, vends - v0s, s * 8, 8, 1);
+							psw_band_n++; psw_fine_cmds++;
+						    }
+						}
+					    }
+					    else
+					    {   /* V-BANDS: <=8 x (own window + full-width quad) --
+						   the per-band window's x-crop follows the edge */
+						for (int s = 0; ; ++s)
+						{
+						    int v0b = v0 + s * 8, v1b;
+						    if (v0b >= vend) break;
+						    v1b = v0b + 8; if (v1b > vend) v1b = vend;
+						    {
+							int gy1b = y1 - (v0b << 16), gy0b = y1 - (v1b << 16);
+							int ms = psw_clip_axis(bxv, byv, m, cxs, cys, 1, +1, gy0b);
+							if (ms < 3) continue;
+							ms = psw_clip_axis(cxs, cys, ms, dxs, dys, 1, -1, gy1b);
+							if (ms < 3) continue;
+							{
+							    int bwxl, bwxr, bwyt, bwyb, px, py, oks = 1;
+							    int sqx[4], sqy[4];
+							    bwxl = bwyt = 0x7fff; bwxr = bwyb = -0x7fff;
+							    for (i = 0; i < ms; ++i)
+							    {
+								if (!psw_project(dxs[i], dys[i], ph, psign, &px, &py))
+								{ oks = 0; break; }
+								if (px < bwxl) bwxl = px; if (px > bwxr) bwxr = px;
+								if (py < bwyt) bwyt = py; if (py > bwyb) bwyb = py;
+							    }
+							    if (!oks) continue;
+							    oks  = psw_project(x0, gy1b, ph, psign, &sqx[0], &sqy[0]);
+							    oks &= psw_project(x1, gy1b, ph, psign, &sqx[1], &sqy[1]);
+							    oks &= psw_project(x1, gy0b, ph, psign, &sqx[2], &sqy[2]);
+							    oks &= psw_project(x0, gy0b, ph, psign, &sqx[3], &sqy[3]);
+							    if (!oks) continue;
+							    psw_emit_clipwin(bwxl, bwyt, bwxr, bwyb);
+							    psw_emit_rectquad(slot, colr, sqx, sqy,
+							                      v0b, v1b - v0b, 0, 64, 1);
+							    psw_band_n++; psw_fine_cmds += 2;
+							}
+						    }
+						}
+					    }
+					    done = 1;
+					}
+					else if (vdp1_wnext + 1 < vdp1_wall_cap
+					         && psw_flat_cmds + 1 < psw_flat_cap_dyn)
+					{   /* coarse band + window (far/small pieces: the
+					       64u step projects sub-pixel there) */
+					    psw_emit_clipwin(wxl, wyt, wxr, wyb);
+					    psw_emit_rectquad(slot, colr, qx, qy, v0, vend - v0, 0, 64, 1);
+					    done = 1; psw_band_n++;
+					}
 				    }
 				}
 			    }
@@ -8792,12 +8932,17 @@ static int psw_plane_los_cull(const int *cx, const int *cy, int n, int h,
 	if (d2 > dfar)  { dfar  = d2; xf = cx[i]; yf = cy[i]; }
 	if (d2 < dnear) { dnear = d2; xn = cx[i]; yn = cy[i]; }
     }
-    {   /* round 9 softening (console 2026-09-02, "il manque beaucoup de murs et
-	   plafonds"): the farthest-vertex probe alone killed WHOLE planes whose
-	   far corner sat past a doorway while most of the plane was overhead /
-	   underfoot and plainly visible.  Full cull now needs the farthest AND
-	   nearest vertices proven hidden; one of the two hidden = mixed -> the
-	   tile walker refines per tile (bounded 64u over-cull fringe only). */
+    {   /* Round 20: the WHOLE-PLANE cull is DELETED (console: a triangle-sized
+	   hole with k0 d0 r0 -- every SAMPLED ray, verts + centroid, happened to
+	   be blocked by low neighbouring rooms while the plane's middle showed
+	   plainly through a window above them.  Sampling points is NOT a proof
+	   that a REGION is hidden; three rounds of adding samples -- far+near,
+	   all verts, centroid -- only shrank the failure, never removed it).
+	   The probes now only classify the plane MIXED (per-tile refinement) vs
+	   fully-visible; the wrongly-classified cost is bounded overdraw on an
+	   idle VDP1, never a hole.  Floors do not even reach here anymore (the
+	   painter + the RBG0 punch cover every floor overdraw case by
+	   construction -- the caller skips the ladder for psign > 0). */
 	int fhid, nhid;
 	if (psign > 0)
 	{
@@ -8808,36 +8953,6 @@ static int psw_plane_los_cull(const int *cx, const int *cy, int n, int h,
 	{
 	    fhid = psw_ceil_pt_hidden(xf, yf, h);
 	    nhid = psw_ceil_pt_hidden(xn, yn, h);
-	}
-	if (fhid && nhid)
-	{   /* round 10 (console 2026-09-02, "il manque des sols et plafonds
-	       quand ils ne sont pas integralement couverts"): far+near hidden
-	       could still hide a plane whose MIDDLE shows (window sill, crate
-	       gap).  Full cull now demands EVERY vertex proven hidden; one
-	       visible vertex downgrades to the per-tile refinement.  The extra
-	       probes are only paid by planes already past the far+near gate =
-	       mostly genuinely hidden ones. */
-	    int allhid = 1;
-	    for (i = 0; i < n && allhid; ++i)
-	    {
-		if ((cx[i] == xf && cy[i] == yf) || (cx[i] == xn && cy[i] == yn))
-		    continue;
-		allhid = (psign > 0) ? psw_floor_pt_hidden(cx[i], cy[i], h)
-		                     : psw_ceil_pt_hidden(cx[i], cy[i], h);
-	    }
-	    if (allhid)
-	    {   /* round 13 ("trous derriere des obstacles"): every VERTEX behind
-		   a fat obstacle can still leave the middle visible -- confirm on
-		   the centroid before the full cull. */
-		long long sx = 0, sy = 0;
-		for (i = 0; i < n; ++i) { sx += cx[i]; sy += cy[i]; }
-		sx /= n; sy /= n;
-		allhid = (psign > 0) ? psw_floor_pt_hidden((int)sx, (int)sy, h)
-		                     : psw_ceil_pt_hidden((int)sx, (int)sy, h);
-	    }
-	    if (allhid) return 1;
-	    *tile_test = 1;
-	    return 0;
 	}
 	*tile_test = fhid || nhid;
     }
@@ -9353,7 +9468,7 @@ static void vdp1_walls_flush(void)
            clamped: a HOLD frame can leave them stale for one frame. */
         int tail = (psw_sub_tail < wall_acc_n) ? psw_sub_tail : wall_acc_n;
         psw_flat_cmds = 0; psw_flat_denied = 0; psw_punch_cmds = 0;
-        psw_band_n = 0; psw_fanq_n = 0;
+        psw_band_n = 0; psw_fanq_n = 0; psw_fine_cmds = 0;
         for (int s = 0; s < PSW_FLAT_SLOTS; ++s) psw_slot[s].used = 0;
         /* NEAR->FAR pre-pass, round 9: pure BUDGET arithmetic -- the visibility
            verdicts were computed at NOTE time (core portal bands + LOS ladder,

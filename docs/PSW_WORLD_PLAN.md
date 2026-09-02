@@ -268,6 +268,28 @@ StoreWallRange, curline/frontsector/backsector/rw_angle1 vivants).
 > comme avant. À surveiller : VD1 `<ms>` (attente fence — le vrai prix du plot en salle
 > lourde), `w` doit rester 0, LP/B cohérents. Fence = inchangée (sentinelle = banque
 > vide, adresse fixe). Build normal : extension compilée out (#if SAT_PSW), bit-intact.
+> **Round 20 console (2026-09-02)** : trois symptômes nommés par l'owner, trois mécanismes.
+> (1) **Trou triangulaire avec k0 d0 r0** = le cull plan-entier par ÉCHANTILLONNAGE
+> (sommets+centroïde) : chaque rayon échantillonné tombait sur un bloqueur (pièces basses
+> voisines) pendant que le MILIEU du plan était visible par une fenêtre au-dessus — un
+> échantillon n'est pas une preuve. SUPPRIMÉ (pas re-paramétré). Les sols perdent AUSSI
+> leurs sondes par-tuile (pure économie de fill à risque de trou : le peintre recouvre
+> tout sol sur-peint, le poinçon couvre le cas dominant — par construction) ; les
+> plafonds gardent l'échelle UNIQUEMENT pour le classement mixte + garde-ciel par tuile
+> (nécessaire : peindre sur le ciel VDP2 est ineffaçable). (2) **Escalier du rebord**
+> (« trait rouge au lieu du trait vert ») : le bord d'une bande est PLAT par tuile (bbox)
+> ⇒ bordure diagonale = marches de 64u. Fix : pièces de bord PROCHES (bbox projetée
+> ≥24 px) raffinées en SOUS-BANDES DE 8 TEXELS selon l'axe dominant de la diagonale —
+> u-strips (1 fenêtre + ≤8 quads, CMDSRCA décalé par pas de 8 texels) quand le bord
+> court en x-monde, v-bandes (fenêtre par bande) quand il court en y ; pas 64→8 unités.
+> Plafonné PSW_FINE_CAP 64 cmds/frame (dépense réelle au-dessus de la facture — la
+> jauge sert naturellement le PROCHE, seul à passer la porte de taille). (3) **« Pourquoi
+> autant de rose avec de la marge ? »** = famine de SLOTS TEXTURE flats, pas de
+> commandes : 4 slots pour 6-10 flats distincts par scène ⇒ du 5e lump au 10e, plan
+> entier en aplat magenta. PSW_FLAT_SLOTS 4→8 : 2 slots muraux small cédés (pool mur à
+> tx11/26 = à moitié vide ; WTEX_SMALL_N 16→14 build PSW seul, relayout pool fin
+> 0x25C59E00, flats 4-7 jusqu'à 0x25C5DE00, sous l'extension banque). Attendu : le trou
+> triangle mort, le rebord droit, le magenta réduit au LOD ≤16 px réel.
 
 ## Étape 2 — sols non-dominants + plafonds (quads de sous-secteurs)
 

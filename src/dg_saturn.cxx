@@ -682,6 +682,8 @@ static int  psw_kill_last = 0;             /* subsectors whose flats the FILL bu
                                               last frame (row 13 `k`) -- far-first loss */
 static int  psw_punch_last = 0;            /* RBG0 punch polygons last frame (row 13 `u`) */
 static int  psw_wall_cull_last = 0;        /* wall quads occlusion-culled last frame (row 13 `c`) */
+static int  psw_band_last = 0;             /* clean band+window flat pieces (row 13 `b`) */
+static int  psw_fan_last = 0;              /* fan flat pieces/planes (row 13 `n`) */
 #endif
 extern "C" int            sat_sky_view;         /* core Part 5: elected split view for the HW sky (-1 = none => all software) */
 extern "C" unsigned int   sat_sky_px_view[4];   /* core Part 5: per-view SKY pixel coverage (election metric) */
@@ -3311,14 +3313,16 @@ static void fps_update(void)
                lead-fill/clamp fields are all dead in that mode): t = tier quads accepted
                last frame, r = shed (wall_acc/px budget full = the FAR remainder). */
             if (sat_psw_active)
-                snprintf(ovbuf, sizeof ovbuf, "PSW t%d r%d f%d d%d k%d u%d c%d    ",
+                snprintf(ovbuf, sizeof ovbuf, "PSW t%d r%d f%d d%d k%d u%d c%d b%d n%d  ",
                          sat_psw_t_last > 999 ? 999 : sat_psw_t_last,
                          sat_psw_r_last > 999 ? 999 : sat_psw_r_last,
                          psw_flat_last  > 999 ? 999 : psw_flat_last,
                          psw_flat_denied_last > 99 ? 99 : psw_flat_denied_last,
                          psw_kill_last  > 99  ? 99  : psw_kill_last,
                          psw_punch_last > 99  ? 99  : psw_punch_last,
-                         psw_wall_cull_last > 99 ? 99 : psw_wall_cull_last);
+                         psw_wall_cull_last > 99 ? 99 : psw_wall_cull_last,
+                         psw_band_last > 99 ? 99 : psw_band_last,
+                         psw_fan_last  > 99 ? 99 : psw_fan_last);
 #endif
             if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 13, ovbuf);
             /* row 15 (SCU-DSP feasibility, deliverable #1): per-frame sprite cost split.
@@ -7993,6 +7997,12 @@ static int psw_sub_n = 0;
 static int psw_sub_tail = 0x7fff;    /* wall watermark at the FIRST overflow (0x7fff = none) */
 static int psw_spr_tail = 0x7fff;    /* vissprite watermark at the FIRST overflow */
 static int psw_flat_cmds = 0;
+static int psw_paint_idx = 88;   /* L+X flat paint, PER EMIT PATH (round 12 diagnostic):
+                                    88 = RED full tile, 4 = WHITE band+window (rect/clean),
+                                    250 = MAGENTA fan (edge warp OR budget degrade) --
+                                    one capture names the path a bad quad took */
+static int psw_band_n = 0;       /* clean band+window pieces this flush (row 13 `b`) */
+static int psw_fanq_n = 0;       /* fan pieces/planes this flush (row 13 `n`) */
 static int psw_flat_cap_dyn = PSW_FLAT_CAP;  /* round 9: per-frame REAL flat room = bank
                                                 minus the walls' decided command cost minus
                                                 the things reserve (famine unification --
@@ -8212,9 +8222,10 @@ static void psw_emit_flatquad(int slot, unsigned short colr, const int *qx, cons
     else
 	cmd[0] = 0x0004;   /* slot famine: solid POLYGON, colr = light bank | flat texel */
     if (sat_wall_paint & 1)
-    {   /* DEBUG PAINT: flats solid RED (walls green, things blue -- the L+X triad) */
+    {   /* DEBUG PAINT by EMIT PATH (walls green, things blue, punch yellow):
+	   psw_paint_idx = 88 full tile / 250 fan -- set by the caller */
 	cmd[0] = 0x0004;
-	cmd[3] = (unsigned short)(0x0100u | 88u);
+	cmd[3] = (unsigned short)(0x0100u | (unsigned)psw_paint_idx);
     }
     for (i = 0; i < 4; ++i)
     {
@@ -8271,6 +8282,12 @@ static void psw_emit_rectquad(int slot, unsigned short colr,
     cmd[4] = (unsigned short)((psw_slot_vram[slot] + (unsigned int)v0 * 64u
                                - VDP1_VRAM_BASE) >> 3);
     cmd[5] = (unsigned short)(0x0800 | vh);           /* 64 x vh texels */
+    if (sat_wall_paint & 1)
+    {   /* DEBUG PAINT: band+window pieces solid WHITE (the window still masks,
+	   so the painted shape IS the region really painted) */
+	cmd[0] = 0x0004;
+	cmd[3] = (unsigned short)(0x0100u | 4u);
+    }
     for (i = 0; i < 4; ++i)
     {
 	cmd[6 + 2*i] = (short)((qx[i] << detailshift) + vx);
@@ -8469,6 +8486,7 @@ static void psw_emit_plane_tiles(int slot, unsigned short colr,
 		if (!psw_project(x1, y1, ph, psign, &qx[1], &qy[1])) continue;
 		if (!psw_project(x1, y0, ph, psign, &qx[2], &qy[2])) continue;
 		if (!psw_project(x0, y0, ph, psign, &qx[3], &qy[3])) continue;
+		psw_paint_idx = 88;                     /* L+X: full tiles RED */
 		psw_emit_flatquad(slot, colr, qx, qy);
 	    }
 	    else
@@ -8479,7 +8497,7 @@ static void psw_emit_plane_tiles(int slot, unsigned short colr,
 		    if (!psw_project(bxv[i], byv[i], ph, psign, &sxv[i], &syv[i]))
 		    { okv = 0; break; }
 		if (!okv) continue;
-		if (slot >= 0 && !(sat_wall_paint & 1))
+		if (slot >= 0)
 		{   /* CLEAN PIECE (round 11, generalizes the round-9 axis rect):
 		       every non-axis edge lies on a VIEW-CLIP line, so whatever
 		       the full-width band paints beyond the true piece is
@@ -8533,7 +8551,7 @@ static void psw_emit_plane_tiles(int slot, unsigned short colr,
 				    if (allaxis && pbx0 == x0 && pbx1 == x1)
 				    {   /* full-width axis rect: window-free */
 					psw_emit_rectquad(slot, colr, qx, qy, v0, vend - v0, 0);
-					done = 1;
+					done = 1; psw_band_n++;
 				    }
 				    else if (vdp1_wnext + 1 < vdp1_wall_cap
 				             && psw_flat_cmds + 1 < psw_flat_cap_dyn)
@@ -8546,7 +8564,7 @@ static void psw_emit_plane_tiles(int slot, unsigned short colr,
 					}
 					psw_emit_clipwin(wxl, wyt, wxr, wyb);
 					psw_emit_rectquad(slot, colr, qx, qy, v0, vend - v0, 1);
-					done = 1;
+					done = 1; psw_band_n++;
 				    }
 				}
 			    }
@@ -8556,6 +8574,7 @@ static void psw_emit_plane_tiles(int slot, unsigned short colr,
 		if (!done)
 		{   /* diagonal sector border: fan of the full character (warp
 		       bounded to the tile) */
+		    psw_paint_idx = 250; psw_fanq_n++;  /* L+X: fans MAGENTA */
 		    for (i = 1; i + 1 < m; i += 2)
 		    {
 			int qx[4], qy[4];
@@ -8873,6 +8892,8 @@ static void psw_emit_subflats(int k)
 		if (!fan)
 		    psw_emit_plane_tiles(slot, pc, cx, cy, n, ph, psign, cull_h);
 		else
+		{
+		    psw_paint_idx = 250; psw_fanq_n++;  /* L+X: degrade fans MAGENTA too */
 		    for (i = 1; i + 1 < n; i += 2)
 		    {
 			int qx[4], qy[4];
@@ -8883,6 +8904,7 @@ static void psw_emit_subflats(int k)
 			qx[3] = sxv[i2];    qy[3] = syv[i2];
 			psw_emit_flatquad(slot, pc, qx, qy);
 		    }
+		}
 	    }
 	}
 	}
@@ -9135,6 +9157,7 @@ static void vdp1_walls_flush(void)
            clamped: a HOLD frame can leave them stale for one frame. */
         int tail = (psw_sub_tail < wall_acc_n) ? psw_sub_tail : wall_acc_n;
         psw_flat_cmds = 0; psw_flat_denied = 0; psw_punch_cmds = 0;
+        psw_band_n = 0; psw_fanq_n = 0;
         for (int s = 0; s < PSW_FLAT_SLOTS; ++s) psw_slot[s].used = 0;
         /* NEAR->FAR pre-pass, round 9: pure BUDGET arithmetic -- the visibility
            verdicts were computed at NOTE time (core portal bands + LOS ladder,
@@ -9218,6 +9241,7 @@ static void vdp1_walls_flush(void)
         }
         psw_flat_last = psw_flat_cmds; psw_flat_denied_last = psw_flat_denied;
         psw_kill_last = psw_kill_n;    psw_punch_last = psw_punch_cmds;
+        psw_band_last = psw_band_n;    psw_fan_last = psw_fanq_n;
         /* (row 13 `c` is now the CORE band-cull counter sat_psw_wcull,
            snapshotted at the frame-boundary latch with tiers/ref) */
 #if SAT_WORLD_THINGS_VDP1

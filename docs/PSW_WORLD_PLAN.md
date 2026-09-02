@@ -193,6 +193,12 @@ StoreWallRange, curline/frontsector/backsector/rw_angle1 vivants).
 > aplat = 4 ; fan d'aplat DÉCIMÉ ≤4 quads (13 quads facturés 2 se faisaient tronquer en
 > plein milieu) ; trigger d'émission aligné. NB multijoueur : PSW reste verrouillé 1p
 > (latch) ; le MP du disque -Psw = chemin classique + banque 304 ; disque normal intact.
+> **Round 15 console (2026-09-02, cf28e0e)** : encore des trous — row 13 `k12-22` avec
+> `f34-97` = le budget jetait des plans SUR LE PAPIER (banque à moitié vide) : la
+> facturation honnête 2e+1 gardait l'estimateur BBOX qui sur-charge ×3-6 les slivers
+> diagonaux. Fix : `psw_tile_est` = tuiles TOUCHÉES (aire/64² + périmètre-L1/128 + 1,
+> borne sup — facturer sous le coût = troncature du proche). Peinture bandes BLANC→ORANGE
+> (216, le blanc noyait l'overlay). Attendu : k~0, les coins noirs morts. Pool 31,95 Ko.
 
 ## Étape 2 — sols non-dominants + plafonds (quads de sous-secteurs)
 

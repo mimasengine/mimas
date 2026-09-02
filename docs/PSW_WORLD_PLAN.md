@@ -104,6 +104,13 @@ StoreWallRange, curline/frontsector/backsector/rw_angle1 vivants).
 > les tuiles fantômes, VDP1 > RBG0 en couche) — les sous-secteurs dominants émettent leur
 > polygone en POLYGON couleur-0 SPD (recette erase) à leur rang peintre, uniquement les
 > frames où un sol plus bas est en vue. Row 13 += `u<n>` ; L+X = poinçons JAUNES.
+> **Round 7 (2026-09-02, c123ecb/4af6840/f4ebafa)** : CULL DE LIGNE DE VISÉE des sols —
+> 1-3 sondes BSP par point (milieu du trajet, croisement exact à la hauteur d'un sol plus
+> haut trouvé à mi-chemin, croisement au rebord du dominant), échelle plan→tuile (2 sondes
+> par plan ; par-tuile seulement si mitigé). Tue les tuiles cachées AVANT slot/projection/
+> clip ; le poinçon ne s'arme que si un sol bas survit. Occulteur fin raté = overdraw
+> d'avant (jamais pire) ; sur-cull possible d'une frange de fosse (proxy coin-le-plus-loin).
+> Plafonds symétriques non faits. Reste : test console, 3b midtex, verdict.
 
 ## Étape 2 — sols non-dominants + plafonds (quads de sous-secteurs)
 

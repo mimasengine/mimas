@@ -662,7 +662,10 @@ extern "C" int            sat_frame_has_sky;/* core: a sky visplane was in view 
    painter wall producer, replaces R_StoreWallRange) and in R_DrawPlanes
    (r_plane.c, election-only early-out: no spans, no punch). */
 extern "C" int sat_psw_active = 0;
-static int sat_psw_req = 0;
+static int sat_psw_req = 1;     /* owner 2026-09-02: the R+C toggle is GONE -- the -Psw build
+                                   boots painter-ON and never switches (mode transitions are
+                                   the historical corruption class, and the OFF path made the
+                                   console captures ambiguous).  A/B = the two discs. */
 extern "C" int sat_psw_tiers;   /* core r_segs.c: tier quads accepted this frame */
 extern "C" int sat_psw_ref;     /* core r_segs.c: tier quads shed (budget/list full) */
 static int sat_psw_t_last = 0, sat_psw_r_last = 0;  /* frame-boundary snapshot (overlay row 13) */
@@ -676,6 +679,7 @@ static int  psw_flat_denied_last = 0;      /* flat quads DROPPED last frame (row
                                               slot famine AND the flat not peekable */
 static int  psw_kill_last = 0;             /* subsectors whose flats the FILL budget cut
                                               last frame (row 13 `k`) -- far-first loss */
+static int  psw_punch_last = 0;            /* RBG0 punch polygons last frame (row 13 `u`) */
 #endif
 extern "C" int            sat_sky_view;         /* core Part 5: elected split view for the HW sky (-1 = none => all software) */
 extern "C" unsigned int   sat_sky_px_view[4];   /* core Part 5: per-view SKY pixel coverage (election metric) */
@@ -3305,12 +3309,13 @@ static void fps_update(void)
                lead-fill/clamp fields are all dead in that mode): t = tier quads accepted
                last frame, r = shed (wall_acc/px budget full = the FAR remainder). */
             if (sat_psw_active)
-                snprintf(ovbuf, sizeof ovbuf, "PSW t%d r%d f%d d%d k%d           ",
+                snprintf(ovbuf, sizeof ovbuf, "PSW t%d r%d f%d d%d k%d u%d       ",
                          sat_psw_t_last > 999 ? 999 : sat_psw_t_last,
                          sat_psw_r_last > 999 ? 999 : sat_psw_r_last,
                          psw_flat_last  > 999 ? 999 : psw_flat_last,
                          psw_flat_denied_last > 99 ? 99 : psw_flat_denied_last,
-                         psw_kill_last  > 99  ? 99  : psw_kill_last);
+                         psw_kill_last  > 99  ? 99  : psw_kill_last,
+                         psw_punch_last > 99  ? 99  : psw_punch_last);
 #endif
             if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 13, ovbuf);
             /* row 15 (SCU-DSP feasibility, deliverable #1): per-frame sprite cost split.
@@ -8271,22 +8276,58 @@ static void psw_emit_plane_tiles(int slot, unsigned short colr,
     }
 }
 
-/* the two flat lumps subsector record k wants this frame (-1 = skip): the floor
-   skips above-eye / missing / the RBG0 dominant triple; the ceiling skips
-   below-eye / sky.  Shared by the flush's NEAR->FAR slot reservation and the
-   emitter so both agree on who needs a slot. */
-static void psw_sub_lumps(int k, int *fl, int *cl)
+/* RBG0 PUNCH (console 2026-09-01, owner: "un sol plus loin sous le plan affiché
+   sur le sol").  The painter orders VDP1 surfaces among themselves, but the
+   DOMINANT floor lives on VDP2 -- a layer BELOW the sprites -- so its subsectors
+   emitted nothing and could never overpaint the tiles of a LOWER floor hidden
+   behind their ledge.  Fix in painter terms: when such a lower floor is in view
+   (psw_punch_frame), each dominant subsector emits its floor polygon as a
+   colour-0 SPD POLYGON at its rank (the proven erase recipe): sprite pixel 0 is
+   transparent to VDP2, so the punch literally paints RBG0 over the ghost. */
+static int psw_punch_frame = 0;      /* pre-pass: a floor LOWER than the dominant emits */
+static int psw_punch_cmds = 0;       /* (psw_punch_last lives in the early overlay block) */
+static void psw_emit_punchquad(const int *qx, const int *qy)
 {
-    *fl = *cl = -1;
+    unsigned short cmd[16];
+    extern int detailshift, viewwindowx, viewwindowy;
+    int vx = viewwindowx, vy = viewwindowy, i;
+    if (vdp1_wnext >= vdp1_wall_cap) return;
+    if (psw_flat_cmds >= PSW_FLAT_CAP) return;
+    memset(cmd, 0, sizeof cmd);
+    cmd[0] = 0x0004;                   /* POLYGON */
+    cmd[2] = 0x00C0;                   /* SPD: colour-0 pixels are WRITTEN (erase recipe) */
+    cmd[3] = 0x0000;                   /* sprite 0 = transparent -> RBG0 shows through */
+    if (sat_wall_paint & 1)
+	cmd[3] = (unsigned short)(0x0100u | 163u);   /* L+X: punches solid YELLOW */
+    for (i = 0; i < 4; ++i)
+    {
+	cmd[6 + 2*i] = (short)((qx[i] << detailshift) + vx);
+	cmd[7 + 2*i] = (short)(qy[i] + vy);
+    }
+    vdp1_cmd_at(VDP1_BANK[vdp1_wbank], vdp1_wnext++, cmd);
+    psw_flat_cmds++; psw_punch_cmds++;
+}
+
+/* the two flat lumps subsector record k wants this frame (-1 = skip): the floor
+   skips above-eye / missing / the RBG0 dominant triple (fdom flags the latter --
+   the punch candidate); the ceiling skips below-eye / sky.  Shared by the
+   flush's NEAR->FAR slot reservation and the emitter so both agree. */
+static void psw_sub_lumps(int k, int *fl, int *cl, int *fdom)
+{
+    *fl = *cl = -1; *fdom = 0;
     /* dominant match on HEIGHT+PIC only -- the light band is deliberately NOT part
        of it: a band-variant twin (same floor, light gradient sector) used to slip
        through and paint a stretched VDP1 patch OVER the RBG0 dominant (console
        2026-09-01, "sol vdp1 mal texture par-dessus le sol vdp2").  RBG0 already
        draws that surface; its single light band is the lesser artefact. */
-    if (psw_sub[k].fh < viewz && psw_sub[k].flump >= 0
-        && !(psw_sub[k].fh == sat_vdp2_floor_h
-             && (int)psw_sub[k].fpic == sat_vdp2_floor_pic))
-	*fl = psw_sub[k].flump;
+    if (psw_sub[k].fh < viewz && psw_sub[k].flump >= 0)
+    {
+	if (psw_sub[k].fh == sat_vdp2_floor_h
+	    && (int)psw_sub[k].fpic == sat_vdp2_floor_pic)
+	    *fdom = 1;              /* RBG0 draws it -> punch candidate (see the emitter) */
+	else
+	    *fl = psw_sub[k].flump;
+    }
     if (psw_sub[k].ch > viewz && psw_sub[k].clump >= 0)
 	*cl = psw_sub[k].clump;
 }
@@ -8305,14 +8346,40 @@ static void psw_emit_subflats(int k)
     if (!psw_polys_ok || sn < 0) return;
     if (psw_sub_kill[k]) return;             /* cut by the fill budget (far-first) */
     {
-    int fl, cl;
-    psw_sub_lumps(k, &fl, &cl);
+    int fl, cl, fdom;
+    psw_sub_lumps(k, &fl, &cl, &fdom);
     for (int pass = 0; pass < 2; ++pass)
     {
 	int ph, psign, lump;
 	if (pass == 0)                                  /* FLOOR */
 	{
-	    if (fl < 0) continue;
+	    if (fl < 0)
+	    {
+		if (fdom && psw_punch_frame)
+		{   /* dominant floor: punch RBG0 back over any lower-floor ghost
+		       behind it (colour-0 polygon at this sub's painter rank) */
+		    n = psw_plane_poly(sn, viewz - psw_sub[k].fh, 1, cx, cy);
+		    if (n >= 3)
+		    {
+			int pok = 1;
+			for (i = 0; i < n; ++i)
+			    if (!psw_project(cx[i], cy[i], viewz - psw_sub[k].fh, 1,
+			                     &sxv[i], &syv[i])) { pok = 0; break; }
+			if (pok)
+			    for (i = 1; i + 1 < n; i += 2)
+			    {
+				int qx[4], qy[4];
+				int i2 = (i + 2 < n) ? i + 2 : i + 1;
+				qx[0] = sxv[0];     qy[0] = syv[0];
+				qx[1] = sxv[i];     qy[1] = syv[i];
+				qx[2] = sxv[i + 1]; qy[2] = syv[i + 1];
+				qx[3] = sxv[i2];    qy[3] = syv[i2];
+				psw_emit_punchquad(qx, qy);
+			    }
+		    }
+		}
+		continue;
+	    }
 	    ph = viewz - psw_sub[k].fh; psign = 1; lump = fl;
 	}
 	else                                            /* CEILING */
@@ -8611,7 +8678,7 @@ static void vdp1_walls_flush(void)
            to FARTHER subsectors -> emitted first, without flats.  Watermarks are
            clamped: a HOLD frame can leave them stale for one frame. */
         int tail = (psw_sub_tail < wall_acc_n) ? psw_sub_tail : wall_acc_n;
-        psw_flat_cmds = 0; psw_flat_denied = 0;
+        psw_flat_cmds = 0; psw_flat_denied = 0; psw_punch_cmds = 0;
         for (int s = 0; s < PSW_FLAT_SLOTS; ++s) psw_slot[s].used = 0;
         /* NEAR->FAR pre-pass, two budgets at once:
            - TILES: spend PSW_TILE_BUDGET grid tiles (the world-clip bounds fill
@@ -8625,15 +8692,17 @@ static void vdp1_walls_flush(void)
              frame; far flats beyond the slots fall back to the solid polygon. */
         {
             int ftile = 0;
-            psw_kill_n = 0;
+            psw_kill_n = 0; psw_punch_frame = 0;
             for (int k = 0; k < psw_sub_n; ++k)
             {
-                int fl, cl;
+                int fl, cl, fdom;
                 psw_sub_kill[k] = 0;
-                psw_sub_lumps(k, &fl, &cl);
+                psw_sub_lumps(k, &fl, &cl, &fdom);
                 if (fl < 0 && cl < 0) continue;
                 if (ftile >= PSW_TILE_BUDGET)
                 { psw_sub_kill[k] = 1; psw_kill_n++; continue; }
+                if (fl >= 0 && psw_sub[k].fh < sat_vdp2_floor_h)
+                    psw_punch_frame = 1;    /* a LOWER floor emits -> dominant subs punch */
                 if (psw_polys_ok && psw_sub[k].subnum >= 0)
                 {
                     int cxv[PSW_FAN_MAX], cyv[PSW_FAN_MAX], nn, e;
@@ -8680,7 +8749,7 @@ static void vdp1_walls_flush(void)
 #endif
         }
         psw_flat_last = psw_flat_cmds; psw_flat_denied_last = psw_flat_denied;
-        psw_kill_last = psw_kill_n;
+        psw_kill_last = psw_kill_n;    psw_punch_last = psw_punch_cmds;
 #if SAT_WORLD_THINGS_VDP1
         if (psw_thing_drop > 0)
         {   /* a dropped queued thing is drawn by NOBODY this frame (the vanish class):
@@ -11699,9 +11768,7 @@ static void poll_pad(void)
        never mid-frame (mode-switch corruption class).  Same posture rule as L+C: C is the
        run button, both-shoulders-released is the play stance, so this cannot fire from
        neutral.  Row 13 becomes the PSW row while active. */
-    if (sat_local_players <= 1 && !(cur & PER_DGT_TR) && (cur & PER_DGT_TL)   /* R held, L released */
-        && (changed & PER_DGT_TC) && !(cur & PER_DGT_TC))
-        sat_psw_req ^= 1;
+    /* (R+C toggle REMOVED 2026-09-02, owner: sat_psw_req boots 1 -- see its declaration.) */
 #endif
     /* Pad L+C (L held, R released, 1p only): cycle the CUMULATIVE perf-lever level 0->1->2->3->4->0
        (core sat_opt, defined + fully documented in core/r_segs.c).

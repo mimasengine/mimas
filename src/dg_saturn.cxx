@@ -8983,8 +8983,14 @@ static void psw_emit_subflats(int k)
 	       LRU away from the near tiled flats.  fanbit folds the standby-rescue
 	       bit in: a rescued plane is a solid by definition. */
 	    int fanbit = (pass == 0) ? (0x10 | 0x40) : (0x20 | 0x80);
+	    /* belt recheck on the STORED bill (round 18): psw_tile_est here is the
+	       raw touched count -- for a probed MIXED plane it over-reads its cost
+	       several-fold and the belt forced NEAR granted planes to solid late in
+	       the frame (part of the console "zone rose" excess).  The stored
+	       fe/ce IS this pass's honest upper bound. */
+	    int ebill = 2 * (int)((pass == 0) ? psw_sub_fe[k] : psw_sub_ce[k]) + 1;
 	    int solid = (psw_sub_flag[k] & fanbit)
-	           || (psw_flat_cmds + 2 * psw_tile_est(cx, cy, n) + 1 > psw_flat_cap_dyn);
+	           || (psw_flat_cmds + ebill > psw_flat_cap_dyn);
 	    int slot = solid ? -1 : psw_slot_get(lump);
 	    int nr, li, zi, ok = 1, fb = 0;
 	    unsigned short colr, scolr;
@@ -9210,6 +9216,51 @@ static void vdp1_walls_flush(void)
     int nv = sat_local_players; if (nv < 1) nv = 1; else if (nv > 4) nv = 4;
     int nviews = sat_split_active ? nv : 1;             /* d_main renders nv views in split (2..4) */
     int surplus = budget - wall_acc_n;                 /* cmds available beyond the all-flat baseline */
+#if SAT_PSW
+    if (sat_psw_active)
+    {   /* round 18: WALLS YIELD TO FLATS (the walls-yield-to-things precedent).
+           Console: the acid room held k11-16 with c193-251 -- the famine became
+           REAL, and the marginal loser was wrong: a wall that loses its texture
+           upgrade DEGRADES to a 1-cmd flat (correct geometry, wall colour); a
+           plane that loses its budget is a HOLE (sky/black).  So the flats'
+           GUARANTEED demand -- min(4, e) per eligible pass, 4 per punch-dominant,
+           + the things reserve and margin -- is carved out of the wall-upgrade
+           surplus BEFORE any wall goes tiled.  Near walls still upgrade first
+           with whatever remains.  (psw_punch_frame is resolved HERE now; the
+           budget pre-pass below reuses it.) */
+        int fdem = 0;
+        psw_punch_frame = 0;
+        for (int k = 0; k < psw_sub_n; ++k)
+        {
+            int fl, cl, fdom;
+            psw_sub_lumps(k, &fl, &cl, &fdom);
+            if (fl >= 0 && !(psw_sub_flag[k] & 1)
+                && psw_sub[k].fh < sat_vdp2_floor_h)
+            { psw_punch_frame = 1; break; }
+        }
+        for (int k = 0; k < psw_sub_n; ++k)
+        {
+            int fl, cl, fdom;
+            psw_sub_lumps(k, &fl, &cl, &fdom);
+            if (fl < 0 && cl < 0 && !fdom) continue;
+            if (fdom && psw_punch_frame) fdem += 4;
+            if (fl >= 0 && !(psw_sub_flag[k] & 1))
+            {
+                int e = (psw_sub_flag[k] & 0x10) ? 4 : 2 * (int)psw_sub_fe[k] + 1;
+                fdem += (e < 4) ? e : 4;
+            }
+            if (cl >= 0 && !(psw_sub_flag[k] & 4))
+            {
+                int e = (psw_sub_flag[k] & 0x20) ? 4 : 2 * (int)psw_sub_ce[k] + 1;
+                fdem += (e < 4) ? e : 4;
+            }
+        }
+#if SAT_WORLD_THINGS_VDP1
+        fdem += 2 * thing_acc_n + 8;
+#endif
+        surplus -= fdem + 4;
+    }
+#endif
     if (surplus < 0) surplus = 0;
     int surplus_per_view = surplus / nviews;
     int extra_used[4] = { 0, 0, 0, 0 };
@@ -9330,7 +9381,7 @@ static void vdp1_walls_flush(void)
            (row 13 `k`), never the near field. */
         {
             int ftile = 0, fbudget, wall_cmds = 0, treserve = 0;
-            psw_kill_n = 0; psw_punch_frame = 0;
+            psw_kill_n = 0;   /* (psw_punch_frame: resolved by the walls-yield scan above) */
             for (int i = 0; i < wall_acc_n; ++i)
                 wall_cmds += psw_wall_paper(i);
 #if SAT_WORLD_THINGS_VDP1
@@ -9352,47 +9403,65 @@ static void vdp1_walls_flush(void)
                cap ran dry).  Bill 2e+1 for a tiled plane, 4 for a solid
                degrade; the budget DEGRADES before it kills, near->far. */
             int limit = fbudget;
-            /* punch pre-scan (round 16): psw_punch_frame used to be built IN the
-               billing loop, so dominant subs visited before the discovery were
-               billed as if no punch would fire.  Resolve it first; the billing
-               loop then charges every dominant sub its real punch paper. */
-            for (int k = 0; k < psw_sub_n; ++k)
-            {
-                int fl, cl, fdom;
-                psw_sub_lumps(k, &fl, &cl, &fdom);
-                if (fl >= 0 && !(psw_sub_flag[k] & 1)
-                    && psw_sub[k].fh < sat_vdp2_floor_h)
-                { psw_punch_frame = 1; break; }
-            }
+            /* ROUND 18: GUARANTEED-MINIMUM ALLOCATION (owner: "c'est si
+               complique de ne pas avoir de trous ?").  The old greedy grant
+               gave near planes their FULL tiled cost first, so in a heavy
+               room the far tail dropped outright while near planes feasted.
+               Round A (near->far): every eligible pass is billed only its
+               FLOOR cost min(4, e) -- nobody drops while the guarantee
+               fits, so holes appear ONLY when even all-solids overflow the
+               bank (and the emit-time rescue still nets those).  Round B
+               (near->far): the leftover upgrades passes to full tiles
+               (charge e-4) and assigns the 4 texture slots -- quality
+               degrades near-last, presence is near-universal.
+               (psw_punch_frame was resolved in the walls-yield scan.) */
             for (int k = 0; k < psw_sub_n; ++k)
             {
                 int fl, cl, fdom, dropped = 0;
                 psw_sub_lumps(k, &fl, &cl, &fdom);
                 if (fl < 0 && cl < 0 && !fdom) continue;
                 /* punch paper: UNCONDITIONAL 4 (round 16) -- the emitter never
-                   consults the budget flags for punches, and the old fan emitted
-                   up to 13 quads while billed 1 (a silent billing-law violation,
-                   console u26).  The punch fan is now DECIMATED to <=4 quads. */
+                   consults the budget flags for punches; the fan is DECIMATED
+                   to <=4 quads (billing-law violation fixed, console u26). */
                 if (fdom && psw_punch_frame) ftile += 4;
                 if (fl >= 0 && !(psw_sub_flag[k] & 1))
-                {   /* note-time solid LOD (0x10): billed at its 4-cmd cost; only
-                       the TILED arm reserves one of the 4 texture slots (a solid
-                       needs the centre-texel peek, not a slot -- round 16). */
+                {
                     int e = (psw_sub_flag[k] & 0x10) ? 4 : 2 * (int)psw_sub_fe[k] + 1;
-                    if (ftile + e <= limit)      { ftile += e;
-                                                   if (!(psw_sub_flag[k] & 0x10)) psw_slot_get(fl); }
-                    else if (ftile + 4 <= limit) { ftile += 4; psw_sub_flag[k] |= 0x10; }
+                    int m = (e < 4) ? e : 4;
+                    if (ftile + m <= limit) ftile += m;
                     else { psw_sub_flag[k] |= 0x40; dropped = 1; }   /* STANDBY: rescue at emit */
                 }
                 if (cl >= 0 && !(psw_sub_flag[k] & 4))
                 {
                     int e = (psw_sub_flag[k] & 0x20) ? 4 : 2 * (int)psw_sub_ce[k] + 1;
-                    if (ftile + e <= limit)      { ftile += e;
-                                                   if (!(psw_sub_flag[k] & 0x20)) psw_slot_get(cl); }
-                    else if (ftile + 4 <= limit) { ftile += 4; psw_sub_flag[k] |= 0x20; }
+                    int m = (e < 4) ? e : 4;
+                    if (ftile + m <= limit) ftile += m;
                     else { psw_sub_flag[k] |= 0x80; dropped = 1; }
                 }
                 if (dropped) psw_kill_n++;
+            }
+            for (int k = 0; k < psw_sub_n; ++k)
+            {   /* round B: upgrades + slots, near->far.  A pass already billed
+                   its full e (e <= 4) is tiled as-is and only needs its slot;
+                   a provisional solid upgrades iff the difference fits, else
+                   it KEEPS its guaranteed 4 (0x10).  Note-LOD solids (0x10
+                   set at note) never upgrade and take no slot. */
+                int fl, cl, fdom;
+                psw_sub_lumps(k, &fl, &cl, &fdom);
+                if (fl >= 0 && !(psw_sub_flag[k] & 0x41) && !(psw_sub_flag[k] & 0x10))
+                {
+                    int e = 2 * (int)psw_sub_fe[k] + 1;
+                    if (e <= 4)                        psw_slot_get(fl);
+                    else if (ftile + (e - 4) <= limit) { ftile += e - 4; psw_slot_get(fl); }
+                    else                               psw_sub_flag[k] |= 0x10;
+                }
+                if (cl >= 0 && !(psw_sub_flag[k] & 0x84) && !(psw_sub_flag[k] & 0x20))
+                {
+                    int e = 2 * (int)psw_sub_ce[k] + 1;
+                    if (e <= 4)                        psw_slot_get(cl);
+                    else if (ftile + (e - 4) <= limit) { ftile += e - 4; psw_slot_get(cl); }
+                    else                               psw_sub_flag[k] |= 0x20;
+                }
             }
             /* rescue ledger: every commitment not yet emitted (walls + things
                reserve + margin + the flats' committed paper).  See the decl. */

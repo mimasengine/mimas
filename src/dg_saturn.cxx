@@ -7981,6 +7981,16 @@ static const unsigned int psw_slot_vram[PSW_FLAT_SLOTS] =
    (the same trade as the wall potato LOD, keyed on projection not distance). */
 #define PSW_SOLID_HPX    16          /* projected height at/below which a plane goes solid */
 #define PSW_SOLID_AREA   1024        /* projected bbox area (px^2) gate, same LOD */
+/* MIXED-plane probed billing (round 17).  Console r16: k5-11 FLICKERING frame to
+   frame with the bank 62% empty (c112-172 / B281-296) -- the residual paper hog
+   is the MIXED planes (LOD-exempt): they bill every touched tile at 2 cmds while
+   the emitter's per-tile LOS probes skip most of them.  At NOTE time the first
+   PSW_PROBE_TILES bbox tiles now run the SAME 3-probe verdict the emitter uses;
+   the bill becomes 2*visible+1 and the verdicts are CACHED in a per-sub prefix
+   mask the emitter consumes -- probes paid ONCE, bill == an upper bound still
+   (unprobed tail billed full; bit clear == proven-not-hidden by the identical
+   deterministic test, so the emitter skips the re-probe both ways). */
+#define PSW_PROBE_TILES  32          /* prefix mask width (one unsigned int) */
 /* Flat FILL budget, in estimated screen PIXELS (spawn-scene verdict 2026-08-31: an open
    scene emitted 69 full-polygon quads -> VDP1 plot 38 ms vs 12 in a corridor -- the L5
    plot-time law; the command-count budgets are blind to fill).  Spent NEAR->FAR in the
@@ -8017,6 +8027,9 @@ static int psw_paint_idx = 88;   /* L+X flat paint, PER EMIT PATH (round 12 diag
                                     one capture names the path a bad quad took */
 static int psw_band_n = 0;       /* clean band+window pieces this flush (row 13 `b`) */
 static int psw_fanq_n = 0;       /* fan pieces/planes this flush (row 13 `n`) */
+static unsigned int psw_cur_mask = 0;   /* round 17: the emitting plane's cached tile-LOS
+                                           prefix (psw_sub_fmask/cmask), read only when
+                                           cull_h is armed (mixed plane) */
 static int psw_flat_cap_dyn = PSW_FLAT_CAP;  /* round 9: per-frame REAL flat room = bank
                                                 minus the walls' decided command cost minus
                                                 the things reserve (famine unification --
@@ -8030,7 +8043,20 @@ static unsigned char psw_sub_flag[PSW_SUB_MAX];   /* NOTE-time verdicts: b0 floo
                                                      paper famine -- emit-time slack rescue) */
 static unsigned char psw_sub_fe[PSW_SUB_MAX];     /* note-time tile estimate, floor (255-clamped) */
 static unsigned char psw_sub_ce[PSW_SUB_MAX];     /* note-time tile estimate, ceiling */
+static unsigned int  psw_sub_fmask[PSW_SUB_MAX];  /* round 17: MIXED planes only -- per-tile
+                                                     LOS verdicts of the first PSW_PROBE_TILES
+                                                     bbox tiles (bit set = PROVEN hidden), in
+                                                     the emitter's exact walk order; valid iff
+                                                     the pass's mixed bit (b1/b3) is set */
+static unsigned int  psw_sub_cmask[PSW_SUB_MAX];
 static int psw_kill_n = 0;           /* subs killed this flush (row 13 `k`; NET of rescues) */
+static int psw_wall_paper(int i)     /* one wall's pre-pass paper (round 17: also released
+                                        into the rescue ledger as each wall is plotted) */
+{
+    return (wall_acc[i].mode == 1) ? wall_tilecount(i)
+         : (wall_acc[i].mode == 3) ? wall_banded_cost(i)
+         : (wall_acc[i].mode == 2) ? 1 : 0;
+}
 static int psw_paper_left = 0;       /* round 16 rescue ledger: paper (upper-bound cost) of
                                         every COMMITTED item not yet emitted.  Decremented per
                                         sub as its flats emit; walls/things are never released
@@ -8058,6 +8084,7 @@ static int  psw_project(int wx, int wy, int ph, int psign, int *psx, int *psy);
 static int  psw_tile_est(const int *cx, const int *cy, int n);
 static int  psw_plane_los_cull(const int *cx, const int *cy, int n, int h,
                                int psign, int *tile_test);
+static int  psw_tile_hidden(int x0, int y0, int psign, int h);   /* the 3-probe tile verdict */
 extern "C" int R_PswBandBoxHidden(int xl, int xr, int yt, int yb);   /* core r_segs.c */
 
 static void sat_psw_sub_note(int subnum, int fh, int ch, int fpic,
@@ -8130,6 +8157,35 @@ static void sat_psw_sub_note(int subnum, int fh, int ch, int fpic,
 		}
 	    }
 	    e = psw_tile_est(cxv, cyv, nn);
+	    if (tt)
+	    {   /* MIXED plane: probe its tiles NOW with the emitter's exact
+		   verdict and bill only the visible ones (round 17 -- see
+		   PSW_PROBE_TILES).  min() with the touched estimate keeps
+		   the sliver bound; both are upper bounds on the real spend. */
+		unsigned int msk = 0;
+		int bx0 = cxv[0], bx1 = cxv[0], by0 = cyv[0], by1 = cyv[0];
+		int vis = 0, ti = 0;
+		for (v = 1; v < nn; ++v)
+		{
+		    if (cxv[v] < bx0) bx0 = cxv[v]; if (cxv[v] > bx1) bx1 = cxv[v];
+		    if (cyv[v] < by0) by0 = cyv[v]; if (cyv[v] > by1) by1 = cyv[v];
+		}
+		{
+		    int txa = bx0 >> 22, txb = (bx1 - 1) >> 22;
+		    int tya = by0 >> 22, tyb = (by1 - 1) >> 22;
+		    for (int ty2 = tya; ty2 <= tyb; ++ty2)
+		    for (int tx2 = txa; tx2 <= txb; ++tx2, ++ti)
+		    {
+			if (ti >= PSW_PROBE_TILES) { vis++; continue; }
+			if (psw_tile_hidden(tx2 << 22, ty2 << 22, psn, h))
+			    msk |= 1u << ti;
+			else vis++;
+		    }
+		}
+		if (pass == 0) psw_sub_fmask[k] = msk;
+		else           psw_sub_cmask[k] = msk;
+		if (vis < e) e = vis;
+	    }
 	    if (e > 255) e = 255;
 	    if (pass == 0) psw_sub_fe[k] = (unsigned char)e;
 	    else           psw_sub_ce[k] = (unsigned char)e;
@@ -8456,8 +8512,9 @@ static void psw_emit_plane_tiles(int slot, unsigned short colr,
     {
 	int txa = bx0 >> 22, txb = (bx1 - 1) >> 22;
 	int tya = by0 >> 22, tyb = (by1 - 1) >> 22;
+	int ti = 0;                        /* round 17: cell index in NOTE walk order */
 	for (int ty = tya; ty <= tyb; ++ty)
-	for (int tx = txa; tx <= txb; ++tx)
+	for (int tx = txa; tx <= txb; ++tx, ++ti)
 	{
 	    int ax[PSW_FAN_MAX], ay[PSW_FAN_MAX];
 	    int bxv[PSW_FAN_MAX], byv[PSW_FAN_MAX];
@@ -8467,26 +8524,17 @@ static void psw_emit_plane_tiles(int slot, unsigned short colr,
 	    long long area2;
 	    if (psw_flat_cmds >= psw_flat_cap_dyn) return;
 	    if (cull_h != 0x7fffffff)
-	    {   /* mixed-visibility plane: probe the farthest tile corner, and --
-	           round 10 -- confirm on the OPPOSITE (nearest) corner before
-	           skipping: the far corner alone culled tiles whose near half
-	           was plainly visible behind a crate edge / ceiling lip
-	           (console 2026-09-02, the partial-coverage patches).  Visible
-	           tiles still pay ONE probe (short-circuit). */
-		int fx = (viewx < x0 + (32 << 16)) ? x1 : x0;
-		int fy = (viewy < y0 + (32 << 16)) ? y1 : y0;
-		int nx = (fx == x0) ? x1 : x0;
-		int ny = (fy == y0) ? y1 : y0;
-		int mx = x0 + (32 << 16), my = y0 + (32 << 16);
-		/* round 13: + the CENTRE (a 64u crate hides exactly both diagonal
-		   corners of a 64u tile while slivers stay visible -- "trous
-		   derriere des obstacles").  Visible tiles still pay ONE probe. */
-		if (psign > 0 ? (psw_floor_pt_hidden(fx, fy, cull_h)
-		                 && psw_floor_pt_hidden(nx, ny, cull_h)
-		                 && psw_floor_pt_hidden(mx, my, cull_h))
-		              : (psw_ceil_pt_hidden(fx, fy, cull_h)
-		                 && psw_ceil_pt_hidden(nx, ny, cull_h)
-		                 && psw_ceil_pt_hidden(mx, my, cull_h))) continue;
+	    {   /* mixed-visibility plane -- the 3-probe verdict (far corner +
+	           opposite near corner + centre, rounds 10/13: "trous derriere
+	           des obstacles").  Round 17: the NOTE already ran it for the
+	           first PSW_PROBE_TILES cells and cached the verdicts in the
+	           prefix mask (same walk order, same deterministic inputs), so
+	           consume the bit both ways: set = proven hidden (skip), clear
+	           = proven visible (paint, no re-probe).  Only cells past the
+	           prefix still probe here. */
+		if (ti < PSW_PROBE_TILES)
+		{ if ((psw_cur_mask >> ti) & 1u) continue; }
+		else if (psw_tile_hidden(x0, y0, psign, cull_h)) continue;
 	    }
 	    m = psw_clip_axis(cx, cy, n, ax, ay, 0, +1, x0);
 	    if (m < 3) continue;
@@ -8674,6 +8722,28 @@ static int psw_ceil_pt_hidden(int fx, int fy, int ch)
 	if (R_PswCeilingAt(px, py) <= hm) return 1;
     }
     return 0;
+}
+
+/* ONE tile's LOS verdict -- the 3-probe test (far diagonal corner + opposite
+   near corner + centre), shared VERBATIM by the emitter's tile walk and the
+   round-17 note-time probed billing: the two MUST agree bit for bit, or the
+   bill stops being an upper bound (note says hidden, emitter paints).  All
+   inputs are frame-static (view + BSP heights), so the verdict is
+   deterministic between note and flush. */
+static int psw_tile_hidden(int x0, int y0, int psign, int h)
+{
+    int x1 = x0 + (64 << 16), y1 = y0 + (64 << 16);
+    int fx = (viewx < x0 + (32 << 16)) ? x1 : x0;
+    int fy = (viewy < y0 + (32 << 16)) ? y1 : y0;
+    int nx = (fx == x0) ? x1 : x0;
+    int ny = (fy == y0) ? y1 : y0;
+    int mx = x0 + (32 << 16), my = y0 + (32 << 16);
+    return psign > 0 ? (psw_floor_pt_hidden(fx, fy, h)
+                        && psw_floor_pt_hidden(nx, ny, h)
+                        && psw_floor_pt_hidden(mx, my, h))
+                     : (psw_ceil_pt_hidden(fx, fy, h)
+                        && psw_ceil_pt_hidden(nx, ny, h)
+                        && psw_ceil_pt_hidden(mx, my, h));
 }
 
 /* Plane-level ladder: probe the FARTHEST (most likely visible) and NEAREST
@@ -8955,7 +9025,10 @@ static void psw_emit_subflats(int k)
 		   cannot swim; the lost texture at degrade distance is the
 		   potato trade. */
 		if (!solid)
+		{
+		    psw_cur_mask = (pass == 0) ? psw_sub_fmask[k] : psw_sub_cmask[k];
 		    psw_emit_plane_tiles(slot, pc, cx, cy, n, ph, psign, cull_h, scolr);
+		}
 		else
 		{   /* round 14: the solid fan is DECIMATED to <= 4 quads (a many-
 		       vert clipped poly fanned 13 quads while billed 2, and the cap
@@ -9038,6 +9111,9 @@ static void psw_emit_subthings(int v0, int v1)
 	    vdp1_cmd_at(VDP1_BANK[vdp1_wbank], vdp1_wnext++, cmd);
 	}
 	psw_thing_cmds += 2;
+	psw_paper_left -= 2;   /* round 17: release this thing's reserve (2 cmds)
+	                          into the rescue ledger; the +8 batch-restore
+	                          share of treserve stays held = conservative */
 	any = 1;
     }
     if (any)
@@ -9256,9 +9332,7 @@ static void vdp1_walls_flush(void)
             int ftile = 0, fbudget, wall_cmds = 0, treserve = 0;
             psw_kill_n = 0; psw_punch_frame = 0;
             for (int i = 0; i < wall_acc_n; ++i)
-                wall_cmds += (wall_acc[i].mode == 1) ? wall_tilecount(i)
-                           : (wall_acc[i].mode == 3) ? wall_banded_cost(i)
-                           : (wall_acc[i].mode == 2) ? 1 : 0;
+                wall_cmds += psw_wall_paper(i);
 #if SAT_WORLD_THINGS_VDP1
             treserve = 2 * thing_acc_n + 8;   /* 2 cmds/thing + the per-batch clip restores */
 #endif
@@ -9324,7 +9398,13 @@ static void vdp1_walls_flush(void)
                reserve + margin + the flats' committed paper).  See the decl. */
             psw_paper_left = wall_cmds + treserve + 4 + ftile;
         }
-        for (int i = wall_acc_n - 1; i >= tail; --i) VDP1_PLOT_WALL(i);
+        for (int i = wall_acc_n - 1; i >= tail; --i)
+        {   /* round 17: release each plotted wall's paper into the rescue
+               ledger -- these TAIL walls are the farthest of all and plot
+               BEFORE any sub, so the far standbys finally see real slack */
+            VDP1_PLOT_WALL(i);
+            psw_paper_left -= psw_wall_paper(i);
+        }
 #if SAT_WORLD_THINGS_VDP1
         if (psw_spr_tail != 0x7fff)
             psw_emit_subthings(psw_spr_tail, 0x7fff);   /* things of overflowed (farther) subs */
@@ -9336,7 +9416,8 @@ static void vdp1_walls_flush(void)
             if (wend > wall_acc_n) wend = wall_acc_n;
             if (wbeg > wend) wbeg = wend;
             psw_emit_subflats(k);
-            for (int i = wend - 1; i >= wbeg; --i) VDP1_PLOT_WALL(i);
+            for (int i = wend - 1; i >= wbeg; --i)
+            { VDP1_PLOT_WALL(i); psw_paper_left -= psw_wall_paper(i); }
 #if SAT_WORLD_THINGS_VDP1
             psw_emit_subthings((int)psw_sub[k].s0,
                                (k + 1 < psw_sub_n) ? (int)psw_sub[k + 1].s0 : psw_spr_tail);

@@ -149,6 +149,18 @@ StoreWallRange, curline/frontsector/backsector/rw_angle1 vivants).
 > sonde, court-circuit). À surveiller : MST79-84 / 12,6 fps dans la salle aux caisses
 > (k52-54 = budget tuiles saturé — beaucoup de subs) → prochaine cible perf après la
 > validation correction.
+> **Round 11 console (2026-09-02, 60e9046)** : 4 symptômes → 3 mécanismes. (1) grands
+> plans désalignés = le raccourci « >48 tuiles ⇒ UN fan étiré » recréait l'étirement
+> pleine-salle sur chaque grand plafond — SUPPRIMÉ, les géants tuilent. (2) plans limités
+> en distance + grands plafonds troués = le budget TUAIT les subs lointains et le cap
+> tronquait un plan en pleine marche — le budget DÉGRADE maintenant (plan trop cher → fan
+> étiré 2 cmds, b4/b5 ; l'émetteur réserve 2 cmds/tuile avant d'entamer une marche ; `k` =
+> seulement les plans qui ne peuvent même pas payer leur fan). (3) swim des quads
+> débordant l'écran = le fan ré-étirait le caractère sur le bord de coupe MOUVANT du
+> near-clip/frustum — une pièce PROPRE (arêtes non-axiales toutes sur des lignes de clip
+> de vue ⇒ fuite hors écran par construction) émet ancrée monde : sous-bande v snappée aux
+> texels + pleine largeur tuile + fenêtre UserClip au bbox projeté (généralise le rect du
+> round 9) ; seule une frontière de secteur DIAGONALE garde le fan borné. Pool 34,05 Ko.
 
 ## Étape 2 — sols non-dominants + plafonds (quads de sous-secteurs)
 

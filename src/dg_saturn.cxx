@@ -668,6 +668,7 @@ static int sat_psw_req = 1;     /* owner 2026-09-02: the R+C toggle is GONE -- t
                                    console captures ambiguous).  A/B = the two discs. */
 extern "C" int sat_psw_tiers;   /* core r_segs.c: tier quads accepted this frame */
 extern "C" int sat_psw_ref;     /* core r_segs.c: tier quads shed (budget/list full) */
+extern "C" int sat_psw_wcull;   /* core r_segs.c: tier quads culled by the portal bands (round 9) */
 static int sat_psw_t_last = 0, sat_psw_r_last = 0;  /* frame-boundary snapshot (overlay row 13) */
 /* step 2: per-subsector flats (recorder installed at init; machinery near vdp1_walls_flush) */
 extern "C" void (*sat_psw_sub_hook)(int subnum, int fh, int ch, int fpic,
@@ -5806,8 +5807,20 @@ extern "C" void sat_sky_precache(void)
    (below), so VDP1 never reads a texture mid-rebuild. */
 #define VDP1_ROOT_ADDR  0x25C00000u
 #define VDP1_BANKE_ADDR 0x25C00040u
+#if SAT_PSW
+/* PSW round 9: the painter shares ONE bank between walls + grid-64 flat tiles +
+   punches + things + weapon/HUD, and 256 commands starved it (console 2026-09-02:
+   flats f91-133 alone; the far->near emission then dropped the NEAREST geometry
+   at the cap = the hole class).  0x25C04100..0x25C04FFF was unreferenced VRAM
+   (WTEX_BASE starts at 0x25C05000), so the banks grow into it: 2 x 0x2600 ends
+   at 0x25C04D00, +48 commands each.  PSW builds only -- the validated normal
+   build keeps its exact bank geometry. */
+static const unsigned int VDP1_BANK[2] = { 0x25C00100u, 0x25C02700u };
+#define VDP1_BANK_CMDS  304               /* commands per bank (0x2600 VRAM / 32B each) */
+#else
 static const unsigned int VDP1_BANK[2] = { 0x25C00100u, 0x25C02100u };
 #define VDP1_BANK_CMDS  256               /* commands per bank (0x2000 VRAM / 32B each) */
+#endif
 #define VDP1_CMD_GUARD  (VDP1_BANK_CMDS - 2)   /* weapon/HUD stop here (leave end + 1) */
 
 /* Texture cache: each weapon frame's texture lives in a STABLE VRAM slot keyed by
@@ -6561,6 +6574,24 @@ static int wall_banded_cost(int wi)  /* est. cmd cost of a banded wall = ONE ban
     if (n > MAXWALLTILES) n = MAXWALLTILES;
     return n + 1;
 }
+
+#if SAT_PSW
+static int wall_hypermag(int wi)
+{   /* round 9 (console 2026-09-02, "porte en plein ecran -> trois textures de
+       porte"): a hyper-magnified piece's world-anchored tile extrapolates to
+       texw * xspan / du screen px; past the emitter's coordinate guards it
+       falls into the full-char squish (or the du==0 degenerate quad) = ONE
+       WHOLE texture squeezed onto each subdivision piece, N copies across the
+       wall.  The normal build routes such walls to the software fallback
+       upstream; PSW has none, so the piece is forced FLAT instead -- a shaded
+       wall beats three fake doors when the player is touching it. */
+    int texw = texturewidthmask[wall_acc[wi].texnum] + 1;
+    int du = wall_acc[wi].u2 - wall_acc[wi].u1; if (du < 0) du = -du;
+    int xspan = wall_acc[wi].x2 - wall_acc[wi].x1; if (xspan < 0) xspan = -xspan;
+    if (du == 0) return 1;
+    return (long long)texw * xspan > (long long)du * 640;
+}
+#endif
 
 /* Emit the horizontal u-tiles of ONE vertical band: the texture rows at [charAddr, +charSize.h]
    mapped across the wall's u-range, window-clipped to [x1,x2].  The yl/yh args are THIS band's
@@ -7959,29 +7990,17 @@ static int psw_sub_n = 0;
 static int psw_sub_tail = 0x7fff;    /* wall watermark at the FIRST overflow (0x7fff = none) */
 static int psw_spr_tail = 0x7fff;    /* vissprite watermark at the FIRST overflow */
 static int psw_flat_cmds = 0;
+static int psw_flat_cap_dyn = PSW_FLAT_CAP;  /* round 9: per-frame REAL flat room = bank
+                                                minus the walls' decided command cost minus
+                                                the things reserve (famine unification --
+                                                console 2026-09-02: flats overflowing the
+                                                shared bank dropped the NEAREST walls) */
 static unsigned char psw_sub_kill[PSW_SUB_MAX];   /* 1 = this sub's flats cut by the fill budget */
-static unsigned char psw_sub_flag[PSW_SUB_MAX];   /* pre-pass verdicts: b0 floor hidden,
+static unsigned char psw_sub_flag[PSW_SUB_MAX];   /* NOTE-time verdicts: b0 floor hidden,
                                                      b1 floor per-tile probe, b2/b3 = ceiling */
+static unsigned char psw_sub_fe[PSW_SUB_MAX];     /* note-time tile estimate, floor (255-clamped) */
+static unsigned char psw_sub_ce[PSW_SUB_MAX];     /* note-time tile estimate, ceiling */
 static int psw_kill_n = 0;           /* subs killed this flush (row 13 `k`) */
-
-static void sat_psw_sub_note(int subnum, int fh, int ch, int fpic,
-                             int flump, int clump, int light, int vis0)
-{
-    if (psw_sub_n >= PSW_SUB_MAX)
-    {
-	if (psw_sub_tail == 0x7fff) { psw_sub_tail = wall_acc_n;   /* tail walls = farther subs */
-	                              psw_spr_tail = vis0; }
-	return;
-    }
-    psw_sub[psw_sub_n].fh = fh;       psw_sub[psw_sub_n].ch = ch;
-    psw_sub[psw_sub_n].flump = flump; psw_sub[psw_sub_n].clump = clump;
-    psw_sub[psw_sub_n].subnum = (short)subnum;
-    psw_sub[psw_sub_n].fpic  = (short)fpic;
-    psw_sub[psw_sub_n].light = (short)light;
-    psw_sub[psw_sub_n].w0    = (short)wall_acc_n;
-    psw_sub[psw_sub_n].s0    = (short)vis0;
-    psw_sub_n++;
-}
 
 extern "C" int             psw_polys_ok;     /* core r_bsp.c: polygon pools valid */
 extern "C" int             R_PswFloorAt(int x, int y);   /* core: floor height at a 2D point (BSP walk) */
@@ -7989,6 +8008,86 @@ extern "C" int             R_PswCeilingAt(int x, int y); /* core: ceiling height
 extern "C" int            *psw_pvx, *psw_pvy;
 extern "C" unsigned short *psw_pvi;
 extern "C" unsigned char  *psw_pvn;
+
+/* round 9: the visibility verdicts moved from the flush pre-pass into the NOTE
+   hook -- the core's portal bands (r_segs.c sat_psw_bt/bb) are folded during
+   the walk, so ONLY at visit time do they hold exactly the strictly-nearer
+   occluders this sub must be tested against (at flush time they are final =
+   they would wrongly include FARTHER walls).  Forward decls for the machinery
+   defined below. */
+static int  psw_plane_poly(int sn, int ph, int psign, int *ox, int *oy);
+static int  psw_project(int wx, int wy, int ph, int psign, int *psx, int *psy);
+static int  psw_tile_est(const int *cx, const int *cy, int n);
+static int  psw_plane_los_cull(const int *cx, const int *cy, int n, int h,
+                               int psign, int *tile_test);
+extern "C" int R_PswBandBoxHidden(int xl, int xr, int yt, int yb);   /* core r_segs.c */
+
+static void sat_psw_sub_note(int subnum, int fh, int ch, int fpic,
+                             int flump, int clump, int light, int vis0)
+{
+    int k;
+    if (psw_sub_n >= PSW_SUB_MAX)
+    {
+	if (psw_sub_tail == 0x7fff) { psw_sub_tail = wall_acc_n;   /* tail walls = farther subs */
+	                              psw_spr_tail = vis0; }
+	return;
+    }
+    k = psw_sub_n;
+    psw_sub[k].fh = fh;       psw_sub[k].ch = ch;
+    psw_sub[k].flump = flump; psw_sub[k].clump = clump;
+    psw_sub[k].subnum = (short)subnum;
+    psw_sub[k].fpic  = (short)fpic;
+    psw_sub[k].light = (short)light;
+    psw_sub[k].w0    = (short)wall_acc_n;
+    psw_sub[k].s0    = (short)vis0;
+    psw_sub_flag[k] = 0; psw_sub_fe[k] = 8; psw_sub_ce[k] = 8;  /* 8 = unknown-est default */
+    if (psw_polys_ok && subnum >= 0)
+    {
+	int cxv[PSW_FAN_MAX], cyv[PSW_FAN_MAX];
+	for (int pass = 0; pass < 2; ++pass)
+	{
+	    int h, psn, bit, nn, tt, e, v;
+	    if (pass == 0)
+	    {   /* floor candidate?  The dominant test uses LAST frame's dominant
+		   (fresh election happens post-walk in R_DrawPlanes): a stale
+		   miss only means one unculled/unbilled plane for one frame --
+		   the flush re-derives fl/cl/fdom with the fresh dominant. */
+		if (fh >= viewz || flump < 0) continue;
+		if (fh == sat_vdp2_floor_h && fpic == sat_vdp2_floor_pic) continue;
+		h = fh; psn = 1; bit = 1;
+	    }
+	    else
+	    {
+		if (ch <= viewz || clump < 0) continue;
+		h = ch; psn = -1; bit = 4;
+	    }
+	    nn = psw_plane_poly(subnum, psn > 0 ? viewz - h : h - viewz, psn, cxv, cyv);
+	    if (nn < 3) { psw_sub_flag[k] |= bit; continue; }
+	    if (psw_plane_los_cull(cxv, cyv, nn, h, psn, &tt))
+	    { psw_sub_flag[k] |= bit; continue; }
+	    if (tt) psw_sub_flag[k] |= bit << 1;
+	    {   /* projected bbox vs the core's portal bands (view-relative) */
+		int sx, sy, okp = 1;
+		int xl = 0x7fff, xr = -0x7fff, yt = 0x7fff, yb = -0x7fff;
+		for (v = 0; v < nn; ++v)
+		{
+		    if (!psw_project(cxv[v], cyv[v],
+		                     psn > 0 ? viewz - h : h - viewz,
+		                     psn, &sx, &sy)) { okp = 0; break; }
+		    if (sx < xl) xl = sx; if (sx > xr) xr = sx;
+		    if (sy < yt) yt = sy; if (sy > yb) yb = sy;
+		}
+		if (okp && R_PswBandBoxHidden(xl, xr, yt, yb))
+		{ psw_sub_flag[k] |= bit; continue; }
+	    }
+	    e = psw_tile_est(cxv, cyv, nn);
+	    if (e > 255) e = 255;
+	    if (pass == 0) psw_sub_fe[k] = (unsigned char)e;
+	    else           psw_sub_ce[k] = (unsigned char)e;
+	}
+    }
+    psw_sub_n++;
+}
 
 /* SH-2 DIVU FixedDiv, IPL15 across the 3-write/1-read window (the fvdp1_fdiv recipe). */
 static inline int psw_fdiv(int a, int b)
@@ -8096,7 +8195,7 @@ static void psw_emit_flatquad(int slot, unsigned short colr, const int *qx, cons
     extern int detailshift, viewwindowx, viewwindowy;
     int vx = viewwindowx, vy = viewwindowy, i;
     if (vdp1_wnext >= vdp1_wall_cap) return;
-    if (psw_flat_cmds >= PSW_FLAT_CAP) return;
+    if (psw_flat_cmds >= psw_flat_cap_dyn) return;
     memset(cmd, 0, sizeof cmd);
     cmd[0] = 0x0002;                                  /* DISTORSP */
     cmd[2] = 0x00E0;                                  /* no clip | 8bpp bank | SPD | ECD */
@@ -8113,6 +8212,61 @@ static void psw_emit_flatquad(int slot, unsigned short colr, const int *qx, cons
 	cmd[0] = 0x0004;
 	cmd[3] = (unsigned short)(0x0100u | 88u);
     }
+    for (i = 0; i < 4; ++i)
+    {
+	cmd[6 + 2*i] = (short)((qx[i] << detailshift) + vx);
+	cmd[7 + 2*i] = (short)(qy[i] + vy);
+    }
+    vdp1_cmd_at(VDP1_BANK[vdp1_wbank], vdp1_wnext++, cmd);
+    psw_flat_cmds++;
+}
+
+/* round 9 -- one UserClip window (framebuffer coords, clamped to the view
+   rect), billed as a flat command.  Modal VDP1 state: only Window_In commands
+   read it, and every later Window_In user (walls, things) sets its own. */
+static void psw_emit_clipwin(int xl, int yt, int xr, int yb)
+{
+    unsigned short cmd[16];
+    extern int detailshift, viewwindowx, viewwindowy;
+    int vx = viewwindowx, vy = viewwindowy;
+    int fxl = (xl << detailshift) + vx, fxr = ((xr + 1) << detailshift) - 1 + vx;
+    int fyt = yt + vy, fyb = yb + vy;
+    int bxl = vx, bxr = vx + (viewwidth << detailshift) - 1;
+    int byt = vy, byb = vy + viewheight - 1;
+    if (vdp1_wnext >= vdp1_wall_cap) return;
+    if (fxl < bxl) fxl = bxl; if (fxr > bxr) fxr = bxr;
+    if (fyt < byt) fyt = byt; if (fyb > byb) fyb = byb;
+    if (fxr < fxl) fxr = fxl;
+    if (fyb < fyt) fyb = fyt;
+    memset(cmd, 0, sizeof cmd);
+    cmd[0]  = 0x0008;                  /* FUNC_UserClip */
+    cmd[6]  = (short)fxl; cmd[7]  = (short)fyt;
+    cmd[10] = (short)fxr; cmd[11] = (short)fyb;
+    vdp1_cmd_at(VDP1_BANK[vdp1_wbank], vdp1_wnext++, cmd);
+    psw_flat_cmds++;
+}
+
+/* round 9 -- GRID-64 exact rect tile: the flat char's contiguous v sub-band
+   [v0, v0+vh) mapped onto the quad (canonical order (x0,ry1),(x1,ry1),(x1,ry0),
+   (x0,ry0) = char rows running toward -y, the R_MapPlane phase).  win = 1 draws
+   Window_In behind the clip window psw_emit_clipwin just set (the wall recipe:
+   world-anchored band + window = exact texels for a rect narrower than the
+   tile -- a horizontal char sub-range is not addressable on VDP1). */
+static void psw_emit_rectquad(int slot, unsigned short colr,
+                              const int *qx, const int *qy, int v0, int vh, int win)
+{
+    unsigned short cmd[16];
+    extern int detailshift, viewwindowx, viewwindowy;
+    int vx = viewwindowx, vy = viewwindowy, i;
+    if (vdp1_wnext >= vdp1_wall_cap) return;
+    if (psw_flat_cmds >= psw_flat_cap_dyn) return;
+    memset(cmd, 0, sizeof cmd);
+    cmd[0] = 0x0002;                                  /* DISTORSP */
+    cmd[2] = (unsigned short)(win ? 0x04E0 : 0x00E0); /* (Window_In) | 8bpp bank | SPD | ECD */
+    cmd[3] = colr;
+    cmd[4] = (unsigned short)((psw_slot_vram[slot] + (unsigned int)v0 * 64u
+                               - VDP1_VRAM_BASE) >> 3);
+    cmd[5] = (unsigned short)(0x0800 | vh);           /* 64 x vh texels */
     for (i = 0; i < 4; ++i)
     {
 	cmd[6 + 2*i] = (short)((qx[i] << detailshift) + vx);
@@ -8234,7 +8388,7 @@ static void psw_emit_plane_tiles(int slot, unsigned short colr,
 	    int x1 = x0 + (64 << 16), y1 = y0 + (64 << 16);
 	    int m, full;
 	    long long area2;
-	    if (psw_flat_cmds >= PSW_FLAT_CAP) return;
+	    if (psw_flat_cmds >= psw_flat_cap_dyn) return;
 	    if (cull_h != 0x7fffffff)
 	    {   /* mixed-visibility plane: probe the farthest tile corner (the
 	           most likely visible one) -- proven blocked => skip the tile
@@ -8261,7 +8415,11 @@ static void psw_emit_plane_tiles(int slot, unsigned short colr,
 	    }
 	    if (area2 < 0) area2 = -area2;
 	    if ((area2 >> 33) < 2) continue;             /* sliver < ~2 units^2 */
-	    full = ((area2 >> 33) >= 64 * 64 - 32);      /* ~the whole tile */
+	    full = ((area2 >> 33) >= 64 * 64 - 2);       /* the whole tile (round 9: the old
+	                                                    -32 tolerance let a corner-cut tile
+	                                                    pass as full and its square OVERHANG
+	                                                    the neighbouring floor -- console
+	                                                    2026-09-02 "un coin qui depasse") */
 	    if (full)
 	    {   /* exact texture: char (0,0) at world (x0,y1), rows run toward -y */
 		int qx[4], qy[4];
@@ -8272,21 +8430,87 @@ static void psw_emit_plane_tiles(int slot, unsigned short colr,
 		psw_emit_flatquad(slot, colr, qx, qy);
 	    }
 	    else
-	    {   /* edge tile: fan of the full character (warp bounded to the tile) */
-		int sxv[PSW_FAN_MAX], syv[PSW_FAN_MAX], ok = 1;
-		for (i = 0; i < m; ++i)
-		    if (!psw_project(bxv[i], byv[i], ph, psign, &sxv[i], &syv[i]))
-		    { ok = 0; break; }
-		if (!ok) continue;
-		for (i = 1; i + 1 < m; i += 2)
-		{
-		    int qx[4], qy[4];
-		    int i2 = (i + 2 < m) ? i + 2 : i + 1;
-		    qx[0] = sxv[0];     qy[0] = syv[0];
-		    qx[1] = sxv[i];     qy[1] = syv[i];
-		    qx[2] = sxv[i + 1]; qy[2] = syv[i + 1];
-		    qx[3] = sxv[i2];    qy[3] = syv[i2];
-		    psw_emit_flatquad(slot, colr, qx, qy);
+	    {
+		int done = 0;
+		if (m == 4 && slot >= 0 && !(sat_wall_paint & 1))
+		{   /* AXIS-ALIGNED RECT (the common Doom border, round 9): EXACT
+		       texels.  The v sub-range is a contiguous char slice; a
+		       horizontal sub-range is NOT addressable in a VDP1 char, so
+		       a narrow rect draws the FULL-WIDTH band quad world-anchored
+		       plus a UserClip window cutting it to the rect (the wall
+		       emitter's recipe).  Kills the "textures pas alignees entre
+		       cellules" class for orthogonal geometry; diagonal borders
+		       keep the bounded fan warp below. */
+		    int rect = 1, rx0, rx1, ry0, ry1;
+		    for (i = 0; i < 4; ++i)
+		    {
+			int j = (i + 1) & 3;
+			if (bxv[i] != bxv[j] && byv[i] != byv[j]) { rect = 0; break; }
+		    }
+		    rx0 = rx1 = bxv[0]; ry0 = ry1 = byv[0];
+		    for (i = 1; i < 4; ++i)
+		    {
+			if (bxv[i] < rx0) rx0 = bxv[i]; if (bxv[i] > rx1) rx1 = bxv[i];
+			if (byv[i] < ry0) ry0 = byv[i]; if (byv[i] > ry1) ry1 = byv[i];
+		    }
+		    if (rect && rx1 > rx0 && ry1 > ry0)
+		    {
+			int v0 = (y1 - ry1) >> 16;
+			int vh = (ry1 - ry0 + 0x8000) >> 16;
+			int fullw = (rx0 == x0 && rx1 == x1);
+			int qx[4], qy[4], okq;
+			if (v0 < 0) v0 = 0; else if (v0 > 63) v0 = 63;
+			if (vh < 1) vh = 1;
+			if (v0 + vh > 64) vh = 64 - v0;
+			okq  = psw_project(x0, ry1, ph, psign, &qx[0], &qy[0]);
+			okq &= psw_project(x1, ry1, ph, psign, &qx[1], &qy[1]);
+			okq &= psw_project(x1, ry0, ph, psign, &qx[2], &qy[2]);
+			okq &= psw_project(x0, ry0, ph, psign, &qx[3], &qy[3]);
+			if (okq && fullw)
+			{
+			    psw_emit_rectquad(slot, colr, qx, qy, v0, vh, 0);
+			    done = 1;
+			}
+			else if (okq && vdp1_wnext + 1 < vdp1_wall_cap
+			         && psw_flat_cmds + 1 < psw_flat_cap_dyn)
+			{
+			    int wx[4], wy[4], okw;
+			    okw  = psw_project(rx0, ry1, ph, psign, &wx[0], &wy[0]);
+			    okw &= psw_project(rx1, ry1, ph, psign, &wx[1], &wy[1]);
+			    okw &= psw_project(rx1, ry0, ph, psign, &wx[2], &wy[2]);
+			    okw &= psw_project(rx0, ry0, ph, psign, &wx[3], &wy[3]);
+			    if (okw)
+			    {
+				int wxl = wx[0], wxr = wx[0], wyt = wy[0], wyb = wy[0];
+				for (i = 1; i < 4; ++i)
+				{
+				    if (wx[i] < wxl) wxl = wx[i]; if (wx[i] > wxr) wxr = wx[i];
+				    if (wy[i] < wyt) wyt = wy[i]; if (wy[i] > wyb) wyb = wy[i];
+				}
+				psw_emit_clipwin(wxl, wyt, wxr, wyb);
+				psw_emit_rectquad(slot, colr, qx, qy, v0, vh, 1);
+				done = 1;
+			    }
+			}
+		    }
+		}
+		if (!done)
+		{   /* edge tile: fan of the full character (warp bounded to the tile) */
+		    int sxv[PSW_FAN_MAX], syv[PSW_FAN_MAX], ok = 1;
+		    for (i = 0; i < m; ++i)
+			if (!psw_project(bxv[i], byv[i], ph, psign, &sxv[i], &syv[i]))
+			{ ok = 0; break; }
+		    if (!ok) continue;
+		    for (i = 1; i + 1 < m; i += 2)
+		    {
+			int qx[4], qy[4];
+			int i2 = (i + 2 < m) ? i + 2 : i + 1;
+			qx[0] = sxv[0];     qy[0] = syv[0];
+			qx[1] = sxv[i];     qy[1] = syv[i];
+			qx[2] = sxv[i + 1]; qy[2] = syv[i + 1];
+			qx[3] = sxv[i2];    qy[3] = syv[i2];
+			psw_emit_flatquad(slot, colr, qx, qy);
+		    }
 		}
 	    }
 	}
@@ -8371,76 +8595,38 @@ static int psw_plane_los_cull(const int *cx, const int *cy, int n, int h,
 	if (d2 > dfar)  { dfar  = d2; xf = cx[i]; yf = cy[i]; }
 	if (d2 < dnear) { dnear = d2; xn = cx[i]; yn = cy[i]; }
     }
-    *tile_test = 0;
-    if (psign > 0)
-    {
-	if (psw_floor_pt_hidden(xf, yf, h)) return 1;
-	*tile_test = psw_floor_pt_hidden(xn, yn, h);
-    }
-    else
-    {
-	if (psw_ceil_pt_hidden(xf, yf, h)) return 1;
-	*tile_test = psw_ceil_pt_hidden(xn, yn, h);
+    {   /* round 9 softening (console 2026-09-02, "il manque beaucoup de murs et
+	   plafonds"): the farthest-vertex probe alone killed WHOLE planes whose
+	   far corner sat past a doorway while most of the plane was overhead /
+	   underfoot and plainly visible.  Full cull now needs the farthest AND
+	   nearest vertices proven hidden; one of the two hidden = mixed -> the
+	   tile walker refines per tile (bounded 64u over-cull fringe only). */
+	int fhid, nhid;
+	if (psign > 0)
+	{
+	    fhid = psw_floor_pt_hidden(xf, yf, h);
+	    nhid = psw_floor_pt_hidden(xn, yn, h);
+	}
+	else
+	{
+	    fhid = psw_ceil_pt_hidden(xf, yf, h);
+	    nhid = psw_ceil_pt_hidden(xn, yn, h);
+	}
+	if (fhid && nhid) return 1;
+	*tile_test = fhid || nhid;
     }
     return 0;
 }
 
-/* WALL-OCCLUSION BUCKETS (owner: "l'occlusion par les murs à la PowerSlave").
-   40 x 8-px screen slices, each holding ONE open vertical band [t,b].  The
-   pre-pass walks subsectors NEAR->FAR: it tests each sub's planes and walls
-   against the bands built so far (= strictly nearer occluders, the BSP
-   guarantee), then FOLDS the sub's own accepted wall quads in -- so a window's
-   upper/lower tiers narrow the band exactly like a PowerSlave portal, and the
-   rooms behind emit only what the opening shows.  Folding uses the quad's INNER
-   rows over fully-covered buckets (conservative occluder), tests use the OUTER
-   rows over every touched bucket (conservative visibility): a middle-split band
-   (rare floating quad) is ignored, so nothing visible is ever culled. */
-#define PSW_OCC_NB 40
-static short psw_occ_t[PSW_OCC_NB], psw_occ_b[PSW_OCC_NB];
-static unsigned char wall_cull[WALL_ACC_MAX];   /* 1 = occlusion-culled (PSW only) */
-static int psw_wall_cull = 0;
-
-static int psw_occ_box_hidden(int xl, int xr, int yt, int yb)
-{
-    int b, ba = xl >> 3, bb = xr >> 3;
-    if (ba < 0) ba = 0;
-    if (bb >= PSW_OCC_NB) bb = PSW_OCC_NB - 1;
-    if (ba > bb) return 0;
-    for (b = ba; b <= bb; ++b)
-	if (yt <= psw_occ_b[b] && yb >= psw_occ_t[b]) return 0;   /* meets an open band */
-    return 1;
-}
-
-static int psw_occ_wall_hidden(int i)
-{
-    int xa = wall_acc[i].x1, xb = wall_acc[i].x2, t;
-    int qt = wall_acc[i].yl1 < wall_acc[i].yl2 ? wall_acc[i].yl1 : wall_acc[i].yl2;
-    int qb = wall_acc[i].yh1 > wall_acc[i].yh2 ? wall_acc[i].yh1 : wall_acc[i].yh2;
-    if (xa > xb) { t = xa; xa = xb; xb = t; }
-    return psw_occ_box_hidden(xa, xb, qt, qb);
-}
-
-static void psw_occ_fold(int i)
-{
-    int xa = wall_acc[i].x1, xb = wall_acc[i].x2, t, b, ba, bb;
-    int qt = wall_acc[i].yl1 > wall_acc[i].yl2 ? wall_acc[i].yl1 : wall_acc[i].yl2;
-    int qb = wall_acc[i].yh1 < wall_acc[i].yh2 ? wall_acc[i].yh1 : wall_acc[i].yh2;
-    if (xa > xb) { t = xa; xa = xb; xb = t; }
-    if (qt > qb) return;
-    ba = (xa + 7) >> 3;                       /* fully-covered buckets only */
-    bb = ((xb + 1) >> 3) - 1;
-    if (ba < 0) ba = 0;
-    if (bb >= PSW_OCC_NB) bb = PSW_OCC_NB - 1;
-    for (b = ba; b <= bb; ++b)
-    {
-	if (qt <= psw_occ_t[b] && qb >= psw_occ_b[b])
-	{ psw_occ_t[b] = 1; psw_occ_b[b] = 0; }              /* closed */
-	else if (qt <= psw_occ_t[b] && qb >= psw_occ_t[b])
-	    psw_occ_t[b] = (short)(qb + 1);                  /* shaved from the top */
-	else if (qb >= psw_occ_b[b] && qt <= psw_occ_b[b])
-	    psw_occ_b[b] = (short)(qt - 1);                  /* shaved from the bottom */
-    }
-}
+/* (round-8 WALL-OCCLUSION BUCKETS deleted in round 9.  Console 2026-09-02 read
+   c0 on every capture: a full-height band is only ever TOUCHED at its edges by
+   mid-screen wall quads, and without folding the FLAT regions the bands never
+   narrowed -- the scheme could not cull by construction.  The occlusion now
+   lives in core r_segs.c as per-column PORTAL BANDS (sat_psw_bt/bb): tiers are
+   tested and culled at the hook, subsector planes are tested at NOTE time via
+   R_PswBandBoxHidden, and the fold includes the front sector's ceiling/floor
+   plane regions -- vanilla ceilingclip/floorclip semantics, which is what makes
+   the bands actually bite.) */
 
 /* RBG0 PUNCH (console 2026-09-01, owner: "un sol plus loin sous le plan affiché
    sur le sol").  The painter orders VDP1 surfaces among themselves, but the
@@ -8458,7 +8644,7 @@ static void psw_emit_punchquad(const int *qx, const int *qy)
     extern int detailshift, viewwindowx, viewwindowy;
     int vx = viewwindowx, vy = viewwindowy, i;
     if (vdp1_wnext >= vdp1_wall_cap) return;
-    if (psw_flat_cmds >= PSW_FLAT_CAP) return;
+    if (psw_flat_cmds >= psw_flat_cap_dyn) return;
     memset(cmd, 0, sizeof cmd);
     cmd[0] = 0x0004;                   /* POLYGON */
     cmd[2] = 0x00C0;                   /* SPD: colour-0 pixels are WRITTEN (erase recipe) */
@@ -8748,6 +8934,9 @@ static void vdp1_walls_flush(void)
         for (int i = 0; i < wall_acc_n && i < budget; ++i)
         {
             if (!wall_acc[i].special) continue;
+#if SAT_PSW
+            if (sat_psw_active && wall_hypermag(i)) { wall_acc[i].mode = 2; continue; }
+#endif
             int slot = wall_tex_resolve(wall_acc[i].texnum, wall_acc[i].cmap);
             if (slot >= 0) { wall_acc[i].slot = (short)slot; wall_acc[i].mode = 1; }
             else
@@ -8785,6 +8974,9 @@ static void vdp1_walls_flush(void)
         int wmode = sat_iso_flat            ? 2   /* iso mode 4: force every VDP1 wall FLAT (overdraw-vs-fill probe) */
                   : (wall_acc[i].special)  ? 0
                   : wall_potato(i);
+#if SAT_PSW
+        if (sat_psw_active && wmode != 2 && wall_hypermag(i)) wmode = 2;
+#endif
         /* THE SIXTH PATH (owner's console capture: w0 sb0 lb..:0 fl0/0 and flat walls on
            screen -- all five known causes at zero, so a sixth existed).  Here it is: the
            wall was never a candidate for texturing at all, because its own SQ style asked
@@ -8837,16 +9029,13 @@ static void vdp1_walls_flush(void)
        the wall-cap guard, a texture slot that will not resolve, a degenerate quad.  Rather than
        audit every `return` in three emit functions, watch the command pointer: if it did not
        move, nothing was written and this wall is a hole.  Row 13 `N<orphan>/<drop>`. */
-#if SAT_PSW
-#define PSW_WCULL(i) (sat_psw_active && wall_cull[i])   /* occlusion-culled: skip, not a drop */
-#else
-#define PSW_WCULL(i) 0
-#endif
+/* (round 9: the PSW wall-occlusion branch left this macro -- tiers are now
+   culled in core R_PswEmitTier against the portal bands, BEFORE they ever
+   reach wall_acc, so every accumulated wall is meant to be plotted.) */
 #define VDP1_PLOT_WALL(i) do {                                                       \
         unsigned int wn0 = vdp1_wnext;                                               \
         int emitted = 1;                                                             \
-        if      (PSW_WCULL(i))            emitted = 0;                               \
-        else if (sat_wall_paint & 1)      wall_emit_flat(i);   /* DEBUG PAINT green */\
+        if      (sat_wall_paint & 1)      wall_emit_flat(i);   /* DEBUG PAINT green */\
         else if (wall_acc[i].mode == 1)   wall_emit(i);                              \
         else if (wall_acc[i].mode == 3)   wall_emit_banded(i);                       \
         else if (wall_acc[i].mode == 2)   wall_emit_flat(i);                         \
@@ -8865,99 +9054,57 @@ static void vdp1_walls_flush(void)
         int tail = (psw_sub_tail < wall_acc_n) ? psw_sub_tail : wall_acc_n;
         psw_flat_cmds = 0; psw_flat_denied = 0; psw_punch_cmds = 0;
         for (int s = 0; s < PSW_FLAT_SLOTS; ++s) psw_slot[s].used = 0;
-        /* NEAR->FAR pre-pass, two budgets at once:
-           - TILES: spend PSW_TILE_BUDGET grid tiles (the world-clip bounds fill
-             ~= visible by construction, so the scarce resources left are command
-             SLOTS and emission CPU -- both proportional to tiles); once it is
-             gone the remaining (farther) subs' flats are KILLED for this frame
-             (row 13 `k`).  A single plane above PSW_TILE_PLANE_MAX bills the 2
-             commands of its stretched-fan fallback, matching the emitter.
-           - SLOTS: reserve the texture slots for the nearest surviving flats; a
-             reserved slot is 'used' and cannot be evicted for the rest of the
-             frame; far flats beyond the slots fall back to the solid polygon. */
+        /* NEAR->FAR pre-pass, round 9: pure BUDGET arithmetic -- the visibility
+           verdicts were computed at NOTE time (core portal bands + LOS ladder,
+           stored in psw_sub_flag / psw_sub_fe / psw_sub_ce), and the wall tiers
+           were culled in core before they ever reached wall_acc.  Three pools:
+           - COMMANDS: the flats' real room = bank - the walls' decided command
+             cost - the things reserve (famine unification: flats overflowing
+             the shared bank used to drop the NEAREST geometry, since emission
+             is far->near -- console 2026-09-02, the hole class);
+           - TILES: PSW_TILE_BUDGET grid tiles bound the VDP1 fill (plot time);
+           - SLOTS: reserve the texture slots for the nearest surviving flats.
+           All spent NEAR->FAR, so any loss is the FARTHEST rooms' flats
+           (row 13 `k`), never the near field. */
         {
-            extern int viewwindowx, viewwindowy, viewheight, detailshift;
-            int ftile = 0;
-            psw_kill_n = 0; psw_punch_frame = 0; psw_wall_cull = 0;
-            for (int b = 0; b < PSW_OCC_NB; ++b)
-            {   /* occlusion buckets: open band = the whole view */
-                psw_occ_t[b] = (short)viewwindowy;
-                psw_occ_b[b] = (short)(viewwindowy + viewheight - 1);
-            }
+            int ftile = 0, fbudget, wall_cmds = 0, treserve = 0;
+            psw_kill_n = 0; psw_punch_frame = 0;
+            for (int i = 0; i < wall_acc_n; ++i)
+                wall_cmds += (wall_acc[i].mode == 1) ? wall_tilecount(i)
+                           : (wall_acc[i].mode == 3) ? wall_banded_cost(i)
+                           : (wall_acc[i].mode == 2) ? 1 : 0;
+#if SAT_WORLD_THINGS_VDP1
+            treserve = 2 * thing_acc_n + 8;   /* 2 cmds/thing + the per-batch clip restores */
+#endif
+            fbudget = (vdp1_wall_cap - (int)vdp1_wnext) - wall_cmds - treserve - 4;
+            if (fbudget < 0) fbudget = 0;
+            if (fbudget > PSW_FLAT_CAP) fbudget = PSW_FLAT_CAP;
+            psw_flat_cap_dyn = fbudget;
             for (int k = 0; k < psw_sub_n; ++k)
             {
                 int fl, cl, fdom;
-                int wend = (k + 1 < psw_sub_n) ? (int)psw_sub[k + 1].w0 : tail;
-                int wbeg = (int)psw_sub[k].w0;
-                if (wend > wall_acc_n) wend = wall_acc_n;
-                if (wbeg > wend) wbeg = wend;
-                psw_sub_kill[k] = 0; psw_sub_flag[k] = 0;
+                psw_sub_kill[k] = 0;
                 psw_sub_lumps(k, &fl, &cl, &fdom);
-                if (fl >= 0 || cl >= 0)
+                /* punch: a lower-than-dominant floor SURVIVED its note verdict */
+                if (fl >= 0 && !(psw_sub_flag[k] & 1)
+                    && psw_sub[k].fh < sat_vdp2_floor_h)
+                    psw_punch_frame = 1;
+                if (fl < 0 && cl < 0 && !fdom) continue;
+                if (ftile >= PSW_TILE_BUDGET || ftile >= fbudget)
+                { psw_sub_kill[k] = 1; psw_kill_n++; continue; }
+                if (fdom) ftile += 1;             /* punch room at this sub's rank */
+                if (fl >= 0 && !(psw_sub_flag[k] & 1))
                 {
-                    if (ftile >= PSW_TILE_BUDGET)
-                    { psw_sub_kill[k] = 1; psw_kill_n++; }
-                    else if (psw_polys_ok && psw_sub[k].subnum >= 0)
-                    {
-                        int cxv[PSW_FAN_MAX], cyv[PSW_FAN_MAX], nn, e, tt, v;
-                        int sn = (int)psw_sub[k].subnum;
-                        for (int pass = 0; pass < 2; ++pass)
-                        {
-                            int h, psn, bit;
-                            if (pass == 0) { if (fl < 0) continue;
-                                             h = psw_sub[k].fh; psn = 1;  bit = 1; }
-                            else           { if (cl < 0) continue;
-                                             h = psw_sub[k].ch; psn = -1; bit = 4; }
-                            nn = psw_plane_poly(sn, psn > 0 ? viewz - h : h - viewz,
-                                                psn, cxv, cyv);
-                            if (nn < 3) { psw_sub_flag[k] |= bit; continue; }
-                            if (psw_plane_los_cull(cxv, cyv, nn, h, psn, &tt))
-                            { psw_sub_flag[k] |= bit; continue; }
-                            if (tt) psw_sub_flag[k] |= bit << 1;
-                            {   /* projected bbox vs the wall-occlusion buckets
-                                   (only NEARER subs' walls are folded so far) */
-                                int sx, sy, okp = 1;
-                                int xl = 0x7fff, xr = -0x7fff;
-                                int yt = 0x7fff, yb = -0x7fff;
-                                for (v = 0; v < nn; ++v)
-                                {
-                                    if (!psw_project(cxv[v], cyv[v],
-                                                     psn > 0 ? viewz - h : h - viewz,
-                                                     psn, &sx, &sy)) { okp = 0; break; }
-                                    sx = (sx << detailshift) + viewwindowx;
-                                    sy += viewwindowy;
-                                    if (sx < xl) xl = sx; if (sx > xr) xr = sx;
-                                    if (sy < yt) yt = sy; if (sy > yb) yb = sy;
-                                }
-                                if (okp && psw_occ_box_hidden(xl, xr, yt, yb))
-                                { psw_sub_flag[k] |= bit; continue; }
-                            }
-                            if (psn > 0 && h < sat_vdp2_floor_h)
-                                psw_punch_frame = 1;   /* a lower floor SURVIVES -> punch */
-                            e = psw_tile_est(cxv, cyv, nn);
-                            ftile += (e > PSW_TILE_PLANE_MAX) ? 2 : e;
-                        }
-                    }
-                    if (!psw_sub_kill[k])
-                    {
-                        if (fl >= 0 && !(psw_sub_flag[k] & 1)) psw_slot_get(fl);
-                        if (cl >= 0 && !(psw_sub_flag[k] & 4)) psw_slot_get(cl);
-                    }
+                    int e = psw_sub_fe[k];
+                    ftile += (e > PSW_TILE_PLANE_MAX) ? 2 : e + 1;  /* +1 = edge slack */
+                    psw_slot_get(fl);
                 }
-                /* this sub's walls: cull against the nearer state, then fold the
-                   survivors in as occluders for everything farther */
-                for (int i = wbeg; i < wend; ++i)
+                if (cl >= 0 && !(psw_sub_flag[k] & 4))
                 {
-                    wall_cull[i] = (unsigned char)psw_occ_wall_hidden(i);
-                    if (wall_cull[i]) psw_wall_cull++;
-                    else psw_occ_fold(i);
+                    int e = psw_sub_ce[k];
+                    ftile += (e > PSW_TILE_PLANE_MAX) ? 2 : e + 1;
+                    psw_slot_get(cl);
                 }
-            }
-            /* overflow-tail walls are farther than every recorded sub */
-            for (int i = tail; i < wall_acc_n; ++i)
-            {
-                wall_cull[i] = (unsigned char)psw_occ_wall_hidden(i);
-                if (wall_cull[i]) psw_wall_cull++;
             }
         }
         for (int i = wall_acc_n - 1; i >= tail; --i) VDP1_PLOT_WALL(i);
@@ -8980,7 +9127,8 @@ static void vdp1_walls_flush(void)
         }
         psw_flat_last = psw_flat_cmds; psw_flat_denied_last = psw_flat_denied;
         psw_kill_last = psw_kill_n;    psw_punch_last = psw_punch_cmds;
-        psw_wall_cull_last = psw_wall_cull;
+        /* (row 13 `c` is now the CORE band-cull counter sat_psw_wcull,
+           snapshotted at the frame-boundary latch with tiers/ref) */
 #if SAT_WORLD_THINGS_VDP1
         if (psw_thing_drop > 0)
         {   /* a dropped queued thing is drawn by NOBODY this frame (the vanish class):
@@ -11682,7 +11830,8 @@ extern "C" void DG_DrawFrame(void)
        are snapshotted here so row 13 prints last frame's numbers whatever the overlay mode. */
     {
         sat_psw_t_last = sat_psw_tiers; sat_psw_r_last = sat_psw_ref;
-        sat_psw_tiers = 0; sat_psw_ref = 0;
+        psw_wall_cull_last = sat_psw_wcull;             /* round 9: core band culls */
+        sat_psw_tiers = 0; sat_psw_ref = 0; sat_psw_wcull = 0;
         psw_sub_n = 0; psw_sub_tail = 0x7fff;   /* step 2: fresh recorder for the next walk
                                                    (this frame's records were consumed at the kick) */
         psw_spr_tail = 0x7fff;                  /* step 3: sprite-watermark tail, same lifecycle */

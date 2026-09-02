@@ -290,6 +290,24 @@ StoreWallRange, curline/frontsector/backsector/rw_angle1 vivants).
 > tx11/26 = à moitié vide ; WTEX_SMALL_N 16→14 build PSW seul, relayout pool fin
 > 0x25C59E00, flats 4-7 jusqu'à 0x25C5DE00, sous l'extension banque). Attendu : le trou
 > triangle mort, le rebord droit, le magenta réduit au LOD ≤16 px réel.
+> **Round 21 console (2026-09-02)** : owner — (1) « le trou triangulaire est encore là,
+> c'est un plafond en partie occulté par un mur » ⇒ fausse route round 20 : le cull
+> plan-entier n'était pas le mécanisme. Pli bandes-portales relu = vanilla-correct par
+> colonne, bandbox conservateur ⇒ LE suspect restant qui colle (forme = sous-secteur,
+> bordé de murs dessinés, insensible à TOUS les changements culls/budget) = **débordement
+> silencieux du recorder** (PSW_SUB_MAX 240 : les subs en excès émettent leurs murs, leurs
+> flats JAMAIS — la classe round-13 revenue). Fix : 240→384 (+~5 Ko .bss) ET fin du cap
+> silencieux : row 13 `r` (mort sous PSW) → **`o` = overflows comptés** — o>0 = remonter
+> la constante, o0 + trou = classe inconnue. (2) « le rose toujours là, flat » ⇒ mon
+> erreur round 20 : retirer les sondes par-tuile des SOLS a fait exploser leur coût en
+> COMMANDES (chaque tuile sur-peinte = 2 cmds) ⇒ facture pleine ⇒ tour B n'upgradait
+> plus ⇒ budget-solid partout. Sondes sols RESTAURÉES (classification mixte + facture
+> sondée) ; le cull plan-entier reste supprimé. (3) « bancal » (sous-bandes) : assumé —
+> silhouette exacte + texture ancrée-monde + une commande = impossible sur VDP1 (le
+> mapping n'est world-exact que sur des rects alignés monde) ; le choix = ancrage + pas
+> de 8u, l'alternative (warp exact) = le swimmer prouvé. PowerSlave n'a pas ce problème
+> parce que ses niveaux sont dessinés sur la grille. Attendu : triangle mort (ou o>0 le
+> désigne), rose → orange/texturé, `o` à surveiller en priorité.
 
 ## Étape 2 — sols non-dominants + plafonds (quads de sous-secteurs)
 

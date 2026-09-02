@@ -684,6 +684,7 @@ static int  psw_punch_last = 0;            /* RBG0 punch polygons last frame (ro
 static int  psw_wall_cull_last = 0;        /* wall quads occlusion-culled last frame (row 13 `c`) */
 static int  psw_band_last = 0;             /* clean band+window flat pieces (row 13 `b`) */
 static int  psw_fan_last = 0;              /* fan flat pieces/planes (row 13 `n`) */
+static int  psw_sub_ovf_last = 0;          /* subsector-recorder overflow (row 13 `o`) */
 #endif
 extern "C" int            sat_sky_view;         /* core Part 5: elected split view for the HW sky (-1 = none => all software) */
 extern "C" unsigned int   sat_sky_px_view[4];   /* core Part 5: per-view SKY pixel coverage (election metric) */
@@ -3311,11 +3312,14 @@ static void fps_update(void)
 #if SAT_PSW
             /* PSW tenant of row 13 (replaces LOS while the painter world is ON -- LOS's
                lead-fill/clamp fields are all dead in that mode): t = tier quads accepted
-               last frame, r = shed (wall_acc/px budget full = the FAR remainder). */
+               last frame.  (`r` -- wall refusals, structurally 0 under PSW since the
+               px-budget refusal is skipped -- ceded its slot to `o` in round 21:
+               subsector-RECORDER overflow, the silent plane-hole class.  o>0 = the
+               triangle holes are PSW_SUB_MAX, nothing else.) */
             if (sat_psw_active)
-                snprintf(ovbuf, sizeof ovbuf, "PSW t%d r%d f%d d%d k%d u%d c%d b%d n%d  ",
+                snprintf(ovbuf, sizeof ovbuf, "PSW t%d o%d f%d d%d k%d u%d c%d b%d n%d  ",
                          sat_psw_t_last > 999 ? 999 : sat_psw_t_last,
-                         sat_psw_r_last > 999 ? 999 : sat_psw_r_last,
+                         psw_sub_ovf_last > 999 ? 999 : psw_sub_ovf_last,
                          psw_flat_last  > 999 ? 999 : psw_flat_last,
                          psw_flat_denied_last > 99 ? 99 : psw_flat_denied_last,
                          psw_kill_last  > 99  ? 99  : psw_kill_last,
@@ -7996,8 +8000,15 @@ static void vdp1_floors_flush(void) {}
    KNOWN one-frame artifact: a slot eviction re-uploads texels the still-plotting
    previous bank may read (same acceptance as the parked design; LRU keeps
    resident flats stable below 3 distinct lumps/frame). */
-#define PSW_SUB_MAX      240   /* round 13: 192 overflowed on wide views (tail subs
-                                  have walls but NO flats = distance holes) */
+#define PSW_SUB_MAX      384   /* round 21: 240 -> 384.  The recorder overflow is the
+                                  LAST mechanism standing for the owner's triangle hole
+                                  (a ceiling partially occluded by a wall, k0 d0 r0,
+                                  UNMOVED by every cull/budget change): a sub past the
+                                  cap emits its walls (tail) but NEVER its flats -- a
+                                  missing plane in the exact shape of a subsector,
+                                  bordered by drawn walls.  Round 13 saw this class at
+                                  192 and raised blind; this time the overflow is
+                                  COUNTED (psw_sub_ovf, row 13 `o`) -- no silent cap. */
 #define PSW_FLAT_SLOTS   8
 /* 3 slots fill the freed F-bank top (0x25C7D000..0x25C80000); the 4th takes the
    KB below (0x25C7C000), which only the worst-case 2p HUD stack can reach -- and
@@ -8076,6 +8087,10 @@ static struct {
 } psw_sub[PSW_SUB_MAX];
 static int psw_sub_n = 0;
 static int psw_sub_tail = 0x7fff;    /* wall watermark at the FIRST overflow (0x7fff = none) */
+static int psw_sub_ovf = 0;          /* subs REJECTED by the recorder this walk (round 21:
+                                        each is a plane hole nothing else can explain --
+                                        row 13 `o`, psw_sub_ovf_last up top; o>0 = raise
+                                        PSW_SUB_MAX again) */
 static int psw_spr_tail = 0x7fff;    /* vissprite watermark at the FIRST overflow */
 static int psw_flat_cmds = 0;
 static int psw_paint_idx = 88;   /* L+X flat paint, PER EMIT PATH (round 12 diagnostic):
@@ -8154,6 +8169,7 @@ static void sat_psw_sub_note(int subnum, int fh, int ch, int fpic,
     {
 	if (psw_sub_tail == 0x7fff) { psw_sub_tail = wall_acc_n;   /* tail walls = farther subs */
 	                              psw_spr_tail = vis0; }
+	psw_sub_ovf++;                                             /* round 21: a COUNTED hole */
 	return;
     }
     k = psw_sub_n;
@@ -8187,14 +8203,16 @@ static void sat_psw_sub_note(int subnum, int fh, int ch, int fpic,
 	    }
 	    nn = psw_plane_poly(subnum, psn > 0 ? viewz - h : h - viewz, psn, cxv, cyv);
 	    if (nn < 3) { psw_sub_flag[k] |= bit; continue; }
-	    /* round 20: FLOORS take no LOS ladder at all -- overdrawn floor
-	       pixels are overpainted by nearer subs (painter) or punched back
-	       to RBG0 (dominant ledges), so the probes could only ever CREATE
-	       holes there, never correctness.  Ceilings keep the ladder for
-	       the MIXED classification (the per-tile sky-hack guard is what
-	       stops a far ceiling ghosting over the VDP2 sky). */
+	    /* round 21: the ladder is back for FLOORS too -- round 20 removed it
+	       arguing fill is free on an idle VDP1, but every overdrawn tile is
+	       also 2 COMMANDS, and the bank is 495, not infinite: open scenes
+	       billed (and would really spend) their floors at FULL touched
+	       tiles, round B could upgrade almost nothing, and the whole far
+	       field went budget-solid = the console "toujours rempli de rose".
+	       The ladder only ever CLASSIFIES now (mixed -> per-tile probes +
+	       probed billing); the whole-plane cull stays deleted (round 20). */
 	    tt = 0;
-	    if (psn < 0) psw_plane_los_cull(cxv, cyv, nn, h, psn, &tt);
+	    psw_plane_los_cull(cxv, cyv, nn, h, psn, &tt);
 	    if (tt) psw_sub_flag[k] |= bit << 1;
 	    {   /* projected bbox vs the core's portal bands (view-relative) */
 		int sx, sy, okp = 1;
@@ -8940,9 +8958,10 @@ static int psw_plane_los_cull(const int *cx, const int *cy, int n, int h,
 	   all verts, centroid -- only shrank the failure, never removed it).
 	   The probes now only classify the plane MIXED (per-tile refinement) vs
 	   fully-visible; the wrongly-classified cost is bounded overdraw on an
-	   idle VDP1, never a hole.  Floors do not even reach here anymore (the
-	   painter + the RBG0 punch cover every floor overdraw case by
-	   construction -- the caller skips the ladder for psign > 0). */
+	   idle VDP1, never a whole-plane hole.  (Round 21: floors are BACK on
+	   this ladder -- overdraw is also COMMANDS, not just fill, and skipping
+	   the classification made open scenes bill/spend their floors at full
+	   touched tiles = the budget-solid magenta flood.) */
 	int fhid, nhid;
 	if (psign > 0)
 	{
@@ -12349,7 +12368,8 @@ extern "C" void DG_DrawFrame(void)
     {
         sat_psw_t_last = sat_psw_tiers; sat_psw_r_last = sat_psw_ref;
         psw_wall_cull_last = sat_psw_wcull;             /* round 9: core band culls */
-        sat_psw_tiers = 0; sat_psw_ref = 0; sat_psw_wcull = 0;
+        psw_sub_ovf_last = psw_sub_ovf;                 /* round 21: recorder overflow */
+        sat_psw_tiers = 0; sat_psw_ref = 0; sat_psw_wcull = 0; psw_sub_ovf = 0;
         psw_sub_n = 0; psw_sub_tail = 0x7fff;   /* step 2: fresh recorder for the next walk
                                                    (this frame's records were consumed at the kick) */
         psw_spr_tail = 0x7fff;                  /* step 3: sprite-watermark tail, same lifecycle */

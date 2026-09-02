@@ -250,6 +250,24 @@ StoreWallRange, curline/frontsector/backsector/rw_angle1 vivants).
 > normal les aplats sont couleur-texel (vert nukage sur RBG0 acide = camouflés) et
 > partiellement repeints par les poinçons couleur-0 ; L+X révèle leur étendue réelle =
 > le champ lointain dégradé. Attendu salle acide : murs plus plats, plans TOUS présents.
+> **Round 19 (2026-09-02) — EXTENSION DE BANQUE, fin du rationnement** (owner : « on est
+> passés en full vdp1 pour trouver de la performance, et tout ce que tu fais c'est
+> couper » — exact). Constat : la salle acide tourne à ~12 fps CPU-bound avec fence `w0`
+> partout = le VDP1 finissait toujours en avance, seul le PLAFOND DE 304 était plein —
+> un plafond artificiel. Les 12 Ko libres en queue de pool murs (0x25C5E000..0x25C61000,
+> réservés par leur propre commentaire « ≥ one 8 KB VDP1 command bank ») deviennent
+> 2×192 slots : slot physique 303 de chaque banque = sysclip+JUMP_ASSIGN statique vers
+> son extension (recette du terminateur per-frame, écrite une fois à l'init) ;
+> `vdp1_cmd_at()` traduit les slots logiques ≥303 — aucun émetteur ne change. **304 →
+> 495 commandes logiques** ; WALL_CMD_CAP 487, PSW_FLAT_CAP 232→420 ; compteur LOPR
+> extension-aware (un overrun dans l'extension se mappe en slots logiques). **Round-18
+> « murs cèdent aux flats » RETIRÉ** (demande owner) : plus personne ne cède — murs
+> tuilés ET plans tuilés tiennent ensemble (~370-430 < 487 dans la salle acide).
+> L'allocation garantie A/B reste (police d'allocation saine, upgrade tout quand ça
+> tient). Attendu : k0 partout, magenta réduit aux bandes LOD ≤16 px, murs texturés
+> comme avant. À surveiller : VD1 `<ms>` (attente fence — le vrai prix du plot en salle
+> lourde), `w` doit rester 0, LP/B cohérents. Fence = inchangée (sentinelle = banque
+> vide, adresse fixe). Build normal : extension compilée out (#if SAT_PSW), bit-intact.
 
 ## Étape 2 — sols non-dominants + plafonds (quads de sous-secteurs)
 

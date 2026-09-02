@@ -5820,7 +5820,22 @@ extern "C" void sat_sky_precache(void)
    at 0x25C04D00, +48 commands each.  PSW builds only -- the validated normal
    build keeps its exact bank geometry. */
 static const unsigned int VDP1_BANK[2] = { 0x25C00100u, 0x25C02700u };
-#define VDP1_BANK_CMDS  304               /* commands per bank (0x2600 VRAM / 32B each) */
+/* PSW round 19: BANK EXTENSION (owner: "on est passes en full vdp1 pour trouver de
+   la performance, et tout ce que tu fais c'est couper").  The famine rounds were
+   rationing an ARTIFICIAL ceiling: the 12 KB at the wall-pool tail (0x25C5E000..
+   0x25C61000, documented spare since the WTEX 3-class cut -- its own comment said
+   ">= one 8 KB VDP1 command bank if the bank widening wants it") becomes 2 x 192
+   command slots.  Each bank's PHYSICAL slot 303 holds a STATIC sysclip+JUMP_ASSIGN
+   into its extension (the exact per-frame terminator recipe, written once at init);
+   vdp1_cmd_at() translates logical slots >= 303 to the extension, so every emitter
+   keeps its plain wnext++.  304 -> 495 logical commands: the acid-room demand
+   (walls tiled + all flats tiled + things) fits WITHOUT yielding anything.  The
+   plot-time check: that room runs ~12 fps CPU-bound with fence w0 (the plot always
+   finished early) -- the VDP1 was idle, only the bank was full. */
+#define VDP1_BANK_SPLIT     303           /* last physical slot of the 0x2600 region = the JUMP */
+static const unsigned int VDP1_BANK_EXT[2] = { 0x25C5E000u, 0x25C5F800u };
+#define VDP1_BANK_EXT_CMDS  192           /* 0x1800 VRAM / 32B each */
+#define VDP1_BANK_CMDS  (VDP1_BANK_SPLIT + VDP1_BANK_EXT_CMDS)   /* 495 logical cmds per bank */
 #else
 static const unsigned int VDP1_BANK[2] = { 0x25C00100u, 0x25C02100u };
 #define VDP1_BANK_CMDS  256               /* commands per bank (0x2000 VRAM / 32B each) */
@@ -6012,9 +6027,18 @@ static int thing_drop_hold = 0;            /* kicks left with the emit-cap ramp 
                                               at the top: the overlay row prints it far above here) */
 #endif
 
-/* Write one 32-byte VDP1 command (16 halfwords) at command index `idx` of `base`. */
+/* Write one 32-byte VDP1 command (16 halfwords) at command index `idx` of `base`.
+   PSW: logical slots >= VDP1_BANK_SPLIT of a wall bank land in its EXTENSION region
+   (the physical slot 303 holds the static jump there -- see VDP1_BANK_EXT). */
 static void vdp1_cmd_at(unsigned int base, int idx, const unsigned short *c)
 {
+#if SAT_PSW
+    if (idx >= VDP1_BANK_SPLIT && (base == VDP1_BANK[0] || base == VDP1_BANK[1]))
+    {
+        base = VDP1_BANK_EXT[base == VDP1_BANK[1] ? 1 : 0];
+        idx -= VDP1_BANK_SPLIT;
+    }
+#endif
     volatile unsigned short *p = (volatile unsigned short *)base + idx * 16;
     for (int k = 0; k < 16; ++k)
         p[k] = c[k];
@@ -6092,8 +6116,10 @@ static inline unsigned short pal_rgb555(int idx)
 #define WTEX_NARROW_BASE (WTEX_SMALL_BASE  + WTEX_SMALL_N  * WTEX_SMALL_SZ)   /* 0x25C26000 */
 #define WTEX_WIDE_BASE   (WTEX_NARROW_BASE + WTEX_NARROW_N * WTEX_NARROW_SZ)  /* 0x25C3E000 */
 #define WTEX_SLOTS       (WTEX_SMALL_N + WTEX_NARROW_N + WTEX_WIDE_N)         /* 26 (was 19) */
-/* Pool ends 0x25C5E000; WPN_TEX_BASE is 0x25C61000 -> 0x3000 = 12 KB SPARE at the pool tail,
-   contiguous and unclaimed.  >= one 8 KB VDP1 command bank if the bank widening wants it. */
+/* Pool ends 0x25C5E000; WPN_TEX_BASE is 0x25C61000 -> 0x3000 = 12 KB at the pool tail.
+   CLAIMED by the PSW bank extension (round 19): 2 x 192 command slots (VDP1_BANK_EXT),
+   exactly the "one 8 KB command bank" this note reserved it for.  Normal builds leave
+   it untouched (the extension is #if SAT_PSW). */
 #define WALL_CMD_CAP   (VDP1_BANK_CMDS - 8)   /* walls stop here -> room for end + margin */
 /* RUNTIME wall cap = the view-count-scaled reservation (sat_walls_kick sets it before the flush).
    1p keeps WALL_CMD_CAP.  In a co-op split the walls saturate the bank and the OVERLAYS emitted
@@ -7967,8 +7993,12 @@ static void vdp1_floors_flush(void) {}
    PSW is 1p-locked by the frame-boundary latch, so it is free in every PSW frame. */
 static const unsigned int psw_slot_vram[PSW_FLAT_SLOTS] =
     { 0x25C7D000u, 0x25C7E000u, 0x25C7F000u, 0x25C7C000u };
-#define PSW_FLAT_CAP     232         /* belt: whole-frame flat command hard cap
-                                        (the DYNAMIC budget is the real law) */
+#define PSW_FLAT_CAP     420         /* belt: whole-frame flat command hard cap
+                                        (the DYNAMIC budget is the real law).
+                                        Round 19: raised 232 -> 420 with the bank
+                                        extension (495 cmds) -- the old value was
+                                        sized for the 304 bank and would have been
+                                        the new artificial ceiling. */
 #define PSW_TZ_NEAR      (24 << 16)
 #define PSW_FAN_MAX      28          /* poly verts: core caps at 20, +3 view clips, +4 tile cuts */
 /* DISTANCE LOD (round 16).  Console 2026-09-02: k8-18 with the bank HALF EMPTY
@@ -9216,51 +9246,9 @@ static void vdp1_walls_flush(void)
     int nv = sat_local_players; if (nv < 1) nv = 1; else if (nv > 4) nv = 4;
     int nviews = sat_split_active ? nv : 1;             /* d_main renders nv views in split (2..4) */
     int surplus = budget - wall_acc_n;                 /* cmds available beyond the all-flat baseline */
-#if SAT_PSW
-    if (sat_psw_active)
-    {   /* round 18: WALLS YIELD TO FLATS (the walls-yield-to-things precedent).
-           Console: the acid room held k11-16 with c193-251 -- the famine became
-           REAL, and the marginal loser was wrong: a wall that loses its texture
-           upgrade DEGRADES to a 1-cmd flat (correct geometry, wall colour); a
-           plane that loses its budget is a HOLE (sky/black).  So the flats'
-           GUARANTEED demand -- min(4, e) per eligible pass, 4 per punch-dominant,
-           + the things reserve and margin -- is carved out of the wall-upgrade
-           surplus BEFORE any wall goes tiled.  Near walls still upgrade first
-           with whatever remains.  (psw_punch_frame is resolved HERE now; the
-           budget pre-pass below reuses it.) */
-        int fdem = 0;
-        psw_punch_frame = 0;
-        for (int k = 0; k < psw_sub_n; ++k)
-        {
-            int fl, cl, fdom;
-            psw_sub_lumps(k, &fl, &cl, &fdom);
-            if (fl >= 0 && !(psw_sub_flag[k] & 1)
-                && psw_sub[k].fh < sat_vdp2_floor_h)
-            { psw_punch_frame = 1; break; }
-        }
-        for (int k = 0; k < psw_sub_n; ++k)
-        {
-            int fl, cl, fdom;
-            psw_sub_lumps(k, &fl, &cl, &fdom);
-            if (fl < 0 && cl < 0 && !fdom) continue;
-            if (fdom && psw_punch_frame) fdem += 4;
-            if (fl >= 0 && !(psw_sub_flag[k] & 1))
-            {
-                int e = (psw_sub_flag[k] & 0x10) ? 4 : 2 * (int)psw_sub_fe[k] + 1;
-                fdem += (e < 4) ? e : 4;
-            }
-            if (cl >= 0 && !(psw_sub_flag[k] & 4))
-            {
-                int e = (psw_sub_flag[k] & 0x20) ? 4 : 2 * (int)psw_sub_ce[k] + 1;
-                fdem += (e < 4) ? e : 4;
-            }
-        }
-#if SAT_WORLD_THINGS_VDP1
-        fdem += 2 * thing_acc_n + 8;
-#endif
-        surplus -= fdem + 4;
-    }
-#endif
+    /* (round-18 "walls yield to flats" REVERTED in round 19, owner's call: with the
+       bank extension -- 495 logical commands -- walls and flats both fit textured;
+       the surplus carve-out was rationing an artificial ceiling.) */
     if (surplus < 0) surplus = 0;
     int surplus_per_view = surplus / nviews;
     int extra_used[4] = { 0, 0, 0, 0 };
@@ -9381,7 +9369,18 @@ static void vdp1_walls_flush(void)
            (row 13 `k`), never the near field. */
         {
             int ftile = 0, fbudget, wall_cmds = 0, treserve = 0;
-            psw_kill_n = 0;   /* (psw_punch_frame: resolved by the walls-yield scan above) */
+            psw_kill_n = 0; psw_punch_frame = 0;
+            /* punch pre-scan (round 16, back home after the round-18 revert):
+               resolve psw_punch_frame BEFORE billing so every dominant sub is
+               charged its real punch paper. */
+            for (int k = 0; k < psw_sub_n; ++k)
+            {
+                int fl, cl, fdom;
+                psw_sub_lumps(k, &fl, &cl, &fdom);
+                if (fl >= 0 && !(psw_sub_flag[k] & 1)
+                    && psw_sub[k].fh < sat_vdp2_floor_h)
+                { psw_punch_frame = 1; break; }
+            }
             for (int i = 0; i < wall_acc_n; ++i)
                 wall_cmds += psw_wall_paper(i);
 #if SAT_WORLD_THINGS_VDP1
@@ -9741,6 +9740,24 @@ static void vdp1_wpn_init(void)
     memset(cmd, 0, sizeof cmd);
     cmd[0] = 0x8000;                                 /*             + end */
     vdp1_cmd_at(VDP1_BANKE_ADDR, 1, cmd);
+
+#if SAT_PSW
+    /* Bank-extension bridges (round 19): each bank's PHYSICAL slot 303 = a static
+       sysclip+JUMP_ASSIGN into its extension region.  Same non-drawing vehicle as
+       the per-frame terminator (0x0009|0x1000, idempotent sysclip values); the
+       LINK is constant, so this is written ONCE and never touched again --
+       vdp1_cmd_at() translates every logical write >= 303 past it. */
+    for (int b = 0; b < 2; ++b)
+    {
+        volatile unsigned short *p =
+            (volatile unsigned short *)VDP1_BANK[b] + VDP1_BANK_SPLIT * 16;
+        memset(cmd, 0, sizeof cmd);
+        cmd[0]  = (unsigned short)(0x0009 | 0x1000);
+        cmd[1]  = (unsigned short)((VDP1_BANK_EXT[b] - VDP1_VRAM_BASE) >> 3);
+        cmd[10] = 319; cmd[11] = 223;
+        for (int k = 0; k < 16; ++k) p[k] = cmd[k];
+    }
+#endif
 
     vdp1_bank = 0; vdp1_wactive = 0;
     for (int i = 0; i < WPN_CACHE_N; ++i) wpn_cache[i].lump = -1;
@@ -10517,6 +10534,12 @@ static void vdp1_wpn_kick(void)
         unsigned int bank_off = VDP1_BANK[vdp1_bank & 1] - VDP1_VRAM_BASE;   /* 0x100 (bank0) / 0x2100 (bank1) */
         unsigned int base_ca  = bank_off >> 3;
         unsigned int end_ca   = (bank_off + (unsigned int)vdp1_last_cmds * 32u) >> 3;
+#if SAT_PSW
+        /* round 19: a list longer than the contiguous region ends in the EXTENSION */
+        if (vdp1_last_cmds > VDP1_BANK_SPLIT)
+            end_ca = (VDP1_BANK_EXT[vdp1_bank & 1] - VDP1_VRAM_BASE
+                      + ((unsigned int)vdp1_last_cmds - VDP1_BANK_SPLIT) * 32u) >> 3;
+#endif
         vdp1_lopr  = VDP1_LOPR;
         vdp1_endca = (unsigned short)end_ca;
         {   /* LP = how far LOPR got through the W bank.  BOTH "completed" directions read 100:
@@ -10525,8 +10548,20 @@ static void vdp1_wpn_kick(void)
                  chain before we sampled -- HW-VERIFIED 2026-07-26 (short lists that finish read Lc;
                  long lists that overrun read a mid-bank addr).  This is COMPLETION, not 0%.
                Only LOPR strictly INSIDE [base,end] is a real transfer-over (LP<100 = the flicker). */
-            int span = (int)end_ca - (int)base_ca;         /* = vdp1_last_cmds * 4 (cmd-addr units) */
+            int span = vdp1_last_cmds * 4;                 /* cmd-addr units (4 per 32B command) */
             int got  = (int)vdp1_lopr - (int)base_ca;
+#if SAT_PSW
+            {   /* round 19: LOPR inside the extension maps back to logical slots
+                   (LOPR past the contiguous region used to clamp to "finished") */
+                int ext_ca = (int)((VDP1_BANK_EXT[vdp1_bank & 1] - VDP1_VRAM_BASE) >> 3);
+                if ((int)vdp1_lopr >= ext_ca
+                    && (int)vdp1_lopr < ext_ca + VDP1_BANK_EXT_CMDS * 4)
+                    got = VDP1_BANK_SPLIT * 4 + ((int)vdp1_lopr - ext_ca);
+                else if (got >= VDP1_BANK_SPLIT * 4 && got < span
+                         && vdp1_last_cmds > VDP1_BANK_SPLIT)
+                    got = VDP1_BANK_SPLIT * 4;             /* parked on the jump slot */
+            }
+#endif
             int overran = 0;
             if      (got < 0)     vdp1_lp_pct = 100;       /* finished W -> jumped past it (idle/F)   */
             else if (span <= 0)   vdp1_lp_pct = 100;       /* empty list                              */

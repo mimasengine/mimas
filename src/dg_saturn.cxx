@@ -8002,8 +8002,8 @@ static int psw_sub_tail = 0x7fff;    /* wall watermark at the FIRST overflow (0x
 static int psw_spr_tail = 0x7fff;    /* vissprite watermark at the FIRST overflow */
 static int psw_flat_cmds = 0;
 static int psw_paint_idx = 88;   /* L+X flat paint, PER EMIT PATH (round 12 diagnostic):
-                                    88 = RED full tile, 4 = WHITE band+window (rect/clean),
-                                    250 = MAGENTA fan (edge warp OR budget degrade) --
+                                    88 = RED full tile, 216 = ORANGE band+window,
+                                    250 = MAGENTA solid (budget degrade / famine) --
                                     one capture names the path a bad quad took */
 static int psw_band_n = 0;       /* clean band+window pieces this flush (row 13 `b`) */
 static int psw_fanq_n = 0;       /* fan pieces/planes this flush (row 13 `n`) */
@@ -8287,10 +8287,11 @@ static void psw_emit_rectquad(int slot, unsigned short colr,
                                - VDP1_VRAM_BASE) >> 3);
     cmd[5] = (unsigned short)(0x0800 | vh);           /* 64 x vh texels */
     if (sat_wall_paint & 1)
-    {   /* DEBUG PAINT: band+window pieces solid WHITE (the window still masks,
-	   so the painted shape IS the region really painted) */
+    {   /* DEBUG PAINT: band+window pieces solid ORANGE (owner: white drowned
+	   the overlay text).  The window still masks, so the painted shape IS
+	   the region really painted. */
 	cmd[0] = 0x0004;
-	cmd[3] = (unsigned short)(0x0100u | 4u);
+	cmd[3] = (unsigned short)(0x0100u | 216u);
     }
     for (i = 0; i < 4; ++i)
     {
@@ -8342,18 +8343,32 @@ static int psw_plane_poly(int sn, int ph, int psign, int *ox, int *oy)
     return n;
 }
 
-/* GRID-64 (the PowerSlave data model): how many 64x64 world tiles the clipped
-   plane polygon's bbox spans -- the budget unit AND the tiles-vs-fan branch. */
+/* GRID-64: TOUCHED-tile estimate for the clipped (convex) plane polygon --
+   area/64^2 + L1-perimeter/128 + 1.  Round 15: the old BBOX count over-charged
+   Doom's elongated diagonal sliver subsectors 3-6x, and with the round-14
+   honest 2e+1 billing that overestimate became the NEW famine: the pre-pass
+   dropped 12-22 planes per frame ON PAPER while the bank sat half used
+   (console 2026-09-02, k12-22 with f34-97 = the black wedge holes).  The
+   formula stays an UPPER bound on touched tiles for the shapes that matter
+   (straddling square: est 4 vs ~3 real; 5x1 sliver: 12 vs ~10; diagonal run:
+   18 vs ~16) -- billing below cost would resurrect the NEAR truncation. */
 static int psw_tile_est(const int *cx, const int *cy, int n)
 {
-    int x0 = cx[0], x1 = cx[0], y0 = cy[0], y1 = cy[0], i;
-    for (i = 1; i < n; ++i)
+    long long a2 = 0;
+    int i, per = 0, rx = cx[0], ry = cy[0];
+    for (i = 0; i < n; ++i)
     {
-	if (cx[i] < x0) x0 = cx[i]; if (cx[i] > x1) x1 = cx[i];
-	if (cy[i] < y0) y0 = cy[i]; if (cy[i] > y1) y1 = cy[i];
+	int j = (i + 1 == n) ? 0 : i + 1;
+	int ax = cx[i] - rx, ay = cy[i] - ry;      /* recentred: products fit 64-bit */
+	int bx = cx[j] - rx, by = cy[j] - ry;
+	int dx = bx - ax, dy = by - ay;
+	if (dx < 0) dx = -dx;
+	if (dy < 0) dy = -dy;
+	per += (dx >> 16) + (dy >> 16);
+	a2  += (long long)ax * by - (long long)bx * ay;
     }
-    return (((x1 - 1) >> 22) - (x0 >> 22) + 1)
-         * (((y1 - 1) >> 22) - (y0 >> 22) + 1);
+    if (a2 < 0) a2 = -a2;
+    return (int)((a2 >> 33) >> 12) + (per >> 7) + 1;
 }
 
 /* Sutherland against an axis-aligned line: keep sgn*(coord - lim) >= 0.

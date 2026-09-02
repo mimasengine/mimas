@@ -161,6 +161,18 @@ StoreWallRange, curline/frontsector/backsector/rw_angle1 vivants).
 > de vue ⇒ fuite hors écran par construction) émet ancrée monde : sous-bande v snappée aux
 > texels + pleine largeur tuile + fenêtre UserClip au bbox projeté (généralise le rect du
 > round 9) ; seule une frontière de secteur DIAGONALE garde le fan borné. Pool 34,05 Ko.
+> **Round 12 console (2026-09-02, f247632 core / c2d6a55)** : « toujours les mêmes
+> problèmes, swim et trous dans les plafonds » → arrêt des fixes à l'aveugle. (1) TROUS =
+> vrai bug trouvé, constant depuis le round 3 : le builder de polygones TRONQUAIT LA QUEUE
+> des feuilles > 20 sommets (corde ⇒ un COIN de sous-secteur manquant, endroit fixe, sol
+> ET plafond — RBG0 masque le sol, d'où « trous dans les plafonds » seulement). Remplacé
+> par une décimation convexe (retrait des coins les plus plats), + garde mi-chaîne pour
+> que psw_clip_line ne perde jamais de sommets en silence. (2) SWIM = 2 candidats aux
+> remèdes opposés (ondulation affine des grands quads proches → subdivision en profondeur ;
+> ré-étirement du fan sur bords de coupe diagonaux → ancrage) ⇒ le disque DISCRIMINE :
+> L+X peint par CHEMIN (ROUGE tuile pleine / BLANC bande+fenêtre / MAGENTA fan ; murs
+> verts, things bleus, poinçons jaunes), row 13 += `b<bandes> n<fans>`. Question console :
+> les quads qui swiment sont de quelle couleur ? Pool 33,22 Ko.
 
 ## Étape 2 — sols non-dominants + plafonds (quads de sous-secteurs)
 

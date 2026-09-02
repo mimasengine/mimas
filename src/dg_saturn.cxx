@@ -7959,15 +7959,16 @@ static void vdp1_floors_flush(void) {}
    KNOWN one-frame artifact: a slot eviction re-uploads texels the still-plotting
    previous bank may read (same acceptance as the parked design; LRU keeps
    resident flats stable below 3 distinct lumps/frame). */
-#define PSW_SUB_MAX      192
+#define PSW_SUB_MAX      240   /* round 13: 192 overflowed on wide views (tail subs
+                                  have walls but NO flats = distance holes) */
 #define PSW_FLAT_SLOTS   4
 /* 3 slots fill the freed F-bank top (0x25C7D000..0x25C80000); the 4th takes the
    KB below (0x25C7C000), which only the worst-case 2p HUD stack can reach -- and
    PSW is 1p-locked by the frame-boundary latch, so it is free in every PSW frame. */
 static const unsigned int psw_slot_vram[PSW_FLAT_SLOTS] =
     { 0x25C7D000u, 0x25C7E000u, 0x25C7F000u, 0x25C7C000u };
-#define PSW_FLAT_CAP     192         /* belt: whole-frame flat command hard cap
-                                        (the TILE budget below is the real law) */
+#define PSW_FLAT_CAP     232         /* belt: whole-frame flat command hard cap
+                                        (the DYNAMIC budget is the real law) */
 #define PSW_TZ_NEAR      (24 << 16)
 #define PSW_FAN_MAX      28          /* poly verts: core caps at 20, +3 view clips, +4 tile cuts */
 /* Flat FILL budget, in estimated screen PIXELS (spawn-scene verdict 2026-08-31: an open
@@ -7979,7 +7980,12 @@ static const unsigned int psw_slot_vram[PSW_FLAT_SLOTS] =
    tiles, the world-clip already bounds fill ~= visible, so the ONLY scarce
    resource left is COMMAND SLOTS (256/bank shared with walls+things+weapon+HUD)
    and emission CPU -- the budget is a TILE COUNT, spent NEAR->FAR. */
-#define PSW_TILE_BUDGET    140       /* whole-frame flat tile allowance (bank is 256) */
+#define PSW_TILE_BUDGET    220       /* whole-frame flat tile allowance.  140 dated from
+                                        the pre-cull era (it bounded painter OVERDRAW);
+                                        with LOS + portal bands trimming hidden planes,
+                                        emitted area ~= visible area, and 140 starved the
+                                        horizon (console 2026-09-02: "trous a distance").
+                                        The command budget still rules the bank. */
 /* (PSW_TILE_PLANE_MAX deleted in round 11: the ">48 tiles => ONE stretched fan"
    shortcut re-created the whole-room stretch on every LARGE ceiling -- console
    2026-09-02 "les textures des grands plans ne respectent pas leur alignement".
@@ -8388,41 +8394,16 @@ static int psw_clip_axis(const int *ax, const int *ay, int n, int *bx, int *by,
 static int psw_floor_pt_hidden(int fx, int fy, int fh);   /* sightline probes (below) */
 static int psw_ceil_pt_hidden(int fx, int fy, int ch);
 
-/* round 11: bitmask of the view-clip lines a world point lies on (near plane at
-   `nlim` = bit0, the two 90-deg frustum edges at -8u = bits 1/2), within 1/8
-   world unit -- the crossings psw_clip_dir creates satisfy their line equation
-   to ~1/60 u, so the test recognizes them reliably. */
-static int psw_view_line_mask(int wx, int wy, int nlim)
-{
-    int dx = wx - viewx, dy = wy - viewy, mk = 0, v;
-    v = FixedMul(dx, viewcos) + FixedMul(dy, viewsin) - nlim;
-    if (v < 0) v = -v;
-    if (v < (1 << 13)) mk |= 1;
-    v = FixedMul(dx, viewcos + viewsin) + FixedMul(dy, viewsin - viewcos) + (8 << 16);
-    if (v < 0) v = -v;
-    if (v < (1 << 13)) mk |= 2;
-    v = FixedMul(dx, viewcos - viewsin) + FixedMul(dy, viewsin + viewcos) + (8 << 16);
-    if (v < 0) v = -v;
-    if (v < (1 << 13)) mk |= 4;
-    return mk;
-}
+/* (psw_view_line_mask deleted in round 13 with the "clean" gate: every edge
+   piece now takes the world-anchored band+window path.) */
 
 static void psw_emit_plane_tiles(int slot, unsigned short colr,
                                  const int *cx, const int *cy, int n,
-                                 int ph, int psign, int cull_h)
+                                 int ph, int psign, int cull_h,
+                                 unsigned short scolr)   /* solid fallback colour
+                                                            (light | centre texel) */
 {
     int bx0 = cx[0], bx1 = cx[0], by0 = cy[0], by1 = cy[0], i;
-    int nlim = PSW_TZ_NEAR + (8 << 16);   /* the near-clip line psw_plane_poly used */
-    {
-	extern int detailshift;
-	int hw2  = (viewwidth << detailshift) >> 1;
-	int rows = (psign > 0) ? (viewheight - centery + 2) : (centery + 2);
-	if (rows > 0)
-	{
-	    int l2 = (int)(((long long)ph * hw2) / rows);
-	    if (l2 > nlim) nlim = l2;
-	}
-    }
     for (i = 1; i < n; ++i)
     {
 	if (cx[i] < bx0) bx0 = cx[i]; if (cx[i] > bx1) bx1 = cx[i];
@@ -8452,10 +8433,16 @@ static void psw_emit_plane_tiles(int slot, unsigned short colr,
 		int fy = (viewy < y0 + (32 << 16)) ? y1 : y0;
 		int nx = (fx == x0) ? x1 : x0;
 		int ny = (fy == y0) ? y1 : y0;
+		int mx = x0 + (32 << 16), my = y0 + (32 << 16);
+		/* round 13: + the CENTRE (a 64u crate hides exactly both diagonal
+		   corners of a 64u tile while slivers stay visible -- "trous
+		   derriere des obstacles").  Visible tiles still pay ONE probe. */
 		if (psign > 0 ? (psw_floor_pt_hidden(fx, fy, cull_h)
-		                 && psw_floor_pt_hidden(nx, ny, cull_h))
+		                 && psw_floor_pt_hidden(nx, ny, cull_h)
+		                 && psw_floor_pt_hidden(mx, my, cull_h))
 		              : (psw_ceil_pt_hidden(fx, fy, cull_h)
-		                 && psw_ceil_pt_hidden(nx, ny, cull_h))) continue;
+		                 && psw_ceil_pt_hidden(nx, ny, cull_h)
+		                 && psw_ceil_pt_hidden(mx, my, cull_h))) continue;
 	    }
 	    m = psw_clip_axis(cx, cy, n, ax, ay, 0, +1, x0);
 	    if (m < 3) continue;
@@ -8498,27 +8485,19 @@ static void psw_emit_plane_tiles(int slot, unsigned short colr,
 		    { okv = 0; break; }
 		if (!okv) continue;
 		if (slot >= 0)
-		{   /* CLEAN PIECE (round 11, generalizes the round-9 axis rect):
-		       every non-axis edge lies on a VIEW-CLIP line, so whatever
-		       the full-width band paints beyond the true piece is
-		       OFF-SCREEN by construction (a near-cut leak projects below
-		       the bottom edge, a frustum leak beyond the sides).  Such a
-		       piece emits WORLD-ANCHORED: the char's v sub-band SNAPPED
-		       to texel rows + the full tile width + a UserClip window at
-		       the piece's projected bbox.  No texel is restretched onto
-		       the MOVING clip boundary any more -- that restretch was the
-		       swim ("les quads qui debordent de l'ecran swim").  Only a
-		       diagonal SECTOR border (leak would land on-screen) keeps
-		       the bounded fan below. */
-		    int clean = 1;
-		    for (i = 0; i < m && clean; ++i)
-		    {
-			int j = (i + 1 == m) ? 0 : i + 1;
-			if (bxv[i] == bxv[j] || byv[i] == byv[j]) continue;  /* axis edge */
-			clean = (psw_view_line_mask(bxv[i], byv[i], nlim)
-			         & psw_view_line_mask(bxv[j], byv[j], nlim)) != 0;
-		    }
-		    if (clean)
+		{   /* EVERY edge piece is a WORLD-ANCHORED BAND (round 13): the
+		       char's v sub-band SNAPPED to texel rows + the full tile
+		       width + a UserClip window at the piece's projected bbox.
+		       The round-11 "clean" gate routed diagonal-sector pieces to
+		       a textured fan -- and the console named the fan as THE
+		       swimmer ("c'est le magenta qui swim"): a full char pinned
+		       to moving view-clip verts restretches every frame.  The
+		       band's texels are world-pinned, so the price moves from
+		       swim to a bounded LEAK across a diagonal edge inside the
+		       window bbox: invisible on BSP splitlines (same sector,
+		       same phase), covered by the step wall on height borders,
+		       visible at worst as a <=64u bleed on a same-height
+		       diagonal trim or a diagonal sky edge. */
 		    {
 			int pbx0 = bxv[0], pbx1 = bxv[0], pby0 = byv[0], pby1 = byv[0];
 			for (i = 1; i < m; ++i)
@@ -8572,9 +8551,9 @@ static void psw_emit_plane_tiles(int slot, unsigned short colr,
 		    }
 		}
 		if (!done)
-		{   /* diagonal sector border: fan of the full character (warp
-		       bounded to the tile) */
-		    psw_paint_idx = 250; psw_fanq_n++;  /* L+X: fans MAGENTA */
+		{   /* band unprojectable / slot famine: SOLID piece -- exact
+		       geometry, textureless, cannot swim */
+		    psw_paint_idx = 250; psw_fanq_n++;  /* L+X: solids MAGENTA */
 		    for (i = 1; i + 1 < m; i += 2)
 		    {
 			int qx[4], qy[4];
@@ -8583,7 +8562,7 @@ static void psw_emit_plane_tiles(int slot, unsigned short colr,
 			qx[1] = sxv[i];     qy[1] = syv[i];
 			qx[2] = sxv[i + 1]; qy[2] = syv[i + 1];
 			qx[3] = sxv[i2];    qy[3] = syv[i2];
-			psw_emit_flatquad(slot, colr, qx, qy);
+			psw_emit_flatquad(-1, scolr, qx, qy);
 		    }
 		}
 	    }
@@ -8701,6 +8680,16 @@ static int psw_plane_los_cull(const int *cx, const int *cy, int n, int h,
 		    continue;
 		allhid = (psign > 0) ? psw_floor_pt_hidden(cx[i], cy[i], h)
 		                     : psw_ceil_pt_hidden(cx[i], cy[i], h);
+	    }
+	    if (allhid)
+	    {   /* round 13 ("trous derriere des obstacles"): every VERTEX behind
+		   a fat obstacle can still leave the middle visible -- confirm on
+		   the centroid before the full cull. */
+		long long sx = 0, sy = 0;
+		for (i = 0; i < n; ++i) { sx += cx[i]; sy += cy[i]; }
+		sx /= n; sy /= n;
+		allhid = (psign > 0) ? psw_floor_pt_hidden((int)sx, (int)sy, h)
+		                     : psw_ceil_pt_hidden((int)sx, (int)sy, h);
 	    }
 	    if (allhid) return 1;
 	    *tile_test = 1;
@@ -8847,13 +8836,13 @@ static void psw_emit_subflats(int k)
 	    }
 	{
 	    int slot = psw_slot_get(lump);
-	    int nr, li, zi, ok = 1, fb = -1;
-	    unsigned short colr;
-	    if (slot < 0)
-	    {   /* famine (>PSW_FLAT_SLOTS distinct flats this frame): solid fallback */
+	    int nr, li, zi, ok = 1, fb = 0;
+	    unsigned short colr, scolr;
+	    {   /* centre texel: the SOLID colour for slot famine, the budget
+		   degrade, and unprojectable band pieces (round 13) */
 		const unsigned char *src = R_FlatCachePeek(lump);
-		if (!src) { psw_flat_denied++; continue; }
-		fb = src[32*64 + 32];
+		if (src) fb = src[32*64 + 32];
+		else if (slot < 0) { psw_flat_denied++; continue; }
 	    }
 	    for (i = 0; i < n; ++i)
 		if (!psw_project(cx[i], cy[i], ph, psign, &sxv[i], &syv[i])) { ok = 0; break; }
@@ -8878,22 +8867,21 @@ static void psw_emit_subflats(int k)
 	    colr = wall_light_colr(zlight[li][zi]);
 	    {
 		unsigned short pc = slot < 0 ? (unsigned short)(colr | fb) : colr;
-		/* round 11: giants TILE like everyone (the >48 stretched-fan
-		   shortcut was the "grands plans desalignes").  The fan is now
-		   only the graceful DEGRADE: chosen by the budget pre-pass
-		   (b4/b5, far subs), or here when the command room cannot cover
-		   the whole tile walk (2 cmds/tile worst case) -- a stretched
-		   far plane beats a HALF-TEXTURED near one (the mid-plane
-		   truncation was the "grands plafonds pas entierement textures"
-		   hole class). */
+		scolr = (unsigned short)(colr | fb);
+		/* round 13: the budget DEGRADE is a SOLID fill now, no longer a
+		   textured stretch-fan -- the console named the fan as THE
+		   swimmer ("c'est le magenta qui swim"): a full char pinned to
+		   MOVING view-clip verts restretches every frame.  A solid
+		   cannot swim; the lost texture at degrade distance is the
+		   potato trade. */
 		int fanbit = (pass == 0) ? 0x10 : 0x20;
-		int fan = (psw_sub_flag[k] & fanbit)
+		int solid = (psw_sub_flag[k] & fanbit)
 		       || (psw_flat_cmds + 2 * psw_tile_est(cx, cy, n) > psw_flat_cap_dyn);
-		if (!fan)
-		    psw_emit_plane_tiles(slot, pc, cx, cy, n, ph, psign, cull_h);
+		if (!solid)
+		    psw_emit_plane_tiles(slot, pc, cx, cy, n, ph, psign, cull_h, scolr);
 		else
 		{
-		    psw_paint_idx = 250; psw_fanq_n++;  /* L+X: degrade fans MAGENTA too */
+		    psw_paint_idx = 250; psw_fanq_n++;  /* L+X: solids MAGENTA */
 		    for (i = 1; i + 1 < n; i += 2)
 		    {
 			int qx[4], qy[4];
@@ -8902,7 +8890,7 @@ static void psw_emit_subflats(int k)
 			qx[1] = sxv[i];     qy[1] = syv[i];
 			qx[2] = sxv[i + 1]; qy[2] = syv[i + 1];
 			qx[3] = sxv[i2];    qy[3] = syv[i2];
-			psw_emit_flatquad(slot, pc, qx, qy);
+			psw_emit_flatquad(-1, scolr, qx, qy);
 		    }
 		}
 	    }

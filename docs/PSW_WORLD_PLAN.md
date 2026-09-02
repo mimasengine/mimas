@@ -214,6 +214,23 @@ StoreWallRange, curline/frontsector/backsector/rw_angle1 vivants).
 > silencieuse de la loi, `u26` réels pour ~10 facturés) : décimé ≤4 quads + facturé 4 avec
 > pré-scan punch_frame AVANT la boucle budget. Bonus : un solide ne vole plus de slot
 > texture (les 4 slots servent aux seuls tuilés). `k` = NET après repêchage. Pool 30,8 Ko.
+> **Round 17 console (2026-09-02)** : 2×2 captures quasi identiques, l'une trouée l'autre
+> non — les trouées sont EXACTEMENT les `k>0` (k11/k5 vs k0), banque réelle 62 % vide
+> (`c112-172 / B281-296`) : famine papier MARGINALE, le total facturé oscille autour de la
+> limite 232 et un pas de côté fait basculer quelques plans. Le facturier résiduel = les
+> plans MIXTES (exemptés du LOD par la classe tache-sur-ciel) : facturés toutes tuiles
+> touchées, émis une fraction (sondes LOS). Fix : à la NOTE, les 32 premières tuiles bbox
+> d'un plan mixte passent le MÊME verdict 3-sondes que l'émetteur (`psw_tile_hidden`,
+> partagé verbatim — les deux DOIVENT être bit-à-bit identiques ou la borne sup casse) ;
+> facture = 2×visibles+1 (∧ l'estimation touchées : min de deux bornes sup) ; verdicts
+> CACHÉS dans un masque préfixe par sub (psw_sub_fmask/cmask, valide ssi bit mixte) que
+> l'émetteur consomme dans les DEUX sens (bit posé = caché→skip, bit clair = visible→peint
+> sans re-sonder) — les sondes sont payées UNE fois. + le ledger repêchage RELÂCHE le
+> papier murs (les murs tail = les plus lointains, plottés avant tout sub) et 2/thing émis
+> → le slack arrive assez tôt pour les standbys lointains. Explique aussi les « k sans
+> trous » : des plans fantômes (mixtes entièrement cachés aux sondes) facturés pleins et
+> jetés sur le papier sans perte visuelle — désormais facturés 1, toujours accordés.
+> Pool 28,09 Ko (masques 1,9 Ko + code sondes). Attendu : k0 STABLE en se déplaçant.
 
 ## Étape 2 — sols non-dominants + plafonds (quads de sous-secteurs)
 

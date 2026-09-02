@@ -7980,6 +7980,7 @@ static void sat_psw_sub_note(int subnum, int fh, int ch, int fpic,
 }
 
 extern "C" int             psw_polys_ok;     /* core r_bsp.c: polygon pools valid */
+extern "C" int             R_PswFloorAt(int x, int y);   /* core: floor height at a 2D point (BSP walk) */
 extern "C" int            *psw_pvx, *psw_pvy;
 extern "C" unsigned short *psw_pvi;
 extern "C" unsigned char  *psw_pvn;
@@ -8206,7 +8207,7 @@ static int psw_clip_axis(const int *ax, const int *ay, int n, int *bx, int *by,
    borders (vs the old whole-room stretch).  Cost is uniform per tile. */
 static void psw_emit_plane_tiles(int slot, unsigned short colr,
                                  const int *cx, const int *cy, int n,
-                                 int ph, int psign)
+                                 int ph, int psign, int tstar)
 {
     int bx0 = cx[0], bx1 = cx[0], by0 = cy[0], by1 = cy[0], i;
     for (i = 1; i < n; ++i)
@@ -8227,6 +8228,15 @@ static void psw_emit_plane_tiles(int slot, unsigned short colr,
 	    int m, full;
 	    long long area2;
 	    if (psw_flat_cmds >= PSW_FLAT_CAP) return;
+	    if (tstar > 0)
+	    {   /* pit tile (floor below the dominant): test the farthest corner's
+	           dominant-height crossing -- hidden => skip before any clip work */
+		int fx = (viewx < x0 + (32 << 16)) ? x1 : x0;
+		int fy = (viewy < y0 + (32 << 16)) ? y1 : y0;
+		int px = viewx + (int)(((long long)(fx - viewx) * tstar) >> 16);
+		int py = viewy + (int)(((long long)(fy - viewy) * tstar) >> 16);
+		if (R_PswFloorAt(px, py) >= sat_vdp2_floor_h) continue;
+	    }
 	    m = psw_clip_axis(cx, cy, n, ax, ay, 0, +1, x0);
 	    if (m < 3) continue;
 	    m = psw_clip_axis(ax, ay, m, bxv, byv, 0, -1, x1);
@@ -8274,6 +8284,32 @@ static void psw_emit_plane_tiles(int slot, unsigned short colr,
 	    }
 	}
     }
+}
+
+/* PIT-VISIBILITY CULL (owner 2026-09-02: "c'est du travail gâché d'émettre des
+   tuiles qui ne seront pas du tout visibles").  A floor point LOWER than the
+   dominant is occluded iff the sightline to it is already under local ground
+   where it crosses the dominant's HEIGHT -- and that crossing is ONE 2D point,
+   P* = eye + t*(p - eye) with t = (viewz-hd)/(viewz-hf), constant per plane.
+   One BSP point query (R_PswFloorAt) asks "is there dominant-high ground
+   there": floor(P*) >= hd => blocked.  Sound per point; per plane/tile we test
+   the FARTHEST vertex/corner (the most likely visible one), so a partially
+   visible pit fringe can occasionally be over-culled -- the cheap trade asked
+   for.  Zero cost when no lower-than-dominant floor is in view. */
+static int psw_pit_hidden(const int *cx, const int *cy, int n, int fh)
+{
+    long long best = -1;
+    int i, fx = cx[0], fy = cy[0], t, px, py;
+    for (i = 0; i < n; ++i)
+    {
+	long long dx = cx[i] - viewx, dy = cy[i] - viewy;
+	long long d2 = dx * dx + dy * dy;
+	if (d2 > best) { best = d2; fx = cx[i]; fy = cy[i]; }
+    }
+    t  = psw_fdiv(viewz - sat_vdp2_floor_h, viewz - fh);
+    px = viewx + (int)(((long long)(fx - viewx) * t) >> 16);
+    py = viewy + (int)(((long long)(fy - viewy) * t) >> 16);
+    return R_PswFloorAt(px, py) >= sat_vdp2_floor_h;
 }
 
 /* RBG0 PUNCH (console 2026-09-01, owner: "un sol plus loin sous le plan affiché
@@ -8390,6 +8426,14 @@ static void psw_emit_subflats(int k)
 	n = psw_plane_poly(sn, ph, psign, cx, cy);      /* world-clipped: no offscreen tail */
 	if (n < 3) continue;
 	{
+	    int tstar = 0;
+	    if (pass == 0 && psw_sub[k].fh < sat_vdp2_floor_h)
+	    {   /* floor below the dominant: whole-plane pit cull, then arm the
+	           per-tile test with the plane's constant crossing ratio */
+		if (psw_pit_hidden(cx, cy, n, psw_sub[k].fh)) continue;
+		tstar = psw_fdiv(viewz - sat_vdp2_floor_h, viewz - psw_sub[k].fh);
+	    }
+	{
 	    int slot = psw_slot_get(lump);
 	    int nr, li, zi, ok = 1, fb = -1;
 	    unsigned short colr;
@@ -8423,7 +8467,7 @@ static void psw_emit_subflats(int k)
 	    {
 		unsigned short pc = slot < 0 ? (unsigned short)(colr | fb) : colr;
 		if (psw_tile_est(cx, cy, n) <= PSW_TILE_PLANE_MAX)
-		    psw_emit_plane_tiles(slot, pc, cx, cy, n, ph, psign);
+		    psw_emit_plane_tiles(slot, pc, cx, cy, n, ph, psign, tstar);
 		else
 		    /* pathological giant (huge non-dominant, non-sky plane): ONE
 		       stretched fan beats hundreds of tile commands */
@@ -8438,6 +8482,7 @@ static void psw_emit_subflats(int k)
 			psw_emit_flatquad(slot, pc, qx, qy);
 		    }
 	    }
+	}
 	}
     }
     }
@@ -8701,8 +8746,6 @@ static void vdp1_walls_flush(void)
                 if (fl < 0 && cl < 0) continue;
                 if (ftile >= PSW_TILE_BUDGET)
                 { psw_sub_kill[k] = 1; psw_kill_n++; continue; }
-                if (fl >= 0 && psw_sub[k].fh < sat_vdp2_floor_h)
-                    psw_punch_frame = 1;    /* a LOWER floor emits -> dominant subs punch */
                 if (psw_polys_ok && psw_sub[k].subnum >= 0)
                 {
                     int cxv[PSW_FAN_MAX], cyv[PSW_FAN_MAX], nn, e;
@@ -8710,8 +8753,13 @@ static void vdp1_walls_flush(void)
                     if (fl >= 0)
                     {
                         nn = psw_plane_poly(sn, viewz - psw_sub[k].fh, 1, cxv, cyv);
-                        if (nn >= 3)
+                        if (nn >= 3
+                            && !(psw_sub[k].fh < sat_vdp2_floor_h
+                                 && psw_pit_hidden(cxv, cyv, nn, psw_sub[k].fh)))
                         {
+                            if (psw_sub[k].fh < sat_vdp2_floor_h)
+                                psw_punch_frame = 1;   /* a lower floor SURVIVES the
+                                                          pit cull -> dominants punch */
                             e = psw_tile_est(cxv, cyv, nn);
                             ftile += (e > PSW_TILE_PLANE_MAX) ? 2 : e;
                         }

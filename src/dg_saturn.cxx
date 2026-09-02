@@ -680,6 +680,7 @@ static int  psw_flat_denied_last = 0;      /* flat quads DROPPED last frame (row
 static int  psw_kill_last = 0;             /* subsectors whose flats the FILL budget cut
                                               last frame (row 13 `k`) -- far-first loss */
 static int  psw_punch_last = 0;            /* RBG0 punch polygons last frame (row 13 `u`) */
+static int  psw_wall_cull_last = 0;        /* wall quads occlusion-culled last frame (row 13 `c`) */
 #endif
 extern "C" int            sat_sky_view;         /* core Part 5: elected split view for the HW sky (-1 = none => all software) */
 extern "C" unsigned int   sat_sky_px_view[4];   /* core Part 5: per-view SKY pixel coverage (election metric) */
@@ -3309,13 +3310,14 @@ static void fps_update(void)
                lead-fill/clamp fields are all dead in that mode): t = tier quads accepted
                last frame, r = shed (wall_acc/px budget full = the FAR remainder). */
             if (sat_psw_active)
-                snprintf(ovbuf, sizeof ovbuf, "PSW t%d r%d f%d d%d k%d u%d       ",
+                snprintf(ovbuf, sizeof ovbuf, "PSW t%d r%d f%d d%d k%d u%d c%d    ",
                          sat_psw_t_last > 999 ? 999 : sat_psw_t_last,
                          sat_psw_r_last > 999 ? 999 : sat_psw_r_last,
                          psw_flat_last  > 999 ? 999 : psw_flat_last,
                          psw_flat_denied_last > 99 ? 99 : psw_flat_denied_last,
                          psw_kill_last  > 99  ? 99  : psw_kill_last,
-                         psw_punch_last > 99  ? 99  : psw_punch_last);
+                         psw_punch_last > 99  ? 99  : psw_punch_last,
+                         psw_wall_cull_last > 99 ? 99 : psw_wall_cull_last);
 #endif
             if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 13, ovbuf);
             /* row 15 (SCU-DSP feasibility, deliverable #1): per-frame sprite cost split.
@@ -7958,6 +7960,8 @@ static int psw_sub_tail = 0x7fff;    /* wall watermark at the FIRST overflow (0x
 static int psw_spr_tail = 0x7fff;    /* vissprite watermark at the FIRST overflow */
 static int psw_flat_cmds = 0;
 static unsigned char psw_sub_kill[PSW_SUB_MAX];   /* 1 = this sub's flats cut by the fill budget */
+static unsigned char psw_sub_flag[PSW_SUB_MAX];   /* pre-pass verdicts: b0 floor hidden,
+                                                     b1 floor per-tile probe, b2/b3 = ceiling */
 static int psw_kill_n = 0;           /* subs killed this flush (row 13 `k`) */
 
 static void sat_psw_sub_note(int subnum, int fh, int ch, int fpic,
@@ -7981,6 +7985,7 @@ static void sat_psw_sub_note(int subnum, int fh, int ch, int fpic,
 
 extern "C" int             psw_polys_ok;     /* core r_bsp.c: polygon pools valid */
 extern "C" int             R_PswFloorAt(int x, int y);   /* core: floor height at a 2D point (BSP walk) */
+extern "C" int             R_PswCeilingAt(int x, int y); /* core: ceiling height (sky occludes = sky-hack) */
 extern "C" int            *psw_pvx, *psw_pvy;
 extern "C" unsigned short *psw_pvi;
 extern "C" unsigned char  *psw_pvn;
@@ -8205,10 +8210,11 @@ static int psw_clip_axis(const int *ax, const int *ay, int n, int *bx, int *by,
    tile is the polygon clipped to the tile square (snapped seams), drawn as a fan
    of the full character = a texture warp BOUNDED to 64 world units at sector
    borders (vs the old whole-room stretch).  Cost is uniform per tile. */
-static int psw_floor_pt_hidden(int fx, int fy, int fh);   /* sightline probe (below) */
+static int psw_floor_pt_hidden(int fx, int fy, int fh);   /* sightline probes (below) */
+static int psw_ceil_pt_hidden(int fx, int fy, int ch);
 static void psw_emit_plane_tiles(int slot, unsigned short colr,
                                  const int *cx, const int *cy, int n,
-                                 int ph, int psign, int cull_fh)
+                                 int ph, int psign, int cull_h)
 {
     int bx0 = cx[0], bx1 = cx[0], by0 = cy[0], by1 = cy[0], i;
     for (i = 1; i < n; ++i)
@@ -8229,13 +8235,14 @@ static void psw_emit_plane_tiles(int slot, unsigned short colr,
 	    int m, full;
 	    long long area2;
 	    if (psw_flat_cmds >= PSW_FLAT_CAP) return;
-	    if (cull_fh != 0x7fffffff)
-	    {   /* mixed-visibility floor plane: probe the farthest tile corner
-	           (the most likely visible one) -- proven blocked => skip the
-	           tile before any clip work */
+	    if (cull_h != 0x7fffffff)
+	    {   /* mixed-visibility plane: probe the farthest tile corner (the
+	           most likely visible one) -- proven blocked => skip the tile
+	           before any clip work */
 		int fx = (viewx < x0 + (32 << 16)) ? x1 : x0;
 		int fy = (viewy < y0 + (32 << 16)) ? y1 : y0;
-		if (psw_floor_pt_hidden(fx, fy, cull_fh)) continue;
+		if (psign > 0 ? psw_floor_pt_hidden(fx, fy, cull_h)
+		              : psw_ceil_pt_hidden(fx, fy, cull_h)) continue;
 	    }
 	    m = psw_clip_axis(cx, cy, n, ax, ay, 0, +1, x0);
 	    if (m < 3) continue;
@@ -8328,12 +8335,32 @@ static int psw_floor_pt_hidden(int fx, int fy, int fh)
     return 0;
 }
 
+/* Ceiling twin: mirrored comparisons, sightline going UP.  R_PswCeilingAt makes
+   a SKY ceiling occlude at its height = Doom's sky-hack convention for free (a
+   tall interior ceiling can no longer ghost above an outdoor sky edge). */
+static int psw_ceil_pt_hidden(int fx, int fy, int ch)
+{
+    int mx = viewx + ((fx - viewx) >> 1);
+    int my = viewy + ((fy - viewy) >> 1);
+    int hm = R_PswCeilingAt(mx, my);
+    int zm = viewz + ((ch - viewz) >> 1);          /* sightline height at t = 1/2 */
+    if (hm < zm) return 1;
+    if (hm < ch)
+    {   /* a lower ceiling midway: exact crossing at its height */
+	int t  = psw_fdiv(hm - viewz, ch - viewz);
+	int px = viewx + (int)(((long long)(fx - viewx) * t) >> 16);
+	int py = viewy + (int)(((long long)(fy - viewy) * t) >> 16);
+	if (R_PswCeilingAt(px, py) <= hm) return 1;
+    }
+    return 0;
+}
+
 /* Plane-level ladder: probe the FARTHEST (most likely visible) and NEAREST
    polygon vertices.  Farthest hidden -> cull the whole plane (return 1).
    Otherwise *tile_test = nearest hidden: 0 = plane reads fully visible (skip
    every per-tile probe), 1 = mixed -> the tile walker refines per tile. */
-static int psw_plane_floor_cull(const int *cx, const int *cy, int n, int fh,
-                                int *tile_test)
+static int psw_plane_los_cull(const int *cx, const int *cy, int n, int h,
+                              int psign, int *tile_test)
 {
     long long dfar = -1, dnear = 0x7fffffffffffffffLL;
     int i, xf = cx[0], yf = cy[0], xn = cx[0], yn = cy[0];
@@ -8345,9 +8372,74 @@ static int psw_plane_floor_cull(const int *cx, const int *cy, int n, int fh,
 	if (d2 < dnear) { dnear = d2; xn = cx[i]; yn = cy[i]; }
     }
     *tile_test = 0;
-    if (psw_floor_pt_hidden(xf, yf, fh)) return 1;
-    *tile_test = psw_floor_pt_hidden(xn, yn, fh);
+    if (psign > 0)
+    {
+	if (psw_floor_pt_hidden(xf, yf, h)) return 1;
+	*tile_test = psw_floor_pt_hidden(xn, yn, h);
+    }
+    else
+    {
+	if (psw_ceil_pt_hidden(xf, yf, h)) return 1;
+	*tile_test = psw_ceil_pt_hidden(xn, yn, h);
+    }
     return 0;
+}
+
+/* WALL-OCCLUSION BUCKETS (owner: "l'occlusion par les murs à la PowerSlave").
+   40 x 8-px screen slices, each holding ONE open vertical band [t,b].  The
+   pre-pass walks subsectors NEAR->FAR: it tests each sub's planes and walls
+   against the bands built so far (= strictly nearer occluders, the BSP
+   guarantee), then FOLDS the sub's own accepted wall quads in -- so a window's
+   upper/lower tiers narrow the band exactly like a PowerSlave portal, and the
+   rooms behind emit only what the opening shows.  Folding uses the quad's INNER
+   rows over fully-covered buckets (conservative occluder), tests use the OUTER
+   rows over every touched bucket (conservative visibility): a middle-split band
+   (rare floating quad) is ignored, so nothing visible is ever culled. */
+#define PSW_OCC_NB 40
+static short psw_occ_t[PSW_OCC_NB], psw_occ_b[PSW_OCC_NB];
+static unsigned char wall_cull[WALL_ACC_MAX];   /* 1 = occlusion-culled (PSW only) */
+static int psw_wall_cull = 0;
+
+static int psw_occ_box_hidden(int xl, int xr, int yt, int yb)
+{
+    int b, ba = xl >> 3, bb = xr >> 3;
+    if (ba < 0) ba = 0;
+    if (bb >= PSW_OCC_NB) bb = PSW_OCC_NB - 1;
+    if (ba > bb) return 0;
+    for (b = ba; b <= bb; ++b)
+	if (yt <= psw_occ_b[b] && yb >= psw_occ_t[b]) return 0;   /* meets an open band */
+    return 1;
+}
+
+static int psw_occ_wall_hidden(int i)
+{
+    int xa = wall_acc[i].x1, xb = wall_acc[i].x2, t;
+    int qt = wall_acc[i].yl1 < wall_acc[i].yl2 ? wall_acc[i].yl1 : wall_acc[i].yl2;
+    int qb = wall_acc[i].yh1 > wall_acc[i].yh2 ? wall_acc[i].yh1 : wall_acc[i].yh2;
+    if (xa > xb) { t = xa; xa = xb; xb = t; }
+    return psw_occ_box_hidden(xa, xb, qt, qb);
+}
+
+static void psw_occ_fold(int i)
+{
+    int xa = wall_acc[i].x1, xb = wall_acc[i].x2, t, b, ba, bb;
+    int qt = wall_acc[i].yl1 > wall_acc[i].yl2 ? wall_acc[i].yl1 : wall_acc[i].yl2;
+    int qb = wall_acc[i].yh1 < wall_acc[i].yh2 ? wall_acc[i].yh1 : wall_acc[i].yh2;
+    if (xa > xb) { t = xa; xa = xb; xb = t; }
+    if (qt > qb) return;
+    ba = (xa + 7) >> 3;                       /* fully-covered buckets only */
+    bb = ((xb + 1) >> 3) - 1;
+    if (ba < 0) ba = 0;
+    if (bb >= PSW_OCC_NB) bb = PSW_OCC_NB - 1;
+    for (b = ba; b <= bb; ++b)
+    {
+	if (qt <= psw_occ_t[b] && qb >= psw_occ_b[b])
+	{ psw_occ_t[b] = 1; psw_occ_b[b] = 0; }              /* closed */
+	else if (qt <= psw_occ_t[b] && qb >= psw_occ_t[b])
+	    psw_occ_t[b] = (short)(qb + 1);                  /* shaved from the top */
+	else if (qb >= psw_occ_b[b] && qt <= psw_occ_b[b])
+	    psw_occ_b[b] = (short)(qt - 1);                  /* shaved from the bottom */
+    }
 }
 
 /* RBG0 PUNCH (console 2026-09-01, owner: "un sol plus loin sous le plan affiché
@@ -8464,13 +8556,16 @@ static void psw_emit_subflats(int k)
 	n = psw_plane_poly(sn, ph, psign, cx, cy);      /* world-clipped: no offscreen tail */
 	if (n < 3) continue;
 	{
-	    int cull_fh = 0x7fffffff;
+	    int cull_h = 0x7fffffff;
 	    if (pass == 0)
-	    {   /* floor: sightline-cull ladder -- whole plane first, per-tile
-	           refinement only when the plane reads mixed */
-		int ttest = 0;
-		if (psw_plane_floor_cull(cx, cy, n, psw_sub[k].fh, &ttest)) continue;
-		if (ttest) cull_fh = psw_sub[k].fh;
+	    {   /* trust the pre-pass verdicts (LOS + wall-occlusion buckets) */
+		if (psw_sub_flag[k] & 1) continue;
+		if (psw_sub_flag[k] & 2) cull_h = psw_sub[k].fh;
+	    }
+	    else
+	    {
+		if (psw_sub_flag[k] & 4) continue;
+		if (psw_sub_flag[k] & 8) cull_h = psw_sub[k].ch;
 	    }
 	{
 	    int slot = psw_slot_get(lump);
@@ -8506,7 +8601,7 @@ static void psw_emit_subflats(int k)
 	    {
 		unsigned short pc = slot < 0 ? (unsigned short)(colr | fb) : colr;
 		if (psw_tile_est(cx, cy, n) <= PSW_TILE_PLANE_MAX)
-		    psw_emit_plane_tiles(slot, pc, cx, cy, n, ph, psign, cull_fh);
+		    psw_emit_plane_tiles(slot, pc, cx, cy, n, ph, psign, cull_h);
 		else
 		    /* pathological giant (huge non-dominant, non-sky plane): ONE
 		       stretched fan beats hundreds of tile commands */
@@ -8742,10 +8837,16 @@ static void vdp1_walls_flush(void)
        the wall-cap guard, a texture slot that will not resolve, a degenerate quad.  Rather than
        audit every `return` in three emit functions, watch the command pointer: if it did not
        move, nothing was written and this wall is a hole.  Row 13 `N<orphan>/<drop>`. */
+#if SAT_PSW
+#define PSW_WCULL(i) (sat_psw_active && wall_cull[i])   /* occlusion-culled: skip, not a drop */
+#else
+#define PSW_WCULL(i) 0
+#endif
 #define VDP1_PLOT_WALL(i) do {                                                       \
         unsigned int wn0 = vdp1_wnext;                                               \
         int emitted = 1;                                                             \
-        if      (sat_wall_paint & 1)      wall_emit_flat(i);   /* DEBUG PAINT green */\
+        if      (PSW_WCULL(i))            emitted = 0;                               \
+        else if (sat_wall_paint & 1)      wall_emit_flat(i);   /* DEBUG PAINT green */\
         else if (wall_acc[i].mode == 1)   wall_emit(i);                              \
         else if (wall_acc[i].mode == 3)   wall_emit_banded(i);                       \
         else if (wall_acc[i].mode == 2)   wall_emit_flat(i);                         \
@@ -8775,45 +8876,88 @@ static void vdp1_walls_flush(void)
              reserved slot is 'used' and cannot be evicted for the rest of the
              frame; far flats beyond the slots fall back to the solid polygon. */
         {
+            extern int viewwindowx, viewwindowy, viewheight, detailshift;
             int ftile = 0;
-            psw_kill_n = 0; psw_punch_frame = 0;
+            psw_kill_n = 0; psw_punch_frame = 0; psw_wall_cull = 0;
+            for (int b = 0; b < PSW_OCC_NB; ++b)
+            {   /* occlusion buckets: open band = the whole view */
+                psw_occ_t[b] = (short)viewwindowy;
+                psw_occ_b[b] = (short)(viewwindowy + viewheight - 1);
+            }
             for (int k = 0; k < psw_sub_n; ++k)
             {
                 int fl, cl, fdom;
-                psw_sub_kill[k] = 0;
+                int wend = (k + 1 < psw_sub_n) ? (int)psw_sub[k + 1].w0 : tail;
+                int wbeg = (int)psw_sub[k].w0;
+                if (wend > wall_acc_n) wend = wall_acc_n;
+                if (wbeg > wend) wbeg = wend;
+                psw_sub_kill[k] = 0; psw_sub_flag[k] = 0;
                 psw_sub_lumps(k, &fl, &cl, &fdom);
-                if (fl < 0 && cl < 0) continue;
-                if (ftile >= PSW_TILE_BUDGET)
-                { psw_sub_kill[k] = 1; psw_kill_n++; continue; }
-                if (psw_polys_ok && psw_sub[k].subnum >= 0)
+                if (fl >= 0 || cl >= 0)
                 {
-                    int cxv[PSW_FAN_MAX], cyv[PSW_FAN_MAX], nn, e, tt;
-                    int sn = (int)psw_sub[k].subnum;
-                    if (fl >= 0)
+                    if (ftile >= PSW_TILE_BUDGET)
+                    { psw_sub_kill[k] = 1; psw_kill_n++; }
+                    else if (psw_polys_ok && psw_sub[k].subnum >= 0)
                     {
-                        nn = psw_plane_poly(sn, viewz - psw_sub[k].fh, 1, cxv, cyv);
-                        if (nn >= 3
-                            && !psw_plane_floor_cull(cxv, cyv, nn, psw_sub[k].fh, &tt))
+                        int cxv[PSW_FAN_MAX], cyv[PSW_FAN_MAX], nn, e, tt, v;
+                        int sn = (int)psw_sub[k].subnum;
+                        for (int pass = 0; pass < 2; ++pass)
                         {
-                            if (psw_sub[k].fh < sat_vdp2_floor_h)
-                                psw_punch_frame = 1;   /* a lower floor SURVIVES the
-                                                          pit cull -> dominants punch */
+                            int h, psn, bit;
+                            if (pass == 0) { if (fl < 0) continue;
+                                             h = psw_sub[k].fh; psn = 1;  bit = 1; }
+                            else           { if (cl < 0) continue;
+                                             h = psw_sub[k].ch; psn = -1; bit = 4; }
+                            nn = psw_plane_poly(sn, psn > 0 ? viewz - h : h - viewz,
+                                                psn, cxv, cyv);
+                            if (nn < 3) { psw_sub_flag[k] |= bit; continue; }
+                            if (psw_plane_los_cull(cxv, cyv, nn, h, psn, &tt))
+                            { psw_sub_flag[k] |= bit; continue; }
+                            if (tt) psw_sub_flag[k] |= bit << 1;
+                            {   /* projected bbox vs the wall-occlusion buckets
+                                   (only NEARER subs' walls are folded so far) */
+                                int sx, sy, okp = 1;
+                                int xl = 0x7fff, xr = -0x7fff;
+                                int yt = 0x7fff, yb = -0x7fff;
+                                for (v = 0; v < nn; ++v)
+                                {
+                                    if (!psw_project(cxv[v], cyv[v],
+                                                     psn > 0 ? viewz - h : h - viewz,
+                                                     psn, &sx, &sy)) { okp = 0; break; }
+                                    sx = (sx << detailshift) + viewwindowx;
+                                    sy += viewwindowy;
+                                    if (sx < xl) xl = sx; if (sx > xr) xr = sx;
+                                    if (sy < yt) yt = sy; if (sy > yb) yb = sy;
+                                }
+                                if (okp && psw_occ_box_hidden(xl, xr, yt, yb))
+                                { psw_sub_flag[k] |= bit; continue; }
+                            }
+                            if (psn > 0 && h < sat_vdp2_floor_h)
+                                psw_punch_frame = 1;   /* a lower floor SURVIVES -> punch */
                             e = psw_tile_est(cxv, cyv, nn);
                             ftile += (e > PSW_TILE_PLANE_MAX) ? 2 : e;
                         }
                     }
-                    if (cl >= 0)
+                    if (!psw_sub_kill[k])
                     {
-                        nn = psw_plane_poly(sn, psw_sub[k].ch - viewz, -1, cxv, cyv);
-                        if (nn >= 3)
-                        {
-                            e = psw_tile_est(cxv, cyv, nn);
-                            ftile += (e > PSW_TILE_PLANE_MAX) ? 2 : e;
-                        }
+                        if (fl >= 0 && !(psw_sub_flag[k] & 1)) psw_slot_get(fl);
+                        if (cl >= 0 && !(psw_sub_flag[k] & 4)) psw_slot_get(cl);
                     }
                 }
-                if (fl >= 0) psw_slot_get(fl);
-                if (cl >= 0) psw_slot_get(cl);
+                /* this sub's walls: cull against the nearer state, then fold the
+                   survivors in as occluders for everything farther */
+                for (int i = wbeg; i < wend; ++i)
+                {
+                    wall_cull[i] = (unsigned char)psw_occ_wall_hidden(i);
+                    if (wall_cull[i]) psw_wall_cull++;
+                    else psw_occ_fold(i);
+                }
+            }
+            /* overflow-tail walls are farther than every recorded sub */
+            for (int i = tail; i < wall_acc_n; ++i)
+            {
+                wall_cull[i] = (unsigned char)psw_occ_wall_hidden(i);
+                if (wall_cull[i]) psw_wall_cull++;
             }
         }
         for (int i = wall_acc_n - 1; i >= tail; --i) VDP1_PLOT_WALL(i);
@@ -8836,6 +8980,7 @@ static void vdp1_walls_flush(void)
         }
         psw_flat_last = psw_flat_cmds; psw_flat_denied_last = psw_flat_denied;
         psw_kill_last = psw_kill_n;    psw_punch_last = psw_punch_cmds;
+        psw_wall_cull_last = psw_wall_cull;
 #if SAT_WORLD_THINGS_VDP1
         if (psw_thing_drop > 0)
         {   /* a dropped queued thing is drawn by NOBODY this frame (the vanish class):

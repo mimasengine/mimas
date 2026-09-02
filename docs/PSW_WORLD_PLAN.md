@@ -199,6 +199,21 @@ StoreWallRange, curline/frontsector/backsector/rw_angle1 vivants).
 > diagonaux. Fix : `psw_tile_est` = tuiles TOUCHÉES (aire/64² + périmètre-L1/128 + 1,
 > borne sup — facturer sous le coût = troncature du proche). Peinture bandes BLANC→ORANGE
 > (216, le blanc noyait l'overlay). Attendu : k~0, les coins noirs morts. Pool 31,95 Ko.
+> **Round 16 console (2026-09-02)** : encore des trous — `k8-18` avec `c113-154 / B296` =
+> banque à MOITIÉ VIDE, famine papier 2e édition (l'estimateur tuiles-touchées facture 2/
+> tuile mais le réel émet une fraction : sondes LOS des plans mixtes, slivers, clips vides ;
+> les grands plans lointains facturent des dizaines de tuiles projetées sur ~10 px). Fix à
+> 3 étages : (1) **LOD de distance à la note** — bbox projetée ≤16 px de haut (ou ≤1024 px²)
+> ET plan non-mixte ⇒ SOLIDE d'office (bit 0x10/0x20), facturé 4, émis ≤4 quads (les mixtes
+> sont exempts : le fan saute les sondes par-tuile ⇒ tache ineffaçable sur le ciel VDP2) ;
+> (2) **standby + repêchage sur slack réel** — la pré-passe ne jette plus (bits 0x40/0x80),
+> l'émission repêche en solide ssi `wnext réel + 4 + psw_paper_left ≤ cap` (ledger du papier
+> committé non émis, décrémenté par sub APRÈS ses 2 passes ; murs/things jamais relâchés =
+> double compte conservateur ; plafond mixte JAMAIS repêché — classe tache-sur-ciel) ;
+> (3) **facture punch honnête** — le fan punch émettait ≤13 quads facturés 1 (violation
+> silencieuse de la loi, `u26` réels pour ~10 facturés) : décimé ≤4 quads + facturé 4 avec
+> pré-scan punch_frame AVANT la boucle budget. Bonus : un solide ne vole plus de slot
+> texture (les 4 slots servent aux seuls tuilés). `k` = NET après repêchage. Pool 30,8 Ko.
 
 ## Étape 2 — sols non-dominants + plafonds (quads de sous-secteurs)
 

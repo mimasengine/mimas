@@ -700,6 +700,20 @@ StoreWallRange, curline/frontsector/backsector/rw_angle1 vivants).
 > 30-60 %, P ≈ max(murs, flats) + fence ≈ 20-29 ms, F<join> = qui est le
 > chemin long (haut = soupape v2 : rendre les plans les plus proches au
 > master). NON validé console.
+>
+> **HOTFIX même jour (f707de4)** — 1er disque P33 sur console : **<1 fps,
+> MST1111, to9:W, row 13 à zéro, sols absents**. Cause MESURÉE (objdump,
+> constantes sub-r15) : la passe flats slave débordait la pile aux 4 Ko de
+> r_parallel — `psw_emit_plane_tiles` = **0xd20 = 3 360 o de frame à elle
+> seule** (caches cmbuf/pjx/pjy/pjs + colonnes de coins), lambda emit64
+> 0x524, subflats 0x27c, bake_build 0x434 ⇒ chaîne pire ~5,5 Ko ; dès le
+> premier plan tuilé la pile crevait dans le .bss de r_parallel (flags rp
+> stompés = les to:W). Fix : pile DÉDIÉE 7 Ko en queue d'arène sf (trampoline
+> r14 de rp_run_on_stack verbatim) + canary en pied de pile planté par le
+> master à chaque dispatch et vérifié au fence (stompé ou body mort ⇒ pads +
+> latch F!) + gate 1p. Arène 15,4→22,5 Ko PU_LEVEL. Leçon : MESURER les
+> frames (objdump) avant de mettre une chaîne sur une pile bornée — la passe
+> objdump existe maintenant. NON validé console (2e disque).
 
 - **Polygones de sous-secteurs au level-load** (p_setup.c après :1234, PU_LEVEL zone
   LWRAM) : clip récursif du bbox map par les splitlines ancêtres (node_t x16/y16/dx16/

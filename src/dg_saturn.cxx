@@ -3358,8 +3358,14 @@ static void fps_update(void)
                    B dominates + fast high => the border tail = projections;
                    j dominates => psw_project unit cost is the fire;
                    none dominate => the cost is the walk/cache, not
-                   arithmetic. */
-                snprintf(ovbuf, sizeof ovbuf, "P30 e%d/%d B%d/%d/%d q%d j%d/%d f%d ",
+                   arithmetic.
+                   ROUND 31 (console P30: B18-21 of ew23-27 = borders ARE the
+                   bill; fast 0-3/86-149 = the all-axis precondition almost
+                   never held; j ~5us/proj = projections healthy): exact soft
+                   edges via clip crossing tags + the fast path now takes ONE
+                   diagonal hard cut (near-line rows, lone diagonal walls).
+                   `B<fast>` counts both rect and rect+1diag fires. */
+                snprintf(ovbuf, sizeof ovbuf, "P31 e%d/%d B%d/%d/%d q%d j%d/%d f%d ",
                          psw_ef_ms_last > 99 ? 99 : psw_ef_ms_last,
                          psw_ew_ms_last > 99 ? 99 : psw_ew_ms_last,
                          psw_eb_ms_last > 99 ? 99 : psw_eb_ms_last,
@@ -8645,8 +8651,19 @@ static int psw_project(int wx, int wy, int ph, int psign, int *psx, int *psy)
    keep  FixedMul(x - viewx, fcx) + FixedMul(y - viewy, fcy) >= lim.
    (viewcos, viewsin) = the near plane; (cos+sin, sin-cos) / (cos-sin, sin+cos)
    = the 90-deg frustum edges (sx >= 0 <=> tz+tx >= 0, sx <= vw <=> tz-tx >= 0). */
-static int psw_clip_dir(const int *ax, const int *ay, int n, int *bx, int *by,
-                        int fcx, int fcy, int lim)
+/* ROUND 31 -- vertex TAGS ride the clip: a kept vertex carries its tag, a
+   crossing gets `newtag` (1 = near plane, 2/3 = the frustum side passes).
+   A convex clip makes exactly TWO crossings and leaves them ADJACENT (the
+   removed arc collapses to the chord), so an output edge whose endpoints
+   share a tag >= 2 provably LIES ON that frustum line -- the walk's soft
+   test reads this EXACTLY.  The old distance test (1/8 u threshold) missed
+   crossings on very long edges (interpolation error grows with edge length:
+   > ~6000 u overflows the threshold -- the big open zones, exactly where
+   console P30 read fast 0-3/86-149), and stays as a fallback for the one
+   case tags miss (an ORIGINAL vertex sitting exactly on the line). */
+static int psw_clip_dir(const int *ax, const int *ay, const unsigned char *at,
+                        int n, int *bx, int *by, unsigned char *bt,
+                        int fcx, int fcy, int lim, unsigned char newtag)
 {
     int i, m = 0;
     int fa  = FixedMul(ax[0] - viewx, fcx) + FixedMul(ay[0] - viewy, fcy) - lim;
@@ -8654,12 +8671,14 @@ static int psw_clip_dir(const int *ax, const int *ay, int n, int *bx, int *by,
     {
 	int j  = (i + 1 == n) ? 0 : i + 1;
 	int fb = FixedMul(ax[j] - viewx, fcx) + FixedMul(ay[j] - viewy, fcy) - lim;
-	if (fa >= 0 && m < PSW_FAN_MAX) { bx[m] = ax[i]; by[m] = ay[i]; m++; }
+	if (fa >= 0 && m < PSW_FAN_MAX)
+	{ bx[m] = ax[i]; by[m] = ay[i]; bt[m] = at[i]; m++; }
 	if ((fa >= 0) != (fb >= 0) && m < PSW_FAN_MAX)
 	{
 	    int t = psw_fdiv(fa, fa - fb);            /* 16.16, 0..1 (signs differ) */
 	    bx[m] = ax[i] + (int)(((long long)(ax[j] - ax[i]) * t) >> 16);
 	    by[m] = ay[i] + (int)(((long long)(ay[j] - ay[i]) * t) >> 16);
+	    bt[m] = newtag;
 	    m++;
 	}
 	fa = fb;
@@ -8909,15 +8928,21 @@ static void psw_emit_rectquad(int slot, unsigned short colr,
       and projective straightness keeps the whole polygon inside;
    2./3. the 90-deg frustum edges (8u slack), bounding sx.
    Returns the vertex count into (ox,oy); < 3 = nothing visible (free cull). */
+static unsigned char psw_pp_tag[PSW_FAN_MAX];   /* round 31: vertex tags of the
+                       LAST psw_plane_poly result (side channel -- consumed by
+                       psw_emit_subflats right after the call, before any other
+                       plane_poly can run).  0 original / 1 near / 2,3 frustum. */
 static int psw_plane_poly(int sn, int ph, int psign, int *ox, int *oy)
 {
     extern int detailshift;
     int wx[PSW_FAN_MAX], wy[PSW_FAN_MAX];
     int tx[PSW_FAN_MAX], ty[PSW_FAN_MAX];
+    unsigned char ta[PSW_FAN_MAX], tb[PSW_FAN_MAX];
     int n0 = psw_pvn[sn], i, n;
     if (n0 < 3) return 0;
     for (i = 0; i < n0; ++i)
-    { wx[i] = psw_pvx[psw_pvi[sn] + i]; wy[i] = psw_pvy[psw_pvi[sn] + i]; }
+    { wx[i] = psw_pvx[psw_pvi[sn] + i]; wy[i] = psw_pvy[psw_pvi[sn] + i];
+      ta[i] = 0; }
     {
 	int hw2  = (viewwidth << detailshift) >> 1;
 	int rows = (psign > 0) ? (viewheight - centery + 2) : (centery + 2);
@@ -8927,16 +8952,16 @@ static int psw_plane_poly(int sn, int ph, int psign, int *ox, int *oy)
 	    int l2 = (int)(((long long)ph * hw2) / rows);
 	    if (l2 > lim) lim = l2;
 	}
-	n = psw_clip_dir(wx, wy, n0, tx, ty, viewcos, viewsin, lim);
+	n = psw_clip_dir(wx, wy, ta, n0, tx, ty, tb, viewcos, viewsin, lim, 1);
     }
     if (n < 3) return 0;
-    n = psw_clip_dir(tx, ty, n, ox, oy,
-                     viewcos + viewsin, viewsin - viewcos, -(8 << 16));
+    n = psw_clip_dir(tx, ty, tb, n, ox, oy, ta,
+                     viewcos + viewsin, viewsin - viewcos, -(8 << 16), 2);
     if (n < 3) return 0;
-    n = psw_clip_dir(ox, oy, n, tx, ty,
-                     viewcos - viewsin, viewsin + viewcos, -(8 << 16));
+    n = psw_clip_dir(ox, oy, ta, n, tx, ty, tb,
+                     viewcos - viewsin, viewsin + viewcos, -(8 << 16), 3);
     if (n < 3) return 0;
-    for (i = 0; i < n; ++i) { ox[i] = tx[i]; oy[i] = ty[i]; }
+    for (i = 0; i < n; ++i) { ox[i] = tx[i]; oy[i] = ty[i]; psw_pp_tag[i] = tb[i]; }
     return n;
 }
 
@@ -9169,6 +9194,15 @@ static void psw_emit_plane_tiles(int slot, unsigned short colr,
 	    {
 		int j = (i + 1 == n) ? 0 : i + 1;
 		if ((on2[i] && on2[j]) || (on3[i] && on3[j])) softm |= 1u << i;
+		/* ROUND 31: EXACT soft via the clip's crossing tags (union with
+		   the distance test above -- tags catch the long-edge crossings
+		   whose interpolation error overflowed the 1/8u threshold, the
+		   big open zones where console P30 read fast 0-3; the distance
+		   test still catches an original vertex sitting exactly on the
+		   line).  psw_pp_tag is the side channel of the plane_poly call
+		   this poly came from (no other runs in between). */
+		if (psw_pp_tag[i] >= 2 && psw_pp_tag[i] == psw_pp_tag[j])
+		    softm |= 1u << i;
 	    }
 	}
 	unsigned int hardm = fullm & ~softm;
@@ -9196,9 +9230,11 @@ static void psw_emit_plane_tiles(int slot, unsigned short colr,
 	    int m, full;
 	    long long area2;
 	    unsigned int cuth = cutm & hardm;
+	    unsigned int cutd = cuth & ~axm;     /* round 31: DIAGONAL hard cuts */
+	    unsigned int cutax = cuth & axm;
 	    if (psw_flat_cmds >= psw_flat_cap_dyn) { stop = 1; return; }
 	    psw_eb_bord++;                       /* round 30 `B../../<n>` */
-	    if (cuth && !(cuth & ~axm))
+	    if (cuth && (cutd & (cutd - 1)) == 0)
 	    {   /* ROUND 29 -- AXIS-CUT FAST PATH (console P28: ew 19-26 ms with
 	           b59-99 border tiles = the walk's dominant bill; each paid 4
 	           Sutherland passes + shoelace + divisions here).  When every
@@ -9219,7 +9255,7 @@ static void psw_emit_plane_tiles(int slot, unsigned short colr,
 		for (int e2 = 0; e2 < n; ++e2)
 		{
 		    int j2;
-		    if (!((cuth >> e2) & 1u)) continue;
+		    if (!((cutax >> e2) & 1u)) continue;
 		    j2 = (e2 + 1 == n) ? 0 : e2 + 1;
 		    if (cx[e2] == cx[j2])
 		    {   /* vertical cut x = cx[e2]: keep-side from the winding */
@@ -9237,22 +9273,89 @@ static void psw_emit_plane_tiles(int slot, unsigned short colr,
 		    }
 		}
 		if (px1 <= px0 || py1 <= py0) return;
-		if (wpos)
+		if (!cutd)
 		{
-		    bxv[0] = px0; byv[0] = py0; bxv[1] = px1; byv[1] = py0;
-		    bxv[2] = px1; byv[2] = py1; bxv[3] = px0; byv[3] = py1;
+		    if (wpos)
+		    {
+			bxv[0] = px0; byv[0] = py0; bxv[1] = px1; byv[1] = py0;
+			bxv[2] = px1; byv[2] = py1; bxv[3] = px0; byv[3] = py1;
+		    }
+		    else
+		    {
+			bxv[0] = px0; byv[0] = py0; bxv[1] = px0; byv[1] = py1;
+			bxv[2] = px1; byv[2] = py1; bxv[3] = px1; byv[3] = py0;
+		    }
+		    m = 4;
+		    area2 = 2 * (long long)(px1 - px0) * (py1 - py0);
 		}
 		else
-		{
-		    bxv[0] = px0; byv[0] = py0; bxv[1] = px0; byv[1] = py1;
-		    bxv[2] = px1; byv[2] = py1; bxv[3] = px1; byv[3] = py0;
+		{   /* ROUND 31 -- ONE diagonal hard cut (the near line's tile
+		       row, a lone diagonal leaf/splitline edge -- console P30:
+		       fast 0-3/86-149, the all-axis precondition almost never
+		       held): a single Sutherland pass of the clamped rect
+		       against that edge, vs 4 passes over the whole n-gon.
+		       f is the same 64-bit cross as the corner masks; fa and
+		       fa-fb are normalized by a SHARED shift to 30 bits before
+		       the 16.16 division, so the crossing lands within ~0.002u
+		       of exact -- and a neighbour tile interpolates the same
+		       corner-f pair along the shared side, so seams stay
+		       consistent (the r29 rounding precedent; proven vs the
+		       old clip in r31_onediag_check.py, 67k tiles). */
+		    int e2d = 0, j2d, rm = 0;
+		    long long ex, ey, fa;
+		    while (!((cutd >> e2d) & 1u)) ++e2d;
+		    j2d = (e2d + 1 == n) ? 0 : e2d + 1;
+		    ex = cx[j2d] - cx[e2d]; ey = cy[j2d] - cy[e2d];
+		    if (wpos)
+		    {
+			ax[0] = px0; ay[0] = py0; ax[1] = px1; ay[1] = py0;
+			ax[2] = px1; ay[2] = py1; ax[3] = px0; ay[3] = py1;
+		    }
+		    else
+		    {
+			ax[0] = px0; ay[0] = py0; ax[1] = px0; ay[1] = py1;
+			ax[2] = px1; ay[2] = py1; ax[3] = px1; ay[3] = py0;
+		    }
+		    fa = ex * (long long)(ay[0] - cy[e2d])
+		       - ey * (long long)(ax[0] - cx[e2d]);
+		    for (i = 0; i < 4; ++i)
+		    {
+			int j3 = (i + 1) & 3;
+			long long fb = ex * (long long)(ay[j3] - cy[e2d])
+			             - ey * (long long)(ax[j3] - cx[e2d]);
+			int ina = wpos ? (fa >= 0) : (fa <= 0);
+			int inb = wpos ? (fb >= 0) : (fb <= 0);
+			if (ina) { bxv[rm] = ax[i]; byv[rm] = ay[i]; rm++; }
+			if (ina != inb)
+			{
+			    long long d2v = fa - fb;
+			    long long m1 = fa < 0 ? -fa : fa;
+			    long long m2 = d2v < 0 ? -d2v : d2v;
+			    int sh = 0, t;
+			    if (m2 > m1) m1 = m2;
+			    while (m1 >= (1ll << 30)) { m1 >>= 1; sh++; }
+			    t = psw_fdiv((int)(fa >> sh), (int)(d2v >> sh));
+			    bxv[rm] = ax[i] + (int)(((long long)(ax[j3] - ax[i]) * t) >> 16);
+			    byv[rm] = ay[i] + (int)(((long long)(ay[j3] - ay[i]) * t) >> 16);
+			    rm++;
+			}
+			fa = fb;
+		    }
+		    if (rm < 3) return;
+		    m = rm;
+		    area2 = 0;
+		    for (i = 0; i < m; ++i)
+		    {
+			int j3 = (i + 1 == m) ? 0 : i + 1;
+			area2 += (long long)(bxv[i] - x0) * (byv[j3] - y0)
+			       - (long long)(bxv[j3] - x0) * (byv[i] - y0);
+		    }
+		    if (area2 < 0) area2 = -area2;
 		}
-		m = 4;
-		area2 = 2 * (long long)(px1 - px0) * (py1 - py0);
 	    }
 	    else
 	    {
-	    /* general piece (diagonal hard cut): the exact clipped poly-cap-tile */
+	    /* general piece (2+ diagonal hard cuts): the clipped poly-cap-tile */
 	    m = psw_clip_axis(cx, cy, n, ax, ay, 0, +1, x0);
 	    if (m < 3) return;
 	    m = psw_clip_axis(ax, ay, m, bxv, byv, 0, -1, x1);

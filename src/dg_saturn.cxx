@@ -3334,8 +3334,13 @@ static void fps_update(void)
                    P - ef = walls + things + pre-pass + kick.  This names the
                    ~100 us/cmd constant ("loi L4") instead of betting on it --
                    the round-26/27 lesson, twice paid.  `o` (0/0 since r21/r22)
-                   and `c` (core band-cull, dormant) ceded their columns. */
-                snprintf(ovbuf, sizeof ovbuf, "P28 N%d/%d e%d/%d/%d t%d f%d k%d u%d b%d n%d ",
+                   and `c` (core band-cull, dormant) ceded their columns.
+                   ROUND 29 (console P28 read: y 0-2 = staging works, ew-y
+                   19-26 = the border walk, ef-ew 7-14 = per-plane prep):
+                   axis-cut border rect fast path, mixed interiors on the
+                   corner cache, flag-gates before the world clip, 1-projection
+                   near-row light, visplanes deleted under PSW (vp reads 0). */
+                snprintf(ovbuf, sizeof ovbuf, "P29 N%d/%d e%d/%d/%d t%d f%d k%d u%d b%d n%d ",
                          psw_note_ms_last > 99 ? 99 : psw_note_ms_last,
                          psw_fence_ms_last,
                          psw_ef_ms_last > 99 ? 99 : psw_ef_ms_last,
@@ -8517,6 +8522,41 @@ static void sat_psw_sub_note(int subnum, int fh, int ch, int fpic,
     psw_note_frt += (unsigned short)(frt_read() - t0);
 }
 
+/* ROUND 29 -- the owner's deletion directive ("supprimer tout ce qui ne sert
+   plus dans le mode full vdp1").  Under PSW the whole visplane machinery
+   (R_FindPlane per subsector, vp16-55 planes/frame on console P28) served TWO
+   consumers: sky presence and the flat-dalle residency loop in R_DrawPlanes --
+   and the dominant election, whose coverage sums are all zero without span
+   marking, i.e. it already always took its under-eye fallback.  Both survivors
+   come straight from the notes the platform records anyway: clump == -1 is the
+   sky-hack encoding (r_bsp.c hook), flump/clump are the frame's flat lumps.
+   Core now calls THIS from R_DrawPlanes' PSW block (same timing as the old
+   loop: post-walk, pre-kick) and R_Subsector skips R_FindPlane entirely when
+   sat_psw_active -- row LIM `vp` reads 0 in PSW builds by design.  A recorder
+   overflow (> PSW_SUB_MAX subs) can miss a sky-only-in-the-tail frame; the
+   overflowed subs never emitted anyway (counted, psw_sub_ovf). */
+extern "C" unsigned char *R_FlatCacheGet(int lumpnum);
+extern "C" void R_PswFrameFlats(void)
+{
+    int seen[16], ns = 0, k, i;
+    for (k = 0; k < psw_sub_n; ++k)
+    {
+	int l2[2];
+	l2[0] = psw_sub[k].flump; l2[1] = psw_sub[k].clump;
+	if (l2[1] < 0) sat_frame_has_sky = 1;
+	for (i = 0; i < 2; ++i)
+	{
+	    int lu = l2[i], s;
+	    if (lu < 0) continue;
+	    for (s = 0; s < ns; ++s) if (seen[s] == lu) break;
+	    if (s < ns) continue;
+	    if (ns < 16) seen[ns++] = lu;
+	    R_FlatCacheGet(lu);          /* one disc read per residency, then
+	                                    the LRU dalle holds it (`ld` caps) */
+	}
+    }
+}
+
 /* SH-2 DIVU FixedDiv, IPL15 across the 3-write/1-read window (the fvdp1_fdiv recipe). */
 static inline int psw_fdiv(int a, int b)
 {
@@ -9104,6 +9144,13 @@ static void psw_emit_plane_tiles(int slot, unsigned short colr,
 	    }
 	}
 	unsigned int hardm = fullm & ~softm;
+	unsigned int axm = 0;               /* round 29: axis-aligned edges (the
+	                                       border fast path's precondition) */
+	for (i = 0; i < n; ++i)
+	{
+	    int j = (i + 1 == n) ? 0 : i + 1;
+	    if (cx[i] == cx[j] || cy[i] == cy[j]) axm |= 1u << i;
+	}
 	long long egx[PSW_FAN_MAX], egy[PSW_FAN_MAX];   /* d(cross)/d(tile step) */
 	for (i = 0; i < n; ++i)
 	{
@@ -9111,38 +9158,71 @@ static void psw_emit_plane_tiles(int slot, unsigned short colr,
 	    egx[i] = -((long long)(cy[j] - cy[i]) << 22);   /* -ey * 64u */
 	    egy[i] =  ((long long)(cx[j] - cx[i]) << 22);   /*  ex * 64u */
 	}
-	auto emit64 = [&](int tx, int ty, int interior) -> void
-	{
+	auto emit64 = [&](int tx, int ty, unsigned int cutm) -> void
+	{   /* BORDER tile only since round 29 (interiors ride emitfull's corner
+	       cache; the mixed walk's note-mask check is hoisted to its caller). */
 	    int ax[PSW_FAN_MAX], ay[PSW_FAN_MAX];
 	    int bxv[PSW_FAN_MAX], byv[PSW_FAN_MAX];
 	    int x0 = tx << 22, y0 = ty << 22;
 	    int x1 = x0 + (64 << 16), y1 = y0 + (64 << 16);
 	    int m, full;
 	    long long area2;
+	    unsigned int cuth = cutm & hardm;
 	    if (psw_flat_cmds >= psw_flat_cap_dyn) { stop = 1; return; }
-	    if (cull_h != 0x7fffffff)
-	    {   /* mixed plane: the note's cached verdicts, POSITIONAL index
-	           (round 22: keyed by cell position in the bbox's row-major
-	           order, so the walk order is free to differ) */
-		int ti = (ty - tya) * tw + (tx - txa);
-		if (ti >= 0 && ti < PSW_PROBE_TILES)
-		{ if ((psw_cur_mask >> ti) & 1u) return; }
-		else if (psw_tile_hidden(x0, y0, 64 << 16, psign, cull_h)) return;
+	    if (cuth && !(cuth & ~axm))
+	    {   /* ROUND 29 -- AXIS-CUT FAST PATH (console P28: ew 19-26 ms with
+	           b59-99 border tiles = the walk's dominant bill; each paid 4
+	           Sutherland passes + shoelace + divisions here).  When every
+	           HARD cutting edge is axis-aligned -- Doom's common case -- the
+	           piece tile-cap-poly is an exact RECT: clamp the tile bounds by
+	           each cutting line, O(1), zero divisions.  Crossings on axis
+	           edges interpolate exactly, so this is BIT-IDENTICAL to the old
+	           clip (r29_border_check.py, 34k tiles).  SOFT frustum bits are
+	           IGNORED like class-2 full squares: the piece widens past the
+	           frustum line only (tail <= 64u, VDP1-system-clipped; on-screen
+	           texels identical, proven point-wise in the same harness) --
+	           and the widened rect often SAVES a window command.  A poly
+	           vertex strictly inside the tile puts BOTH its edges in cutm
+	           (a line through a square's interior separates its corners), so
+	           a diagonal corner can never hide from this test. */
+		int px0 = x0, px1 = x1, py0 = y0, py1 = y1;
+		for (int e2 = 0; e2 < n; ++e2)
+		{
+		    int j2;
+		    if (!((cuth >> e2) & 1u)) continue;
+		    j2 = (e2 + 1 == n) ? 0 : e2 + 1;
+		    if (cx[e2] == cx[j2])
+		    {   /* vertical cut x = cx[e2]: keep-side from the winding */
+			if (wpos ? (cy[j2] > cy[e2]) : (cy[j2] < cy[e2]))
+			{ if (cx[e2] < px1) px1 = cx[e2]; }
+			else
+			{ if (cx[e2] > px0) px0 = cx[e2]; }
+		    }
+		    else
+		    {   /* horizontal cut y = cy[e2] */
+			if (wpos ? (cx[j2] > cx[e2]) : (cx[j2] < cx[e2]))
+			{ if (cy[e2] > py0) py0 = cy[e2]; }
+			else
+			{ if (cy[e2] < py1) py1 = cy[e2]; }
+		    }
+		}
+		if (px1 <= px0 || py1 <= py0) return;
+		if (wpos)
+		{
+		    bxv[0] = px0; byv[0] = py0; bxv[1] = px1; byv[1] = py0;
+		    bxv[2] = px1; byv[2] = py1; bxv[3] = px0; byv[3] = py1;
+		}
+		else
+		{
+		    bxv[0] = px0; byv[0] = py0; bxv[1] = px0; byv[1] = py1;
+		    bxv[2] = px1; byv[2] = py1; bxv[3] = px1; byv[3] = py0;
+		}
+		m = 4;
+		area2 = 2 * (long long)(px1 - px0) * (py1 - py0);
 	    }
-	    if (interior)
-	    {   /* contained in every HARD edge (round 27: possibly cut by a
-	           soft frustum edge -- tail <= 64u, system-clipped): ONE
-	           command, no clip, no window, provably inside this leaf */
-		int qx[4], qy[4];
-		if (!psw_project(x0, y1, ph, psign, &qx[0], &qy[0])) return;
-		if (!psw_project(x1, y1, ph, psign, &qx[1], &qy[1])) return;
-		if (!psw_project(x1, y0, ph, psign, &qx[2], &qy[2])) return;
-		if (!psw_project(x0, y0, ph, psign, &qx[3], &qy[3])) return;
-		psw_paint_idx = 176;                /* L+X: full squares RED */
-		psw_emit_flatquad(slot, colr, qx, qy);
-		return;
-	    }
-	    /* BORDER tile: the exact clipped piece (poly-cap-tile) */
+	    else
+	    {
+	    /* general piece (diagonal hard cut): the exact clipped poly-cap-tile */
 	    m = psw_clip_axis(cx, cy, n, ax, ay, 0, +1, x0);
 	    if (m < 3) return;
 	    m = psw_clip_axis(ax, ay, m, bxv, byv, 0, -1, x1);
@@ -9159,6 +9239,7 @@ static void psw_emit_plane_tiles(int slot, unsigned short colr,
 		       - (long long)(bxv[j] - x0) * (byv[i] - y0);
 	    }
 	    if (area2 < 0) area2 = -area2;
+	    }
 	    if ((area2 >> 33) < 2) return;               /* sliver < ~2 units^2 */
 	    full = ((area2 >> 33) >= 64 * 64 - 2);       /* the whole tile (round 9: the old
 	                                                    -32 tolerance let a corner-cut tile
@@ -9509,11 +9590,31 @@ static void psw_emit_plane_tiles(int slot, unsigned short colr,
 		};
 		if (cull_h != 0x7fffffff)
 		{   /* mixed plane: singles (probes/mask; strips would defeat
-		       the per-tile skipping) */
+		       the per-tile skipping).  ROUND 29: the note-mask check is
+		       hoisted HERE (it gated both classes inside emit64), and a
+		       surviving interior tile rides emitfull's corner-projection
+		       cache -- the old uncached interior branch re-projected the
+		       same 4 grid corners up to 4x over. */
 		    for (int ty = cy0r; ty <= cy1r && !stop; ++ty)
 		    {
 			int cls = tclass(ty);
-			if (cls) emit64(tx, ty, cls >= 2);
+			if (!cls) continue;
+			{   /* the note's cached verdicts, POSITIONAL index
+			       (round 22: keyed by cell position in the bbox's
+			       row-major order, walk order free to differ) */
+			    int ti = (ty - tya) * tw + (tx - txa);
+			    if (ti >= 0 && ti < PSW_PROBE_TILES)
+			    { if ((psw_cur_mask >> ti) & 1u) continue; }
+			    else if (psw_tile_hidden(tx << 22, ty << 22, 64 << 16,
+			                             psign, cull_h)) continue;
+			}
+			if (cls >= 2) emitfull(ty);
+			else
+			{
+			    int r0 = ty - cy0r;
+			    emit64(tx, ty, fullm & ~(cmA[r0] & cmA[r0 + 1]
+			                             & cmB[r0] & cmB[r0 + 1]));
+			}
 		    }
 		}
 		else
@@ -9530,7 +9631,12 @@ static void psw_emit_plane_tiles(int slot, unsigned short colr,
 			    && tclass(ty + 1) == 3
 			    && stripe(ty, 2)) { ty += 2; continue; }
 			if (cls >= 2) emitfull(ty);
-			else          emit64(tx, ty, 0);
+			else
+			{
+			    int r0 = ty - cy0r;
+			    emit64(tx, ty, fullm & ~(cmA[r0] & cmA[r0 + 1]
+			                             & cmB[r0] & cmB[r0 + 1]));
+			}
 			++ty;
 		    }
 		}
@@ -9972,22 +10078,17 @@ static void psw_emit_subflats(int k)
 	    if (cl < 0) continue;
 	    ph = psw_sub[k].ch - viewz; psign = -1; lump = cl;
 	}
-	n = psw_plane_poly(sn, ph, psign, cx, cy);      /* world-clipped: no offscreen tail */
-	if (n < 3) continue;
 	{
 	    int cull_h = 0x7fffffff;
+	    /* ROUND 29: the note/pre-pass verdicts gate FIRST -- a hidden or
+	       dropped plane used to pay psw_plane_poly's three world clips just
+	       to throw them away (console P28: ef-ew 7-14 ms of per-plane prep). */
 	    if (pass == 0)
 	    {   /* trust the pre-pass verdicts (LOS + wall-occlusion buckets) */
 		if (psw_sub_flag[k] & 1) continue;
-		if (psw_sub_flag[k] & 0x40)
-		{   /* STANDBY (paper famine): rescue as a 4-cmd SOLID iff the
-		       bank's REAL slack provably covers it beyond every not-yet-
-		       emitted commitment (round 16) -- the near field's paper
-		       stays reserved, so this can never re-create the round-9
-		       near truncation.  Rescued => k stops counting it. */
-		    if ((int)vdp1_wnext + 4 + psw_paper_left > vdp1_wall_cap) continue;
-		    psw_kill_n--;
-		}
+		if ((psw_sub_flag[k] & 0x40)
+		    && (int)vdp1_wnext + 4 + psw_paper_left > vdp1_wall_cap)
+		    continue;
 		if (psw_sub_flag[k] & 2) cull_h = psw_sub[k].fh;
 	    }
 	    else
@@ -10000,10 +10101,20 @@ static void psw_emit_subflats(int k)
 		       counted in k.  (Floors are safe: ledge ghosts are covered
 		       by the punch + nearer subs overpaint the rest.) */
 		    if (psw_sub_flag[k] & 8) continue;
-		    if ((int)vdp1_wnext + 4 + psw_paper_left > vdp1_wall_cap) continue;
-		    psw_kill_n--;
+		    if ((int)vdp1_wnext + 4 + psw_paper_left > vdp1_wall_cap)
+			continue;
 		}
 		if (psw_sub_flag[k] & 8) cull_h = psw_sub[k].ch;
+	    }
+	    n = psw_plane_poly(sn, ph, psign, cx, cy);  /* world-clipped: no offscreen tail */
+	    if (n < 3) continue;
+	    if (psw_sub_flag[k] & ((pass == 0) ? 0x40 : 0x80))
+	    {   /* STANDBY (paper famine): rescue as a 4-cmd SOLID iff the bank's
+	           REAL slack provably covers it beyond every not-yet-emitted
+	           commitment (round 16; the paper check passed above) -- the near
+	           field's paper stays reserved, so this can never re-create the
+	           round-9 near truncation.  Rescued => k stops counting it. */
+		psw_kill_n--;
 	    }
 	{
 	    /* solid verdict FIRST (round 16): a solid plane needs the centre-texel
@@ -10032,21 +10143,46 @@ static void psw_emit_subflats(int k)
 		if (src) fb = src[32*64 + 32];
 		else if (slot < 0) { psw_flat_denied++; continue; }
 	    }
-	    for (i = 0; i < n; ++i)
-		if (!psw_project(cx[i], cy[i], ph, psign, &sxv[i], &syv[i])) { ok = 0; break; }
-	    if (!ok) continue;
-	    {   /* fully offscreen (e.g. the ceiling while looking down): VDP1 would
-		   still pay the walk for it -- cull for free */
-		int xl = sxv[0], xr = sxv[0], yt = syv[0], yb = syv[0];
+	    if (solid)
+	    {   /* the fan needs every projected vertex; the offscreen cull rides
+		   the same loop for free */
+		for (i = 0; i < n; ++i)
+		    if (!psw_project(cx[i], cy[i], ph, psign, &sxv[i], &syv[i])) { ok = 0; break; }
+		if (!ok) continue;
+		{
+		    int xl = sxv[0], xr = sxv[0], yt = syv[0], yb = syv[0];
+		    for (i = 1; i < n; ++i)
+		    { if (sxv[i] < xl) xl = sxv[i]; if (sxv[i] > xr) xr = sxv[i];
+		      if (syv[i] < yt) yt = syv[i]; if (syv[i] > yb) yb = syv[i]; }
+		    if (xr < 0 || xl > viewwidth - 1 || yb < 0 || yt > viewheight - 1) continue;
+		}
+		/* light: the R_MapPlane formula at the quad's NEAR row (fvdp1 recipe) */
+		nr = syv[0];
 		for (i = 1; i < n; ++i)
-		{ if (sxv[i] < xl) xl = sxv[i]; if (sxv[i] > xr) xr = sxv[i];
-		  if (syv[i] < yt) yt = syv[i]; if (syv[i] > yb) yb = syv[i]; }
-		if (xr < 0 || xl > viewwidth - 1 || yb < 0 || yt > viewheight - 1) continue;
+		    if (psign > 0 ? (syv[i] > nr) : (syv[i] < nr)) nr = syv[i];
 	    }
-	    /* light: the R_MapPlane formula at the quad's NEAR row (the fvdp1 recipe) */
-	    nr = syv[0];
-	    for (i = 1; i < n; ++i)
-		if (psign > 0 ? (syv[i] > nr) : (syv[i] < nr)) nr = syv[i];
+	    else
+	    {   /* ROUND 29 -- a tiled plane needed the n projections only for the
+		   near-row light + a "fully offscreen" cull (console P28: ef-ew
+		   7-14 ms of per-plane prep).  The near row is the MIN-DEPTH
+		   vertex's row (a horizontal plane's screen row is a monotonic
+		   function of forward depth; a depth tie is a row tie), so ONE
+		   projection after an n-term depth scan gives the bit-identical
+		   nr -- and the min-depth vertex is exactly the one psw_project
+		   would reject first, so the drop condition is unchanged too.
+		   The offscreen cull is dropped here: a world-clipped forward-
+		   facing plane is on screen except the 8u frustum-slack sliver,
+		   whose few quads the VDP1 system clip eats. */
+		int dmin = 0, vi = 0;
+		for (i = 0; i < n; ++i)
+		{
+		    int d = FixedMul(cx[i] - viewx, viewcos)
+		          + FixedMul(cy[i] - viewy, viewsin);
+		    if (i == 0 || d < dmin) { dmin = d; vi = i; }
+		}
+		if (!psw_project(cx[vi], cy[vi], ph, psign, &sxv[0], &syv[0])) continue;
+		nr = syv[0];
+	    }
 	    if (nr < 0) nr = 0; else if (nr >= viewheight) nr = viewheight - 1;
 	    li = ((int)psw_sub[k].light >> 4) + extralight;
 	    if (li < 0) li = 0; else if (li > 15) li = 15;

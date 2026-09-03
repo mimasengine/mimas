@@ -149,8 +149,17 @@ endif
 # R_DrawPlanes, dg_saturn.cxx R+C live toggle + view-blit cut) into the binary.  Empty
 # (default) = ZERO PSW bytes -- the normal build is unchanged.  build.ps1 -Psw sets it.
 SAT_PSW ?=
+# Round 29: under PSW no visplane is ever CREATED any more (R_Subsector skips
+# R_FindPlane when sat_psw_active; sky + dalle residency read the platform
+# notes) -- MAXVISPLANES only sizes the R+C software-toggle fallback there.
+# 96 covers the measured 1p peak (45, TNT MAP11) with 2x margin and returns
+# ~0.9 KB of bss (vpsort + hashnext) to the thin Psw TLSF pool.  The normal
+# build keeps 256 -- same flag string, bit-intact.
 ifneq ($(SAT_PSW),)
   PSW_FLAG = -DSAT_PSW=$(SAT_PSW)
+  MAXVP = 96
+else
+  MAXVP = 256
 endif
 
 # SRL puts modules/dummy/ in the path which stubs out stdio.h (no FILE type).
@@ -189,7 +198,7 @@ endif
 #   (DG_ZoneBase = LOW_WORK_RAM_SIZE - RP_CMD_BUF_SIZE) -- endgame RAM for big PWADs.  DoomJo: benign.
 SRL_CUSTOM_CCFLAGS = -w -fsigned-char \
     -DCMAP256 -DDOOMGENERIC_RESX=320 -DDOOMGENERIC_RESY=200 -DNDEBUG \
-    -DMAXVISPLANES=256 \
+    -DMAXVISPLANES=$(MAXVP) \
     -DSAT_VISPLANE_POOL=1 -DVP_POOL_PLANES=64 \
     -DRP_CMD_BUF_SIZE=0x2000 \
     -DTEXCACHE_MARGIN=0x20000 \

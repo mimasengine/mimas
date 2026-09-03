@@ -8031,16 +8031,16 @@ static const unsigned int psw_slot_vram[PSW_FLAT_SLOTS] =
 /* (PSW_SOLID_HPX / PSW_SOLID_AREA -- the round-16 small-projection->solid LOD --
    DELETED in round 22: it was the standing magenta source ("le rose est toujours
    flat"), and the 128 SUPER-TILES serve the far field TEXTURED instead.) */
-#define PSW_SUPER_PX     28          /* round 22: a 128x128 super-tile whose projected
-                                        diagonal spans at/below this emits as ONE quad --
-                                        the 64 char mapped over 128 world = u advances at
-                                        (wx>>1)&63, grid-continuous across super-tiles.
-                                        VDP1 cannot wrap/repeat a char (linear read), but
-                                        on an ALIGNED 2x grid the same char IS its own
-                                        repeat, just 2x zoomed -- unreadable at gate
-                                        distance.  (A true half-res mip char would even
-                                        keep the scale: +4KB/slot, later option.) */
-#define PSW_SOFT_MAX     6           /* soft far-border lines scanned per sub (core) */
+/* (PSW_SUPER_PX / the 128 zoomed super-tiles -- DELETED in round 24: the 64
+   char over 128 world is a 2x zoom, and the console read it instantly ("les
+   superquads avec texture zoomes sont trop visibles, je n'en veux pas").  The
+   far-field economy lives in the EXACT vertical strips instead -- x2 and x3
+   tiles per command, world-exact at any distance.  A true half-res mip char
+   (+4KB/slot) would revive supers exactly; parked.) */
+#define PSW_SOFT_MAX     8           /* soft far-border lines scanned per sub (core);
+                                        raised 6 -> 8 in round 24 with the widened
+                                        criterion (any height/flat change) -- a silent
+                                        truncation here = a missed clip = a step bleed */
 /* MIXED-plane probed billing (round 17).  Console r16: k5-11 FLICKERING frame to
    frame with the bank 62% empty (c112-172 / B281-296) -- the residual paper hog
    is the MIXED planes (LOD-exempt): they bill every touched tile at 2 cmds while
@@ -8098,10 +8098,15 @@ static int psw_sub_ovf = 0;          /* subs REJECTED by the recorder this walk 
                                         PSW_SUB_MAX again) */
 static int psw_spr_tail = 0x7fff;    /* vissprite watermark at the FIRST overflow */
 static int psw_flat_cmds = 0;
-static int psw_paint_idx = 88;   /* L+X flat paint, PER EMIT PATH (round 12 diagnostic):
-                                    88 = RED full tile, 216 = ORANGE band+window,
-                                    250 = MAGENTA solid (budget degrade / famine) --
-                                    one capture names the path a bad quad took */
+static int psw_paint_idx = 176;  /* L+X flat paint, PER EMIT PATH (round 12 diagnostic):
+                                    176 = RED full tile/exact strip, 4 = WHITE own-quad
+                                    (small plane), 216 = ORANGE band+window, 250 =
+                                    MAGENTA solid (budget degrade / famine) -- one
+                                    capture names the path a bad quad took.  ROUND 24:
+                                    the old "red" was PLAYPAL 88 = (183,183,183) GREY --
+                                    console 2026-09-03 "je n'ai jamais vu de rouge" while
+                                    full squares WERE firing, painted grey.  PLAYPAL 176
+                                    is (255,0,0). */
 static int psw_band_n = 0;       /* clean band+window pieces this flush (row 13 `b`) */
 static int psw_fanq_n = 0;       /* fan pieces/planes this flush (row 13 `n`) */
 static unsigned int psw_cur_mask = 0;   /* round 17: the emitting plane's cached tile-LOS
@@ -8111,8 +8116,9 @@ static int psw_fine_cmds = 0;    /* round 20: edge-refinement commands spent thi
                                     (capped at PSW_FINE_CAP -- see the defines) */
 static int psw_cur_sub = -1;     /* round 22: subnum of the plane being emitted (the
                                     tile walker rescans its soft border lines) */
-static int psw_cur_tall = 0;     /* round 23: the emitting plane's slot is PAIRED --
-                                    interior tile columns may emit 64x128 strips */
+static int psw_cur_tall = 0;     /* round 23/24: the emitting plane's slot CHAIN length
+                                    minus one (0 = single, 1 = pair, 2 = triple) --
+                                    interior tile columns emit 64x128 / 64x192 strips */
 static int psw_leaf_bad = 0;     /* round 22: noted subs whose LEAF POLYGON is invalid
                                     (pvn < 3) -- the deterministic same-spot hole class
                                     (owner: "le triangle est la systematiquement, c'est
@@ -8399,69 +8405,89 @@ static int psw_slot_upload(int v, int lumpnum)
     if (locked) W_ReleaseLumpNum(lumpnum);
     return 0;
 }
-static void psw_slot_break(int s)      /* dissolve any pair s belongs to (metadata only) */
+static void psw_slot_break(int s)      /* dissolve any CHAIN s belongs to (metadata only) */
 {
+    if (psw_slot[s].shadow) s = psw_slot[s].pairbase;
     if (psw_slot[s].tall)
     {
-	int t = psw_slot_next[s];
-	if (t >= 0 && psw_slot[t].shadow)
-	{ psw_slot[t].shadow = 0; psw_slot[t].lumpnum = -1; psw_slot[t].lru = 0; }
+	int t = s;
+	for (int c = psw_slot[s].tall; c > 0; --c)
+	{
+	    t = psw_slot_next[t];
+	    if (t < 0 || !psw_slot[t].shadow) break;
+	    psw_slot[t].shadow = 0; psw_slot[t].lumpnum = -1; psw_slot[t].lru = 0;
+	}
 	psw_slot[s].tall = 0;
     }
-    if (psw_slot[s].shadow)
-    {
-	psw_slot[psw_slot[s].pairbase].tall = 0;
-	psw_slot[s].shadow = 0; psw_slot[s].lumpnum = -1;
-    }
 }
-static int psw_slot_get(int lumpnum, int tall = 0)
+static int psw_slot_get(int lumpnum, int want = 0)   /* want = EXTRA chained slots (0..2):
+                                                        round 24 -- triples ("augmente a
+                                                        trois", the no-red reason found:
+                                                        PLAYPAL 88 is grey) */
 {
     int i, v = -1;
     unsigned int best = 0xffffffffu;
     for (i = 0; i < PSW_FLAT_SLOTS; ++i)
 	if (!psw_slot[i].shadow && psw_slot[i].lumpnum == lumpnum)
 	{
+	    int t = i, c;
 	    psw_slot[i].lru = ++psw_slot_tick; psw_slot[i].used = 1;
-	    if (psw_slot[i].tall)
-	    {   /* keep the shadow reserved alongside its base */
-		int t = psw_slot_next[i];
+	    for (c = psw_slot[i].tall; c > 0; --c)
+	    {   /* keep every shadow reserved alongside its base */
+		t = psw_slot_next[t];
 		psw_slot[t].lru = psw_slot[i].lru; psw_slot[t].used = 1;
 	    }
-	    else if (tall)
-	    {   /* upgrade in place iff the neighbour is free this frame */
-		int t = psw_slot_next[i];
-		if (t >= 0 && !psw_slot[t].used && psw_slot_upload(t, lumpnum) == 0)
-		{
-		    psw_slot_break(t);
-		    psw_slot[t].lumpnum = lumpnum; psw_slot[t].shadow = 1;
-		    psw_slot[t].pairbase = (unsigned char)i;
-		    psw_slot[t].used = 1; psw_slot[t].lru = psw_slot[i].lru;
-		    psw_slot[i].tall = 1;
-		}
+	    while ((int)psw_slot[i].tall < want)
+	    {   /* extend in place iff the next neighbour is free this frame */
+		t = i;
+		for (c = psw_slot[i].tall; c > 0; --c) t = psw_slot_next[t];
+		t = psw_slot_next[t];
+		if (t < 0 || psw_slot[t].used || psw_slot_upload(t, lumpnum) != 0) break;
+		psw_slot_break(t);
+		psw_slot[t].lumpnum = lumpnum; psw_slot[t].shadow = 1;
+		psw_slot[t].pairbase = (unsigned char)i;
+		psw_slot[t].used = 1; psw_slot[t].lru = psw_slot[i].lru;
+		psw_slot[i].tall++;
 	    }
 	    return i;
 	}
-    if (tall)
-    {   /* miss wanting a pair: two adjacent unreserved slots, oldest pair first */
+    for (; want > 0; --want)
+    {   /* miss wanting a chain: want+1 ADJACENT unreserved slots, the least
+	   recently used run first; degrade toward a shorter chain (then the
+	   single path below) when no run of that length is free */
 	int bs = -1; unsigned int bl = 0xffffffffu;
 	for (i = 0; i < PSW_FLAT_SLOTS; ++i)
 	{
-	    int t = psw_slot_next[i];
-	    unsigned int l;
-	    if (t < 0 || psw_slot[i].used || psw_slot[t].used) continue;
-	    l = (psw_slot[i].lru > psw_slot[t].lru) ? psw_slot[i].lru : psw_slot[t].lru;
+	    int t = i, c; unsigned int l = psw_slot[i].lru;
+	    if (psw_slot[i].used) continue;
+	    for (c = 0; c < want; ++c)
+	    {
+		t = psw_slot_next[t];
+		if (t < 0 || psw_slot[t].used) { t = -1; break; }
+		if (psw_slot[t].lru > l) l = psw_slot[t].lru;
+	    }
+	    if (t < 0) continue;
 	    if (l < bl) { bl = l; bs = i; }
 	}
-	if (bs >= 0 && psw_slot_upload(bs, lumpnum) == 0
-	    && psw_slot_upload(psw_slot_next[bs], lumpnum) == 0)
+	if (bs < 0) continue;
 	{
-	    int t = psw_slot_next[bs];
-	    psw_slot_break(bs); psw_slot_break(t);
+	    int t = bs, c, ok = (psw_slot_upload(bs, lumpnum) == 0);
+	    for (c = 0; c < want && ok; ++c)
+	    { t = psw_slot_next[t]; ok = (psw_slot_upload(t, lumpnum) == 0); }
+	    if (!ok) continue;
+	    psw_slot_break(bs);
 	    psw_slot[bs].lumpnum = lumpnum; psw_slot[bs].lru = ++psw_slot_tick;
-	    psw_slot[bs].used = 1; psw_slot[bs].tall = 1; psw_slot[bs].shadow = 0;
-	    psw_slot[t].lumpnum = lumpnum; psw_slot[t].lru = psw_slot[bs].lru;
-	    psw_slot[t].used = 1; psw_slot[t].tall = 0; psw_slot[t].shadow = 1;
-	    psw_slot[t].pairbase = (unsigned char)bs;
+	    psw_slot[bs].used = 1; psw_slot[bs].tall = (unsigned char)want;
+	    psw_slot[bs].shadow = 0;
+	    t = bs;
+	    for (c = 0; c < want; ++c)
+	    {
+		t = psw_slot_next[t];
+		psw_slot_break(t);
+		psw_slot[t].lumpnum = lumpnum; psw_slot[t].lru = psw_slot[bs].lru;
+		psw_slot[t].used = 1; psw_slot[t].tall = 0; psw_slot[t].shadow = 1;
+		psw_slot[t].pairbase = (unsigned char)bs;
+	    }
 	    return bs;
 	}
     }
@@ -8498,7 +8524,7 @@ static void psw_emit_flatquad(int slot, unsigned short colr, const int *qx, cons
 	cmd[0] = 0x0004;   /* slot famine: solid POLYGON, colr = light bank | flat texel */
     if (sat_wall_paint & 1)
     {   /* DEBUG PAINT by EMIT PATH (walls green, things blue, punch yellow):
-	   psw_paint_idx = 88 full tile / 250 fan -- set by the caller */
+	   psw_paint_idx = 176 full tile / 250 fan -- set by the caller */
 	cmd[0] = 0x0004;
 	cmd[3] = (unsigned short)(0x0100u | (unsigned)psw_paint_idx);
     }
@@ -8709,9 +8735,10 @@ static void psw_emit_plane_tiles(int slot, unsigned short colr,
 	   by nearer subs, or is pixel-identical (split chords, same flat).
 	   Only soft-crossing tiles pay the exact clipped path (bands + the
 	   round-20 fine sub-bands): the stairs die where a wall IS the true
-	   silhouette, and stay 8u-fine where nothing covers.  Non-mixed planes
-	   walk a TWO-LEVEL grid: far 128 super-tiles emit as one quad (the 64
-	   char over 128 world -- grid-continuous, see PSW_SUPER_PX). */
+	   silhouette, and stay 8u-fine where nothing covers.  ROUND 24: the
+	   grid is the norm for the LARGE flats only -- small planes (steps,
+	   sills) take ONE own-quad below, and non-mixed columns compress into
+	   exact 64x128/64x192 strips (chained slots). */
 	int tw = txb - txa + 1;
 	int slx1[PSW_SOFT_MAX], sly1[PSW_SOFT_MAX];
 	int slx2[PSW_SOFT_MAX], sly2[PSW_SOFT_MAX];
@@ -8729,6 +8756,67 @@ static void psw_emit_plane_tiles(int slot, unsigned short colr,
 		    - (long long)(cx[j] - cx[0]) * (cy[i] - cy[0]);
 	    }
 	    wpos = (aw >= 0);
+	}
+	/* ROUND 24 -- OWN-QUAD small planes (owner: "marche, rebord de fenetre
+	   ... candidats parfaits pour avoir leur propre quad texture projete").
+	   A plane whose clipped poly is <= 4 verts and thinner than one tile in
+	   some direction leaves the grid: ONE projected quad, exact to the leaf
+	   shape (zero overdraw, zero holes, no soft-line work at all), its
+	   texture the bbox sub-rect of the flat char -- exact world phase when
+	   the bbox fits the char without wrapping, a bounded stretch otherwise
+	   (these pieces border height changes, so there is no neighbour phase
+	   to preserve).  The long-side cap (128) bounds the stretch to 2x;
+	   bigger narrow strips fall back to the exact grid bands. */
+	if (n <= 4 && slot >= 0
+	    && (bx1 - bx0 < (64 << 16) || by1 - by0 < (64 << 16))
+	    && bx1 - bx0 <= (128 << 16) && by1 - by0 <= (128 << 16))
+	{
+	    int hid = 0;
+	    if (cull_h != 0x7fffffff)
+	    {   /* the owner's 5-point coverage spec, on the bbox */
+		int mx = (bx0 >> 1) + (bx1 >> 1), my = (by0 >> 1) + (by1 >> 1);
+		hid = (psign > 0)
+		    ? (psw_floor_pt_hidden(bx0, by0, cull_h) && psw_floor_pt_hidden(bx1, by0, cull_h)
+		       && psw_floor_pt_hidden(bx1, by1, cull_h) && psw_floor_pt_hidden(bx0, by1, cull_h)
+		       && psw_floor_pt_hidden(mx, my, cull_h))
+		    : (psw_ceil_pt_hidden(bx0, by0, cull_h) && psw_ceil_pt_hidden(bx1, by0, cull_h)
+		       && psw_ceil_pt_hidden(bx1, by1, cull_h) && psw_ceil_pt_hidden(bx0, by1, cull_h)
+		       && psw_ceil_pt_hidden(mx, my, cull_h));
+	    }
+	    if (hid) return;
+	    {
+		int qx[4], qy[4], ord[4], k0 = 0, okq = 1;
+		long long bestd = -1;
+		for (i = 0; i < n; ++i)
+		{   /* vert nearest the bbox's TOP-LEFT = the (u0,v0) texture corner */
+		    long long d = (long long)(cx[i] - bx0) + (long long)(by1 - cy[i]);
+		    if (bestd < 0 || d < bestd) { bestd = d; k0 = i; }
+		}
+		for (i = 0; i < 4; ++i)
+		{   /* TL->TR->BR->BL is CLOCKWISE in world (y up): walk the poly
+		       against its winding when it is CCW; a triangle repeats its
+		       last vert (VDP1 degenerate quad) */
+		    int s2 = (i < n) ? i : n - 1;
+		    ord[i] = wpos ? (k0 - s2 + n) % n : (k0 + s2) % n;
+		}
+		for (i = 0; i < 4 && okq; ++i)
+		    okq = psw_project(cx[ord[i]], cy[ord[i]], ph, psign, &qx[i], &qy[i]);
+		if (okq)
+		{
+		    int u0 = (bx0 >> 16) & 63;
+		    int uw = ((bx1 - bx0) >> 16) + 1;
+		    int v0 = (-(by1 >> 16)) & 63;
+		    int vh = ((by1 - by0) >> 16) + 1;
+		    uw += u0 & 7; u0 &= ~7; uw = (uw + 7) & ~7;
+		    if (uw > 64) uw = 64;
+		    if (vh > 64) vh = 64;
+		    if (u0 + uw > 64) u0 = 0;      /* the char cannot wrap: phase */
+		    if (v0 + vh > 64) v0 = 0;      /* lost, stretch stays bounded */
+		    psw_paint_idx = 4;             /* L+X: own-quads WHITE */
+		    psw_emit_rectquad(slot, colr, qx, qy, v0, vh, u0, uw, 0);
+		    return;
+		}
+	    }
 	}
 	auto emit64 = [&](int tx, int ty) -> void
 	{
@@ -8772,7 +8860,7 @@ static void psw_emit_plane_tiles(int slot, unsigned short colr,
 		if (!psw_project(x1, y1, ph, psign, &qx[1], &qy[1])) return;
 		if (!psw_project(x1, y0, ph, psign, &qx[2], &qy[2])) return;
 		if (!psw_project(x0, y0, ph, psign, &qx[3], &qy[3])) return;
-		psw_paint_idx = 88;                 /* L+X: full squares RED */
+		psw_paint_idx = 176;                /* L+X: full squares RED */
 		psw_emit_flatquad(slot, colr, qx, qy);
 		return;
 	    }
@@ -8806,7 +8894,7 @@ static void psw_emit_plane_tiles(int slot, unsigned short colr,
 		if (!psw_project(x1, y1, ph, psign, &qx[1], &qy[1])) return;
 		if (!psw_project(x1, y0, ph, psign, &qx[2], &qy[2])) return;
 		if (!psw_project(x0, y0, ph, psign, &qx[3], &qy[3])) return;
-		psw_paint_idx = 88;                     /* L+X: full tiles RED */
+		psw_paint_idx = 176;                    /* L+X: full tiles RED */
 		psw_emit_flatquad(slot, colr, qx, qy);
 	    }
 	    else
@@ -9003,15 +9091,15 @@ static void psw_emit_plane_tiles(int slot, unsigned short colr,
 		}
 	    }
 	};
-	auto strip2 = [&](int tx, int ty) -> int
-	{   /* round 23: EXACT 64x128 vertical strip over tiles (tx,ty)+(tx,ty+1)
-	       -- the paired slot's second half aliases the neighbour slot, so
-	       ONE command covers TWO tiles at world-exact texture (v phase kept:
-	       the strip top is 128-grid... 64-grid aligned and the char period
-	       is 64).  Returns 1 = handled (strip emitted, or both tiles proven
-	       fully outside); 0 = fall back to single tiles. */
+	auto stripn = [&](int tx, int ty, int cnt) -> int
+	{   /* round 23/24: EXACT 64x(cnt*64) vertical strip over tiles (tx,ty)..
+	       (tx,ty+cnt-1) -- the chained slots alias one another, so ONE
+	       command covers cnt tiles at world-exact texture (v phase kept:
+	       the strip top is 64-grid aligned and the char period is 64).
+	       Returns 1 = handled (strip emitted, or all tiles proven fully
+	       outside); 0 = fall back to shorter strips / single tiles. */
 	    int x0 = tx << 22, y0 = ty << 22;
-	    int x1 = x0 + (64 << 16), y1 = y0 + (128 << 16);
+	    int x1 = x0 + (64 << 16), y1 = y0 + ((cnt * 64) << 16);
 	    int sqx[4], sqy[4], s;
 	    if (psw_flat_cmds >= psw_flat_cap_dyn) { stop = 1; return 1; }
 	    for (int i2 = 0; i2 < n; ++i2)
@@ -9032,72 +9120,30 @@ static void psw_emit_plane_tiles(int slot, unsigned short colr,
 	    if (!psw_project(x1, y1, ph, psign, &sqx[1], &sqy[1])) return 0;
 	    if (!psw_project(x1, y0, ph, psign, &sqx[2], &sqy[2])) return 0;
 	    if (!psw_project(x0, y0, ph, psign, &sqx[3], &sqy[3])) return 0;
-	    psw_paint_idx = 88;                     /* L+X: exact strips RED */
-	    psw_emit_rectquad(slot, colr, sqx, sqy, 0, 128, 0, 64, 0);
+	    psw_paint_idx = 176;                    /* L+X: exact strips RED */
+	    psw_emit_rectquad(slot, colr, sqx, sqy, 0, cnt * 64, 0, 64, 0);
 	    return 1;
 	};
 	if (cull_h != 0x7fffffff)
-	{   /* mixed plane: flat 64 walk (probes/mask; no super-tiles -- their
-	       coarse cells would defeat the per-tile skipping) */
+	{   /* mixed plane: flat 64 walk (probes/mask; no strips -- their
+	       coarse spans would defeat the per-tile skipping) */
 	    for (int ty = tya; ty <= tyb && !stop; ++ty)
 	    for (int tx = txa; tx <= txb && !stop; ++tx)
 		emit64(tx, ty);
 	}
 	else
-	{   /* two-level grid: a far 128 SUPER-TILE is ONE quad (round 22 --
-	       the owner's bigger-quads LOD); near/edge supers split into
-	       their 64 cells */
-	    for (int sy = tya & ~1; sy <= tyb && !stop; sy += 2)
-	    for (int sx = txa & ~1; sx <= txb && !stop; sx += 2)
+	{   /* round 24: the 128 zoomed supers are DELETED (owner: "trop
+	       visibles, je n'en veux pas").  Per COLUMN, exact strips take 3
+	       then 2 tiles per command when the slot chain covers them;
+	       singles otherwise -- everything world-exact. */
+	    for (int tx = txa; tx <= txb && !stop; ++tx)
+	    for (int ty = tya; ty <= tyb && !stop; )
 	    {
-		int x0 = sx << 22, y0 = sy << 22;
-		int x1 = x0 + (128 << 16), y1 = y0 + (128 << 16);
-		int sqx[4], sqy[4], ok = 0, s2, soft2, outs = 0;
-		for (int i2 = 0; i2 < n && !outs; ++i2)
-		{   /* SAT: super fully outside -> all 4 cells are too */
-		    int j2 = (i2 + 1 == n) ? 0 : i2 + 1;
-		    long long ex = cx[j2] - cx[i2], ey = cy[j2] - cy[i2];
-		    long long c00 = ex * (y0 - cy[i2]) - ey * (x0 - cx[i2]);
-		    long long c10 = ex * (y0 - cy[i2]) - ey * (x1 - cx[i2]);
-		    long long c11 = ex * (y1 - cy[i2]) - ey * (x1 - cx[i2]);
-		    long long c01 = ex * (y1 - cy[i2]) - ey * (x0 - cx[i2]);
-		    outs = wpos ? (c00 < 0 && c10 < 0 && c11 < 0 && c01 < 0)
-		                : (c00 > 0 && c10 > 0 && c11 > 0 && c01 > 0);
-		}
-		if (outs) continue;
-		soft2 = 0;
-		for (s2 = 0; s2 < nsoft && !soft2; ++s2)
-		    soft2 = psw_line_cuts_tile(x0, y0, x1, y1,
-		                               slx1[s2], sly1[s2], slx2[s2], sly2[s2]);
-		if (!soft2
-		    && psw_project(x0, y1, ph, psign, &sqx[0], &sqy[0])
-		    && psw_project(x1, y0, ph, psign, &sqx[2], &sqy[2]))
-		{
-		    int ddx = sqx[2] - sqx[0], ddy = sqy[2] - sqy[0];
-		    if (ddx < 0) ddx = -ddx;
-		    if (ddy < 0) ddy = -ddy;
-		    if (ddx + ddy <= 2 * PSW_SUPER_PX
-		        && psw_project(x1, y1, ph, psign, &sqx[1], &sqy[1])
-		        && psw_project(x0, y0, ph, psign, &sqx[3], &sqy[3]))
-			ok = 1;
-		}
-		if (ok)
-		{
-		    if (psw_flat_cmds >= psw_flat_cap_dyn) { stop = 1; continue; }
-		    psw_paint_idx = 88;             /* L+X: full squares RED */
-		    psw_emit_flatquad(slot, colr, sqx, sqy);
-		    continue;
-		}
-		for (int cxi = 0; cxi < 2; ++cxi)
-		{   /* round 23: per column, an exact vertical strip when the
-		       slot is paired; single tiles otherwise */
-		    int tx = sx + cxi;
-		    if (tx > txb) break;
-		    if (psw_cur_tall && sy + 1 <= tyb && strip2(tx, sy))
-			continue;
-		    emit64(tx, sy);
-		    if (sy + 1 <= tyb) emit64(tx, sy + 1);
-		}
+		if (psw_cur_tall >= 2 && ty + 2 <= tyb && stripn(tx, ty, 3))
+		{ ty += 3; continue; }
+		if (psw_cur_tall >= 1 && ty + 1 <= tyb && stripn(tx, ty, 2))
+		{ ty += 2; continue; }
+		emit64(tx, ty); ++ty;
 	    }
 	}
     }
@@ -9436,10 +9482,11 @@ static void psw_emit_subflats(int k)
 	              + ((psw_sub_soft[k] & ((pass == 0) ? 1 : 2)) ? 9 : 1);
 	    int solid = (psw_sub_flag[k] & fanbit)
 	           || (psw_flat_cmds + ebill > psw_flat_cap_dyn);
+	    int fe_ = (int)((pass == 0) ? psw_sub_fe[k] : psw_sub_ce[k]);
 	    int slot = solid ? -1
-	             : psw_slot_get(lump, (int)((pass == 0) ? psw_sub_fe[k]
-	                                                    : psw_sub_ce[k]) >= 12);
-	    psw_cur_tall = (slot >= 0 && psw_slot[slot].tall);   /* round 23 strips */
+	             : psw_slot_get(lump, (fe_ >= 18) ? 2 : (fe_ >= 12) ? 1 : 0);
+	    psw_cur_tall = (slot >= 0) ? (int)psw_slot[slot].tall : 0;  /* round 24:
+	                       chain length - 1 -> 64x128 / 64x192 strips */
 	    int nr, li, zi, ok = 1, fb = 0;
 	    unsigned short colr, scolr;
 	    {   /* centre texel: the SOLID colour for slot famine, the budget
@@ -9877,15 +9924,21 @@ static void vdp1_walls_flush(void)
                 if (fl >= 0 && !(psw_sub_flag[k] & 0x41) && !(psw_sub_flag[k] & 0x10))
                 {
                     int e = (int)psw_sub_fe[k] + ((psw_sub_soft[k] & 1) ? 9 : 1);
-                    if (e <= 4)                        psw_slot_get(fl);
-                    else if (ftile + (e - 4) <= limit) { ftile += e - 4; psw_slot_get(fl); }
+                    /* round 24: the CHAIN hint must ride the pre-pass grab too --
+                       this near-first pass is what reserves the 8 slots, so an
+                       emission-time-only hint found every neighbour taken and
+                       strips silently degraded to singles */
+                    int wnt = (psw_sub_fe[k] >= 18) ? 2 : (psw_sub_fe[k] >= 12) ? 1 : 0;
+                    if (e <= 4)                        psw_slot_get(fl, wnt);
+                    else if (ftile + (e - 4) <= limit) { ftile += e - 4; psw_slot_get(fl, wnt); }
                     else                               psw_sub_flag[k] |= 0x10;
                 }
                 if (cl >= 0 && !(psw_sub_flag[k] & 0x84) && !(psw_sub_flag[k] & 0x20))
                 {
                     int e = (int)psw_sub_ce[k] + ((psw_sub_soft[k] & 2) ? 9 : 1);
-                    if (e <= 4)                        psw_slot_get(cl);
-                    else if (ftile + (e - 4) <= limit) { ftile += e - 4; psw_slot_get(cl); }
+                    int wnt = (psw_sub_ce[k] >= 18) ? 2 : (psw_sub_ce[k] >= 12) ? 1 : 0;
+                    if (e <= 4)                        psw_slot_get(cl, wnt);
+                    else if (ftile + (e - 4) <= limit) { ftile += e - 4; psw_slot_get(cl, wnt); }
                     else                               psw_sub_flag[k] |= 0x20;
                 }
             }

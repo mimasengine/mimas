@@ -434,6 +434,54 @@ StoreWallRange, curline/frontsector/backsector/rw_angle1 vivants).
 > levier suivant est la FUSION des feuilles sœurs de même secteur au chargement,
 > zéro risque de justesse). NON validé console.
 
+> **Statut 2026-09-03 (round 27 — verdict console P26 : « correct visuellement,
+> catastrophique niveau performance » ⇒ SIMPLIFIER, RÉORDONNER, DÉPORTER SUR LE
+> 2e SH-2).** Les 7 captures P26 ont nommé DEUX facturiers CPU, tous PSW : row-2
+> `P` 41,5-45,6 ms (le flush — ~105 µs/cmd, coût unitaire IDENTIQUE dans le couloir
+> rapide ⇒ facture PAR TUILE TESTÉE : SAT 64-bit en `__muldi3` logiciels ~4/arête/
+> tuile, re-jeté jusqu'à 3× par colonne par les sondes stripn, + 4 passes Sutherland
+> par tuile de bord — y compris les bords de FRUSTUM qui balaient tout le sol en
+> tournant) et `Bw` 12-62 ms (le travail à la NOTE dans la traversée BSP — les
+> marches de sondes LOS des plans mixtes, 5 sondes × 1-3 descentes BSP par tuile,
+> recalculées CHAQUE frame ; 62 = la scène à fenêtres). Slave SH-2 : 1-9 % occupé.
+> Tout le reste innocenté (T1-2, blit 0,1, VD1 5-15 ms, k0/d0/o0 partout — la peur
+> famine 2e+1 ne s'est PAS matérialisée). RÉPONSE EN TROIS ÉTAGES : (1) SIMPLIFIER —
+> grille incrémentale de masques de coins (un cross-product est AFFINE sur une
+> grille : 1 multiplication longue par arête par chunk, puis des ADDITIONS 64-bit
+> par coin — les MÊMES entiers bit à bit, redistribués) ; classification O(1) par
+> tuile, strips gratuits par runs de classes (l'ancien SAT plein-rect était
+> ÉQUIVALENT par convexité), et ARÊTES DE FRUSTUM MOLLES : une tuile contenue dans
+> sa feuille mais coupée par le seul bord d'écran émet 1 plein-carré (queue ≤64u,
+> mangée par le system clip VDP1) au lieu de 2 cmds + Sutherland — le confinement
+> vs la FEUILLE est INTACT, le frustum n'est pas un mur, le near-clip reste dur,
+> les strips restent totalement confinés. (2) RÉORDONNER — la marche de masques
+> quitte la note : jobs en file, verdict appliqué min(vis, est) à une FENCE en tête
+> de flush ; le cull band-box passe AVANT les sondes los_cull (rejet le moins cher
+> d'abord) ; réutilisation EXACTE des masques (même œil + même hauteur ≤8 frames :
+> tourner sur place ne recalcule RIEN — les verdicts ne dépendent pas de l'angle).
+> (3) DÉPORTER — un corps slave draine la file PENDANT la traversée BSP du master
+> (slSlaveFunc via rp_sgl_workptr_reset, l'entonnoir r_parallel ; le slave purge
+> son cache à l'entrée, file et résultats passent par le miroir non-caché — SH-2
+> write-through, le seul risque est la staleness en LECTURE ; fence bornée 6 ms
+> avec fallback inline compté + latch-OFF définitif si le corps se coince). Le memo
+> de coins partagés fait passer les sondes de 5/tuile à ~2,25/tuile (fonction
+> partagée VERBATIM slave/inline/late = masques bit-identiques). PREUVE HORS-LIGNE
+> (leçon round 26) : 4000 tirages — équivalence exacte ancien walk ↔ grille
+> (séquence d'émission, strips compris), les molles ne changent JAMAIS l'ensemble
+> de tuiles couvert et ne franchissent JAMAIS une arête dure, le chunking est sans
+> effet (scratchpad grid_walk_check.py). Row 13 : **« P27 »**, champ **`N<note ms>/
+> <fence ms>`** entre (Bw − N = la marche vanilla ; fence 0 = l'offload a totalement
+> recouvert la traversée), `d` sort (lisait 0 depuis le round 4 ; sa panne est
+> MAGENTA en L+X). Pool Psw 17,36 → **11,31 Ko** (.bss file+table ~3,2 Ko + texte ;
+> marge ~6 Ko au-dessus du plancher famine ~5 Ko — surveiller), normal **bit-intact**
+> (61,33 Ko, 22 233 456 octets). Commit Mimas 5c85d84, core INTOUCHÉ. Attendu
+> console : P doit tomber vers ~12-18 ms et Bw vers ~la-vanilla+N ; L+X = du ROUGE
+> aussi en ceinture de bord d'écran (ex-orange, voulu), VD1 `<ms>` peut monter un
+> peu (queues ≤64u au bord — le prix accepté du 1-cmd). Étage suivant si `P`
+> résiduel le justifie : record/execute du flush (pièces de bord + projections
+> calculées par les DEUX CPU, émission sérielle master) — l'infra fence/file est
+> posée. NON validé console.
+
 - **Polygones de sous-secteurs au level-load** (p_setup.c après :1234, PU_LEVEL zone
   LWRAM) : clip récursif du bbox map par les splitlines ancêtres (node_t x16/y16/dx16/
   dy16 exacts) + les segs de la feuille. ~150 lignes, une fois par niveau.

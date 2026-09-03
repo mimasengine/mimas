@@ -370,6 +370,37 @@ StoreWallRange, curline/frontsector/backsector/rw_angle1 vivants).
 > clippé exact. Pool Psw 15,92 Ko (plancher ~5 Ko — marge fondante), normal 61,33 Ko
 > bit-intact. Commits : core ae62ac7, Mimas a11e5dc. NON validé console.
 
+> **Statut 2026-09-03 (round 25 — console round 24 : orange comprimé, parasites rouges
+> « cube dupliqué », rebords toujours en escalier).** (1) **PARASITES ROUGES = LES
+> STRIPS, prouvé par élimination hors-ligne** : `tools/psw_leaf_check.py` rejoue le
+> builder de polygones de feuille du core bit-à-bit (virgule fixe, boucle de
+> rétrécissement, division C, shave) sur les 9 cartes shareware et compare chaque
+> feuille à la vérité exacte en rationnels — **3423 feuilles, zéro sur-taille, zéro
+> sous-taille, zéro dégénérée, zéro winding inversé**. Le SAT par-arête étant complet
+> pour un convexe, une tuile simple ne peut jamais être émise pleinement hors du
+> polygone. Restait UN émetteur rouge capable : le SAT plein-rect des strips ne
+> rejetait qu'un strip ENTIÈREMENT dehors — un strip chevauchant le polygone sur une
+> seule tuile émettait quand même ses 2-3 tuiles = jusqu'à 2 tuiles pleines jetées
+> dans le vide au bord d'un voisin (depuis le round 23 — les parasites gris d'avant =
+> la même classe ; le « cube dupliqué à droite et à gauche » = le flat du plafond
+> voisin, souvent identique, peint dans le vide de part et d'autre). Fix : chaque
+> tuile couverte par un strip passe désormais le même test pleinement-dehors qu'une
+> single — le strip ne peint plus rien qu'une marche single n'aurait pas peint.
+> (2) **TEXTURE COMPRIMÉE = quad-propre v1** : il élargissait la SOURCE à l'alignement
+> 8-texels en gardant le quad à la vraie taille (compression ≤ ~1,9× sur petites
+> pièces) + perte de phase au franchissement de char. v2 = ANCRÉ MONDE : pièces
+> rect-axiales seulement (diagonale/coupe frustum → grille), coins du quad AUX BORNES
+> SNAPPÉES du grid texel (8 en u, 1 en v), source = le sous-rect de char correspondant
+> — texture exacte et en phase grille PAR CONSTRUCTION, arêtes du quad = les vraies
+> arêtes monde ; fenêtre seulement pour rogner la lèvre de snap (≤7 texels) d'une
+> pièce désalignée ; v peut courir dans les slots-ombres chaînés (≤192). (3) **ESCALIER
+> DES REBORDS = le crop-x de la fenêtre rect** : la bande axiale gardait le quad
+> pleine-largeur et rognait en x par la fenêtre — une ligne de crop VERTICALE contre
+> une arête projetée INCLINÉE = les marches 64u. Les pièces rect-axiales émettent
+> désormais à leur vraie étendue x avec le sous-range u correspondant (1 cmd quand
+> 8-alignée, fenêtre-lèvre sinon). Pool Psw 15,55 Ko, normal 61,33 Ko bit-intact.
+> Commit Mimas 56eb168 (core intouché). NON validé console.
+
 - **Polygones de sous-secteurs au level-load** (p_setup.c après :1234, PU_LEVEL zone
   LWRAM) : clip récursif du bbox map par les splitlines ancêtres (node_t x16/y16/dx16/
   dy16 exacts) + les segs de la feuille. ~150 lignes, une fois par niveau.

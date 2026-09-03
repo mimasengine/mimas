@@ -345,7 +345,30 @@ StoreWallRange, curline/frontsector/backsector/rw_angle1 vivants).
 > psw_paint_idx (bandes = orange posé à l'appel). Prochain cran possible : triples
 > 64×192 (3 slots adjacents), et le mip vrai pour dé-zoomer les super-128.
 
-## Étape 2 — sols non-dominants + plafonds (quads de sous-secteurs)
+> **Statut 2026-09-03 (round 24 — console rounds 22+23 : rouge vrai, quads propres,
+> strips ×3, supers supprimés).** Console : « jamais vu de rouge » + « quads gris des
+> deux côtés de chaque marche (texture du sol en dessous) » + « superquads zoomés trop
+> visibles ». (1) RAISON DU ZÉRO-ROUGE TROUVÉE : PLAYPAL 88 = (183,183,183) GRIS — les
+> pleins carrés et strips TOURNAIENT, peints gris. Peinture = PLAYPAL 176 (255,0,0)
+> désormais. Raison trouvée ⇒ règle du propriétaire satisfaite : chaînes de slots
+> étendues aux TRIPLES (strip 64×192 = 3 tuiles / 1 cmd), et le hint de chaîne passe
+> AUSSI dans le grab de slots du pré-passage round B (le hint émission-seule trouvait
+> tous les voisins pris → strips silencieusement dégradés). (2) SUPERS-128 zoomés
+> SUPPRIMÉS (2× visible). L'économie lointaine = les strips exacts. (3) Tuiles grises
+> des marches : cause = critère de ligne molle trop étroit — un sol d'en face PLUS HAUT
+> restait dur « car la contremarche couvre », mais elle ne couvre que jusqu'à son
+> sommet : le débordement au-delà se projette AU-DESSUS, sur le dessus de marche déjà
+> peint (plus loin). Core ae62ac7 : dur SEULEMENT si continuation exacte (même hauteur
+> ET même flat) ; ciel toujours mou ; PSW_SOFT_MAX 6→8. (4) QUADS PROPRES (directive :
+> « marche, rebord… candidats parfaits pour leur propre quad texturé projeté ») : un
+> plan clippé ≤ 4 sommets et plus étroit qu'une tuile (grand côté ≤ 128) quitte la
+> grille : UN quad projeté exact à la feuille (zéro débordement, zéro trou, zéro ligne
+> molle), texture = sous-rect bbox du char (phase monde exacte si pas de wrap ; sinon
+> étirement borné ≤ 2× — ces pièces bordent des changements de hauteur, aucune phase
+> voisine à préserver). L+X : BLANC (PLAYPAL 4). Hiérarchie : colonne chaude = strip
+> ×3 (1/3) puis ×2 (1/2), tuile (1), petit plan = quad propre (1/plan), bord mou =
+> clippé exact. Pool Psw 15,92 Ko (plancher ~5 Ko — marge fondante), normal 61,33 Ko
+> bit-intact. Commits : core ae62ac7, Mimas a11e5dc. NON validé console.
 
 - **Polygones de sous-secteurs au level-load** (p_setup.c après :1234, PU_LEVEL zone
   LWRAM) : clip récursif du bbox map par les splitlines ancêtres (node_t x16/y16/dx16/

@@ -157,7 +157,7 @@ SAT_PSW ?=
 # build keeps 256 -- same flag string, bit-intact.
 ifneq ($(SAT_PSW),)
   PSW_FLAG = -DSAT_PSW=$(SAT_PSW)
-  MAXVP = 64
+  MAXVP = 40
 else
   MAXVP = 256
 endif

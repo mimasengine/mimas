@@ -521,6 +521,47 @@ StoreWallRange, curline/frontsector/backsector/rw_angle1 vivants).
 > P−ef domine ⇒ les murs/things prennent le staging aussi (déjà fait) et le
 > résiduel = pré-passe. NON validé console.
 
+> **Statut 2026-09-03 (round 29 — verdict console P28 « qu'est-ce qui coûte,
+> encore ? » : les sondes ont répondu, on coupe).** Les 8 captures P28 : `y`
+> **0-2 ms partout** = le staging SlaveDriver marche ET les écritures VRAM
+> n'étaient qu'~1-2 ms du total (pari « pousser le staging » MORT — la sonde a
+> évité le 3e faux investissement). Le split réel : **ew−y 19-26 ms = le walk**
+> (dominant : `b59-99` tuiles de BORD à ~120-180 µs pièce — 4 passes Sutherland
+> + shoelace + 4-8 projections non cachées chacune ; + les intérieurs des plans
+> MIXTES qui reprojetaient 4 coins sans cache), **ef−ew 7-14 = la prep par
+> plan** (psw_plane_poly refait au flush + n projections pour bbox/lumière),
+> **P−ef 8-10 = murs/things/pré-passe**. Round 29, coupes prouvées : (1)
+> **FAST-PATH BORD AXIAL** dans emit64 — quand toutes les arêtes coupantes
+> DURES (cutm = fullm & ~a4, lu des masques de coins) sont axiales (le cas
+> Doom), la pièce tuile∩poly est un RECT exact clampé par les lignes coupantes :
+> O(1), zéro division, **bit-identique** à l'ancien clip (r29_border_check.py,
+> 34k tuiles ; un sommet de poly STRICTEMENT dans la tuile met ses DEUX arêtes
+> dans cutm — une droite qui traverse un carré sépare ses coins — donc un coin
+> diagonal ne peut pas se cacher). Les bits SOFT (frustum) sont ignorés comme
+> les carrés classe-2 (queue ≤64u mangée par le system-clip, texels à l'écran
+> prouvés égaux point à point) et ÉCONOMISENT souvent la window. (2) Intérieurs
+> des plans mixtes sur le cache de projections de coins (emitfull ; le check de
+> masque est hissé dans le walk, la branche intérieure non cachée d'emit64 est
+> SUPPRIMÉE). (3) psw_emit_subflats : les verdicts note/pré-passe passent AVANT
+> les 3 clips monde (un plan caché ne paie plus sa prep), et la lumière near-row
+> d'un plan tuilé = UNE projection (sommet de profondeur min ; la row est
+> monotone en profondeur, égalité⇒égalité — nr bit-identique) au lieu de n ; le
+> cull « entièrement hors écran » tombe pour les plans tuilés (après world-clip
+> il ne reste que le sliver de marge 8u, que le system-clip VDP1 mange). (4)
+> **SUPPRESSION VISPLANES sous PSW** (la directive) : R_Subsector saute
+> R_FindPlane (core 36ecd5d), R_PswFrameFlats (plateforme) nourrit ciel +
+> résidence dalle depuis les notes ; l'élection gardait déjà son fallback
+> sous-l'œil (couvertures nulles sans span marking) ; `vp` lit 0 en PSW par
+> design. (5) Makefile : MAXVISPLANES 96 en build PSW seulement
+> (plane_worklist 8 Ko + vpsort + hashnext) ⇒ **pool 7,94 → 12 Ko** — première
+> marge confortable depuis r27. Build normal **bit-intact** (61,33 Ko /
+> 22 233 456 o exactement). Row 13 : **P29**, champs inchangés. Commits : core
+> 36ecd5d, Mimas a02a31d. Attendu console : `b` en forte baisse de coût (pas de
+> compte — les bandes restent comptées), `ew` divisé ~2-3×, `ef−ew` ~divisé 2,
+> `N` un peu plus bas (plus de R_FindPlane dans Bw) ; le résiduel `P−ef`
+> (murs/things/pré-passe) devient alors la cible du round 30. NON validé
+> console.
+
 - **Polygones de sous-secteurs au level-load** (p_setup.c après :1234, PU_LEVEL zone
   LWRAM) : clip récursif du bbox map par les splitlines ancêtres (node_t x16/y16/dx16/
   dy16 exacts) + les segs de la feuille. ~150 lignes, une fois par niveau.

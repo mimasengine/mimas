@@ -562,6 +562,38 @@ StoreWallRange, curline/frontsector/backsector/rw_angle1 vivants).
 > (murs/things/pré-passe) devient alors la cible du round 30. NON validé
 > console.
 
+> **Statut 2026-09-03 (round 30 — verdict console P29 « meh » : `ew` N'A PAS
+> BOUGÉ, au chiffre près dans le couloir).** Les 7 captures P29 : `ef−ew` a pris
+> les coupes r29 (−2 à −6 ms à charge égale ou supérieure : e33/23 f212 contre
+> e40/26 f175), `vp0` partout (suppression visplanes active), mais **`ew` est
+> IDENTIQUE** (couloir : `e7/6/0 t4 f73 b35` au chiffre près). Trois rounds de
+> coupes arithmétiques bit-identiques (SAT→grille, DIVU recouvert + cache de
+> coins, clip de bord → rect) laissent la constante ~80-100 µs/cmd DEBOUT ⇒ la
+> facture n'est PAS l'arithmétique retirée. En relisant la queue d'émission :
+> chaque tuile de bord projetait TOUS les m sommets de sa pièce (boucle amont
+> `sxv`) alors que les sorties les plus fréquentes ne les lisent jamais (bande
+> pleine-largeur : ses 4 projections snappées seulement ; pièce axiale alignée :
+> ses 4 coins snappés) — 8-12 psw_project par bord, le fast-path r29 n'en
+> touchait aucune. Round 30 : (1) **projections de pièce PARESSEUSES** —
+> projetées au premier usage, dans les trois seuls chemins consommateurs
+> (window du lip de snap, window partagée du !done, fan solide) ; effet de bord
+> près du near-guard : l'ancienne boucle jetait la tuile ENTIÈRE, les bandes
+> émettent désormais — moins de trous en bas d'écran, jamais plus. (2) **Row 13
+> « P30 » nomme l'intérieur de ew** : `e<ef>/<ew> B<ms>/<fast>/<bord> q<ms>
+> j<ms>/<n> f<cmds>` — B = total emit64 (bords) + tirs du fast-path + compte de
+> bords ; q = sondes BSP live des tuiles au-delà du préfixe de masque (plans
+> mixtes) ; j = corps de psw_project, scope flush (~2 frt_read/appel de biais
+> auto). RÈGLE DE LECTURE : B domine + fast≈0 ⇒ le fast-path ne tire jamais
+> (chasse au bug) ; B domine + fast haut ⇒ la queue de bord = projections
+> (j le confirme) ; j domine ⇒ le coût unitaire de psw_project est le feu
+> (candidat : une seule réciproque 1/tz partagée par les 2 divisions — pas
+> bit-identique, à arbitrer) ; AUCUN ne domine ⇒ la constante est structurelle
+> (cache 4 Ko / layout de code, pas l'arithmétique) — et le levier change de
+> nature. `y` (0-2 deux fois) sort de la row avec sa paire frt_read/cmd ;
+> N/fence, t, k, u, b, n cèdent leurs colonnes (compteurs vivants au code).
+> Pool Psw 11,66 Ko ; build normal bit-intact (61,33 Ko / 22 233 456 o). Commit
+> Mimas d0742e3, core intouché. NON validé console.
+
 - **Polygones de sous-secteurs au level-load** (p_setup.c après :1234, PU_LEVEL zone
   LWRAM) : clip récursif du bbox map par les splitlines ancêtres (node_t x16/y16/dx16/
   dy16 exacts) + les segs de la feuille. ~150 lignes, une fois par niveau.

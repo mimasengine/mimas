@@ -594,6 +594,43 @@ StoreWallRange, curline/frontsector/backsector/rw_angle1 vivants).
 > Pool Psw 11,66 Ko ; build normal bit-intact (61,33 Ko / 22 233 456 o). Commit
 > Mimas d0742e3, core intouché. NON validé console.
 
+> **Statut 2026-09-03 (round 31 — verdict console P30 « décevant. encore. » :
+> les sondes ont CONDAMNÉ les bords, et le fast-path ne tirait jamais).** Les 6
+> captures P30 : **B 18-21 ms sur ew 23-27 = les tuiles de bord SONT la
+> facture** (~120-190 µs par entrée, slivers sans émission compris : bord149 >
+> f125) ; **fast 0-3 sur 86-149 = la précondition « toutes arêtes coupantes
+> dures axiales » ne tient presque jamais** dans la vraie géométrie BSP (la
+> ligne de near-clip est une arête dure DIAGONALE qui traverse une rangée
+> entière de tuiles par plan ; les splitlines ancêtres sont diagonales ; et le
+> test soft par distance rate les crossings des arêtes très longues — son seuil
+> 1/8u est débordé par l'erreur d'interpolation au-delà de ~6000u, précisément
+> les grandes zones ouvertes) ; **j 3-5 ms / 600-1100 projections = ~5 µs
+> (~135 cycles) pièce** — psw_project tourne à son coût arithmétique, les
+> projections sont saines ; **q0 partout** — les sondes hors-préfixe hors de
+> cause. Le feu = le gros chemin froid du clip (IPC ~0,3 sur ce chemin vs
+> pleine vitesse sur le petit code chaud). Round 31, deux élargissements
+> prouvés : (1) **soft EXACT par étiquettes de crossing** — psw_clip_dir porte
+> un tag par sommet (gardé = son tag, crossing = l'id de passe 1=near/2,3=côtés
+> frustum) ; un clip convexe laisse ses deux crossings ADJACENTS, donc une
+> arête dont les deux bouts partagent un tag ≥2 est PROUVÉE sur cette ligne de
+> frustum ; union avec l'ancien test de distance (qui garde le cas du sommet
+> original posé exactement sur la ligne). Les tuiles coupées par le frustum en
+> grande zone redeviennent des fulls classe-2, et leurs faux bits durs-diagonaux
+> cessent de bloquer le fast-path. (2) **Le fast-path accepte UNE coupe dure
+> diagonale** : rect clampé par les coupes axiales comme avant, puis UNE passe
+> de Sutherland de ce rect contre l'arête diagonale (cross 64-bit, fa et fa−fb
+> normalisés d'un décalage COMMUN à 30 bits avant la division 16.16 : crossing
+> à ~0,002u de l'exact, coutures cohérentes entre voisines) — couvre les
+> rangées de la ligne near et les murs diagonaux isolés
+> (r31_onediag_check.py, 67k tuiles équivalentes au clip 4-passes, tolérance
+> d'arrondi). Row 13 : **P31**, champs inchangés (`B<fast>` compte les deux
+> variantes). Pool Psw 10,44 Ko ; build normal bit-intact. Commit 9f86328,
+> core intouché. Attendu console : `B<fast>` proche de `B<bord>`, `B<ms>` ÷2-3,
+> `ew` vers ~12-17 ; si fast reste bas ⇒ ≥2 diagonales par tuile (feuilles en
+> coin de BSP) et l'escalade = BAKE de la grille par feuille (décomposition
+> statique par niveau, ~6-8 Ko de zone) documentée comme round 32. NON validé
+> console.
+
 - **Polygones de sous-secteurs au level-load** (p_setup.c après :1234, PU_LEVEL zone
   LWRAM) : clip récursif du bbox map par les splitlines ancêtres (node_t x16/y16/dx16/
   dy16 exacts) + les segs de la feuille. ~150 lignes, une fois par niveau.

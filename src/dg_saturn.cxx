@@ -690,7 +690,11 @@ static int  psw_note_ms_last = 0;          /* round 27: whole note cost last fra
 static int  psw_fence_ms_last = 0;         /* round 27: flush wait on the slave masks, ms (`N.../x`) */
 static int  psw_ef_ms_last = 0;            /* round 28: flats emission total, ms (row 13 `e<a>/../..`) */
 static int  psw_ew_ms_last = 0;            /* round 28: tile-walk share of it, ms (`e../<b>/..`) */
-static int  psw_y_ms_last = 0;             /* round 28: staged cmd-write path, ms (`e../../<c>`) */
+/* (round 30: `y` left the row -- console P28/P29 read 0-2 ms twice, settled;
+   its per-command frt_read pair in vdp1_cmd_at went with it.)  Row 13 `B`/`q`/`j`
+   split ew's interior: emit64 borders / beyond-prefix probes / psw_project. */
+static int  psw_eb_ms_last = 0, psw_eb_fast_last = 0, psw_eb_bord_last = 0;
+static int  psw_q_ms_last = 0, psw_j_ms_last = 0, psw_j_n_last = 0;
 #endif
 extern "C" int            sat_sky_view;         /* core Part 5: elected split view for the HW sky (-1 = none => all software) */
 extern "C" unsigned int   sat_sky_px_view[4];   /* core Part 5: per-view SKY pixel coverage (election metric) */
@@ -3339,19 +3343,32 @@ static void fps_update(void)
                    19-26 = the border walk, ef-ew 7-14 = per-plane prep):
                    axis-cut border rect fast path, mixed interiors on the
                    corner cache, flag-gates before the world clip, 1-projection
-                   near-row light, visplanes deleted under PSW (vp reads 0). */
-                snprintf(ovbuf, sizeof ovbuf, "P29 N%d/%d e%d/%d/%d t%d f%d k%d u%d b%d n%d ",
-                         psw_note_ms_last > 99 ? 99 : psw_note_ms_last,
-                         psw_fence_ms_last,
+                   near-row light, visplanes deleted under PSW (vp reads 0).
+                   ROUND 30 (console P29: ew UNMOVED to the digit -- three
+                   rounds of arithmetic cuts left ~80-100 us/cmd standing, so
+                   MEASURE ew's interior): `B<ms>/<fast>/<bord>` = emit64
+                   border total / axis-rect fires / border tiles; `q` =
+                   beyond-prefix live BSP probes (mixed walk); `j<ms>/<n>` =
+                   psw_project bodies, flush-scoped (~2 frt_read/call bias).
+                   ew - B - q - j(outside B) = walk machinery + emitfull/
+                   stripe residue.  `y` settled 0-2 twice -> left with its
+                   per-cmd frt pair; N /fence, t, k, u, b, n ceded columns
+                   (counters live; k0/u/b/n in legend).  Reading rule: B
+                   dominates + fast~0 => fast path never fires (bug hunt);
+                   B dominates + fast high => the border tail = projections;
+                   j dominates => psw_project unit cost is the fire;
+                   none dominate => the cost is the walk/cache, not
+                   arithmetic. */
+                snprintf(ovbuf, sizeof ovbuf, "P30 e%d/%d B%d/%d/%d q%d j%d/%d f%d ",
                          psw_ef_ms_last > 99 ? 99 : psw_ef_ms_last,
                          psw_ew_ms_last > 99 ? 99 : psw_ew_ms_last,
-                         psw_y_ms_last  > 99 ? 99 : psw_y_ms_last,
-                         sat_psw_t_last > 999 ? 999 : sat_psw_t_last,
-                         psw_flat_last  > 999 ? 999 : psw_flat_last,
-                         psw_kill_last  > 99  ? 99  : psw_kill_last,
-                         psw_punch_last > 99  ? 99  : psw_punch_last,
-                         psw_band_last > 99 ? 99 : psw_band_last,
-                         psw_fan_last  > 99 ? 99 : psw_fan_last);
+                         psw_eb_ms_last > 99 ? 99 : psw_eb_ms_last,
+                         psw_eb_fast_last > 999 ? 999 : psw_eb_fast_last,
+                         psw_eb_bord_last > 999 ? 999 : psw_eb_bord_last,
+                         psw_q_ms_last > 99 ? 99 : psw_q_ms_last,
+                         psw_j_ms_last > 99 ? 99 : psw_j_ms_last,
+                         psw_j_n_last > 9999 ? 9999 : psw_j_n_last,
+                         psw_flat_last  > 999 ? 999 : psw_flat_last);
 #endif
             if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 13, ovbuf);
             /* row 15 (SCU-DSP feasibility, deliverable #1): per-frame sprite cost split.
@@ -6083,7 +6100,6 @@ static int thing_drop_hold = 0;            /* kicks left with the emit-cap ramp 
 static unsigned int vdp1_stg[2][VDP1_STG_N * 8] __attribute__((aligned(4)));
 static int vdp1_stg_side = 0, vdp1_stg_used = 0, vdp1_stg_on = 0;
 static unsigned int vdp1_stg_base = 0, vdp1_stg_next = 0;
-static unsigned int vdp1_stg_frt = 0;    /* row 13 `y` (includes ~2 frt_read/cmd of self-bias) */
 static int psw_stage_dma = 1;            /* latched OFF forever if the channel ever wedges */
 static inline int vdp1_scu0_busy(void)
 { return (int)(*(volatile unsigned int *)0x25FE007Cu & 0x120u); }   /* DSTA, SlaveDriver's mask */
@@ -6133,8 +6149,8 @@ static void vdp1_cmd_at(unsigned int base, int idx, const unsigned short *c)
         idx -= VDP1_BANK_SPLIT;
     }
     if (vdp1_stg_on)
-    {
-        unsigned short t0 = frt_read();
+    {   /* (round 30: the `y` frt bracket left with its row column -- twice
+           read 0-2 ms on console, settled; ~500 module-bus reads/frame gone) */
         unsigned int dst = base + (unsigned int)idx * 32u;
         if (vdp1_stg_used && dst != vdp1_stg_next) vdp1_stg_kick();
         if (vdp1_stg_used == 0) vdp1_stg_base = dst;
@@ -6145,7 +6161,6 @@ static void vdp1_cmd_at(unsigned int base, int idx, const unsigned short *c)
         }
         vdp1_stg_next = dst + 32u;
         if (++vdp1_stg_used >= VDP1_STG_N) vdp1_stg_kick();
-        vdp1_stg_frt += (unsigned short)(frt_read() - t0);
         return;
     }
 #endif
@@ -8348,6 +8363,16 @@ static unsigned int psw_note_frt = 0;   /* frame sum of sat_psw_sub_note (row 13
                                            the _last twins live with the early overlay decls */
 static unsigned int psw_ef_frt = 0;     /* round 28: frame sum of psw_emit_subflats (row 13 `e<a>`) */
 static unsigned int psw_ew_frt = 0;     /* round 28: frame sum of psw_emit_plane_tiles (`e../<b>`) */
+/* ROUND 30 -- ew's interior, named (three rounds of arithmetic cuts left the
+   ~80-100 us/cmd constant standing: measure, stop modelling).  All reset at
+   flush entry (j would otherwise carry the note phase's projections). */
+static unsigned int psw_eb_frt = 0;     /* emit64 borders, total (row 13 `B<ms>/../..`) */
+static int psw_eb_fast = 0;             /* axis-rect fast-path fires (`B../<f>/..`) */
+static int psw_eb_bord = 0;             /* emit64 entries = border tiles (`B../../<n>`) */
+static unsigned int psw_q_frt = 0;      /* beyond-prefix BSP probes, mixed walk (`q`) */
+static unsigned int psw_j_frt = 0;      /* psw_project bodies, flush-scoped (`j<ms>/<n>`;
+                                           ~2 frt_read/call of self-bias rides inside) */
+static int psw_j_n = 0;
 static int psw_mask_late = 0;           /* fence-computed jobs (slave too slow/off) */
 static unsigned int psw_frame_no = 1000;/* > PSW_MASK_AGE so the zeroed table never hits */
 struct psw_mlru
@@ -8592,7 +8617,9 @@ static int psw_project(int wx, int wy, int ph, int psign, int *psx, int *psy)
     int tz = FixedMul(trx, viewcos) + FixedMul(tryy, viewsin);
     int tx, xs, sx, sy, hw2, rz;
     unsigned int sr;
+    unsigned short jt0;
     if (tz < PSW_TZ_NEAR) return 0;
+    jt0 = frt_read();                     /* round 30 `j`: the successful body only */
     __asm__ volatile ("stc sr,%0" : "=r"(sr));
     { unsigned int srm = sr | 0x000000F0u;
       __asm__ volatile ("ldc %0,sr" :: "r"(srm) : "memory"); }
@@ -8610,6 +8637,7 @@ static int psw_project(int wx, int wy, int ph, int psign, int *psx, int *psy)
     sy  = centery + psign * (int)(((long long)rz * hw2) >> 16);
     if (sy < -512)  sy = -512;  else if (sy > 1000) sy = 1000;
     *psx = sx; *psy = sy;
+    psw_j_frt += (unsigned short)(frt_read() - jt0); psw_j_n++;
     return 1;
 }
 
@@ -9169,6 +9197,7 @@ static void psw_emit_plane_tiles(int slot, unsigned short colr,
 	    long long area2;
 	    unsigned int cuth = cutm & hardm;
 	    if (psw_flat_cmds >= psw_flat_cap_dyn) { stop = 1; return; }
+	    psw_eb_bord++;                       /* round 30 `B../../<n>` */
 	    if (cuth && !(cuth & ~axm))
 	    {   /* ROUND 29 -- AXIS-CUT FAST PATH (console P28: ew 19-26 ms with
 	           b59-99 border tiles = the walk's dominant bill; each paid 4
@@ -9186,6 +9215,7 @@ static void psw_emit_plane_tiles(int slot, unsigned short colr,
 	           (a line through a square's interior separates its corners), so
 	           a diagonal corner can never hide from this test. */
 		int px0 = x0, px1 = x1, py0 = y0, py1 = y1;
+		psw_eb_fast++;                   /* round 30 `B../<f>/..` */
 		for (int e2 = 0; e2 < n; ++e2)
 		{
 		    int j2;
@@ -9259,11 +9289,30 @@ static void psw_emit_plane_tiles(int slot, unsigned short colr,
 	    else
 	    {
 		int done = 0;
-		int sxv[PSW_FAN_MAX], syv[PSW_FAN_MAX], okv = 1;
-		for (i = 0; i < m; ++i)
-		    if (!psw_project(bxv[i], byv[i], ph, psign, &sxv[i], &syv[i]))
-		    { okv = 0; break; }
-		if (!okv) return;
+		int sxv[PSW_FAN_MAX], syv[PSW_FAN_MAX], okv = 1, sprj = 0;
+		/* ROUND 30 -- the piece-vertex projections go LAZY.  This upfront
+		   loop projected ALL m verts for EVERY border tile, but the most
+		   common exits never read them: the full-width band uses only its
+		   4 snapped-row projections, the aligned axis piece only its 4
+		   snapped corners.  sxv/syv are consumed by exactly three paths
+		   (snap-lip window bbox, the !done shared window, the solid
+		   fallback fan) -- each now pays the loop itself, once.  Round 29
+		   cut the Sutherland clip and ew did not move (console P29, ew
+		   identical to the digit in the corridor): the border bill is the
+		   PROJECTIONS, so stop making them for nobody.  Side effect on
+		   near-boundary tiles where a piece vert sits behind the near
+		   guard: the old code dropped the WHOLE tile (return before any
+		   emission), the band paths now still emit -- fewer bottom-of-
+		   screen holes, never more. */
+		auto sxv_ensure = [&]() -> int
+		{
+		    if (sprj) return okv;
+		    sprj = 1;
+		    for (i = 0; i < m; ++i)
+			if (!psw_project(bxv[i], byv[i], ph, psign, &sxv[i], &syv[i]))
+			{ okv = 0; break; }
+		    return okv;
+		};
 		if (slot >= 0)
 		{   /* EVERY edge piece is a WORLD-ANCHORED BAND (round 13): the
 		       char's v sub-band SNAPPED to texel rows + the full tile
@@ -9339,6 +9388,7 @@ static void psw_emit_plane_tiles(int slot, unsigned short colr,
 					    int win2 = (wxa != pbx0 || wxb != pbx1);
 					    if (win2)
 					    {
+						if (!sxv_ensure()) return;   /* round 30: lazy (8-misaligned pieces only) */
 						int wxl = sxv[0], wxr = sxv[0], wyt = syv[0], wyb = syv[0];
 						for (i = 1; i < m; ++i)
 						{
@@ -9354,8 +9404,10 @@ static void psw_emit_plane_tiles(int slot, unsigned short colr,
 				    }
 				    if (!done)
 				    {
-					int wxl = sxv[0], wxr = sxv[0], wyt = syv[0], wyb = syv[0];
+					int wxl, wxr, wyt, wyb;
 					int sdx = 0, sdy = 0;
+					if (!sxv_ensure()) return;   /* round 30: lazy (fine/coarse windows need the bbox) */
+					wxl = sxv[0]; wxr = sxv[0]; wyt = syv[0]; wyb = syv[0];
 					for (i = 1; i < m; ++i)
 					{
 					    if (sxv[i] < wxl) wxl = sxv[i]; if (sxv[i] > wxr) wxr = sxv[i];
@@ -9475,6 +9527,7 @@ static void psw_emit_plane_tiles(int slot, unsigned short colr,
 		if (!done)
 		{   /* band unprojectable / slot famine: SOLID piece -- exact
 		       geometry, textureless, cannot swim */
+		    if (!sxv_ensure()) return;          /* round 30: lazy (the fan IS the verts) */
 		    psw_paint_idx = 250; psw_fanq_n++;  /* L+X: solids MAGENTA */
 		    for (i = 1; i + 1 < m; i += 2)
 		    {
@@ -9605,15 +9658,24 @@ static void psw_emit_plane_tiles(int slot, unsigned short colr,
 			    int ti = (ty - tya) * tw + (tx - txa);
 			    if (ti >= 0 && ti < PSW_PROBE_TILES)
 			    { if ((psw_cur_mask >> ti) & 1u) continue; }
-			    else if (psw_tile_hidden(tx << 22, ty << 22, 64 << 16,
-			                             psign, cull_h)) continue;
+			    else
+			    {   /* round 30 `q`: the beyond-prefix tiles pay LIVE
+				   5-point BSP probes inside ew -- bill them */
+				unsigned short q0 = frt_read();
+				int hid = psw_tile_hidden(tx << 22, ty << 22, 64 << 16,
+				                          psign, cull_h);
+				psw_q_frt += (unsigned short)(frt_read() - q0);
+				if (hid) continue;
+			    }
 			}
 			if (cls >= 2) emitfull(ty);
 			else
 			{
 			    int r0 = ty - cy0r;
+			    unsigned short b0 = frt_read();
 			    emit64(tx, ty, fullm & ~(cmA[r0] & cmA[r0 + 1]
 			                             & cmB[r0] & cmB[r0 + 1]));
+			    psw_eb_frt += (unsigned short)(frt_read() - b0);
 			}
 		    }
 		}
@@ -9634,8 +9696,10 @@ static void psw_emit_plane_tiles(int slot, unsigned short colr,
 			else
 			{
 			    int r0 = ty - cy0r;
+			    unsigned short b0 = frt_read();
 			    emit64(tx, ty, fullm & ~(cmA[r0] & cmA[r0 + 1]
 			                             & cmB[r0] & cmB[r0 + 1]));
+			    psw_eb_frt += (unsigned short)(frt_read() - b0);
 			}
 			++ty;
 		    }
@@ -10501,6 +10565,10 @@ static void vdp1_walls_flush(void)
                                SlaveDriver staging buffer; the kick fences it */
         psw_flat_cmds = 0; psw_flat_denied = 0; psw_punch_cmds = 0;
         psw_band_n = 0; psw_fanq_n = 0; psw_fine_cmds = 0;
+        /* round 30: ew-interior probes reset at flush ENTRY -- j would
+           otherwise carry the note phase's projections (bandbox loops) */
+        psw_eb_frt = 0; psw_eb_fast = 0; psw_eb_bord = 0;
+        psw_q_frt = 0; psw_j_frt = 0; psw_j_n = 0;
         for (int s = 0; s < PSW_FLAT_SLOTS; ++s) psw_slot[s].used = 0;
         /* NEAR->FAR pre-pass, round 9: pure BUDGET arithmetic -- the visibility
            verdicts were computed at NOTE time (core portal bands + LOS ladder,
@@ -10662,7 +10730,10 @@ static void vdp1_walls_flush(void)
         psw_note_ms_last = (int)(psw_note_frt / 224u); psw_note_frt = 0;   /* row 13 `N` */
         psw_ef_ms_last = (int)(psw_ef_frt / 224u);   psw_ef_frt  = 0;      /* row 13 `e` triple */
         psw_ew_ms_last = (int)(psw_ew_frt / 224u);   psw_ew_frt  = 0;
-        psw_y_ms_last  = (int)(vdp1_stg_frt / 224u); vdp1_stg_frt = 0;
+        psw_eb_ms_last = (int)(psw_eb_frt / 224u);
+        psw_eb_fast_last = psw_eb_fast; psw_eb_bord_last = psw_eb_bord;
+        psw_q_ms_last = (int)(psw_q_frt / 224u);
+        psw_j_ms_last = (int)(psw_j_frt / 224u); psw_j_n_last = psw_j_n;
         psw_frame_no++;                       /* the mask-reuse clock (PSW_MASK_AGE) */
         /* (row 13 `c` is now the CORE band-cull counter sat_psw_wcull,
            snapshotted at the frame-boundary latch with tiers/ref) */

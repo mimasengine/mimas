@@ -482,6 +482,45 @@ StoreWallRange, curline/frontsector/backsector/rw_angle1 vivants).
 > calculées par les DEUX CPU, émission sérielle master) — l'infra fence/file est
 > posée. NON validé console.
 
+> **Statut 2026-09-03 (round 28 — verdict console P27 « extrêmement décevant » :
+> Bw GUÉRI, P à peine bougé ⇒ NOMMER le coût par commande + staging SlaveDriver).**
+> Les 9 captures P27 : `Bw` 20-62 → **8-12 ms** (l'étage note/masques/slave marche —
+> fence 0 partout, N4-8, N19 sur la scène à note lourde) mais `P` **31-48 ms** :
+> l'attribution round-26 (« le SAT est la facture ») était FAUSSE, deuxième
+> mésattribution d'affilée. Le fait propre des captures : **P est LINÉAIRE en
+> commandes** (c74→6,4 ; c357→35 ; c385→39,8 ; c409→38,8 ≈ **95-100 µs/cmd**,
+> identique dans le couloir rapide) — la constante « loi L4 » déjà MESURÉE au
+> round A/B 3a (64,5 µs/cmd) et oubliée. Réponse (directive owner : « supprime ce
+> qui ne sert plus » + « inspire-toi de SlaveDriver ») : (1) **MESURER l'intérieur
+> de P au lieu de reparier** — row 13 = « P28 », `e<ef>/<ew>/<y>` : ef = tout le
+> côté flats (psw_emit_subflats : poly+projections+lumière+walk), ew = le walk de
+> tuiles seul (prep = ef−ew), y = le chemin d'écriture de commandes stagé ;
+> P−ef = murs+things+pré-passe. `o` (0/0 depuis r21/22) et `c` (dormant) cèdent
+> leurs colonnes. (2) Coupes CERTAINES du coût/cmd, toutes bit-identiques :
+> psw_project recouvre ses DEUX divisions DIVU sous UNE fence IPL (le stall 39
+> cycles ×2 était sec) ; cache de projections de coins sur les colonnes de
+> masques (un coin sert ≤4 tuiles + les strips, lazy) ; (3) **STAGING DE
+> COMMANDES, la recette SlaveDriver VERBATIM** (SPR.C getCmdTable/flushCmdBuffer +
+> DMA.C dmaMemCpy : la référence ne poke JAMAIS le VRAM VDP1 pendant l'émission) —
+> marshaling en HWRAM caché (write-through ⇒ cohérent sans purge), moitiés
+> ping-pong de 16 cmds (la moitié remplie n'est jamais celle en vol — la course
+> que SlaveDriver tolérait), chaque lot part en UNE SCU-DMA niveau 0 async
+> (fence-avant-départ, add 0x101, facteur 7 — constantes de la référence), fence
+> au kick AVANT le flip de racine ; destination non-contiguë = fermeture de lot
+> (traversée du split de banque = une frontière, pas un drain par cmd) ; canal
+> coincé ⇒ latch fallback copie CPU 32-bit. Build normal = boucle directe 16-bit
+> intacte (**bit-intact, 61,33 Ko / 22 233 456 o**). PROGRAMME DE SUPPRESSION
+> (armé sur les sondes du prochain retour) : accumulation visplanes sous PSW
+> (`vp7-39` encore construits pour la seule élection), prologue R_StoreWallRange
+> (`Bp` 2,6-5 ms), élection du dominant depuis psw_sub ; RP_CMDS vérifié = carve
+> à adresse fixe, pas du pool. ⚠ Pool Psw 11,31 → **7,94 Ko** (staging+sondes ;
+> file 64→48, staging 24→16 déjà) — MINCE, la récupération passe par la coupe du
+> mort. Commit Mimas c6ce492, core intouché. Attendu console : lire `e` AVANT
+> tout verdict — si y domine ef−ew ⇒ le staging paie et on pousse (chunks plus
+> gros) ; si ef−ew (prep par plan) domine ⇒ cache des polys note→flush ; si
+> P−ef domine ⇒ les murs/things prennent le staging aussi (déjà fait) et le
+> résiduel = pré-passe. NON validé console.
+
 - **Polygones de sous-secteurs au level-load** (p_setup.c après :1234, PU_LEVEL zone
   LWRAM) : clip récursif du bbox map par les splitlines ancêtres (node_t x16/y16/dx16/
   dy16 exacts) + les segs de la feuille. ~150 lignes, une fois par niveau.

@@ -688,6 +688,9 @@ static int  psw_sub_ovf_last = 0;          /* subsector-recorder overflow (row 1
 static int  psw_leaf_bad_last = 0;         /* invalid leaf polygons noted (row 13 `o/x`) */
 static int  psw_note_ms_last = 0;          /* round 27: whole note cost last frame, ms (row 13 `N`) */
 static int  psw_fence_ms_last = 0;         /* round 27: flush wait on the slave masks, ms (`N.../x`) */
+static int  psw_ef_ms_last = 0;            /* round 28: flats emission total, ms (row 13 `e<a>/../..`) */
+static int  psw_ew_ms_last = 0;            /* round 28: tile-walk share of it, ms (`e../<b>/..`) */
+static int  psw_y_ms_last = 0;             /* round 28: staged cmd-write path, ms (`e../../<c>`) */
 #endif
 extern "C" int            sat_sky_view;         /* core Part 5: elected split view for the HW sky (-1 = none => all software) */
 extern "C" unsigned int   sat_sky_px_view[4];   /* core Part 5: per-view SKY pixel coverage (election metric) */
@@ -3323,21 +3326,25 @@ static void fps_update(void)
                 /* row label = BUILD MARKER since round 26 ("P<round>"): every
                    capture names the build it came from -- ends the "which disc
                    was tested?" ambiguity for good.  BUMP IT EVERY ROUND. */
-                /* ROUND 27: `N<note ms>/<fence ms>` in, `d` out (flat_denied read 0 on
-                   every capture since round 4; its failure mode is MAGENTA in L+X).
-                   N = the whole PSW note cost inside row-2 `Bw` (Bw - N = the vanilla
-                   walk); the /fence half = the flush's wait on the slave mask batch
-                   (0 = the offload fully overlapped the BSP walk). */
-                snprintf(ovbuf, sizeof ovbuf, "P27 N%d/%d t%d o%d/%d f%d k%d u%d c%d b%d n%d ",
+                /* ROUND 28: `e<ef>/<ew>/<y>` = THE INTERIOR OF ROW-2 `P`, in ms --
+                   ef = whole flat side (psw_emit_subflats: poly + projections +
+                   light + walk), ew = the tile walk alone (prep = ef - ew), y =
+                   the staged command-write path (marshal + batches + DMA starts;
+                   ~1 ms of it is the probe's own frt_read pair per command).
+                   P - ef = walls + things + pre-pass + kick.  This names the
+                   ~100 us/cmd constant ("loi L4") instead of betting on it --
+                   the round-26/27 lesson, twice paid.  `o` (0/0 since r21/r22)
+                   and `c` (core band-cull, dormant) ceded their columns. */
+                snprintf(ovbuf, sizeof ovbuf, "P28 N%d/%d e%d/%d/%d t%d f%d k%d u%d b%d n%d ",
                          psw_note_ms_last > 99 ? 99 : psw_note_ms_last,
                          psw_fence_ms_last,
+                         psw_ef_ms_last > 99 ? 99 : psw_ef_ms_last,
+                         psw_ew_ms_last > 99 ? 99 : psw_ew_ms_last,
+                         psw_y_ms_last  > 99 ? 99 : psw_y_ms_last,
                          sat_psw_t_last > 999 ? 999 : sat_psw_t_last,
-                         psw_sub_ovf_last > 99 ? 99 : psw_sub_ovf_last,
-                         psw_leaf_bad_last > 99 ? 99 : psw_leaf_bad_last,
                          psw_flat_last  > 999 ? 999 : psw_flat_last,
                          psw_kill_last  > 99  ? 99  : psw_kill_last,
                          psw_punch_last > 99  ? 99  : psw_punch_last,
-                         psw_wall_cull_last > 99 ? 99 : psw_wall_cull_last,
                          psw_band_last > 99 ? 99 : psw_band_last,
                          psw_fan_last  > 99 ? 99 : psw_fan_last);
 #endif
@@ -6047,6 +6054,71 @@ static int thing_drop_hold = 0;            /* kicks left with the emit-cap ramp 
 /* Write one 32-byte VDP1 command (16 halfwords) at command index `idx` of `base`.
    PSW: logical slots >= VDP1_BANK_SPLIT of a wall bank land in its EXTENSION region
    (the physical slot 303 holds the static jump there -- see VDP1_BANK_EXT). */
+#if SAT_PSW
+/* ROUND 28 -- COMMAND STAGING, the SlaveDriver recipe verbatim (owner:
+   "inspire-toi de SlaveDriver").  Console P27 measured ~95-100 us PER EMITTED
+   COMMAND, scene-independent (c74->P6.4, c357->35, c385->39.8: P is linear in
+   commands -- the "loi L4" constant rediscovered), and this path's 16 uncached
+   B-bus pokes per command are one of the few things every command pays.
+   SlaveDriver never pokes VDP1 VRAM during emission: SPR.C getCmdTable() hands
+   slots in a small work-RAM buffer, flushCmdBuffer() copies each full batch
+   with ONE async SCU-DMA (DMA.C dmaMemCpy: level 0, fence-before-START = at
+   most one in flight, add 0x101, start factor 7).  Here: ping-pong halves so
+   the half being FILLED is never the one in flight (SlaveDriver reuses its
+   single buffer under the DMA -- a race we do not copy), cached HWRAM writes
+   (SH-2 is write-through: memory is current when the DMA reads, no purge),
+   and a non-contiguous destination just closes the batch and starts a new one
+   (the bank-split crossing and the menu-slot patches cost one boundary, never
+   a per-command drain).  The fence runs at the KICK, before the root flip --
+   everything PTMR reads is provably in VRAM.  Normal build: SAT_PSW=0 keeps
+   the direct 16-bit loop byte-identical. */
+#define VDP1_STG_N 16                    /* cmds per half (32 B each): 1 KB total --
+                                            pool-driven (pre-flight 7.03 KB); more
+                                            DMA starts, each ~7 register pokes */
+static unsigned int vdp1_stg[2][VDP1_STG_N * 8] __attribute__((aligned(4)));
+static int vdp1_stg_side = 0, vdp1_stg_used = 0, vdp1_stg_on = 0;
+static unsigned int vdp1_stg_base = 0, vdp1_stg_next = 0;
+static unsigned int vdp1_stg_frt = 0;    /* row 13 `y` (includes ~2 frt_read/cmd of self-bias) */
+static int psw_stage_dma = 1;            /* latched OFF forever if the channel ever wedges */
+static inline int vdp1_scu0_busy(void)
+{ return (int)(*(volatile unsigned int *)0x25FE007Cu & 0x120u); }   /* DSTA, SlaveDriver's mask */
+static void vdp1_stg_kick(void)
+{
+    volatile unsigned int *scu = (volatile unsigned int *)0x25FE0000u;
+    if (!vdp1_stg_used) return;
+    { int g = 0; while (vdp1_scu0_busy() && ++g < 2000000) { }
+      if (g >= 2000000) psw_stage_dma = 0; }
+    if (psw_stage_dma)
+    {
+        scu[0] = (unsigned int)(unsigned long)vdp1_stg[vdp1_stg_side];  /* D0R  (HWRAM)     */
+        scu[1] = vdp1_stg_base;                                         /* D0W  (VDP1 VRAM) */
+        scu[2] = (unsigned int)vdp1_stg_used * 32u;                     /* D0C  bytes       */
+        scu[3] = 0x00000101u;                                           /* D0AD (reference) */
+        scu[5] = 0x00000007u;                                           /* D0MD start factor 7 */
+        scu[4] = 0x00000100u;                                           /* D0EN enable      */
+        scu[4] = 0x00000101u;                                           /*      + start     */
+    }
+    else
+    {   /* channel distrusted: batched 32-bit CPU copy (still half the pokes) */
+        volatile unsigned int *d = (volatile unsigned int *)vdp1_stg_base;
+        const unsigned int *s = vdp1_stg[vdp1_stg_side];
+        for (int k = 0; k < vdp1_stg_used * 8; ++k) d[k] = s[k];
+    }
+    vdp1_stg_side ^= 1;
+    vdp1_stg_used = 0;
+}
+static void vdp1_stage_begin(void)
+{ vdp1_stg_on = 1; vdp1_stg_used = 0; vdp1_stg_next = 0; }
+static void vdp1_stage_fence(void)
+{   /* drain + join: called at the kick, BEFORE the root flip / PTMR */
+    if (!vdp1_stg_on) return;
+    vdp1_stg_kick();
+    { int g = 0; while (vdp1_scu0_busy() && ++g < 2000000) { }
+      if (g >= 2000000) psw_stage_dma = 0; }
+    vdp1_stg_on = 0;
+}
+#endif
+
 static void vdp1_cmd_at(unsigned int base, int idx, const unsigned short *c)
 {
 #if SAT_PSW
@@ -6054,6 +6126,22 @@ static void vdp1_cmd_at(unsigned int base, int idx, const unsigned short *c)
     {
         base = VDP1_BANK_EXT[base == VDP1_BANK[1] ? 1 : 0];
         idx -= VDP1_BANK_SPLIT;
+    }
+    if (vdp1_stg_on)
+    {
+        unsigned short t0 = frt_read();
+        unsigned int dst = base + (unsigned int)idx * 32u;
+        if (vdp1_stg_used && dst != vdp1_stg_next) vdp1_stg_kick();
+        if (vdp1_stg_used == 0) vdp1_stg_base = dst;
+        {
+            unsigned int *d = &vdp1_stg[vdp1_stg_side][(unsigned int)vdp1_stg_used * 8u];
+            for (int k = 0; k < 8; ++k)
+                d[k] = ((unsigned int)c[2 * k] << 16) | c[2 * k + 1];
+        }
+        vdp1_stg_next = dst + 32u;
+        if (++vdp1_stg_used >= VDP1_STG_N) vdp1_stg_kick();
+        vdp1_stg_frt += (unsigned short)(frt_read() - t0);
+        return;
     }
 #endif
     volatile unsigned short *p = (volatile unsigned short *)base + idx * 16;
@@ -8228,7 +8316,9 @@ extern "C" int R_PswBandBoxHidden(int xl, int xr, int yt, int yb);   /* core r_s
       `N<note ms>/<fence ms>`. */
 extern "C" void rp_sgl_workptr_reset(void);            /* core r_parallel.c: joins aux+plane, rewinds GBR+68/72 */
 extern "C" void slSlaveFunc(void (*func)(void *), void *param);   /* SGL */
-#define PSW_MQ_MAX   64                 /* 32 mixed subs x 2 passes; overflow -> inline */
+#define PSW_MQ_MAX   48                 /* 24 mixed subs x 2 passes; overflow -> inline
+                                           (with the memo walk -- graceful, and the
+                                           reuse table absorbs the static/turning case) */
 #define PSW_MLRU_N   32                 /* direct-mapped on (subnum*2+pass)   */
 #define PSW_MASK_AGE 8                  /* frames a stored mask may serve (heights of OTHER
                                            sectors can move under a static view: bounded) */
@@ -8251,6 +8341,8 @@ static int psw_mq_disp = 0;             /* master-local: body dispatched this fr
 static int sat_psw_slave = 1;           /* latched OFF forever if the body ever wedges */
 static unsigned int psw_note_frt = 0;   /* frame sum of sat_psw_sub_note (row 13 `N`);
                                            the _last twins live with the early overlay decls */
+static unsigned int psw_ef_frt = 0;     /* round 28: frame sum of psw_emit_subflats (row 13 `e<a>`) */
+static unsigned int psw_ew_frt = 0;     /* round 28: frame sum of psw_emit_plane_tiles (`e../<b>`) */
 static int psw_mask_late = 0;           /* fence-computed jobs (slave too slow/off) */
 static unsigned int psw_frame_no = 1000;/* > PSW_MASK_AGE so the zeroed table never hits */
 struct psw_mlru
@@ -8445,17 +8537,37 @@ static inline int psw_fdiv(int a, int b)
    0 = nearer than the guard (unreachable after the near clip -- belt only). */
 static int psw_project(int wx, int wy, int ph, int psign, int *psx, int *psy)
 {
+    /* ROUND 28 -- the two DIVU divides OVERLAP the muls (console P27: ~95-100 us
+       PER EMITTED COMMAND, scene-independent -- the "loi L4" constant, and this
+       function runs up to 4x per quad).  The old psw_fdiv pair paid the 39-cycle
+       DIVU latency TWICE as a raw stall (write, read back-to-back) plus two IPL15
+       fences; here each divide runs while the FixedMuls it does not depend on
+       execute, under ONE fence.  Same divisions, same integer results, bit for
+       bit -- only the schedule changed. */
     extern int detailshift;
+    volatile int *dvsr   = (volatile int *)0xFFFFFF00;
+    volatile int *dvdnth = (volatile int *)0xFFFFFF10;
+    volatile int *dvdntl = (volatile int *)0xFFFFFF14;
     int trx = wx - viewx, tryy = wy - viewy;
     int tz = FixedMul(trx, viewcos) + FixedMul(tryy, viewsin);
-    int tx, xs, sx, sy, hw2;
+    int tx, xs, sx, sy, hw2, rz;
+    unsigned int sr;
     if (tz < PSW_TZ_NEAR) return 0;
-    tx  = FixedMul(trx, viewsin) - FixedMul(tryy, viewcos);
-    xs  = psw_fdiv(centerxfrac, tz);
-    sx  = (centerxfrac + FixedMul(tx, xs)) >> 16;
+    __asm__ volatile ("stc sr,%0" : "=r"(sr));
+    { unsigned int srm = sr | 0x000000F0u;
+      __asm__ volatile ("ldc %0,sr" :: "r"(srm) : "memory"); }
+    *dvsr = tz; *dvdnth = centerxfrac >> 16;
+    *dvdntl = (int)((unsigned int)centerxfrac << 16);
+    tx  = FixedMul(trx, viewsin) - FixedMul(tryy, viewcos);   /* hides divide #1 */
     hw2 = (viewwidth << detailshift) >> 1;
-    sy  = centery + psign * (int)(((long long)psw_fdiv(ph, tz) * hw2) >> 16);
+    xs  = *dvdntl;
+    *dvsr = tz; *dvdnth = ph >> 16;
+    *dvdntl = (int)((unsigned int)ph << 16);
+    sx  = (centerxfrac + FixedMul(tx, xs)) >> 16;             /* hides divide #2 */
     if (sx < -1024) sx = -1024; else if (sx > 1023) sx = 1023;
+    rz  = *dvdntl;
+    __asm__ volatile ("ldc %0,sr" :: "r"(sr) : "memory");
+    sy  = centery + psign * (int)(((long long)rz * hw2) >> 16);
     if (sy < -512)  sy = -512;  else if (sy > 1000) sy = 1000;
     *psx = sx; *psy = sy;
     return 1;
@@ -9296,34 +9408,22 @@ static void psw_emit_plane_tiles(int slot, unsigned short colr,
 		}
 	    }
 	};
-	auto stripe = [&](int tx, int ty, int cnt) -> int
-	{   /* round 23/24 strip EMISSION only -- the containment test moved to
-	       the class runs (round 27): the caller proved every tile of the
-	       rect fully contained, which is EQUIVALENT (convexity) to the old
-	       whole-rect 4-corner SAT.  The chained slots alias one another, so
-	       ONE command covers cnt tiles at world-exact texture. */
-	    int x0 = tx << 22, y0 = ty << 22;
-	    int x1 = x0 + (64 << 16), y1 = y0 + ((cnt * 64) << 16);
-	    int sqx[4], sqy[4];
-	    if (psw_flat_cmds >= psw_flat_cap_dyn) { stop = 1; return 1; }
-	    if (!psw_project(x0, y1, ph, psign, &sqx[0], &sqy[0])) return 0;
-	    if (!psw_project(x1, y1, ph, psign, &sqx[1], &sqy[1])) return 0;
-	    if (!psw_project(x1, y0, ph, psign, &sqx[2], &sqy[2])) return 0;
-	    if (!psw_project(x0, y0, ph, psign, &sqx[3], &sqy[3])) return 0;
-	    psw_paint_idx = 176;                    /* L+X: exact strips RED */
-	    psw_emit_rectquad(slot, colr, sqx, sqy, 0, cnt * 64, 0, 64, 0);
-	    return 1;
-	};
 	/* THE WALK, column-streamed: two corner-mask COLUMNS roll across the
 	   bbox (rows chunked at PSW_GMAXH; a strip never crosses a chunk seam,
 	   which only matters on a >128-tile-deep plane = nonexistent).  Cost per
-	   corner: n 64-bit adds; per tile: 4 mask fetches + 2 bit tests. */
+	   corner: n 64-bit adds; per tile: 4 mask fetches + 2 bit tests.
+	   ROUND 28: the corner PROJECTIONS ride the same two columns (a corner
+	   is shared by up to 4 tiles and by the strips above it -- computed
+	   once, lazily, same psw_project bits).  The uncached path stays for
+	   border pieces and mixed planes (whose points are not all corners). */
 #define PSW_GMAXH 128
 	for (int cy0r = tya; cy0r <= tyb && !stop; cy0r += PSW_GMAXH)
 	{
 	    int cy1r = cy0r + PSW_GMAXH - 1; if (cy1r > tyb) cy1r = tyb;
 	    int rows = cy1r - cy0r + 1;
 	    unsigned int cmbuf[2][PSW_GMAXH + 1];
+	    short pjx[2][PSW_GMAXH + 1], pjy[2][PSW_GMAXH + 1];
+	    unsigned char pjs[2][PSW_GMAXH + 1];   /* 0 unknown / 1 ok / 2 fail */
 	    long long ccol[PSW_FAN_MAX];
 	    for (i = 0; i < n; ++i)
 	    {   /* corner (txa, cy0r): the chunk's ONLY long multiplies */
@@ -9336,6 +9436,7 @@ static void psw_emit_plane_tiles(int slot, unsigned short colr,
 	    {
 		unsigned int *cm = cmbuf[cidx];
 		memset(cm, 0, (unsigned)(rows + 1) * sizeof cm[0]);
+		memset(pjs[cidx], 0, (unsigned)(rows + 1));   /* fresh column = fresh projections */
 		for (int e2 = 0; e2 < n; ++e2)
 		{
 		    long long c = ccol[e2], dy2 = egy[e2];
@@ -9362,6 +9463,50 @@ static void psw_emit_plane_tiles(int slot, unsigned short colr,
 		    if ((a4 & hardm) == hardm) return 2;
 		    return 1;
 		};
+		auto cproj = [&](int side, int r, int *ox, int *oy) -> int
+		{   /* side 0 = buffer ca (world x = tx<<22), 1 = cb (tx+1) */
+		    int cidx = side ? cb : ca;
+		    if (!pjs[cidx][r])
+		    {
+			int px, py;
+			pjs[cidx][r] = (unsigned char)
+			    (psw_project((tx + side) << 22, (cy0r + r) << 22,
+			                 ph, psign, &px, &py) ? 1 : 2);
+			if (pjs[cidx][r] == 1)
+			{ pjx[cidx][r] = (short)px; pjy[cidx][r] = (short)py; }
+		    }
+		    if (pjs[cidx][r] != 1) return 0;
+		    *ox = pjx[cidx][r]; *oy = pjy[cidx][r];
+		    return 1;
+		};
+		auto emitfull = [&](int ty) -> void
+		{   /* non-mixed interior single: emit64's interior branch with
+		       the corner cache -- same projections, same command */
+		    int r = ty - cy0r;
+		    int qx[4], qy[4];
+		    if (psw_flat_cmds >= psw_flat_cap_dyn) { stop = 1; return; }
+		    if (!cproj(0, r + 1, &qx[0], &qy[0])) return;
+		    if (!cproj(1, r + 1, &qx[1], &qy[1])) return;
+		    if (!cproj(1, r,     &qx[2], &qy[2])) return;
+		    if (!cproj(0, r,     &qx[3], &qy[3])) return;
+		    psw_paint_idx = 176;                /* L+X: full squares RED */
+		    psw_emit_flatquad(slot, colr, qx, qy);
+		};
+		auto stripe = [&](int ty, int cnt) -> int
+		{   /* strip emission off the corner cache (containment proved
+		       by the class runs -- convexity-equivalent to the old
+		       whole-rect SAT) */
+		    int r = ty - cy0r;
+		    int sqx[4], sqy[4];
+		    if (psw_flat_cmds >= psw_flat_cap_dyn) { stop = 1; return 1; }
+		    if (!cproj(0, r + cnt, &sqx[0], &sqy[0])) return 0;
+		    if (!cproj(1, r + cnt, &sqx[1], &sqy[1])) return 0;
+		    if (!cproj(1, r,       &sqx[2], &sqy[2])) return 0;
+		    if (!cproj(0, r,       &sqx[3], &sqy[3])) return 0;
+		    psw_paint_idx = 176;                /* L+X: exact strips RED */
+		    psw_emit_rectquad(slot, colr, sqx, sqy, 0, cnt * 64, 0, 64, 0);
+		    return 1;
+		};
 		if (cull_h != 0x7fffffff)
 		{   /* mixed plane: singles (probes/mask; strips would defeat
 		       the per-tile skipping) */
@@ -9380,11 +9525,13 @@ static void psw_emit_plane_tiles(int slot, unsigned short colr,
 			if (cls == 0) { ++ty; continue; }
 			if (cls == 3 && psw_cur_tall >= 2 && ty + 2 <= cy1r
 			    && tclass(ty + 1) == 3 && tclass(ty + 2) == 3
-			    && stripe(tx, ty, 3)) { ty += 3; continue; }
+			    && stripe(ty, 3)) { ty += 3; continue; }
 			if (cls == 3 && psw_cur_tall >= 1 && ty + 1 <= cy1r
 			    && tclass(ty + 1) == 3
-			    && stripe(tx, ty, 2)) { ty += 2; continue; }
-			emit64(tx, ty, cls >= 2); ++ty;
+			    && stripe(ty, 2)) { ty += 2; continue; }
+			if (cls >= 2) emitfull(ty);
+			else          emit64(tx, ty, 0);
+			++ty;
 		    }
 		}
 		if (tx < txb) { int t2 = ca; ca = cb; cb = t2; coladv(); colmask(cb); }
@@ -9917,9 +10064,11 @@ static void psw_emit_subflats(int k)
 		   potato trade. */
 		if (!solid)
 		{
+		    unsigned short ew0 = frt_read();   /* round 28 `e../<ew>`: the tile walk */
 		    psw_cur_mask = (pass == 0) ? psw_sub_fmask[k] : psw_sub_cmask[k];
 		    psw_cur_sub  = sn;          /* round 22: soft-line rescan key */
 		    psw_emit_plane_tiles(slot, pc, cx, cy, n, ph, psign, cull_h, scolr);
+		    psw_ew_frt += (unsigned short)(frt_read() - ew0);
 		}
 		else
 		{   /* round 14: the solid fan is DECIMATED to <= 4 quads (a many-
@@ -10212,6 +10361,8 @@ static void vdp1_walls_flush(void)
         int tail = (psw_sub_tail < wall_acc_n) ? psw_sub_tail : wall_acc_n;
         psw_mask_fence();   /* ROUND 27: join the slave's mask batch + apply
                                min(vis, est) BEFORE the pre-pass reads fe/ce */
+        vdp1_stage_begin(); /* ROUND 28: the whole append stream below rides the
+                               SlaveDriver staging buffer; the kick fences it */
         psw_flat_cmds = 0; psw_flat_denied = 0; psw_punch_cmds = 0;
         psw_band_n = 0; psw_fanq_n = 0; psw_fine_cmds = 0;
         for (int s = 0; s < PSW_FLAT_SLOTS; ++s) psw_slot[s].used = 0;
@@ -10357,7 +10508,11 @@ static void vdp1_walls_flush(void)
             int wbeg = (int)psw_sub[k].w0;
             if (wend > wall_acc_n) wend = wall_acc_n;
             if (wbeg > wend) wbeg = wend;
-            psw_emit_subflats(k);
+            {   /* ROUND 28 `e<ef>/..`: the whole flat side of this sub, ms */
+                unsigned short ef0 = frt_read();
+                psw_emit_subflats(k);
+                psw_ef_frt += (unsigned short)(frt_read() - ef0);
+            }
             for (int i = wend - 1; i >= wbeg; --i)
             { VDP1_PLOT_WALL(i); psw_paper_left -= psw_wall_paper(i); }
 #if SAT_WORLD_THINGS_VDP1
@@ -10369,6 +10524,9 @@ static void vdp1_walls_flush(void)
         psw_kill_last = psw_kill_n;    psw_punch_last = psw_punch_cmds;
         psw_band_last = psw_band_n;    psw_fan_last = psw_fanq_n;
         psw_note_ms_last = (int)(psw_note_frt / 224u); psw_note_frt = 0;   /* row 13 `N` */
+        psw_ef_ms_last = (int)(psw_ef_frt / 224u);   psw_ef_frt  = 0;      /* row 13 `e` triple */
+        psw_ew_ms_last = (int)(psw_ew_frt / 224u);   psw_ew_frt  = 0;
+        psw_y_ms_last  = (int)(vdp1_stg_frt / 224u); vdp1_stg_frt = 0;
         psw_frame_no++;                       /* the mask-reuse clock (PSW_MASK_AGE) */
         /* (row 13 `c` is now the CORE band-cull counter sat_psw_wcull,
            snapshotted at the frame-boundary latch with tiers/ref) */
@@ -11538,6 +11696,11 @@ static void vdp1_wpn_kick(void)
     if (sat_fb_starve_t > fb_pk_starve) fb_pk_starve = sat_fb_starve_t;
 #endif
     sat_fb_mag_t = sat_fb_starve_t = 0;   /* reset each frame (also when SHOW_FPS off) */
+#if SAT_PSW
+    vdp1_stage_fence();   /* ROUND 28: everything the root/PTMR below will read must be
+                             IN VRAM -- drain the staging batches and join the SCU-DMA.
+                             The END/erase writes after this point go direct (few cmds). */
+#endif
     /* Advance the per-seg visit tag ONE step per rendered frame, HERE and nowhere else: the kick is
        past this frame's BSP walk and before the next one, and it is per FRAME, not per split VIEW
        (the views drain into the shared bank above).  A per-view counter -- framecount is one -- would

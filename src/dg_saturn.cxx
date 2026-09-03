@@ -693,8 +693,9 @@ static int  psw_ew_ms_last = 0;            /* round 28: tile-walk share of it, m
 /* (round 30: `y` left the row -- console P28/P29 read 0-2 ms twice, settled;
    its per-command frt_read pair in vdp1_cmd_at went with it.)  Row 13 `B`/`q`/`j`
    split ew's interior: emit64 borders / beyond-prefix probes / psw_project. */
-static int  psw_eb_ms_last = 0, psw_eb_fast_last = 0, psw_eb_bord_last = 0;
+static int  psw_eb_ms_last = 0, psw_eb_bord_last = 0;
 static int  psw_q_ms_last = 0, psw_j_ms_last = 0, psw_j_n_last = 0;
+static int  psw_bk_baked_last = 0, psw_bk_live_last = 0;   /* round 32 `K<a>/<b>` */
 #endif
 extern "C" int            sat_sky_view;         /* core Part 5: elected split view for the HW sky (-1 = none => all software) */
 extern "C" unsigned int   sat_sky_px_view[4];   /* core Part 5: per-view SKY pixel coverage (election metric) */
@@ -3364,14 +3365,22 @@ static void fps_update(void)
                    never held; j ~5us/proj = projections healthy): exact soft
                    edges via clip crossing tags + the fast path now takes ONE
                    diagonal hard cut (near-line rows, lone diagonal walls).
-                   `B<fast>` counts both rect and rect+1diag fires. */
-                snprintf(ovbuf, sizeof ovbuf, "P31 e%d/%d B%d/%d/%d q%d j%d/%d f%d ",
+                   `B<fast>` counts both rect and rect+1diag fires.
+                   ROUND 32 (owner GO a+b): THE BAKE.  `q` cedes its column to
+                   `K<baked>/<live>` = tiles emitted from the leaf-grid table
+                   vs live-fallback border tiles (near-cut rows, misaligned
+                   pieces, V-refines, unbaked leaves during warm-up).  B is now
+                   the LIVE-residual meter (it brackets only emit64 calls); ew
+                   carries the bake-build spikes during warm-up (~2 leaves/
+                   frame).  K<live> high & steady => the arena is too small or
+                   the map too diagonal -- read it before judging ew. */
+                snprintf(ovbuf, sizeof ovbuf, "P32 e%d/%d B%d/%d K%d/%d j%d/%d f%d ",
                          psw_ef_ms_last > 99 ? 99 : psw_ef_ms_last,
                          psw_ew_ms_last > 99 ? 99 : psw_ew_ms_last,
                          psw_eb_ms_last > 99 ? 99 : psw_eb_ms_last,
-                         psw_eb_fast_last > 999 ? 999 : psw_eb_fast_last,
                          psw_eb_bord_last > 999 ? 999 : psw_eb_bord_last,
-                         psw_q_ms_last > 99 ? 99 : psw_q_ms_last,
+                         psw_bk_baked_last > 999 ? 999 : psw_bk_baked_last,
+                         psw_bk_live_last > 999 ? 999 : psw_bk_live_last,
                          psw_j_ms_last > 99 ? 99 : psw_j_ms_last,
                          psw_j_n_last > 9999 ? 9999 : psw_j_n_last,
                          psw_flat_last  > 999 ? 999 : psw_flat_last);
@@ -8342,10 +8351,10 @@ extern "C" int R_PswBandBoxHidden(int xl, int xr, int yt, int yb);   /* core r_s
       `N<note ms>/<fence ms>`. */
 extern "C" void rp_sgl_workptr_reset(void);            /* core r_parallel.c: joins aux+plane, rewinds GBR+68/72 */
 extern "C" void slSlaveFunc(void (*func)(void *), void *param);   /* SGL */
-#define PSW_MQ_MAX   48                 /* 24 mixed subs x 2 passes; overflow -> inline
+#define PSW_MQ_MAX   40                 /* r32 pool diet 48->40; overflow -> inline
                                            (with the memo walk -- graceful, and the
                                            reuse table absorbs the static/turning case) */
-#define PSW_MLRU_N   32                 /* direct-mapped on (subnum*2+pass)   */
+#define PSW_MLRU_N   16                 /* direct-mapped on (subnum*2+pass); r32 diet 32->16 */
 #define PSW_MASK_AGE 8                  /* frames a stored mask may serve (heights of OTHER
                                            sectors can move under a static view: bounded) */
 struct psw_maskjob                      /* 24 B -- the pre-flight pool paid 17,36->9,34 KB
@@ -8372,9 +8381,8 @@ static unsigned int psw_ew_frt = 0;     /* round 28: frame sum of psw_emit_plane
 /* ROUND 30 -- ew's interior, named (three rounds of arithmetic cuts left the
    ~80-100 us/cmd constant standing: measure, stop modelling).  All reset at
    flush entry (j would otherwise carry the note phase's projections). */
-static unsigned int psw_eb_frt = 0;     /* emit64 borders, total (row 13 `B<ms>/../..`) */
-static int psw_eb_fast = 0;             /* axis-rect fast-path fires (`B../<f>/..`) */
-static int psw_eb_bord = 0;             /* emit64 entries = border tiles (`B../../<n>`) */
+static unsigned int psw_eb_frt = 0;     /* emit64 LIVE borders, total (row 13 `B<ms>/..`) */
+static int psw_eb_bord = 0;             /* emit64 entries = live border tiles (`B../<n>`) */
 static unsigned int psw_q_frt = 0;      /* beyond-prefix BSP probes, mixed walk (`q`) */
 static unsigned int psw_j_frt = 0;      /* psw_project bodies, flush-scoped (`j<ms>/<n>`;
                                            ~2 frt_read/call of self-bias rides inside) */
@@ -9019,6 +9027,458 @@ static int psw_clip_axis(const int *ax, const int *ay, int n, int *bx, int *by,
     return m;
 }
 
+/* ============================================================================
+   ROUND 32 -- THE LEAF-GRID BAKE (owner GO 2026-09-03: "a+b, changement
+   structurel, le moteur le plus optimisé possible").  The leaf-poly-cap-grid
+   decomposition is WORLD geometry: recomputing it per frame was the measured
+   border bill (console P30/P31: B 18-21 ms INVARIANT under three bit-identical
+   arithmetic cuts -- the cost is the fat clip+band machinery itself, ~0.3 IPC
+   on a 4 KB cache).  Bake it ONCE per leaf, lazily, into a small PU_LEVEL
+   arena: a CLASS byte per tile, an 8-byte record per border tile carrying the
+   band parameters the live tail used to recompute (v0/vend rows, u range,
+   quad x extent, diag bbox), plus an optional 16-byte U-strip refinement
+   record per diagonal tile.  At flush the walk keeps only the VIEW work: the
+   same corner-mask machinery on THREE half-planes (near hard, frustum sides
+   soft), the note-mask gate, projections, staging.  A baked border tile costs
+   a table read + 4 projections + 1-2 commands.
+   LIVE fallback (the full old path, kept verbatim) for: unbaked leaf (no
+   pool / budget spent / arena full / leaf too big), near-cut tiles (the eye
+   row), 8-misaligned axis pieces (their snap-lip window needs exact verts),
+   V-oriented refinement (sdy > sdx) at close range, sub-texel-row slivers,
+   and slot famine (the solid fan needs the piece verts).
+   The piece a baked tile emits equals the live piece for every view-uncut
+   tile (leaf-only geometry; soft view cuts ignored per the r29 law), except
+   the DIAG window box: baked = the piece's world bbox rounded OUTWARD to
+   whole texels -> the crop window can be up to 1 texel looser per side than
+   the live projected-verts box (leak class already accepted for diagonals).
+   Level exit frees everything (PU_LEVEL); psw_pvx + a leveltime drop are
+   watched so stale pointers are dropped before the zone reuses them.
+   Part (b), round 33: the WHOLE flat side moves to the slave SH-2 (owner:
+   "si on peut tout donner à ssh2, allons-y") -- the master keeps walls/
+   things/kick; the bake is what makes the slave's flat pass short enough to
+   hide under them, and the 2e+1 billing law provides the VDP1 index-range
+   reservation it needs. */
+extern "C" void *Z_MainZone(void);
+extern "C" void *Z_Malloc2(void *zone, int size, int tag);   /* NULL on exhaustion, no purge */
+extern "C" int   Z_CanAllocate(int size);
+extern "C" int   numsubsectors;
+extern "C" int   leveltime;
+#define PSW_BK_PU_LEVEL   5              /* z_zone.h enum: STATIC=1,SOUND,MUSIC,FREE,LEVEL */
+#define PSW_BK_POOL_REQ   (12 * 1024)
+#define PSW_BK_ZONE_MIN   (20 * 1024)    /* keep this much TRUE free zone for the loaders */
+#define PSW_BK_TILE_CAP   704            /* class-map bytes per leaf (bbox tiles) */
+#define PSW_BK_REC_CAP    120            /* border records per leaf */
+#define PSW_BK_FINE_CAP_L 24             /* fine records per leaf */
+#define PSW_BK_BUDGET     2              /* leaves baked per frame (warm-up spread) */
+#define PSW_BK_EPOCH_MIN  300            /* frames between full-arena resets */
+#define PSW_BKC_OUT   0
+#define PSW_BKC_SLIV  1
+#define PSW_BKC_FULL  2
+#define PSW_BKC_LIVE  3
+#define PSW_BKC_REC0  4
+struct psw_brec {                        /* 8 B: one baked border tile */
+    unsigned char type;                  /* 0 full-width band | 1 axis piece | 2 diag */
+    unsigned char v0, vend;              /* band char rows */
+    unsigned char a, b;                  /* t1: ua,uwd | t2: bbx0,bbx1 (texels, outward) */
+    unsigned char c, d;                  /* t1: qxa,qxb (8-snapped) | t2: bby0,bby1 */
+    unsigned char fine;                  /* t2: fine idx | 0xFF none | 0xFE V-oriented (live when big) */
+};
+struct psw_bfine { unsigned char v[16]; };   /* 8 x (v0s,vends); 0xFF = empty strip */
+struct psw_bleaf {
+    short subnum;
+    short txa, tya;
+    unsigned char tw, th;
+    unsigned char nrec, nfine;
+};
+static unsigned char  *psw_bk_pool = 0;
+static int             psw_bk_size = 0, psw_bk_used = 0;
+static unsigned short *psw_bk_off = 0;   /* per sub: byte offset; 0xFFFF unbaked, 0xFFFE never */
+static int             psw_bk_nsub = 0;
+static const int      *psw_bk_watch = 0; /* psw_pvx of the level the arena belongs to */
+static int             psw_bk_lt = -1;
+static int             psw_bk_budget = 0;
+static int             psw_bk_age = 0;
+static int             psw_bk_baked_n = 0, psw_bk_live_n = 0;      /* per flush
+                                          (K latches live in the overlay block) */
+
+static void psw_bake_frame(void)
+{
+    if (psw_pvx != psw_bk_watch || !psw_polys_ok || leveltime < psw_bk_lt)
+    {   /* level changed: P_SetupLevel freed our PU_LEVEL arena underneath --
+	   drop the pointers FIRST (the zone allocator is deterministic enough
+	   to hand psw_pvx the same address back, hence the leveltime guard). */
+	psw_bk_pool = 0; psw_bk_off = 0; psw_bk_size = 0; psw_bk_used = 0;
+	psw_bk_nsub = 0; psw_bk_watch = psw_pvx; psw_bk_age = 0;
+	if (psw_polys_ok && numsubsectors > 0
+	    && Z_TrueFree() > PSW_BK_ZONE_MIN + PSW_BK_POOL_REQ + 2 * numsubsectors + 256)
+	{
+	    void *mz = Z_MainZone();
+	    psw_bk_off = (unsigned short *)Z_Malloc2(mz, 2 * numsubsectors, PSW_BK_PU_LEVEL);
+	    psw_bk_pool = psw_bk_off
+	        ? (unsigned char *)Z_Malloc2(mz, PSW_BK_POOL_REQ, PSW_BK_PU_LEVEL) : 0;
+	    if (psw_bk_pool)
+	    {
+		int i;
+		psw_bk_size = PSW_BK_POOL_REQ;
+		psw_bk_nsub = numsubsectors;
+		for (i = 0; i < psw_bk_nsub; ++i) psw_bk_off[i] = 0xFFFFu;
+	    }
+	    else psw_bk_off = 0;        /* stray index block: PU_LEVEL, freed at exit */
+	}
+    }
+    psw_bk_lt = leveltime;
+    psw_bk_budget = PSW_BK_BUDGET;
+    psw_bk_baked_n = 0; psw_bk_live_n = 0;
+    if (psw_bk_pool && psw_bk_used + 1600 > psw_bk_size)
+    {   /* arena full: reset the whole epoch at most every PSW_BK_EPOCH_MIN
+	   frames (travel invalidates the working set; rebake spreads lazily) */
+	if (++psw_bk_age >= PSW_BK_EPOCH_MIN)
+	{
+	    int i;
+	    psw_bk_age = 0; psw_bk_used = 0;
+	    for (i = 0; i < psw_bk_nsub; ++i)
+		if (psw_bk_off[i] != 0xFFFEu) psw_bk_off[i] = 0xFFFFu;
+	}
+    }
+    else psw_bk_age = 0;
+}
+
+static int psw_bake_build(int sn)        /* >= 0 pool offset | -1 no room | -2 never */
+{
+    int wx[PSW_FAN_MAX], wy[PSW_FAN_MAX];
+    int axp[PSW_FAN_MAX], ayp[PSW_FAN_MAX];
+    int bxv[PSW_FAN_MAX], byv[PSW_FAN_MAX];
+    unsigned char cls[PSW_BK_TILE_CAP];
+    struct psw_brec  rec[PSW_BK_REC_CAP];
+    struct psw_bfine fin[PSW_BK_FINE_CAP_L];
+    int n, i, j, wpos2, nrec = 0, nfin = 0;
+    int bx0, bx1, by0, by1, txa, txb, tya, tyb, tw, th, tx, ty;
+    long long aw = 0;
+    if (!psw_polys_ok || psw_pvn[sn] < 3) return -2;
+    n = psw_pvn[sn];
+    if (n > PSW_FAN_MAX) return -2;
+    for (i = 0; i < n; ++i)
+    { wx[i] = psw_pvx[psw_pvi[sn] + i]; wy[i] = psw_pvy[psw_pvi[sn] + i]; }
+    for (i = 0; i < n; ++i)
+    {
+	j = (i + 1 == n) ? 0 : i + 1;
+	aw += (long long)(wx[i] - wx[0]) * (wy[j] - wy[0])
+	    - (long long)(wx[j] - wx[0]) * (wy[i] - wy[0]);
+    }
+    wpos2 = (aw >= 0);
+    bx0 = bx1 = wx[0]; by0 = by1 = wy[0];
+    for (i = 1; i < n; ++i)
+    {
+	if (wx[i] < bx0) bx0 = wx[i]; if (wx[i] > bx1) bx1 = wx[i];
+	if (wy[i] < by0) by0 = wy[i]; if (wy[i] > by1) by1 = wy[i];
+    }
+    txa = bx0 >> 22; txb = (bx1 - 1) >> 22;
+    tya = by0 >> 22; tyb = (by1 - 1) >> 22;
+    tw = txb - txa + 1; th = tyb - tya + 1;
+    if (tw <= 0 || th <= 0 || tw > 255 || th > 255 || tw * th > PSW_BK_TILE_CAP)
+	return -2;
+    for (ty = 0; ty < th; ++ty)
+	for (tx = 0; tx < tw; ++tx)
+	{
+	    int x0 = (txa + tx) << 22, y0 = (tya + ty) << 22;
+	    int x1 = x0 + (64 << 16), y1 = y0 + (64 << 16);
+	    unsigned int a4 = 0, or4 = 0;
+	    unsigned char *out = &cls[ty * tw + tx];
+	    int m, e;
+	    long long area2;
+	    for (e = 0; e < n; ++e)
+	    {
+		int e1 = (e + 1 == n) ? 0 : e + 1;
+		long long ex = wx[e1] - wx[e], ey = wy[e1] - wy[e];
+		int ins = 0, k2;
+		static const int cxo[4] = { 0, 1, 1, 0 }, cyo[4] = { 0, 0, 1, 1 };
+		for (k2 = 0; k2 < 4; ++k2)
+		{
+		    long long c = ex * (long long)((cyo[k2] ? y1 : y0) - wy[e])
+		                - ey * (long long)((cxo[k2] ? x1 : x0) - wx[e]);
+		    int in2 = wpos2 ? (c >= 0) : (c <= 0);
+		    ins += in2;
+		}
+		if (ins == 4) a4 |= 1u << e;
+		if (ins)      or4 |= 1u << e;
+	    }
+	    if ((or4 & ((1u << n) - 1u)) != (1u << n) - 1u) { *out = PSW_BKC_OUT; continue; }
+	    if ((a4 & ((1u << n) - 1u)) == (1u << n) - 1u)  { *out = PSW_BKC_FULL; continue; }
+	    m = psw_clip_axis(wx, wy, n, axp, ayp, 0, +1, x0);
+	    if (m < 3) { *out = PSW_BKC_OUT; continue; }
+	    m = psw_clip_axis(axp, ayp, m, bxv, byv, 0, -1, x1);
+	    if (m < 3) { *out = PSW_BKC_OUT; continue; }
+	    m = psw_clip_axis(bxv, byv, m, axp, ayp, 1, +1, y0);
+	    if (m < 3) { *out = PSW_BKC_OUT; continue; }
+	    m = psw_clip_axis(axp, ayp, m, bxv, byv, 1, -1, y1);
+	    if (m < 3) { *out = PSW_BKC_OUT; continue; }
+	    area2 = 0;
+	    for (i = 0; i < m; ++i)
+	    {
+		j = (i + 1 == m) ? 0 : i + 1;
+		area2 += (long long)(bxv[i] - x0) * (byv[j] - y0)
+		       - (long long)(bxv[j] - x0) * (byv[i] - y0);
+	    }
+	    if (area2 < 0) area2 = -area2;
+	    if ((area2 >> 33) < 2)            { *out = PSW_BKC_SLIV; continue; }
+	    if ((area2 >> 33) >= 64 * 64 - 2) { *out = PSW_BKC_FULL; continue; }
+	    {
+		int pbx0 = bxv[0], pbx1 = bxv[0], pby0 = byv[0], pby1 = byv[0];
+		int v0, vend, allaxis;
+		for (i = 1; i < m; ++i)
+		{
+		    if (bxv[i] < pbx0) pbx0 = bxv[i]; if (bxv[i] > pbx1) pbx1 = bxv[i];
+		    if (byv[i] < pby0) pby0 = byv[i]; if (byv[i] > pby1) pby1 = byv[i];
+		}
+		v0   = (y1 - pby1) >> 16;
+		vend = (y1 - pby0 + 0xFFFF) >> 16;
+		if (v0 < 0) v0 = 0;
+		if (vend > 64) vend = 64;
+		if (vend <= v0) { *out = PSW_BKC_LIVE; continue; }   /* thin: live solid fan */
+		if (nrec >= PSW_BK_REC_CAP) return -2;               /* too rich: never bake */
+		allaxis = (m == 4);
+		for (i = 0; i < 4 && allaxis; ++i)
+		{
+		    j = (i + 1) & 3;
+		    if (bxv[i] != bxv[j] && byv[i] != byv[j]) allaxis = 0;
+		}
+		if (allaxis && pbx0 == x0 && pbx1 == x1)
+		{
+		    rec[nrec].type = 0;
+		    rec[nrec].v0 = (unsigned char)v0; rec[nrec].vend = (unsigned char)vend;
+		    rec[nrec].a = rec[nrec].b = rec[nrec].c = rec[nrec].d = 0;
+		    rec[nrec].fine = 0xFF;
+		    *out = (unsigned char)(PSW_BKC_REC0 + nrec); nrec++;
+		}
+		else if (allaxis)
+		{
+		    int wxa = pbx0 & ~((8 << 16) - 1);
+		    int wxb = (pbx1 + ((8 << 16) - 1)) & ~((8 << 16) - 1);
+		    int ua  = (wxa - x0) >> 16;
+		    int uwd = (wxb - wxa) >> 16;
+		    if (wxa != pbx0 || wxb != pbx1 || ua < 0 || uwd <= 0 || ua + uwd > 64)
+			*out = PSW_BKC_LIVE;         /* snap lip needs the exact window */
+		    else
+		    {
+			rec[nrec].type = 1;
+			rec[nrec].v0 = (unsigned char)v0; rec[nrec].vend = (unsigned char)vend;
+			rec[nrec].a = (unsigned char)ua;  rec[nrec].b = (unsigned char)uwd;
+			rec[nrec].c = (unsigned char)ua;  rec[nrec].d = (unsigned char)(ua + uwd);
+			rec[nrec].fine = 0xFF;
+			*out = (unsigned char)(PSW_BKC_REC0 + nrec); nrec++;
+		    }
+		}
+		else
+		{
+		    int sdx = 0, sdy = 0, bbx0, bbx1, bby0, bby1;
+		    unsigned char fine = 0xFF;
+		    for (i = 0; i < m; ++i)
+		    {
+			int ddx, ddy;
+			j = (i + 1 == m) ? 0 : i + 1;
+			ddx = bxv[j] - bxv[i]; ddy = byv[j] - byv[i];
+			if (ddx && ddy)
+			{
+			    sdx += (ddx < 0) ? -ddx : ddx;
+			    sdy += (ddy < 0) ? -ddy : ddy;
+			}
+		    }
+		    bbx0 = (pbx0 - x0) >> 16;            if (bbx0 < 0) bbx0 = 0;
+		    bbx1 = (pbx1 - x0 + 0xFFFF) >> 16;   if (bbx1 > 64) bbx1 = 64;
+		    bby0 = (pby0 - y0) >> 16;            if (bby0 < 0) bby0 = 0;
+		    bby1 = (pby1 - y0 + 0xFFFF) >> 16;   if (bby1 > 64) bby1 = 64;
+		    if (sdx | sdy)
+		    {
+			if (sdx >= sdy && nfin < PSW_BK_FINE_CAP_L)
+			{   /* bake the 8 U-strip v-ranges (the live fine clips) */
+			    int s;
+			    for (s = 0; s < 8; ++s)
+			    {
+				int gx0 = x0 + (s << 19), gx1 = gx0 + (1 << 19);
+				int ms = psw_clip_axis(bxv, byv, m, axp, ayp, 0, +1, gx0);
+				fin[nfin].v[2 * s] = 0xFF; fin[nfin].v[2 * s + 1] = 0xFF;
+				if (ms < 3) continue;
+				{
+				    int dxs[PSW_FAN_MAX], dys[PSW_FAN_MAX];
+				    ms = psw_clip_axis(axp, ayp, ms, dxs, dys, 0, -1, gx1);
+				    if (ms < 3) continue;
+				    {
+					int sy0 = dys[0], sy1 = dys[0], v0s, vends;
+					for (i = 1; i < ms; ++i)
+					{ if (dys[i] < sy0) sy0 = dys[i];
+					  if (dys[i] > sy1) sy1 = dys[i]; }
+					v0s   = (y1 - sy1) >> 16;
+					vends = (y1 - sy0 + 0xFFFF) >> 16;
+					if (v0s < 0) v0s = 0;
+					if (vends > 64) vends = 64;
+					if (vends <= v0s) continue;
+					fin[nfin].v[2 * s]     = (unsigned char)v0s;
+					fin[nfin].v[2 * s + 1] = (unsigned char)vends;
+				    }
+				}
+			    }
+			    fine = (unsigned char)nfin; nfin++;
+			}
+			else fine = 0xFE;            /* V-oriented (or fine-full): live when big */
+		    }
+		    rec[nrec].type = 2;
+		    rec[nrec].v0 = (unsigned char)v0; rec[nrec].vend = (unsigned char)vend;
+		    rec[nrec].a = (unsigned char)bbx0; rec[nrec].b = (unsigned char)bbx1;
+		    rec[nrec].c = (unsigned char)bby0; rec[nrec].d = (unsigned char)bby1;
+		    rec[nrec].fine = fine;
+		    *out = (unsigned char)(PSW_BKC_REC0 + nrec); nrec++;
+		}
+	    }
+	}
+    {
+	int need = ((int)sizeof(struct psw_bleaf) + tw * th
+	            + nrec * (int)sizeof(struct psw_brec)
+	            + nfin * (int)sizeof(struct psw_bfine) + 3) & ~3;
+	struct psw_bleaf *L;
+	unsigned char *p;
+	if (psw_bk_used + need > psw_bk_size) return -1;
+	L = (struct psw_bleaf *)(psw_bk_pool + psw_bk_used);
+	L->subnum = (short)sn;
+	L->txa = (short)txa; L->tya = (short)tya;
+	L->tw = (unsigned char)tw; L->th = (unsigned char)th;
+	L->nrec = (unsigned char)nrec; L->nfine = (unsigned char)nfin;
+	p = (unsigned char *)(L + 1);
+	memcpy(p, cls, (unsigned)(tw * th)); p += tw * th;
+	memcpy(p, rec, (unsigned)nrec * sizeof(struct psw_brec)); p += nrec * sizeof(struct psw_brec);
+	memcpy(p, fin, (unsigned)nfin * sizeof(struct psw_bfine));
+	{
+	    int off = psw_bk_used;
+	    psw_bk_used += need;
+	    return off;
+	}
+    }
+}
+
+static const struct psw_bleaf *psw_bake_get(int sn)
+{
+    unsigned short off;
+    if (!psw_bk_pool || sn < 0 || sn >= psw_bk_nsub) return 0;
+    off = psw_bk_off[sn];
+    if (off == 0xFFFEu) return 0;
+    if (off != 0xFFFFu) return (const struct psw_bleaf *)(psw_bk_pool + off);
+    if (psw_bk_budget <= 0) return 0;
+    psw_bk_budget--;
+    {
+	int r = psw_bake_build(sn);
+	if (r >= 0)
+	{
+	    psw_bk_off[sn] = (unsigned short)r;
+	    return (const struct psw_bleaf *)(psw_bk_pool + r);
+	}
+	if (r == -2) psw_bk_off[sn] = 0xFFFEu;
+	return 0;
+    }
+}
+
+/* emit one BAKED border tile: 1 = done, 0 = fall back to the live path,
+   -1 = command budget exhausted (caller stops the walk) */
+static int psw_emit_baked(int slot, unsigned short colr, int ph, int psign,
+                          int tx, int ty, const struct psw_brec *br,
+                          const struct psw_bleaf *bk)
+{
+    int x0 = tx << 22, y0 = ty << 22;
+    int x1 = x0 + (64 << 16), y1 = y0 + (64 << 16);
+    int by1s = y1 - ((int)br->v0 << 16), by0s = y1 - ((int)br->vend << 16);
+    int qx[4], qy[4], okq;
+    if (psw_flat_cmds >= psw_flat_cap_dyn) return -1;
+    if (br->type == 0)
+    {   /* full-width band: window-free, the exact live emission */
+	okq  = psw_project(x0, by1s, ph, psign, &qx[0], &qy[0]);
+	okq &= psw_project(x1, by1s, ph, psign, &qx[1], &qy[1]);
+	okq &= psw_project(x1, by0s, ph, psign, &qx[2], &qy[2]);
+	okq &= psw_project(x0, by0s, ph, psign, &qx[3], &qy[3]);
+	if (!okq) return 0;
+	psw_paint_idx = 216;                     /* L+X: bands ORANGE */
+	psw_emit_rectquad(slot, colr, qx, qy, br->v0, br->vend - br->v0, 0, 64, 0);
+	psw_band_n++;
+	return 1;
+    }
+    if (br->type == 1)
+    {   /* aligned axis piece: true x-extent quad + u sub-range, window-free */
+	int wxa = x0 + ((int)br->c << 16), wxb = x0 + ((int)br->d << 16);
+	okq  = psw_project(wxa, by1s, ph, psign, &qx[0], &qy[0]);
+	okq &= psw_project(wxb, by1s, ph, psign, &qx[1], &qy[1]);
+	okq &= psw_project(wxb, by0s, ph, psign, &qx[2], &qy[2]);
+	okq &= psw_project(wxa, by0s, ph, psign, &qx[3], &qy[3]);
+	if (!okq) return 0;
+	psw_paint_idx = 216;
+	psw_emit_rectquad(slot, colr, qx, qy, br->v0, br->vend - br->v0,
+	                  br->a, br->b, 0);
+	psw_band_n++;
+	return 1;
+    }
+    {   /* diagonal piece: window from the baked world bbox (<= 1 texel looser
+	   per side than the live projected-verts box), then the baked U-strip
+	   refinement or the coarse band -- the live gates, mirrored */
+	int bwx0 = x0 + ((int)br->a << 16), bwx1 = x0 + ((int)br->b << 16);
+	int bwy0 = y0 + ((int)br->c << 16), bwy1 = y0 + ((int)br->d << 16);
+	int px, py, wl, wr, wt, wb2;
+	okq  = psw_project(bwx0, bwy1, ph, psign, &px, &py);
+	wl = px; wr = px; wt = py; wb2 = py;
+	okq &= psw_project(bwx1, bwy1, ph, psign, &px, &py);
+	if (okq) { if (px < wl) wl = px; if (px > wr) wr = px;
+	           if (py < wt) wt = py; if (py > wb2) wb2 = py; }
+	okq &= psw_project(bwx1, bwy0, ph, psign, &px, &py);
+	if (okq) { if (px < wl) wl = px; if (px > wr) wr = px;
+	           if (py < wt) wt = py; if (py > wb2) wb2 = py; }
+	okq &= psw_project(bwx0, bwy0, ph, psign, &px, &py);
+	if (okq) { if (px < wl) wl = px; if (px > wr) wr = px;
+	           if (py < wt) wt = py; if (py > wb2) wb2 = py; }
+	if (!okq) return 0;
+	{
+	    int big = (wr - wl >= PSW_FINE_PX || wb2 - wt >= PSW_FINE_PX);
+	    if (big && br->fine == 0xFEu) return 0;      /* V-oriented refine: live */
+	    if (big && br->fine != 0xFFu && br->fine != 0xFEu
+	        && psw_fine_cmds < PSW_FINE_CAP
+	        && vdp1_wnext + 10 < vdp1_wall_cap
+	        && psw_flat_cmds + 10 < psw_flat_cap_dyn)
+	    {   /* baked U-strips: one shared window + <=8 sub-band quads */
+		const struct psw_bfine *bf = (const struct psw_bfine *)
+		    ((const unsigned char *)(bk + 1) + (int)bk->tw * bk->th
+		     + (int)bk->nrec * (int)sizeof(struct psw_brec)) + br->fine;
+		int s;
+		psw_paint_idx = 216;
+		psw_emit_clipwin(wl, wt, wr, wb2);
+		psw_fine_cmds++;
+		for (s = 0; s < 8; ++s)
+		{
+		    int v0s = bf->v[2 * s], vends = bf->v[2 * s + 1];
+		    int gx0, gx1, gy1s, gy0s, oks;
+		    int sqx[4], sqy[4];
+		    if (v0s == 0xFF) continue;
+		    gx0 = x0 + (s << 19); gx1 = gx0 + (1 << 19);
+		    gy1s = y1 - (v0s << 16); gy0s = y1 - (vends << 16);
+		    oks  = psw_project(gx0, gy1s, ph, psign, &sqx[0], &sqy[0]);
+		    oks &= psw_project(gx1, gy1s, ph, psign, &sqx[1], &sqy[1]);
+		    oks &= psw_project(gx1, gy0s, ph, psign, &sqx[2], &sqy[2]);
+		    oks &= psw_project(gx0, gy0s, ph, psign, &sqx[3], &sqy[3]);
+		    if (!oks) continue;
+		    psw_emit_rectquad(slot, colr, sqx, sqy, v0s, vends - v0s, s * 8, 8, 1);
+		    psw_band_n++; psw_fine_cmds++;
+		}
+		return 1;
+	    }
+	    if (vdp1_wnext + 1 >= vdp1_wall_cap
+	        || psw_flat_cmds + 1 >= psw_flat_cap_dyn) return -1;
+	    okq  = psw_project(x0, by1s, ph, psign, &qx[0], &qy[0]);
+	    okq &= psw_project(x1, by1s, ph, psign, &qx[1], &qy[1]);
+	    okq &= psw_project(x1, by0s, ph, psign, &qx[2], &qy[2]);
+	    okq &= psw_project(x0, by0s, ph, psign, &qx[3], &qy[3]);
+	    if (!okq) return 0;
+	    psw_paint_idx = 216;
+	    psw_emit_clipwin(wl, wt, wr, wb2);
+	    psw_emit_rectquad(slot, colr, qx, qy, br->v0, br->vend - br->v0, 0, 64, 1);
+	    psw_band_n++;
+	    return 1;
+	}
+    }
+}
+
 /* Emit one plane as 64x64 WORLD-GRID tiles (the PowerSlave format, imported).
    An INTERIOR tile maps the whole flat character 1:1 -- u = wx&63, v = (-wy)&63,
    the exact software R_MapPlane phase, so VDP1 tiles line up with each other AND
@@ -9177,8 +9637,34 @@ static void psw_emit_plane_tiles(int slot, unsigned short colr,
 	   LEAF is untouched (the frustum is not a wall); the near-clip edge stays
 	   hard (projection guard); STRIPS still require full containment so their
 	   tails never exceed a tile. */
+	/* ROUND 32: with a BAKED leaf the corner-mask machinery runs on the
+	   THREE VIEW half-planes only (near hard, frustum sides soft) -- the
+	   leaf geometry comes from the table.  Everything below (colmask,
+	   tclass, cproj, emitfull, stripe) keys off nmask/fullm/softm/hardm
+	   and works unchanged; the poly-edge branch is the live fallback. */
+	const struct psw_bleaf *bk = (slot >= 0) ? psw_bake_get(psw_cur_sub) : 0;
+	int nmask = n;
 	unsigned int fullm = (1u << n) - 1u;         /* n <= PSW_FAN_MAX 28 */
 	unsigned int softm = 0;
+	int vfcx[3], vfcy[3];
+	long long vlim[3];
+	if (bk)
+	{
+	    extern int detailshift;
+	    int hw2  = (viewwidth << detailshift) >> 1;
+	    int rows = (psign > 0) ? (viewheight - centery + 2) : (centery + 2);
+	    int limN = PSW_TZ_NEAR + (8 << 16);
+	    if (rows > 0)
+	    {
+		int l2 = (int)(((long long)ph * hw2) / rows);
+		if (l2 > limN) limN = l2;
+	    }
+	    vfcx[0] = viewcos;           vfcy[0] = viewsin;           vlim[0] = (long long)limN << 16;
+	    vfcx[1] = viewcos + viewsin; vfcy[1] = viewsin - viewcos; vlim[1] = -((long long)(8 << 16) << 16);
+	    vfcx[2] = viewcos - viewsin; vfcy[2] = viewsin + viewcos; vlim[2] = -((long long)(8 << 16) << 16);
+	    nmask = 3; fullm = 7u; softm = 6u;       /* near hard, sides soft */
+	}
+	else
 	{
 	    unsigned char on2[PSW_FAN_MAX], on3[PSW_FAN_MAX];
 	    int fx2 = viewcos + viewsin, fy2 = viewsin - viewcos;
@@ -9206,156 +9692,40 @@ static void psw_emit_plane_tiles(int slot, unsigned short colr,
 	    }
 	}
 	unsigned int hardm = fullm & ~softm;
-	unsigned int axm = 0;               /* round 29: axis-aligned edges (the
-	                                       border fast path's precondition) */
-	for (i = 0; i < n; ++i)
-	{
-	    int j = (i + 1 == n) ? 0 : i + 1;
-	    if (cx[i] == cx[j] || cy[i] == cy[j]) axm |= 1u << i;
-	}
 	long long egx[PSW_FAN_MAX], egy[PSW_FAN_MAX];   /* d(cross)/d(tile step) */
-	for (i = 0; i < n; ++i)
-	{
-	    int j = (i + 1 == n) ? 0 : i + 1;
-	    egx[i] = -((long long)(cy[j] - cy[i]) << 22);   /* -ey * 64u */
-	    egy[i] =  ((long long)(cx[j] - cx[i]) << 22);   /*  ex * 64u */
+	if (bk)
+	{   /* view half-planes: F = dx*fcx + dy*fcy - lim<<16, inside = F >= 0.
+	       Stored with the poly's winding sign so colmask/tclass's wpos
+	       convention reads them unchanged. */
+	    int sgn = wpos ? 1 : -1;
+	    for (i = 0; i < 3; ++i)
+	    {
+		egx[i] = (long long)sgn * ((long long)vfcx[i] << 22);
+		egy[i] = (long long)sgn * ((long long)vfcy[i] << 22);
+	    }
 	}
-	auto emit64 = [&](int tx, int ty, unsigned int cutm) -> void
-	{   /* BORDER tile only since round 29 (interiors ride emitfull's corner
-	       cache; the mixed walk's note-mask check is hoisted to its caller). */
+	else
+	    for (i = 0; i < n; ++i)
+	    {
+		int j = (i + 1 == n) ? 0 : i + 1;
+		egx[i] = -((long long)(cy[j] - cy[i]) << 22);   /* -ey * 64u */
+		egy[i] =  ((long long)(cx[j] - cx[i]) << 22);   /*  ex * 64u */
+	    }
+	auto emit64 = [&](int tx, int ty) -> void
+	{   /* BORDER tile, LIVE path only since round 32 (baked leaves emit from
+	       the table; this serves near-cut rows, misaligned pieces, V-refines
+	       and unbaked leaves).  The r29/r31 axis-rect fast path was DELETED
+	       with the bake: it covered exactly the tiles the table now owns, and
+	       its code bytes were pool the boot needs. */
 	    int ax[PSW_FAN_MAX], ay[PSW_FAN_MAX];
 	    int bxv[PSW_FAN_MAX], byv[PSW_FAN_MAX];
 	    int x0 = tx << 22, y0 = ty << 22;
 	    int x1 = x0 + (64 << 16), y1 = y0 + (64 << 16);
 	    int m, full;
 	    long long area2;
-	    unsigned int cuth = cutm & hardm;
-	    unsigned int cutd = cuth & ~axm;     /* round 31: DIAGONAL hard cuts */
-	    unsigned int cutax = cuth & axm;
 	    if (psw_flat_cmds >= psw_flat_cap_dyn) { stop = 1; return; }
-	    psw_eb_bord++;                       /* round 30 `B../../<n>` */
-	    if (cuth && (cutd & (cutd - 1)) == 0)
-	    {   /* ROUND 29 -- AXIS-CUT FAST PATH (console P28: ew 19-26 ms with
-	           b59-99 border tiles = the walk's dominant bill; each paid 4
-	           Sutherland passes + shoelace + divisions here).  When every
-	           HARD cutting edge is axis-aligned -- Doom's common case -- the
-	           piece tile-cap-poly is an exact RECT: clamp the tile bounds by
-	           each cutting line, O(1), zero divisions.  Crossings on axis
-	           edges interpolate exactly, so this is BIT-IDENTICAL to the old
-	           clip (r29_border_check.py, 34k tiles).  SOFT frustum bits are
-	           IGNORED like class-2 full squares: the piece widens past the
-	           frustum line only (tail <= 64u, VDP1-system-clipped; on-screen
-	           texels identical, proven point-wise in the same harness) --
-	           and the widened rect often SAVES a window command.  A poly
-	           vertex strictly inside the tile puts BOTH its edges in cutm
-	           (a line through a square's interior separates its corners), so
-	           a diagonal corner can never hide from this test. */
-		int px0 = x0, px1 = x1, py0 = y0, py1 = y1;
-		psw_eb_fast++;                   /* round 30 `B../<f>/..` */
-		for (int e2 = 0; e2 < n; ++e2)
-		{
-		    int j2;
-		    if (!((cutax >> e2) & 1u)) continue;
-		    j2 = (e2 + 1 == n) ? 0 : e2 + 1;
-		    if (cx[e2] == cx[j2])
-		    {   /* vertical cut x = cx[e2]: keep-side from the winding */
-			if (wpos ? (cy[j2] > cy[e2]) : (cy[j2] < cy[e2]))
-			{ if (cx[e2] < px1) px1 = cx[e2]; }
-			else
-			{ if (cx[e2] > px0) px0 = cx[e2]; }
-		    }
-		    else
-		    {   /* horizontal cut y = cy[e2] */
-			if (wpos ? (cx[j2] > cx[e2]) : (cx[j2] < cx[e2]))
-			{ if (cy[e2] > py0) py0 = cy[e2]; }
-			else
-			{ if (cy[e2] < py1) py1 = cy[e2]; }
-		    }
-		}
-		if (px1 <= px0 || py1 <= py0) return;
-		if (!cutd)
-		{
-		    if (wpos)
-		    {
-			bxv[0] = px0; byv[0] = py0; bxv[1] = px1; byv[1] = py0;
-			bxv[2] = px1; byv[2] = py1; bxv[3] = px0; byv[3] = py1;
-		    }
-		    else
-		    {
-			bxv[0] = px0; byv[0] = py0; bxv[1] = px0; byv[1] = py1;
-			bxv[2] = px1; byv[2] = py1; bxv[3] = px1; byv[3] = py0;
-		    }
-		    m = 4;
-		    area2 = 2 * (long long)(px1 - px0) * (py1 - py0);
-		}
-		else
-		{   /* ROUND 31 -- ONE diagonal hard cut (the near line's tile
-		       row, a lone diagonal leaf/splitline edge -- console P30:
-		       fast 0-3/86-149, the all-axis precondition almost never
-		       held): a single Sutherland pass of the clamped rect
-		       against that edge, vs 4 passes over the whole n-gon.
-		       f is the same 64-bit cross as the corner masks; fa and
-		       fa-fb are normalized by a SHARED shift to 30 bits before
-		       the 16.16 division, so the crossing lands within ~0.002u
-		       of exact -- and a neighbour tile interpolates the same
-		       corner-f pair along the shared side, so seams stay
-		       consistent (the r29 rounding precedent; proven vs the
-		       old clip in r31_onediag_check.py, 67k tiles). */
-		    int e2d = 0, j2d, rm = 0;
-		    long long ex, ey, fa;
-		    while (!((cutd >> e2d) & 1u)) ++e2d;
-		    j2d = (e2d + 1 == n) ? 0 : e2d + 1;
-		    ex = cx[j2d] - cx[e2d]; ey = cy[j2d] - cy[e2d];
-		    if (wpos)
-		    {
-			ax[0] = px0; ay[0] = py0; ax[1] = px1; ay[1] = py0;
-			ax[2] = px1; ay[2] = py1; ax[3] = px0; ay[3] = py1;
-		    }
-		    else
-		    {
-			ax[0] = px0; ay[0] = py0; ax[1] = px0; ay[1] = py1;
-			ax[2] = px1; ay[2] = py1; ax[3] = px1; ay[3] = py0;
-		    }
-		    fa = ex * (long long)(ay[0] - cy[e2d])
-		       - ey * (long long)(ax[0] - cx[e2d]);
-		    for (i = 0; i < 4; ++i)
-		    {
-			int j3 = (i + 1) & 3;
-			long long fb = ex * (long long)(ay[j3] - cy[e2d])
-			             - ey * (long long)(ax[j3] - cx[e2d]);
-			int ina = wpos ? (fa >= 0) : (fa <= 0);
-			int inb = wpos ? (fb >= 0) : (fb <= 0);
-			if (ina) { bxv[rm] = ax[i]; byv[rm] = ay[i]; rm++; }
-			if (ina != inb)
-			{
-			    long long d2v = fa - fb;
-			    long long m1 = fa < 0 ? -fa : fa;
-			    long long m2 = d2v < 0 ? -d2v : d2v;
-			    int sh = 0, t;
-			    if (m2 > m1) m1 = m2;
-			    while (m1 >= (1ll << 30)) { m1 >>= 1; sh++; }
-			    t = psw_fdiv((int)(fa >> sh), (int)(d2v >> sh));
-			    bxv[rm] = ax[i] + (int)(((long long)(ax[j3] - ax[i]) * t) >> 16);
-			    byv[rm] = ay[i] + (int)(((long long)(ay[j3] - ay[i]) * t) >> 16);
-			    rm++;
-			}
-			fa = fb;
-		    }
-		    if (rm < 3) return;
-		    m = rm;
-		    area2 = 0;
-		    for (i = 0; i < m; ++i)
-		    {
-			int j3 = (i + 1 == m) ? 0 : i + 1;
-			area2 += (long long)(bxv[i] - x0) * (byv[j3] - y0)
-			       - (long long)(bxv[j3] - x0) * (byv[i] - y0);
-		    }
-		    if (area2 < 0) area2 = -area2;
-		}
-	    }
-	    else
-	    {
-	    /* general piece (2+ diagonal hard cuts): the clipped poly-cap-tile */
+	    psw_eb_bord++;                       /* round 30 `B../<n>` */
+	    /* the exact clipped poly-cap-tile piece */
 	    m = psw_clip_axis(cx, cy, n, ax, ay, 0, +1, x0);
 	    if (m < 3) return;
 	    m = psw_clip_axis(ax, ay, m, bxv, byv, 0, -1, x1);
@@ -9372,7 +9742,6 @@ static void psw_emit_plane_tiles(int slot, unsigned short colr,
 		       - (long long)(bxv[j] - x0) * (byv[i] - y0);
 	    }
 	    if (area2 < 0) area2 = -area2;
-	    }
 	    if ((area2 >> 33) < 2) return;               /* sliver < ~2 units^2 */
 	    full = ((area2 >> 33) >= 64 * 64 - 2);       /* the whole tile (round 9: the old
 	                                                    -32 tolerance let a corner-cut tile
@@ -9662,19 +10031,28 @@ static void psw_emit_plane_tiles(int slot, unsigned short colr,
 	    short pjx[2][PSW_GMAXH + 1], pjy[2][PSW_GMAXH + 1];
 	    unsigned char pjs[2][PSW_GMAXH + 1];   /* 0 unknown / 1 ok / 2 fail */
 	    long long ccol[PSW_FAN_MAX];
-	    for (i = 0; i < n; ++i)
-	    {   /* corner (txa, cy0r): the chunk's ONLY long multiplies */
-		int j = (i + 1 == n) ? 0 : i + 1;
-		long long ex = cx[j] - cx[i], ey = cy[j] - cy[i];
-		ccol[i] = ex * (((long long)cy0r << 22) - cy[i])
-		        - ey * (((long long)txa  << 22) - cx[i]);
-	    }
+	    if (bk)
+		for (i = 0; i < 3; ++i)
+		{   /* view half-plane value at corner (txa, cy0r), winding-signed */
+		    long long F = ((long long)(((long long)txa  << 22) - viewx)) * vfcx[i]
+		                + ((long long)(((long long)cy0r << 22) - viewy)) * vfcy[i]
+		                - vlim[i];
+		    ccol[i] = wpos ? F : -F;
+		}
+	    else
+		for (i = 0; i < n; ++i)
+		{   /* corner (txa, cy0r): the chunk's ONLY long multiplies */
+		    int j = (i + 1 == n) ? 0 : i + 1;
+		    long long ex = cx[j] - cx[i], ey = cy[j] - cy[i];
+		    ccol[i] = ex * (((long long)cy0r << 22) - cy[i])
+		            - ey * (((long long)txa  << 22) - cx[i]);
+		}
 	    auto colmask = [&](int cidx) -> void
 	    {
 		unsigned int *cm = cmbuf[cidx];
 		memset(cm, 0, (unsigned)(rows + 1) * sizeof cm[0]);
 		memset(pjs[cidx], 0, (unsigned)(rows + 1));   /* fresh column = fresh projections */
-		for (int e2 = 0; e2 < n; ++e2)
+		for (int e2 = 0; e2 < nmask; ++e2)
 		{
 		    long long c = ccol[e2], dy2 = egy[e2];
 		    unsigned int b2 = 1u << e2;
@@ -9683,7 +10061,7 @@ static void psw_emit_plane_tiles(int slot, unsigned short colr,
 		}
 	    };
 	    auto coladv = [&]() -> void
-	    { for (int e2 = 0; e2 < n; ++e2) ccol[e2] += egx[e2]; };
+	    { for (int e2 = 0; e2 < nmask; ++e2) ccol[e2] += egx[e2]; };
 	    int ca = 0, cb = 1;
 	    colmask(ca); coladv(); colmask(cb);
 	    for (int tx = txa; tx <= txb && !stop; ++tx)
@@ -9744,7 +10122,86 @@ static void psw_emit_plane_tiles(int slot, unsigned short colr,
 		    psw_emit_rectquad(slot, colr, sqx, sqy, 0, cnt * 64, 0, 64, 0);
 		    return 1;
 		};
-		if (cull_h != 0x7fffffff)
+		if (bk)
+		{   /* ROUND 32 -- BAKED WALK.  tclass here is the VIEW class:
+		       0 out | 1 near-cut (hardm = near only) | 2 side-soft-cut
+		       | 3 fully in.  Leaf classes/pieces come from the table;
+		       near-cut and baked-to-live tiles take the full old path
+		       on the clipped poly (emit64 with cutm 0). */
+		    const unsigned char *bcl = (const unsigned char *)(bk + 1);
+		    const struct psw_brec *brl = (const struct psw_brec *)
+		        (bcl + (int)bk->tw * (int)bk->th);
+		    for (int ty = cy0r; ty <= cy1r && !stop; )
+		    {
+			int cls = tclass(ty), bcls, adv = 1;
+			if (!cls) { ++ty; continue; }
+			if (tx < bk->txa || tx >= bk->txa + (int)bk->tw
+			    || ty < bk->tya || ty >= bk->tya + (int)bk->th)
+			{ ++ty; continue; }          /* outside the leaf bbox */
+			bcls = bcl[(ty - bk->tya) * (int)bk->tw + (tx - bk->txa)];
+			if (bcls == PSW_BKC_OUT || bcls == PSW_BKC_SLIV)
+			{ ++ty; continue; }
+			if (cull_h != 0x7fffffff)
+			{   /* the note's cached verdicts / live probes (hoisted,
+			       same as the live mixed walk) */
+			    int ti = (ty - tya) * tw + (tx - txa);
+			    if (ti >= 0 && ti < PSW_PROBE_TILES)
+			    { if ((psw_cur_mask >> ti) & 1u) { ++ty; continue; } }
+			    else
+			    {
+				unsigned short q0 = frt_read();
+				int hid = psw_tile_hidden(tx << 22, ty << 22, 64 << 16,
+				                          psign, cull_h);
+				psw_q_frt += (unsigned short)(frt_read() - q0);
+				if (hid) { ++ty; continue; }
+			    }
+			}
+			if (cls == 1 || bcls == PSW_BKC_LIVE)
+			{   /* near-cut tile / baked-to-live piece */
+			    unsigned short b0 = frt_read();
+			    emit64(tx, ty);
+			    psw_eb_frt += (unsigned short)(frt_read() - b0);
+			    psw_bk_live_n++;
+			}
+			else if (bcls == PSW_BKC_FULL)
+			{
+			    if (cull_h == 0x7fffffff && cls == 3)
+			    {   /* strips: baked-full runs, view-contained */
+				auto bfull = [&](int ty2) -> int
+				{
+				    if (ty2 >= bk->tya + (int)bk->th) return 0;
+				    return bcl[(ty2 - bk->tya) * (int)bk->tw
+				               + (tx - bk->txa)] == PSW_BKC_FULL
+				        && tclass(ty2) == 3;
+				};
+				if (psw_cur_tall >= 2 && ty + 2 <= cy1r
+				    && bfull(ty + 1) && bfull(ty + 2)
+				    && stripe(ty, 3)) adv = 3;
+				else if (psw_cur_tall >= 1 && ty + 1 <= cy1r
+				    && bfull(ty + 1) && stripe(ty, 2)) adv = 2;
+				else emitfull(ty);
+			    }
+			    else emitfull(ty);
+			    psw_bk_baked_n++;
+			}
+			else
+			{   /* baked border record */
+			    int r2 = psw_emit_baked(slot, colr, ph, psign, tx, ty,
+			                            brl + (bcls - PSW_BKC_REC0), bk);
+			    if (r2 < 0) stop = 1;
+			    else if (r2 == 0)
+			    {
+				unsigned short b0 = frt_read();
+				emit64(tx, ty);
+				psw_eb_frt += (unsigned short)(frt_read() - b0);
+				psw_bk_live_n++;
+			    }
+			    else psw_bk_baked_n++;
+			}
+			ty += adv;
+		    }
+		}
+		else if (cull_h != 0x7fffffff)
 		{   /* mixed plane: singles (probes/mask; strips would defeat
 		       the per-tile skipping).  ROUND 29: the note-mask check is
 		       hoisted HERE (it gated both classes inside emit64), and a
@@ -9774,10 +10231,8 @@ static void psw_emit_plane_tiles(int slot, unsigned short colr,
 			if (cls >= 2) emitfull(ty);
 			else
 			{
-			    int r0 = ty - cy0r;
 			    unsigned short b0 = frt_read();
-			    emit64(tx, ty, fullm & ~(cmA[r0] & cmA[r0 + 1]
-			                             & cmB[r0] & cmB[r0 + 1]));
+			    emit64(tx, ty);
 			    psw_eb_frt += (unsigned short)(frt_read() - b0);
 			}
 		    }
@@ -9798,10 +10253,8 @@ static void psw_emit_plane_tiles(int slot, unsigned short colr,
 			if (cls >= 2) emitfull(ty);
 			else
 			{
-			    int r0 = ty - cy0r;
 			    unsigned short b0 = frt_read();
-			    emit64(tx, ty, fullm & ~(cmA[r0] & cmA[r0 + 1]
-			                             & cmB[r0] & cmB[r0 + 1]));
+			    emit64(tx, ty);
 			    psw_eb_frt += (unsigned short)(frt_read() - b0);
 			}
 			++ty;
@@ -10670,8 +11123,9 @@ static void vdp1_walls_flush(void)
         psw_band_n = 0; psw_fanq_n = 0; psw_fine_cmds = 0;
         /* round 30: ew-interior probes reset at flush ENTRY -- j would
            otherwise carry the note phase's projections (bandbox loops) */
-        psw_eb_frt = 0; psw_eb_fast = 0; psw_eb_bord = 0;
+        psw_eb_frt = 0; psw_eb_bord = 0;
         psw_q_frt = 0; psw_j_frt = 0; psw_j_n = 0;
+        psw_bake_frame();   /* round 32: arena watch/alloc + per-frame bake budget */
         for (int s = 0; s < PSW_FLAT_SLOTS; ++s) psw_slot[s].used = 0;
         /* NEAR->FAR pre-pass, round 9: pure BUDGET arithmetic -- the visibility
            verdicts were computed at NOTE time (core portal bands + LOS ladder,
@@ -10834,9 +11288,10 @@ static void vdp1_walls_flush(void)
         psw_ef_ms_last = (int)(psw_ef_frt / 224u);   psw_ef_frt  = 0;      /* row 13 `e` triple */
         psw_ew_ms_last = (int)(psw_ew_frt / 224u);   psw_ew_frt  = 0;
         psw_eb_ms_last = (int)(psw_eb_frt / 224u);
-        psw_eb_fast_last = psw_eb_fast; psw_eb_bord_last = psw_eb_bord;
+        psw_eb_bord_last = psw_eb_bord;
         psw_q_ms_last = (int)(psw_q_frt / 224u);
         psw_j_ms_last = (int)(psw_j_frt / 224u); psw_j_n_last = psw_j_n;
+        psw_bk_baked_last = psw_bk_baked_n; psw_bk_live_last = psw_bk_live_n;
         psw_frame_no++;                       /* the mask-reuse clock (PSW_MASK_AGE) */
         /* (row 13 `c` is now the CORE band-cull counter sat_psw_wcull,
            snapshotted at the frame-boundary latch with tiers/ref) */

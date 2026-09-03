@@ -671,6 +671,36 @@ StoreWallRange, curline/frontsector/backsector/rw_angle1 vivants).
 > flats du slave assez courte pour se cacher sous les murs du master. NON
 > validé console.
 
+> **STATUT round 33 (2026-09-03)** — Console P32 : « ok, beaucoup mieux » —
+> le bake tient ses promesses (B 19-21 → **1-7 ms**, K70/18 K81/17 = couverture,
+> fps 12→15 en zones ouvertes, 47 en couloir ; ew 13-20, ef 16-26 = les flats
+> restent le poste #1). **ROUND 33 SHIPPÉ : TOUT le côté flats émet sur le
+> SSH2.** Le peintre est un ordre d'INDEX : le pre-pass facture déjà chaque sub
+> en commandes (loi 2e+1) → la boucle master RÉSERVE bill[k] slots par sub et
+> plotte murs/things autour des trous (le staging ferme un batch par
+> discontinuité) ; le slave (canal aux r_parallel : pile 4 Ko, purge cache à
+> l'entrée, join borné FRT) déroule la job-list via les MÊMES émetteurs vers
+> une arène zone (~15,4 Ko PU_LEVEL) — psw_cmd_put/psw_cmd_left détournent
+> chaque écriture et chaque garde de capacité ; reliquats = pads JP-skip
+> (0x4000) ; au fence un SCU-DMA par job pose son bloc (translation split-303
+> miroir de vdp1_cmd_at) ; latches des sondes esclaves en lectures NON-CACHÉES
+> (la ligne cache du master est STALE — LE piège du round). Avec lui : rescue
+> standby → round C du pre-pass (DEUX modes, near-first ; le ledger
+> psw_paper_left MEURT), réserve FINE explicite aux jobs proches (+9), et
+> facture bbox EXACTE pour les petits plans (≤12 tuiles bbox : l'estimateur
+> analytique sous-lisait 13,1 % des feuilles → 3,3 % résiduel, preuve
+> r33_reservation_check.py + splitter DMA exhaustif + invariants du packer).
+> Scratch du bake (2 Ko) déplacé en tête d'arène (la pile aux fait 4 Ko).
+> Diètes pool : STG_N 16→12, MQ 40→32, MLRU 16→8, MAXVP 64→40 (PSW), sondes
+> j+q coupées. Row 13 = **P33** `e<ef>/<ew> B<ms>/<bord> K<b>/<l>
+> F<join>/<drop> f<cmds>` — e/B/K chronométrés sur le FRT du SLAVE (forcé
+> phi/128) ; `F!` = wedge latché (flats de retour master à vie). Pool
+> **6,67 Ko** (plancher 4,8, confort 7 — ⚠ confirmer le boot). Build normal
+> bit-intact. Commit 671810d, core intouché. Attendu console : SLV b% 1-7 →
+> 30-60 %, P ≈ max(murs, flats) + fence ≈ 20-29 ms, F<join> = qui est le
+> chemin long (haut = soupape v2 : rendre les plans les plus proches au
+> master). NON validé console.
+
 - **Polygones de sous-secteurs au level-load** (p_setup.c après :1234, PU_LEVEL zone
   LWRAM) : clip récursif du bbox map par les splitlines ancêtres (node_t x16/y16/dx16/
   dy16 exacts) + les segs de la feuille. ~150 lignes, une fois par niveau.

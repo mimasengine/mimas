@@ -8897,11 +8897,25 @@ static int psw_sf_cur = 0, psw_sf_end = 0;   /* current job window (slave-side) 
 static int psw_sf_drop = 0;             /* cmds refused by a full reservation   */
 static const int *psw_sf_watch = 0;     /* level watch, the bake-arena pattern  */
 static int psw_sf_lt = -1;
+static volatile unsigned int *psw_sf_canary = 0;   /* arena: stack-base guard   */
+static void *psw_sf_stktop = 0;         /* arena: dedicated stack top (grows down) */
+#define PSW_SF_CANARY_V 0x50535733u     /* 'PSW3' */
 #define PSW_SF_JOB_CAP 144              /* >= PSW_FLAT_CAP/3: every job costs >= 3 cmds,
                                            so the cap is unreachable while the bank holds */
-#define PSW_SF_POOL_REQ (PSW_SUB_MAX * 2 \
-                         + PSW_SF_JOB_CAP * (int)sizeof(struct psw_sfjob) \
-                         + PSW_FLAT_CAP * 32)
+/* Dedicated slave STACK for the flat body (arena tail).  MEASURED (objdump,
+   sub-r15 constants): psw_emit_plane_tiles alone is a 0xd20 = 3,360 B frame
+   (cmbuf/pjx/pjy/pjs projection caches + corner columns), its emit64 lambda
+   0x524, psw_emit_subflats 0x27c, psw_bake_build 0x434 -> the worst chain is
+   ~5.2-5.6 KB.  On r_parallel's 4KB aux stack that OVERFLOWED into the .bss
+   below it on HW (console 2026-09-03: <1 fps, MST1111, to9:W = rp flags
+   stomped).  7 KB here leaves ~1.5 KB margin; the canary word at the stack
+   base is planted by the master each dispatch and checked at the fence --
+   stomped => same wedge path as a dead body (pad + latch OFF). */
+#define PSW_SF_STACK   7168
+#define PSW_SF_STG_END (PSW_SUB_MAX * 2 \
+                        + PSW_SF_JOB_CAP * (int)sizeof(struct psw_sfjob) \
+                        + PSW_FLAT_CAP * 32)
+#define PSW_SF_POOL_REQ (PSW_SF_STG_END + 16 + PSW_SF_STACK)
 
 /* every flat emitter writes through here; walls/things keep vdp1_cmd_at */
 static inline int psw_cmd_left(void)
@@ -9265,6 +9279,7 @@ static void psw_sf_frame(void)
     if (psw_pvx != psw_sf_watch || !psw_polys_ok || leveltime < psw_sf_lt)
     {
 	psw_sf_bill = 0; psw_sf_jobs = 0; psw_sf_stg = 0;
+	psw_sf_canary = 0; psw_sf_stktop = 0;
 	psw_sf_watch = psw_pvx;
 	if (psw_polys_ok && numsubsectors > 0
 	    && Z_TrueFree() > PSW_BK_ZONE_MIN + PSW_SF_POOL_REQ + 256)
@@ -9277,6 +9292,9 @@ static void psw_sf_frame(void)
 		psw_sf_jobs = (struct psw_sfjob *)(a + PSW_SUB_MAX * 2);
 		psw_sf_stg  = (unsigned int *)(a + PSW_SUB_MAX * 2
 		                               + PSW_SF_JOB_CAP * (int)sizeof(struct psw_sfjob));
+		psw_sf_canary = (volatile unsigned int *)(a + PSW_SF_STG_END);
+		psw_sf_stktop = (void *)((unsigned int)(unsigned long)
+		                         (a + PSW_SF_POOL_REQ) & ~7u);
 	    }
 	}
     }
@@ -10993,12 +11011,9 @@ static void psw_emit_subflats(int k)
    list in emission order through the very psw_emit_subflats the master would
    run, then pads each job's unused reservation tail with JP-skip commands so
    the VDP1 never executes an unwritten slot. */
-static void psw_sf_body(void)
+static void psw_sf_body_run(void)
 {
-    unsigned short t0;
-    *(volatile unsigned char *)0xFFFFFE16 = 0x02;   /* slave FRT -> phi/128 (the master's
-                                                       rate): e/B divide by 224 ticks/ms */
-    t0 = frt_read();
+    unsigned short t0 = frt_read();
     for (int j = 0; j < psw_sf_njobs; ++j)
     {
 	struct psw_sfjob *J = &psw_sf_jobs[j];
@@ -11015,6 +11030,28 @@ static void psw_sf_body(void)
     psw_ef_frt += (unsigned short)(frt_read() - t0);   /* `e<ef>` = the whole slave pass */
     psw_ucw32((volatile void *)&psw_sf_done, 1u);      /* write-through drains in order:
                                                           every probe above is in RAM first */
+}
+
+/* aux entry, still on r_parallel's 4KB stack: force the slave FRT to the
+   master's rate, then switch to the DEDICATED arena stack for the real body
+   (the measured frame chain is ~5.5 KB -- see PSW_SF_STACK).  Trampoline =
+   rp_run_on_stack's recipe verbatim: r14 keeps the old SP across the call. */
+static void psw_sf_body(void)
+{
+    void *ns = psw_sf_stktop;
+    *(volatile unsigned char *)0xFFFFFE16 = 0x02;   /* slave FRT -> phi/128 (the
+                                                       master's rate, /224 = ms) */
+    __asm__ volatile (
+	"mov.l  r14, @-r15\n\t"   /* save r14 on the OLD stack */
+	"mov    r15, r14\n\t"     /* r14 = old SP (survives the call) */
+	"mov    %[ns], r15\n\t"   /* switch to the dedicated stack */
+	"jsr    @%[fn]\n\t"
+	"nop\n\t"
+	"mov    r14, r15\n\t"     /* restore old SP */
+	"mov.l  @r15+, r14\n\t"   /* restore r14 */
+	:
+	: [ns]"r"(ns), [fn]"r"(psw_sf_body_run)
+	: "r0","r1","r2","r3","r4","r5","r6","r7","pr","t","mach","macl","memory");
 }
 
 /* copy one job's staged block to its reserved VDP1 slots -- the bank-split
@@ -11069,8 +11106,11 @@ static void psw_sf_fence(void)
 	RP_AuxWait();                       /* FRT-bounded join (`to` counts a wedge) */
 	psw_sf_join_ms_last = (int)((unsigned short)(frt_read() - t0) / 224u);
     }
-    if (!psw_ucr32((const volatile void *)&psw_sf_done))
-    {
+    if (!psw_ucr32((const volatile void *)&psw_sf_done)
+        || psw_ucr32((const volatile void *)psw_sf_canary) != PSW_SF_CANARY_V)
+    {   /* body wedged OR the dedicated stack overran its canary: the staged
+	   commands are not trustworthy -- pad every reserved range and turn
+	   the whole scheme off for the session. */
 	unsigned short pad[16];
 	int j, i;
 	sat_psw_sf = 0;
@@ -11365,7 +11405,8 @@ static void vdp1_walls_flush(void)
                pre-pass then also accumulates the per-sub bill -- the exact
                command counts it grants -- which becomes the per-sub VDP1
                index reservation the slave fills. */
-            int sf_ok = (sat_psw_sf && sat_psw_slave && psw_sf_stg != 0 && psw_polys_ok);
+            int sf_ok = (sat_psw_sf && sat_psw_slave && psw_sf_stg != 0
+                         && psw_polys_ok && sat_local_players <= 1);
             if (sf_ok)
                 for (int k = 0; k < psw_sub_n; ++k) psw_sf_bill[k] = 0;
             psw_kill_n = 0; psw_punch_frame = 0;
@@ -11538,6 +11579,7 @@ static void vdp1_walls_flush(void)
                        dispatch NOW so the whole master wall/thing plot below
                        overlaps the flat pass */
                     psw_sf_mode = 1;
+                    *psw_sf_canary = PSW_SF_CANARY_V;   /* stack-base guard */
                     psw_ucw32((volatile void *)&psw_sf_done, 0u);
                     RP_AuxDispatch(psw_sf_body);
                 }

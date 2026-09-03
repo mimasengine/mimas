@@ -8757,64 +8757,86 @@ static void psw_emit_plane_tiles(int slot, unsigned short colr,
 	    }
 	    wpos = (aw >= 0);
 	}
-	/* ROUND 24 -- OWN-QUAD small planes (owner: "marche, rebord de fenetre
-	   ... candidats parfaits pour avoir leur propre quad texture projete").
-	   A plane whose clipped poly is <= 4 verts and thinner than one tile in
-	   some direction leaves the grid: ONE projected quad, exact to the leaf
-	   shape (zero overdraw, zero holes, no soft-line work at all), its
-	   texture the bbox sub-rect of the flat char -- exact world phase when
-	   the bbox fits the char without wrapping, a bounded stretch otherwise
-	   (these pieces border height changes, so there is no neighbour phase
-	   to preserve).  The long-side cap (128) bounds the stretch to 2x;
-	   bigger narrow strips fall back to the exact grid bands. */
-	if (n <= 4 && slot >= 0
-	    && (bx1 - bx0 < (64 << 16) || by1 - by0 < (64 << 16))
-	    && bx1 - bx0 <= (128 << 16) && by1 - by0 <= (128 << 16))
+	/* ROUND 25 -- OWN-QUAD v2 (round-24 v1 was the "texture compressee"
+	   console read: it widened the SOURCE to 8-texel alignment but kept the
+	   quad at the true size = compression up to ~1.9x on small pieces, and
+	   lost the phase across a char boundary).  v2 is WORLD-ANCHORED, the
+	   band recipe turned into one piece: only AXIS-ALIGNED rect polys (a
+	   marche/rebord is one; anything frustum-cut or diagonal falls back to
+	   the grid), quad corners at the piece bounds SNAPPED OUT to the texel
+	   grid (8 in u, 1 in v), source = the matching char sub-rect -- texture
+	   exact and grid-phased BY CONSTRUCTION, quad edges = the true world
+	   edges (no 64u window stairs).  A UserClip window crops the snap lip
+	   only when the piece was actually misaligned (Doom geometry is mostly
+	   8-aligned: usually 1 command).  v may span past 64 into the chained
+	   shadow slots (the strip aliasing = exact continuation). */
+	if (n == 4 && slot >= 0)
 	{
-	    int hid = 0;
-	    if (cull_h != 0x7fffffff)
-	    {   /* the owner's 5-point coverage spec, on the bbox */
-		int mx = (bx0 >> 1) + (bx1 >> 1), my = (by0 >> 1) + (by1 >> 1);
-		hid = (psign > 0)
-		    ? (psw_floor_pt_hidden(bx0, by0, cull_h) && psw_floor_pt_hidden(bx1, by0, cull_h)
-		       && psw_floor_pt_hidden(bx1, by1, cull_h) && psw_floor_pt_hidden(bx0, by1, cull_h)
-		       && psw_floor_pt_hidden(mx, my, cull_h))
-		    : (psw_ceil_pt_hidden(bx0, by0, cull_h) && psw_ceil_pt_hidden(bx1, by0, cull_h)
-		       && psw_ceil_pt_hidden(bx1, by1, cull_h) && psw_ceil_pt_hidden(bx0, by1, cull_h)
-		       && psw_ceil_pt_hidden(mx, my, cull_h));
-	    }
-	    if (hid) return;
+	    int axis = 1;
+	    for (i = 0; i < 4 && axis; ++i)
 	    {
-		int qx[4], qy[4], ord[4], k0 = 0, okq = 1;
-		long long bestd = -1;
-		for (i = 0; i < n; ++i)
-		{   /* vert nearest the bbox's TOP-LEFT = the (u0,v0) texture corner */
-		    long long d = (long long)(cx[i] - bx0) + (long long)(by1 - cy[i]);
-		    if (bestd < 0 || d < bestd) { bestd = d; k0 = i; }
-		}
-		for (i = 0; i < 4; ++i)
-		{   /* TL->TR->BR->BL is CLOCKWISE in world (y up): walk the poly
-		       against its winding when it is CCW; a triangle repeats its
-		       last vert (VDP1 degenerate quad) */
-		    int s2 = (i < n) ? i : n - 1;
-		    ord[i] = wpos ? (k0 - s2 + n) % n : (k0 + s2) % n;
-		}
-		for (i = 0; i < 4 && okq; ++i)
-		    okq = psw_project(cx[ord[i]], cy[ord[i]], ph, psign, &qx[i], &qy[i]);
-		if (okq)
+		int j = (i + 1) & 3;
+		if (cx[i] != cx[j] && cy[i] != cy[j]) axis = 0;
+	    }
+	    if (axis)
+	    {
+		int wxa = bx0 & ~((8 << 16) - 1);
+		int wxb = (bx1 + ((8 << 16) - 1)) & ~((8 << 16) - 1);
+		int wyT = (by1 + 0xFFFF) & ~0xFFFF;
+		int wyB = by0 & ~0xFFFF;
+		int u0 = (wxa >> 16) & 63;
+		int uw = (wxb - wxa) >> 16;
+		int v0 = (-(wyT >> 16)) & 63;
+		int vh = (wyT - wyB) >> 16;
+		int vmax = 64 + psw_cur_tall * 64;
+		if (uw > 0 && vh > 0 && u0 + uw <= 64 && v0 + vh <= vmax)
 		{
-		    int u0 = (bx0 >> 16) & 63;
-		    int uw = ((bx1 - bx0) >> 16) + 1;
-		    int v0 = (-(by1 >> 16)) & 63;
-		    int vh = ((by1 - by0) >> 16) + 1;
-		    uw += u0 & 7; u0 &= ~7; uw = (uw + 7) & ~7;
-		    if (uw > 64) uw = 64;
-		    if (vh > 64) vh = 64;
-		    if (u0 + uw > 64) u0 = 0;      /* the char cannot wrap: phase */
-		    if (v0 + vh > 64) v0 = 0;      /* lost, stretch stays bounded */
-		    psw_paint_idx = 4;             /* L+X: own-quads WHITE */
-		    psw_emit_rectquad(slot, colr, qx, qy, v0, vh, u0, uw, 0);
-		    return;
+		    int hid = 0;
+		    if (cull_h != 0x7fffffff)
+		    {   /* the owner's 5-point coverage spec, on the piece */
+			int mx = (bx0 >> 1) + (bx1 >> 1), my = (by0 >> 1) + (by1 >> 1);
+			hid = (psign > 0)
+			    ? (psw_floor_pt_hidden(bx0, by0, cull_h) && psw_floor_pt_hidden(bx1, by0, cull_h)
+			       && psw_floor_pt_hidden(bx1, by1, cull_h) && psw_floor_pt_hidden(bx0, by1, cull_h)
+			       && psw_floor_pt_hidden(mx, my, cull_h))
+			    : (psw_ceil_pt_hidden(bx0, by0, cull_h) && psw_ceil_pt_hidden(bx1, by0, cull_h)
+			       && psw_ceil_pt_hidden(bx1, by1, cull_h) && psw_ceil_pt_hidden(bx0, by1, cull_h)
+			       && psw_ceil_pt_hidden(mx, my, cull_h));
+		    }
+		    if (hid) return;
+		    {
+			int qx[4], qy[4], okq;
+			okq  = psw_project(wxa, wyT, ph, psign, &qx[0], &qy[0]);
+			okq &= psw_project(wxb, wyT, ph, psign, &qx[1], &qy[1]);
+			okq &= psw_project(wxb, wyB, ph, psign, &qx[2], &qy[2]);
+			okq &= psw_project(wxa, wyB, ph, psign, &qx[3], &qy[3]);
+			if (okq)
+			{
+			    int win = (wxa != bx0 || wxb != bx1 || wyT != by1 || wyB != by0);
+			    if (win)
+			    {   /* crop the <=7-texel snap lip at the true bounds */
+				int px, py, wl = 0x7fff, wr = -0x7fff, wt = 0x7fff, wb = -0x7fff;
+				int okw = 1;
+				okw &= psw_project(bx0, by1, ph, psign, &px, &py);
+				if (okw) { wl = px; wr = px; wt = py; wb = py; }
+				okw &= psw_project(bx1, by1, ph, psign, &px, &py);
+				if (okw) { if (px < wl) wl = px; if (px > wr) wr = px;
+				           if (py < wt) wt = py; if (py > wb) wb = py; }
+				okw &= psw_project(bx1, by0, ph, psign, &px, &py);
+				if (okw) { if (px < wl) wl = px; if (px > wr) wr = px;
+				           if (py < wt) wt = py; if (py > wb) wb = py; }
+				okw &= psw_project(bx0, by0, ph, psign, &px, &py);
+				if (okw) { if (px < wl) wl = px; if (px > wr) wr = px;
+				           if (py < wt) wt = py; if (py > wb) wb = py; }
+				if (!okw) win = 0;      /* unexpected: emit unwindowed,
+				                           lip <= 7 texels */
+				else psw_emit_clipwin(wl, wt, wr, wb);
+			    }
+			    psw_paint_idx = 4;         /* L+X: own-quads WHITE */
+			    psw_emit_rectquad(slot, colr, qx, qy, v0, vh, u0, uw, win ? 1 : 0);
+			    return;
+			}
+		    }
 		}
 	    }
 	}
@@ -8954,7 +8976,46 @@ static void psw_emit_plane_tiles(int slot, unsigned short colr,
 					psw_emit_rectquad(slot, colr, qx, qy, v0, vend - v0, 0, 64, 0);
 					done = 1; psw_band_n++;
 				    }
-				    else
+				    else if (allaxis)
+				    {   /* AXIS RECT piece (round 25): quad at the piece's
+					   true x-extent snapped to the 8-texel source
+					   grid + the matching u sub-range.  The old path
+					   kept the FULL-WIDTH quad and relied on the rect
+					   window's x-crop -- on a slanted projected edge
+					   that vertical crop line was the sill STAIR
+					   maker (console rounds 20/24/25 "rebords pas
+					   corriges").  The quad edges are now the true
+					   world edges; a window survives only to crop
+					   the <=7-texel snap lip of a misaligned piece
+					   (Doom geometry is mostly 8-aligned: 1 cmd). */
+					int wxa = pbx0 & ~((8 << 16) - 1);
+					int wxb = (pbx1 + ((8 << 16) - 1)) & ~((8 << 16) - 1);
+					int ua  = (wxa - x0) >> 16;
+					int uwd = (wxb - wxa) >> 16;
+					int wqx[4], wqy[4], okq2;
+					okq2  = psw_project(wxa, by1s, ph, psign, &wqx[0], &wqy[0]);
+					okq2 &= psw_project(wxb, by1s, ph, psign, &wqx[1], &wqy[1]);
+					okq2 &= psw_project(wxb, by0s, ph, psign, &wqx[2], &wqy[2]);
+					okq2 &= psw_project(wxa, by0s, ph, psign, &wqx[3], &wqy[3]);
+					if (okq2 && ua >= 0 && uwd > 0 && ua + uwd <= 64)
+					{
+					    int win2 = (wxa != pbx0 || wxb != pbx1);
+					    if (win2)
+					    {
+						int wxl = sxv[0], wxr = sxv[0], wyt = syv[0], wyb = syv[0];
+						for (i = 1; i < m; ++i)
+						{
+						    if (sxv[i] < wxl) wxl = sxv[i]; if (sxv[i] > wxr) wxr = sxv[i];
+						    if (syv[i] < wyt) wyt = syv[i]; if (syv[i] > wyb) wyb = syv[i];
+						}
+						psw_emit_clipwin(wxl, wyt, wxr, wyb);
+					    }
+					    psw_emit_rectquad(slot, colr, wqx, wqy, v0, vend - v0,
+					                      ua, uwd, win2 ? 1 : 0);
+					    done = 1; psw_band_n++;
+					}
+				    }
+				    if (!done)
 				    {
 					int wxl = sxv[0], wxr = sxv[0], wyt = syv[0], wyb = syv[0];
 					int sdx = 0, sdy = 0;
@@ -9096,22 +9157,36 @@ static void psw_emit_plane_tiles(int slot, unsigned short colr,
 	       (tx,ty+cnt-1) -- the chained slots alias one another, so ONE
 	       command covers cnt tiles at world-exact texture (v phase kept:
 	       the strip top is 64-grid aligned and the char period is 64).
-	       Returns 1 = handled (strip emitted, or all tiles proven fully
-	       outside); 0 = fall back to shorter strips / single tiles. */
+	       Returns 1 = strip emitted; 0 = fall back to shorter strips /
+	       single tiles.
+	       ROUND 25 -- PER-TILE SAT (console: "tuiles rouges parasites...
+	       dupliquee a droite et a gauche" beside a hanging cube; the leaf
+	       polys were PROVEN exact offline on all 9 shareware maps, and the
+	       single-tile SAT is complete for a convex poly -- the ONLY red
+	       emitter able to paint a tile fully outside the poly was the
+	       strip's whole-rect test: a strip overlapping the poly on one
+	       tile emitted ALL cnt tiles, throwing up to 2 full tiles of this
+	       plane into the void at a neighbour's border since round 23).
+	       Every covered tile must now pass the same fully-outside test a
+	       single would: the strip paints nothing a single walk would not. */
 	    int x0 = tx << 22, y0 = ty << 22;
 	    int x1 = x0 + (64 << 16), y1 = y0 + ((cnt * 64) << 16);
 	    int sqx[4], sqy[4], s;
 	    if (psw_flat_cmds >= psw_flat_cap_dyn) { stop = 1; return 1; }
-	    for (int i2 = 0; i2 < n; ++i2)
+	    for (int c2 = 0; c2 < cnt; ++c2)
 	    {
-		int j2 = (i2 + 1 == n) ? 0 : i2 + 1;
-		long long ex = cx[j2] - cx[i2], ey = cy[j2] - cy[i2];
-		long long c00 = ex * (y0 - cy[i2]) - ey * (x0 - cx[i2]);
-		long long c10 = ex * (y0 - cy[i2]) - ey * (x1 - cx[i2]);
-		long long c11 = ex * (y1 - cy[i2]) - ey * (x1 - cx[i2]);
-		long long c01 = ex * (y1 - cy[i2]) - ey * (x0 - cx[i2]);
-		if (wpos ? (c00 < 0 && c10 < 0 && c11 < 0 && c01 < 0)
-		         : (c00 > 0 && c10 > 0 && c11 > 0 && c01 > 0)) return 1;
+		int ty0 = y0 + ((c2 * 64) << 16), ty1 = ty0 + (64 << 16);
+		for (int i2 = 0; i2 < n; ++i2)
+		{
+		    int j2 = (i2 + 1 == n) ? 0 : i2 + 1;
+		    long long ex = cx[j2] - cx[i2], ey = cy[j2] - cy[i2];
+		    long long c00 = ex * (ty0 - cy[i2]) - ey * (x0 - cx[i2]);
+		    long long c10 = ex * (ty0 - cy[i2]) - ey * (x1 - cx[i2]);
+		    long long c11 = ex * (ty1 - cy[i2]) - ey * (x1 - cx[i2]);
+		    long long c01 = ex * (ty1 - cy[i2]) - ey * (x0 - cx[i2]);
+		    if (wpos ? (c00 < 0 && c10 < 0 && c11 < 0 && c01 < 0)
+		             : (c00 > 0 && c10 > 0 && c11 > 0 && c01 > 0)) return 0;
+		}
 	    }
 	    for (s = 0; s < nsoft; ++s)
 		if (psw_line_cuts_tile(x0, y0, x1, y1,

@@ -401,6 +401,39 @@ StoreWallRange, curline/frontsector/backsector/rw_angle1 vivants).
 > 8-alignée, fenêtre-lèvre sinon). Pool Psw 15,55 Ko, normal 61,33 Ko bit-intact.
 > Commit Mimas 56eb168 (core intouché). NON validé console.
 
+> **Statut 2026-09-03 (round 26 — « RIEN n'a été corrigé » + directive « les murs
+> doivent s'afficher par dessus les plans, à distance équivalente au moins » : LE
+> MODÈLE DE DÉBORDEMENT EST MORT).** La directive du propriétaire a nommé le vrai
+> mécanisme unifiant les trois symptômes : le plein-carré déborde sa feuille en
+> comptant sur « quelque chose recouvre », or le quad couvrant (faces latérales d'un
+> cube suspendu, contremarche, mur sous un rebord) appartient à un sub VOISIN à
+> distance BSP équivalente — qui peut émettre AVANT. Et chaque classification
+> statique de frontière a fui de façon MESURÉE hors-ligne (après correction d'un bug
+> d'index sidedef dans le vérificateur qui avait pollué une passe de mesures) :
+> règle segs = 248 frontières à contenu différent sans seg couvrant (bordures sur
+> splitlines BSP nues — le node builder d'id partitionne LE LONG des linedefs, les
+> segs vont d'un seul côté), murs à double face d'épaisseur zéro (montants de porte :
+> « one-sided = couvert » FAUX, du vrai contenu à 1,5u derrière), règle sondes = 75
+> arêtes / 880 tuiles fautives (des bandes de contenu plus étroites que tout pas
+> d'échantillonnage), règle linedefs / arêtes-en-face : réfutées aussi (les cellules
+> de feuilles NE PAVENT PAS — segs manquants ⇒ recouvrements). CONCLUSION
+> D'ARCHITECTURE : le débordement inter-frontière est infixable ; le nouveau contrat
+> est le CONFINEMENT — un plein-carré ou un strip (1 cmd) n'est émis que s'il est
+> ENTIÈREMENT dans le polygone de la feuille (convexe : 4 coins dans chaque arête) ;
+> toute tuile de bord prend le chemin clippé exact (pièces axiales round-25 = 1 cmd).
+> Un flat ne peut plus peindre UN texel hors de sa feuille ⇒ jamais sur un mur, quel
+> que soit l'ordre, sur tout WAD — par construction, plus aucune énumération de cas.
+> Toute la machinerie lignes molles MEURT (core R_PswSoftLines + sondes voisines +
+> psw_sub_soft) ; facturation = retour à la loi round-14 (2e+1) ; le label row 13
+> devient **« P26 » = MARQUEUR DE BUILD** (incrémenté chaque round — fin définitive
+> du doute « quel disque a été testé ? »). Pool Psw 17,36 Ko (+1,8 Ko rendus par la
+> machinerie supprimée), normal 61,33 Ko bit-intact. Commits : core af13e6d, Mimas
+> 3590a67. Attendu console : L+X plus orange qu'avant sur TOUTES les bordures
+> (le prix du confinement), rouge sur les intérieurs, plus jamais un texel de flat
+> sur un mur ; surveiller `f` et `k` (facture 2e+1 plus lourde — si famine, le
+> levier suivant est la FUSION des feuilles sœurs de même secteur au chargement,
+> zéro risque de justesse). NON validé console.
+
 - **Polygones de sous-secteurs au level-load** (p_setup.c après :1234, PU_LEVEL zone
   LWRAM) : clip récursif du bbox map par les splitlines ancêtres (node_t x16/y16/dx16/
   dy16 exacts) + les segs de la feuille. ~150 lignes, une fois par niveau.

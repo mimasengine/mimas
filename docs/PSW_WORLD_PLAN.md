@@ -326,6 +326,24 @@ StoreWallRange, curline/frontsector/backsector/rw_angle1 vivants).
 > `o<ovf>/<leafbad>` (leafbad = polygones de feuille pvn<3 = la classe déterministe du
 > triangle ; o0/0 + triangle = re-diagnostic). L+X : le ROUGE devient dominant. Pool PSW
 > 17,61 Ko (surveiller ; plancher ~5 Ko), normal 61,33 bit-intact.
+> **Round 23 (2026-09-03) — STRIPS VERTICAUX EXACTS (note owner : « si les super quads
+> sont à texture exacte monde, ils deviennent la norme »)** : les super-128 zoomés ne
+> sont PAS exacts (char 64 étiré ×2 — d'où la porte de distance). L'exactitude à toute
+> distance existe VERTICALEMENT : les 8 slots flats vivent en deux runs VRAM contigus de
+> 16 Ko ({3,0,1,2} à 0x25C7C000, {4,5,6,7} à 0x25C59E00) et les lignes d'un char VDP1
+> sont contiguës ⇒ un flat téléversé dans DEUX slots adjacents se lit comme UN char
+> 64×128 dont la moitié basse ALIASE le voisin = vraie répétition, phase de grille exacte
+> (tout haut de bande 64-aligné = ligne 0 du flat). Horizontal impossible (chaque LIGNE
+> devrait être physiquement doublée). Implémenté : PAIRES DYNAMIQUES dans psw_slot_get
+> (un flat « chaud », fe ≥ 12 tuiles, demande une paire ; les froids restent simples ⇒
+> la capacité en lumps distincts ne baisse que là où le gain existe ; shadow/pairbase +
+> break à l'éviction) ; dans la marche non-mixte, chaque colonne du super-cell tente un
+> STRIP 64×128 (1 cmd / 2 tuiles, exact, toute distance — mêmes portes SAT/lignes
+> molles) avant les tuiles simples. Hiérarchie de coût : loin = super-128 zoomé (1/4),
+> près intérieur chaud = strip exact (1/2), reste = tuile (1/1), bord mou = clippé.
+> L+X : strips ROUGES (famille plein-exact) — psw_emit_rectquad peint désormais via
+> psw_paint_idx (bandes = orange posé à l'appel). Prochain cran possible : triples
+> 64×192 (3 slots adjacents), et le mip vrai pour dé-zoomer les super-128.
 
 ## Étape 2 — sols non-dominants + plafonds (quads de sous-secteurs)
 

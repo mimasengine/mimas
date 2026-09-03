@@ -8111,6 +8111,8 @@ static int psw_fine_cmds = 0;    /* round 20: edge-refinement commands spent thi
                                     (capped at PSW_FINE_CAP -- see the defines) */
 static int psw_cur_sub = -1;     /* round 22: subnum of the plane being emitted (the
                                     tile walker rescans its soft border lines) */
+static int psw_cur_tall = 0;     /* round 23: the emitting plane's slot is PAIRED --
+                                    interior tile columns may emit 64x128 strips */
 static int psw_leaf_bad = 0;     /* round 22: noted subs whose LEAF POLYGON is invalid
                                     (pvn < 3) -- the deterministic same-spot hole class
                                     (owner: "le triangle est la systematiquement, c'est
@@ -8363,40 +8365,115 @@ static int psw_clip_dir(const int *ax, const int *ay, int n, int *bx, int *by,
     return m;
 }
 
-/* flat slots: the fvdp1_slot_get recipe (NO disc I/O ever -- pool hit or resident lump) */
-static struct { int lumpnum; unsigned int lru; unsigned char used; } psw_slot[PSW_FLAT_SLOTS];
+/* flat slots: the fvdp1_slot_get recipe (NO disc I/O ever -- pool hit or resident lump).
+   ROUND 23 -- DYNAMIC VERTICAL PAIRS (owner: "si les super quads sont a texture exacte
+   monde, ils deviennent la norme").  The 8 slots sit in two VRAM-CONTIGUOUS 16KB runs
+   ({3,0,1,2} at 0x25C7C000.. and {4,5,6,7} at 0x25C59E00..), and a char's rows are
+   byte-contiguous -- so a flat uploaded into TWO ADJACENT slots reads as ONE 64x128
+   char whose second half ALIASES the neighbour = an EXACT vertical repeat, grid-phased
+   (the owner's "faire croire au quad qu'il lit deux fois la meme texture", realizable
+   vertically only: a WIDER char would need every ROW physically doubled).  A HOT flat
+   (many interior tiles) asks for a pair; its interior tile columns then emit 64x128
+   STRIPS = 1 command per 2 tiles, exact, at ANY distance.  Cold flats stay single, so
+   the distinct-lump capacity only shrinks where the win is real. */
+static struct { int lumpnum; unsigned int lru;
+                unsigned char used, tall, shadow, pairbase; } psw_slot[PSW_FLAT_SLOTS];
+static const signed char psw_slot_next[PSW_FLAT_SLOTS] = { 1, 2, -1, 0, 5, 6, 7, -1 };
 static unsigned int psw_slot_tick;
-static int psw_slot_get(int lumpnum)
+static int psw_slot_upload(int v, int lumpnum)
+{
+    const unsigned char *src = R_FlatCachePeek(lumpnum);
+    int locked = 0, i;
+    if (!src)
+    {
+	if (!W_LumpResident(lumpnum)) return -1;
+	src = (const unsigned char *)W_CacheLumpNum(lumpnum, 1 /* PU_STATIC */);
+	locked = 1;
+    }
+    {
+	volatile unsigned short *d =
+	    (volatile unsigned short *)psw_slot_vram[v];
+	for (i = 0; i < 2048; ++i)
+	    d[i] = (unsigned short)(((unsigned int)src[2*i] << 8) | src[2*i + 1]);
+    }
+    if (locked) W_ReleaseLumpNum(lumpnum);
+    return 0;
+}
+static void psw_slot_break(int s)      /* dissolve any pair s belongs to (metadata only) */
+{
+    if (psw_slot[s].tall)
+    {
+	int t = psw_slot_next[s];
+	if (t >= 0 && psw_slot[t].shadow)
+	{ psw_slot[t].shadow = 0; psw_slot[t].lumpnum = -1; psw_slot[t].lru = 0; }
+	psw_slot[s].tall = 0;
+    }
+    if (psw_slot[s].shadow)
+    {
+	psw_slot[psw_slot[s].pairbase].tall = 0;
+	psw_slot[s].shadow = 0; psw_slot[s].lumpnum = -1;
+    }
+}
+static int psw_slot_get(int lumpnum, int tall = 0)
 {
     int i, v = -1;
     unsigned int best = 0xffffffffu;
     for (i = 0; i < PSW_FLAT_SLOTS; ++i)
-	if (psw_slot[i].lumpnum == lumpnum)
-	{ psw_slot[i].lru = ++psw_slot_tick; psw_slot[i].used = 1; return i; }
+	if (!psw_slot[i].shadow && psw_slot[i].lumpnum == lumpnum)
+	{
+	    psw_slot[i].lru = ++psw_slot_tick; psw_slot[i].used = 1;
+	    if (psw_slot[i].tall)
+	    {   /* keep the shadow reserved alongside its base */
+		int t = psw_slot_next[i];
+		psw_slot[t].lru = psw_slot[i].lru; psw_slot[t].used = 1;
+	    }
+	    else if (tall)
+	    {   /* upgrade in place iff the neighbour is free this frame */
+		int t = psw_slot_next[i];
+		if (t >= 0 && !psw_slot[t].used && psw_slot_upload(t, lumpnum) == 0)
+		{
+		    psw_slot_break(t);
+		    psw_slot[t].lumpnum = lumpnum; psw_slot[t].shadow = 1;
+		    psw_slot[t].pairbase = (unsigned char)i;
+		    psw_slot[t].used = 1; psw_slot[t].lru = psw_slot[i].lru;
+		    psw_slot[i].tall = 1;
+		}
+	    }
+	    return i;
+	}
+    if (tall)
+    {   /* miss wanting a pair: two adjacent unreserved slots, oldest pair first */
+	int bs = -1; unsigned int bl = 0xffffffffu;
+	for (i = 0; i < PSW_FLAT_SLOTS; ++i)
+	{
+	    int t = psw_slot_next[i];
+	    unsigned int l;
+	    if (t < 0 || psw_slot[i].used || psw_slot[t].used) continue;
+	    l = (psw_slot[i].lru > psw_slot[t].lru) ? psw_slot[i].lru : psw_slot[t].lru;
+	    if (l < bl) { bl = l; bs = i; }
+	}
+	if (bs >= 0 && psw_slot_upload(bs, lumpnum) == 0
+	    && psw_slot_upload(psw_slot_next[bs], lumpnum) == 0)
+	{
+	    int t = psw_slot_next[bs];
+	    psw_slot_break(bs); psw_slot_break(t);
+	    psw_slot[bs].lumpnum = lumpnum; psw_slot[bs].lru = ++psw_slot_tick;
+	    psw_slot[bs].used = 1; psw_slot[bs].tall = 1; psw_slot[bs].shadow = 0;
+	    psw_slot[t].lumpnum = lumpnum; psw_slot[t].lru = psw_slot[bs].lru;
+	    psw_slot[t].used = 1; psw_slot[t].tall = 0; psw_slot[t].shadow = 1;
+	    psw_slot[t].pairbase = (unsigned char)bs;
+	    return bs;
+	}
+    }
     for (i = 0; i < PSW_FLAT_SLOTS; ++i)
 	if (!psw_slot[i].used && psw_slot[i].lru < best)
 	{ best = psw_slot[i].lru; v = i; }
     if (v < 0) return -1;
-    {
-	const unsigned char *src = R_FlatCachePeek(lumpnum);
-	int locked = 0;
-	if (!src)
-	{
-	    if (!W_LumpResident(lumpnum)) return -1;
-	    src = (const unsigned char *)W_CacheLumpNum(lumpnum, 1 /* PU_STATIC */);
-	    locked = 1;
-	}
-	{
-	    volatile unsigned short *d =
-		(volatile unsigned short *)psw_slot_vram[v];
-	    for (i = 0; i < 2048; ++i)
-		d[i] = (unsigned short)(((unsigned int)src[2*i] << 8) | src[2*i + 1]);
-	}
-	if (locked) W_ReleaseLumpNum(lumpnum);
-    }
+    if (psw_slot_upload(v, lumpnum) != 0) return -1;
+    psw_slot_break(v);
     psw_slot[v].lumpnum = lumpnum;
     psw_slot[v].lru = ++psw_slot_tick;
-    psw_slot[v].used = 1;
+    psw_slot[v].used = 1; psw_slot[v].tall = 0; psw_slot[v].shadow = 0;
     return v;
 }
 
@@ -8484,11 +8561,12 @@ static void psw_emit_rectquad(int slot, unsigned short colr,
                                + (unsigned int)u0 - VDP1_VRAM_BASE) >> 3);
     cmd[5] = (unsigned short)(((uw >> 3) << 8) | vh); /* uw x vh texels */
     if (sat_wall_paint & 1)
-    {   /* DEBUG PAINT: band+window pieces solid ORANGE (owner: white drowned
-	   the overlay text).  The window still masks, so the painted shape IS
-	   the region really painted. */
+    {   /* DEBUG PAINT, per emit path via psw_paint_idx (round 23: the exact
+	   64x128 strips are RED like the full squares; bands stay ORANGE --
+	   the callers set the index).  The window still masks, so the painted
+	   shape IS the region really painted. */
 	cmd[0] = 0x0004;
-	cmd[3] = (unsigned short)(0x0100u | 216u);
+	cmd[3] = (unsigned short)(0x0100u | (unsigned)psw_paint_idx);
     }
     for (i = 0; i < 4; ++i)
     {
@@ -8777,6 +8855,7 @@ static void psw_emit_plane_tiles(int slot, unsigned short colr,
 				if (okq)
 				{
 				    int allaxis = (m == 4);
+				    psw_paint_idx = 216;    /* L+X: bands ORANGE */
 				    for (i = 0; i < 4 && allaxis; ++i)
 				    {
 					int j = (i + 1) & 3;
@@ -8924,6 +9003,39 @@ static void psw_emit_plane_tiles(int slot, unsigned short colr,
 		}
 	    }
 	};
+	auto strip2 = [&](int tx, int ty) -> int
+	{   /* round 23: EXACT 64x128 vertical strip over tiles (tx,ty)+(tx,ty+1)
+	       -- the paired slot's second half aliases the neighbour slot, so
+	       ONE command covers TWO tiles at world-exact texture (v phase kept:
+	       the strip top is 128-grid... 64-grid aligned and the char period
+	       is 64).  Returns 1 = handled (strip emitted, or both tiles proven
+	       fully outside); 0 = fall back to single tiles. */
+	    int x0 = tx << 22, y0 = ty << 22;
+	    int x1 = x0 + (64 << 16), y1 = y0 + (128 << 16);
+	    int sqx[4], sqy[4], s;
+	    if (psw_flat_cmds >= psw_flat_cap_dyn) { stop = 1; return 1; }
+	    for (int i2 = 0; i2 < n; ++i2)
+	    {
+		int j2 = (i2 + 1 == n) ? 0 : i2 + 1;
+		long long ex = cx[j2] - cx[i2], ey = cy[j2] - cy[i2];
+		long long c00 = ex * (y0 - cy[i2]) - ey * (x0 - cx[i2]);
+		long long c10 = ex * (y0 - cy[i2]) - ey * (x1 - cx[i2]);
+		long long c11 = ex * (y1 - cy[i2]) - ey * (x1 - cx[i2]);
+		long long c01 = ex * (y1 - cy[i2]) - ey * (x0 - cx[i2]);
+		if (wpos ? (c00 < 0 && c10 < 0 && c11 < 0 && c01 < 0)
+		         : (c00 > 0 && c10 > 0 && c11 > 0 && c01 > 0)) return 1;
+	    }
+	    for (s = 0; s < nsoft; ++s)
+		if (psw_line_cuts_tile(x0, y0, x1, y1,
+		                       slx1[s], sly1[s], slx2[s], sly2[s])) return 0;
+	    if (!psw_project(x0, y1, ph, psign, &sqx[0], &sqy[0])) return 0;
+	    if (!psw_project(x1, y1, ph, psign, &sqx[1], &sqy[1])) return 0;
+	    if (!psw_project(x1, y0, ph, psign, &sqx[2], &sqy[2])) return 0;
+	    if (!psw_project(x0, y0, ph, psign, &sqx[3], &sqy[3])) return 0;
+	    psw_paint_idx = 88;                     /* L+X: exact strips RED */
+	    psw_emit_rectquad(slot, colr, sqx, sqy, 0, 128, 0, 64, 0);
+	    return 1;
+	};
 	if (cull_h != 0x7fffffff)
 	{   /* mixed plane: flat 64 walk (probes/mask; no super-tiles -- their
 	       coarse cells would defeat the per-tile skipping) */
@@ -8976,12 +9088,15 @@ static void psw_emit_plane_tiles(int slot, unsigned short colr,
 		    psw_emit_flatquad(slot, colr, sqx, sqy);
 		    continue;
 		}
-		emit64(sx, sy);
-		if (sx + 1 <= txb) emit64(sx + 1, sy);
-		if (sy + 1 <= tyb)
-		{
-		    emit64(sx, sy + 1);
-		    if (sx + 1 <= txb) emit64(sx + 1, sy + 1);
+		for (int cxi = 0; cxi < 2; ++cxi)
+		{   /* round 23: per column, an exact vertical strip when the
+		       slot is paired; single tiles otherwise */
+		    int tx = sx + cxi;
+		    if (tx > txb) break;
+		    if (psw_cur_tall && sy + 1 <= tyb && strip2(tx, sy))
+			continue;
+		    emit64(tx, sy);
+		    if (sy + 1 <= tyb) emit64(tx, sy + 1);
 		}
 	    }
 	}
@@ -9321,7 +9436,10 @@ static void psw_emit_subflats(int k)
 	              + ((psw_sub_soft[k] & ((pass == 0) ? 1 : 2)) ? 9 : 1);
 	    int solid = (psw_sub_flag[k] & fanbit)
 	           || (psw_flat_cmds + ebill > psw_flat_cap_dyn);
-	    int slot = solid ? -1 : psw_slot_get(lump);
+	    int slot = solid ? -1
+	             : psw_slot_get(lump, (int)((pass == 0) ? psw_sub_fe[k]
+	                                                    : psw_sub_ce[k]) >= 12);
+	    psw_cur_tall = (slot >= 0 && psw_slot[slot].tall);   /* round 23 strips */
 	    int nr, li, zi, ok = 1, fb = 0;
 	    unsigned short colr, scolr;
 	    {   /* centre texel: the SOLID colour for slot famine, the budget

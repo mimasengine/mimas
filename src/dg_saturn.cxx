@@ -685,6 +685,7 @@ static int  psw_wall_cull_last = 0;        /* wall quads occlusion-culled last f
 static int  psw_band_last = 0;             /* clean band+window flat pieces (row 13 `b`) */
 static int  psw_fan_last = 0;              /* fan flat pieces/planes (row 13 `n`) */
 static int  psw_sub_ovf_last = 0;          /* subsector-recorder overflow (row 13 `o`) */
+static int  psw_leaf_bad_last = 0;         /* invalid leaf polygons noted (row 13 `o/x`) */
 #endif
 extern "C" int            sat_sky_view;         /* core Part 5: elected split view for the HW sky (-1 = none => all software) */
 extern "C" unsigned int   sat_sky_px_view[4];   /* core Part 5: per-view SKY pixel coverage (election metric) */
@@ -3317,9 +3318,10 @@ static void fps_update(void)
                subsector-RECORDER overflow, the silent plane-hole class.  o>0 = the
                triangle holes are PSW_SUB_MAX, nothing else.) */
             if (sat_psw_active)
-                snprintf(ovbuf, sizeof ovbuf, "PSW t%d o%d f%d d%d k%d u%d c%d b%d n%d  ",
+                snprintf(ovbuf, sizeof ovbuf, "PSW t%d o%d/%d f%d d%d k%d u%d c%d b%d n%d ",
                          sat_psw_t_last > 999 ? 999 : sat_psw_t_last,
-                         psw_sub_ovf_last > 999 ? 999 : psw_sub_ovf_last,
+                         psw_sub_ovf_last > 99 ? 99 : psw_sub_ovf_last,
+                         psw_leaf_bad_last > 99 ? 99 : psw_leaf_bad_last,
                          psw_flat_last  > 999 ? 999 : psw_flat_last,
                          psw_flat_denied_last > 99 ? 99 : psw_flat_denied_last,
                          psw_kill_last  > 99  ? 99  : psw_kill_last,
@@ -8026,16 +8028,19 @@ static const unsigned int psw_slot_vram[PSW_FLAT_SLOTS] =
                                         the new artificial ceiling. */
 #define PSW_TZ_NEAR      (24 << 16)
 #define PSW_FAN_MAX      28          /* poly verts: core caps at 20, +3 view clips, +4 tile cuts */
-/* DISTANCE LOD (round 16).  Console 2026-09-02: k8-18 with the bank HALF EMPTY
-   (c113-154 / B296) -- the touched-tiles paper still ran 2-3x the real spend
-   (LOS-skipped tiles on mixed planes, sliver/clip zero-emissions, and far
-   planes billing dozens of tiles that project onto a dozen PIXEL rows).  A
-   plane whose projected bbox is this small carries no readable texture at 64u
-   grid anyway: force it SOLID at NOTE time -- billed 4, emitted as <=4
-   decimated quads.  Kills the far field's paper AND its real cost at once
-   (the same trade as the wall potato LOD, keyed on projection not distance). */
-#define PSW_SOLID_HPX    16          /* projected height at/below which a plane goes solid */
-#define PSW_SOLID_AREA   1024        /* projected bbox area (px^2) gate, same LOD */
+/* (PSW_SOLID_HPX / PSW_SOLID_AREA -- the round-16 small-projection->solid LOD --
+   DELETED in round 22: it was the standing magenta source ("le rose est toujours
+   flat"), and the 128 SUPER-TILES serve the far field TEXTURED instead.) */
+#define PSW_SUPER_PX     28          /* round 22: a 128x128 super-tile whose projected
+                                        diagonal spans at/below this emits as ONE quad --
+                                        the 64 char mapped over 128 world = u advances at
+                                        (wx>>1)&63, grid-continuous across super-tiles.
+                                        VDP1 cannot wrap/repeat a char (linear read), but
+                                        on an ALIGNED 2x grid the same char IS its own
+                                        repeat, just 2x zoomed -- unreadable at gate
+                                        distance.  (A true half-res mip char would even
+                                        keep the scale: +4KB/slot, later option.) */
+#define PSW_SOFT_MAX     6           /* soft far-border lines scanned per sub (core) */
 /* MIXED-plane probed billing (round 17).  Console r16: k5-11 FLICKERING frame to
    frame with the bank 62% empty (c112-172 / B281-296) -- the residual paper hog
    is the MIXED planes (LOD-exempt): they bill every touched tile at 2 cmds while
@@ -8104,6 +8109,13 @@ static unsigned int psw_cur_mask = 0;   /* round 17: the emitting plane's cached
                                            cull_h is armed (mixed plane) */
 static int psw_fine_cmds = 0;    /* round 20: edge-refinement commands spent this flush
                                     (capped at PSW_FINE_CAP -- see the defines) */
+static int psw_cur_sub = -1;     /* round 22: subnum of the plane being emitted (the
+                                    tile walker rescans its soft border lines) */
+static int psw_leaf_bad = 0;     /* round 22: noted subs whose LEAF POLYGON is invalid
+                                    (pvn < 3) -- the deterministic same-spot hole class
+                                    (owner: "le triangle est la systematiquement, c'est
+                                    du calcul").  Row 13 `o<ovf>/<leafbad>`; the _last
+                                    twin lives with the early overlay decls. */
 static int psw_flat_cap_dyn = PSW_FLAT_CAP;  /* round 9: per-frame REAL flat room = bank
                                                 minus the walls' decided command cost minus
                                                 the things reserve (famine unification --
@@ -8123,6 +8135,9 @@ static unsigned int  psw_sub_fmask[PSW_SUB_MAX];  /* round 17: MIXED planes only
                                                      the emitter's exact walk order; valid iff
                                                      the pass's mixed bit (b1/b3) is set */
 static unsigned int  psw_sub_cmask[PSW_SUB_MAX];
+static unsigned char psw_sub_soft[PSW_SUB_MAX];   /* round 22: b0 floor / b1 ceiling has
+                                                     SOFT far-border lines (billing +9;
+                                                     the emitter rescans the segs) */
 static int psw_kill_n = 0;           /* subs killed this flush (row 13 `k`; NET of rescues) */
 static int psw_wall_paper(int i)     /* one wall's pre-pass paper (round 17: also released
                                         into the rescue ledger as each wall is plotted) */
@@ -8158,8 +8173,12 @@ static int  psw_project(int wx, int wy, int ph, int psign, int *psx, int *psy);
 static int  psw_tile_est(const int *cx, const int *cy, int n);
 static int  psw_plane_los_cull(const int *cx, const int *cy, int n, int h,
                                int psign, int *tile_test);
-static int  psw_tile_hidden(int x0, int y0, int psign, int h);   /* the 3-probe tile verdict */
+static int  psw_tile_hidden(int x0, int y0, int span, int psign, int h);   /* the 5-probe tile verdict */
+static int  psw_line_cuts_tile(int x0, int y0, int x1, int y1,
+                               int ax, int ay, int bx, int by);
 extern "C" int R_PswBandBoxHidden(int xl, int xr, int yt, int yb);   /* core r_segs.c */
+extern "C" int R_PswSoftLines(int subnum, int psign, int h,
+                              int *lx1, int *ly1, int *lx2, int *ly2, int maxn);
 
 static void sat_psw_sub_note(int subnum, int fh, int ch, int fpic,
                              int flump, int clump, int light, int vis0)
@@ -8181,6 +8200,11 @@ static void sat_psw_sub_note(int subnum, int fh, int ch, int fpic,
     psw_sub[k].w0    = (short)wall_acc_n;
     psw_sub[k].s0    = (short)vis0;
     psw_sub_flag[k] = 0; psw_sub_fe[k] = 8; psw_sub_ce[k] = 8;  /* 8 = unknown-est default */
+    psw_sub_soft[k] = 0;
+    if (psw_polys_ok && subnum >= 0 && psw_pvn[subnum] < 3)
+	psw_leaf_bad++;              /* round 22: INVALID leaf polygon = the
+	                                deterministic same-spot hole class
+	                                (row 13 `o<ovf>/<leafbad>`) */
     if (psw_polys_ok && subnum >= 0)
     {
 	int cxv[PSW_FAN_MAX], cyv[PSW_FAN_MAX];
@@ -8227,17 +8251,17 @@ static void sat_psw_sub_note(int subnum, int fh, int ch, int fpic,
 		}
 		if (okp && R_PswBandBoxHidden(xl, xr, yt, yb))
 		{ psw_sub_flag[k] |= bit; continue; }
-		if (okp && !tt && (yb - yt <= PSW_SOLID_HPX
-		            || (xr - xl) * (yb - yt) <= PSW_SOLID_AREA))
-		{   /* DISTANCE LOD (round 16): too small on screen to carry a
-		       readable 64u texture -- solid from the start, billed 4.
-		       This is where the k8-18 far-field paper went.  MIXED (tt)
-		       planes are exempt: the solid fan skips the per-tile LOS
-		       probes, and a sky-hack-hidden ceiling region would paint
-		       an unerasable patch OVER the VDP2 sky (below VDP1). */
-		    psw_sub_flag[k] |= (pass == 0) ? 0x10 : 0x20;
-		    continue;
-		}
+	    }
+	    /* round 22: the <=16px solid LOD is DELETED (the standing magenta
+	       source) -- far planes now emit TEXTURED 128 super-tiles instead.
+	       Record whether this pass has SOFT far borders (core seg scan):
+	       the pre-pass bills +9 for their clipped tiles, +1 otherwise. */
+	    {
+		int dlx1[PSW_SOFT_MAX], dly1[PSW_SOFT_MAX];
+		int dlx2[PSW_SOFT_MAX], dly2[PSW_SOFT_MAX];
+		if (R_PswSoftLines(subnum, psn, h,
+		                   dlx1, dly1, dlx2, dly2, PSW_SOFT_MAX) > 0)
+		    psw_sub_soft[k] |= (pass == 0) ? 1 : 2;
 	    }
 	    e = psw_tile_est(cxv, cyv, nn);
 	    if (tt)
@@ -8260,7 +8284,7 @@ static void sat_psw_sub_note(int subnum, int fh, int ch, int fpic,
 		    for (int tx2 = txa; tx2 <= txb; ++tx2, ++ti)
 		    {
 			if (ti >= PSW_PROBE_TILES) { vis++; continue; }
-			if (psw_tile_hidden(tx2 << 22, ty2 << 22, psn, h))
+			if (psw_tile_hidden(tx2 << 22, ty2 << 22, 64 << 16, psn, h))
 			    msk |= 1u << ti;
 			else vis++;
 		    }
@@ -8598,38 +8622,91 @@ static void psw_emit_plane_tiles(int slot, unsigned short colr,
     {
 	int txa = bx0 >> 22, txb = (bx1 - 1) >> 22;
 	int tya = by0 >> 22, tyb = (by1 - 1) >> 22;
-	int ti = 0;                        /* round 17: cell index in NOTE walk order */
-	for (int ty = tya; ty <= tyb; ++ty)
-	for (int tx = txa; tx <= txb; ++tx, ++ti)
+	/* ROUND 22 -- THE FULL-SQUARE MODEL (owner: "on peut tout faire avec les
+	   64x64 en carre, quitte a deborder derriere le mur").  A tile that does
+	   not cross a SOFT far border (core scan: away-facing two-sided segs
+	   with a floor drop / ceiling rise / sky beyond) emits as ONE full grid
+	   quad -- its overdraw is repainted by the facing wall (the covering
+	   seg always fronts the viewer's side = drawn after this sub's flats),
+	   by nearer subs, or is pixel-identical (split chords, same flat).
+	   Only soft-crossing tiles pay the exact clipped path (bands + the
+	   round-20 fine sub-bands): the stairs die where a wall IS the true
+	   silhouette, and stay 8u-fine where nothing covers.  Non-mixed planes
+	   walk a TWO-LEVEL grid: far 128 super-tiles emit as one quad (the 64
+	   char over 128 world -- grid-continuous, see PSW_SUPER_PX). */
+	int tw = txb - txa + 1;
+	int slx1[PSW_SOFT_MAX], sly1[PSW_SOFT_MAX];
+	int slx2[PSW_SOFT_MAX], sly2[PSW_SOFT_MAX];
+	int nsoft = 0, stop = 0, wpos;
+	if (psw_cur_sub >= 0)
+	    nsoft = R_PswSoftLines(psw_cur_sub, psign,
+	                           (psign > 0) ? viewz - ph : viewz + ph,
+	                           slx1, sly1, slx2, sly2, PSW_SOFT_MAX);
+	{   /* poly winding (for the SAT fully-outside reject) */
+	    long long aw = 0;
+	    for (i = 0; i < n; ++i)
+	    {
+		int j = (i + 1 == n) ? 0 : i + 1;
+		aw += (long long)(cx[i] - cx[0]) * (cy[j] - cy[0])
+		    - (long long)(cx[j] - cx[0]) * (cy[i] - cy[0]);
+	    }
+	    wpos = (aw >= 0);
+	}
+	auto emit64 = [&](int tx, int ty) -> void
 	{
 	    int ax[PSW_FAN_MAX], ay[PSW_FAN_MAX];
 	    int bxv[PSW_FAN_MAX], byv[PSW_FAN_MAX];
 	    int x0 = tx << 22, y0 = ty << 22;
 	    int x1 = x0 + (64 << 16), y1 = y0 + (64 << 16);
-	    int m, full;
+	    int m, full, soft, s;
 	    long long area2;
-	    if (psw_flat_cmds >= psw_flat_cap_dyn) return;
+	    if (psw_flat_cmds >= psw_flat_cap_dyn) { stop = 1; return; }
 	    if (cull_h != 0x7fffffff)
-	    {   /* mixed-visibility plane -- the 3-probe verdict (far corner +
-	           opposite near corner + centre, rounds 10/13: "trous derriere
-	           des obstacles").  Round 17: the NOTE already ran it for the
-	           first PSW_PROBE_TILES cells and cached the verdicts in the
-	           prefix mask (same walk order, same deterministic inputs), so
-	           consume the bit both ways: set = proven hidden (skip), clear
-	           = proven visible (paint, no re-probe).  Only cells past the
-	           prefix still probe here. */
-		if (ti < PSW_PROBE_TILES)
-		{ if ((psw_cur_mask >> ti) & 1u) continue; }
-		else if (psw_tile_hidden(x0, y0, psign, cull_h)) continue;
+	    {   /* mixed plane: the note's cached verdicts, POSITIONAL index
+	           (round 22: the two-level walk broke the order match, so the
+	           bit is keyed by cell position in the note's row-major walk) */
+		int ti = (ty - tya) * tw + (tx - txa);
+		if (ti >= 0 && ti < PSW_PROBE_TILES)
+		{ if ((psw_cur_mask >> ti) & 1u) return; }
+		else if (psw_tile_hidden(x0, y0, 64 << 16, psign, cull_h)) return;
 	    }
+	    for (i = 0; i < n; ++i)
+	    {   /* SAT reject: the square fully outside ONE poly edge = none of
+	           this plane here (bbox slivers stop costing full quads) */
+		int j = (i + 1 == n) ? 0 : i + 1;
+		long long ex = cx[j] - cx[i], ey = cy[j] - cy[i];
+		long long c00 = ex * (y0 - cy[i]) - ey * (x0 - cx[i]);
+		long long c10 = ex * (y0 - cy[i]) - ey * (x1 - cx[i]);
+		long long c11 = ex * (y1 - cy[i]) - ey * (x1 - cx[i]);
+		long long c01 = ex * (y1 - cy[i]) - ey * (x0 - cx[i]);
+		if (wpos ? (c00 < 0 && c10 < 0 && c11 < 0 && c01 < 0)
+		         : (c00 > 0 && c10 > 0 && c11 > 0 && c01 > 0)) return;
+	    }
+	    soft = 0;
+	    for (s = 0; s < nsoft && !soft; ++s)
+		soft = psw_line_cuts_tile(x0, y0, x1, y1,
+		                          slx1[s], sly1[s], slx2[s], sly2[s]);
+	    if (!soft)
+	    {   /* FULL GRID SQUARE -- 1 command, no clip, no window; the
+	           overdraw is covered (see the model note above) */
+		int qx[4], qy[4];
+		if (!psw_project(x0, y1, ph, psign, &qx[0], &qy[0])) return;
+		if (!psw_project(x1, y1, ph, psign, &qx[1], &qy[1])) return;
+		if (!psw_project(x1, y0, ph, psign, &qx[2], &qy[2])) return;
+		if (!psw_project(x0, y0, ph, psign, &qx[3], &qy[3])) return;
+		psw_paint_idx = 88;                 /* L+X: full squares RED */
+		psw_emit_flatquad(slot, colr, qx, qy);
+		return;
+	    }
+	    /* SOFT border tile: the exact clipped piece (pre-round-22 path) */
 	    m = psw_clip_axis(cx, cy, n, ax, ay, 0, +1, x0);
-	    if (m < 3) continue;
+	    if (m < 3) return;
 	    m = psw_clip_axis(ax, ay, m, bxv, byv, 0, -1, x1);
-	    if (m < 3) continue;
+	    if (m < 3) return;
 	    m = psw_clip_axis(bxv, byv, m, ax, ay, 1, +1, y0);
-	    if (m < 3) continue;
+	    if (m < 3) return;
 	    m = psw_clip_axis(ax, ay, m, bxv, byv, 1, -1, y1);
-	    if (m < 3) continue;
+	    if (m < 3) return;
 	    area2 = 0;                     /* shoelace x2, tile-local (coords <= 2^22) */
 	    for (i = 0; i < m; ++i)
 	    {
@@ -8638,7 +8715,7 @@ static void psw_emit_plane_tiles(int slot, unsigned short colr,
 		       - (long long)(bxv[j] - x0) * (byv[i] - y0);
 	    }
 	    if (area2 < 0) area2 = -area2;
-	    if ((area2 >> 33) < 2) continue;             /* sliver < ~2 units^2 */
+	    if ((area2 >> 33) < 2) return;               /* sliver < ~2 units^2 */
 	    full = ((area2 >> 33) >= 64 * 64 - 2);       /* the whole tile (round 9: the old
 	                                                    -32 tolerance let a corner-cut tile
 	                                                    pass as full and its square OVERHANG
@@ -8647,10 +8724,10 @@ static void psw_emit_plane_tiles(int slot, unsigned short colr,
 	    if (full)
 	    {   /* exact texture: char (0,0) at world (x0,y1), rows run toward -y */
 		int qx[4], qy[4];
-		if (!psw_project(x0, y1, ph, psign, &qx[0], &qy[0])) continue;
-		if (!psw_project(x1, y1, ph, psign, &qx[1], &qy[1])) continue;
-		if (!psw_project(x1, y0, ph, psign, &qx[2], &qy[2])) continue;
-		if (!psw_project(x0, y0, ph, psign, &qx[3], &qy[3])) continue;
+		if (!psw_project(x0, y1, ph, psign, &qx[0], &qy[0])) return;
+		if (!psw_project(x1, y1, ph, psign, &qx[1], &qy[1])) return;
+		if (!psw_project(x1, y0, ph, psign, &qx[2], &qy[2])) return;
+		if (!psw_project(x0, y0, ph, psign, &qx[3], &qy[3])) return;
 		psw_paint_idx = 88;                     /* L+X: full tiles RED */
 		psw_emit_flatquad(slot, colr, qx, qy);
 	    }
@@ -8661,7 +8738,7 @@ static void psw_emit_plane_tiles(int slot, unsigned short colr,
 		for (i = 0; i < m; ++i)
 		    if (!psw_project(bxv[i], byv[i], ph, psign, &sxv[i], &syv[i]))
 		    { okv = 0; break; }
-		if (!okv) continue;
+		if (!okv) return;
 		if (slot >= 0)
 		{   /* EVERY edge piece is a WORLD-ANCHORED BAND (round 13): the
 		       char's v sub-band SNAPPED to texel rows + the full tile
@@ -8846,6 +8923,67 @@ static void psw_emit_plane_tiles(int slot, unsigned short colr,
 		    }
 		}
 	    }
+	};
+	if (cull_h != 0x7fffffff)
+	{   /* mixed plane: flat 64 walk (probes/mask; no super-tiles -- their
+	       coarse cells would defeat the per-tile skipping) */
+	    for (int ty = tya; ty <= tyb && !stop; ++ty)
+	    for (int tx = txa; tx <= txb && !stop; ++tx)
+		emit64(tx, ty);
+	}
+	else
+	{   /* two-level grid: a far 128 SUPER-TILE is ONE quad (round 22 --
+	       the owner's bigger-quads LOD); near/edge supers split into
+	       their 64 cells */
+	    for (int sy = tya & ~1; sy <= tyb && !stop; sy += 2)
+	    for (int sx = txa & ~1; sx <= txb && !stop; sx += 2)
+	    {
+		int x0 = sx << 22, y0 = sy << 22;
+		int x1 = x0 + (128 << 16), y1 = y0 + (128 << 16);
+		int sqx[4], sqy[4], ok = 0, s2, soft2, outs = 0;
+		for (int i2 = 0; i2 < n && !outs; ++i2)
+		{   /* SAT: super fully outside -> all 4 cells are too */
+		    int j2 = (i2 + 1 == n) ? 0 : i2 + 1;
+		    long long ex = cx[j2] - cx[i2], ey = cy[j2] - cy[i2];
+		    long long c00 = ex * (y0 - cy[i2]) - ey * (x0 - cx[i2]);
+		    long long c10 = ex * (y0 - cy[i2]) - ey * (x1 - cx[i2]);
+		    long long c11 = ex * (y1 - cy[i2]) - ey * (x1 - cx[i2]);
+		    long long c01 = ex * (y1 - cy[i2]) - ey * (x0 - cx[i2]);
+		    outs = wpos ? (c00 < 0 && c10 < 0 && c11 < 0 && c01 < 0)
+		                : (c00 > 0 && c10 > 0 && c11 > 0 && c01 > 0);
+		}
+		if (outs) continue;
+		soft2 = 0;
+		for (s2 = 0; s2 < nsoft && !soft2; ++s2)
+		    soft2 = psw_line_cuts_tile(x0, y0, x1, y1,
+		                               slx1[s2], sly1[s2], slx2[s2], sly2[s2]);
+		if (!soft2
+		    && psw_project(x0, y1, ph, psign, &sqx[0], &sqy[0])
+		    && psw_project(x1, y0, ph, psign, &sqx[2], &sqy[2]))
+		{
+		    int ddx = sqx[2] - sqx[0], ddy = sqy[2] - sqy[0];
+		    if (ddx < 0) ddx = -ddx;
+		    if (ddy < 0) ddy = -ddy;
+		    if (ddx + ddy <= 2 * PSW_SUPER_PX
+		        && psw_project(x1, y1, ph, psign, &sqx[1], &sqy[1])
+		        && psw_project(x0, y0, ph, psign, &sqx[3], &sqy[3]))
+			ok = 1;
+		}
+		if (ok)
+		{
+		    if (psw_flat_cmds >= psw_flat_cap_dyn) { stop = 1; continue; }
+		    psw_paint_idx = 88;             /* L+X: full squares RED */
+		    psw_emit_flatquad(slot, colr, sqx, sqy);
+		    continue;
+		}
+		emit64(sx, sy);
+		if (sx + 1 <= txb) emit64(sx + 1, sy);
+		if (sy + 1 <= tyb)
+		{
+		    emit64(sx, sy + 1);
+		    if (sx + 1 <= txb) emit64(sx + 1, sy + 1);
+		}
+	    }
 	}
     }
 }
@@ -8918,20 +9056,47 @@ static int psw_ceil_pt_hidden(int fx, int fy, int ch)
    bill stops being an upper bound (note says hidden, emitter paints).  All
    inputs are frame-static (view + BSP heights), so the verdict is
    deterministic between note and flush. */
-static int psw_tile_hidden(int x0, int y0, int psign, int h)
+static int psw_tile_hidden(int x0, int y0, int span, int psign, int h)
 {
-    int x1 = x0 + (64 << 16), y1 = y0 + (64 << 16);
-    int fx = (viewx < x0 + (32 << 16)) ? x1 : x0;
-    int fy = (viewy < y0 + (32 << 16)) ? y1 : y0;
+    /* round 22: FIVE probes -- all four corners + the centre (the owner's
+       coverage spec: "si les quatre coins et le milieu sont couverts, elle ne
+       sert a rien").  Order = most-likely-visible first (far corner, near
+       corner, centre) so visible tiles still short-circuit early.  `span`
+       parameterises the cell (64-tile or 128-super-tile). */
+    int x1 = x0 + span, y1 = y0 + span;
+    int hs = span >> 1;
+    int fx = (viewx < x0 + hs) ? x1 : x0;
+    int fy = (viewy < y0 + hs) ? y1 : y0;
     int nx = (fx == x0) ? x1 : x0;
     int ny = (fy == y0) ? y1 : y0;
-    int mx = x0 + (32 << 16), my = y0 + (32 << 16);
-    return psign > 0 ? (psw_floor_pt_hidden(fx, fy, h)
-                        && psw_floor_pt_hidden(nx, ny, h)
-                        && psw_floor_pt_hidden(mx, my, h))
-                     : (psw_ceil_pt_hidden(fx, fy, h)
-                        && psw_ceil_pt_hidden(nx, ny, h)
-                        && psw_ceil_pt_hidden(mx, my, h));
+    int mx = x0 + hs, my = y0 + hs;
+    if (psign > 0)
+	return psw_floor_pt_hidden(fx, fy, h) && psw_floor_pt_hidden(nx, ny, h)
+	    && psw_floor_pt_hidden(mx, my, h) && psw_floor_pt_hidden(fx, ny, h)
+	    && psw_floor_pt_hidden(nx, fy, h);
+    return psw_ceil_pt_hidden(fx, fy, h) && psw_ceil_pt_hidden(nx, ny, h)
+	&& psw_ceil_pt_hidden(mx, my, h) && psw_ceil_pt_hidden(fx, ny, h)
+	&& psw_ceil_pt_hidden(nx, fy, h);
+}
+
+/* round 22: does the segment (ax,ay)-(bx,by) CUT the tile square?  Cheap and
+   slightly conservative: segment-bbox overlap + the square's corners straddle
+   the infinite line (a tile flagged past the segment's END merely takes the
+   exact clipped path for nothing). */
+static int psw_line_cuts_tile(int x0, int y0, int x1, int y1,
+                              int ax, int ay, int bx, int by)
+{
+    long long dx, dy, c0, c1, c2, c3;
+    int neg;
+    if ((ax < x0 && bx < x0) || (ax > x1 && bx > x1)) return 0;
+    if ((ay < y0 && by < y0) || (ay > y1 && by > y1)) return 0;
+    dx = (long long)bx - ax; dy = (long long)by - ay;
+    c0 = dx * (y0 - ay) - dy * (x0 - ax);
+    c1 = dx * (y0 - ay) - dy * (x1 - ax);
+    c2 = dx * (y1 - ay) - dy * (x1 - ax);
+    c3 = dx * (y1 - ay) - dy * (x0 - ax);
+    neg = (c0 < 0) + (c1 < 0) + (c2 < 0) + (c3 < 0);
+    return neg != 0 && neg != 4;
 }
 
 /* Plane-level ladder: probe the FARTHEST (most likely visible) and NEAREST
@@ -9152,7 +9317,8 @@ static void psw_emit_subflats(int k)
 	       several-fold and the belt forced NEAR granted planes to solid late in
 	       the frame (part of the console "zone rose" excess).  The stored
 	       fe/ce IS this pass's honest upper bound. */
-	    int ebill = 2 * (int)((pass == 0) ? psw_sub_fe[k] : psw_sub_ce[k]) + 1;
+	    int ebill = (int)((pass == 0) ? psw_sub_fe[k] : psw_sub_ce[k])
+	              + ((psw_sub_soft[k] & ((pass == 0) ? 1 : 2)) ? 9 : 1);
 	    int solid = (psw_sub_flag[k] & fanbit)
 	           || (psw_flat_cmds + ebill > psw_flat_cap_dyn);
 	    int slot = solid ? -1 : psw_slot_get(lump);
@@ -9197,6 +9363,7 @@ static void psw_emit_subflats(int k)
 		if (!solid)
 		{
 		    psw_cur_mask = (pass == 0) ? psw_sub_fmask[k] : psw_sub_cmask[k];
+		    psw_cur_sub  = sn;          /* round 22: soft-line rescan key */
 		    psw_emit_plane_tiles(slot, pc, cx, cy, n, ph, psign, cull_h, scolr);
 		}
 		else
@@ -9230,9 +9397,11 @@ static void psw_emit_subflats(int k)
        4 for a solid (LOD or degrade), 2e+1 for a tiled plane, 4 per punch. */
     psw_paper_left -= ((fdom && psw_punch_frame) ? 4 : 0)
 	+ ((fl >= 0 && !(psw_sub_flag[k] & 0x41))
-	       ? ((psw_sub_flag[k] & 0x10) ? 4 : 2 * (int)psw_sub_fe[k] + 1) : 0)
+	       ? ((psw_sub_flag[k] & 0x10) ? 4
+	          : (int)psw_sub_fe[k] + ((psw_sub_soft[k] & 1) ? 9 : 1)) : 0)
 	+ ((cl >= 0 && !(psw_sub_flag[k] & 0x84))
-	       ? ((psw_sub_flag[k] & 0x20) ? 4 : 2 * (int)psw_sub_ce[k] + 1) : 0);
+	       ? ((psw_sub_flag[k] & 0x20) ? 4
+	          : (int)psw_sub_ce[k] + ((psw_sub_soft[k] & 2) ? 9 : 1)) : 0);
     }
 }
 
@@ -9557,16 +9726,22 @@ static void vdp1_walls_flush(void)
                    consults the budget flags for punches; the fan is DECIMATED
                    to <=4 quads (billing-law violation fixed, console u26). */
                 if (fdom && psw_punch_frame) ftile += 4;
+                /* round 22 billing: a tile is ONE command now (full squares),
+                   +9 flat margin when the pass has SOFT borders (their tiles
+                   pay windows/bands; the fine strips are globally capped and
+                   ride the headroom).  e = fe + (soft ? 9 : 1). */
                 if (fl >= 0 && !(psw_sub_flag[k] & 1))
                 {
-                    int e = (psw_sub_flag[k] & 0x10) ? 4 : 2 * (int)psw_sub_fe[k] + 1;
+                    int e = (psw_sub_flag[k] & 0x10) ? 4
+                          : (int)psw_sub_fe[k] + ((psw_sub_soft[k] & 1) ? 9 : 1);
                     int m = (e < 4) ? e : 4;
                     if (ftile + m <= limit) ftile += m;
                     else { psw_sub_flag[k] |= 0x40; dropped = 1; }   /* STANDBY: rescue at emit */
                 }
                 if (cl >= 0 && !(psw_sub_flag[k] & 4))
                 {
-                    int e = (psw_sub_flag[k] & 0x20) ? 4 : 2 * (int)psw_sub_ce[k] + 1;
+                    int e = (psw_sub_flag[k] & 0x20) ? 4
+                          : (int)psw_sub_ce[k] + ((psw_sub_soft[k] & 2) ? 9 : 1);
                     int m = (e < 4) ? e : 4;
                     if (ftile + m <= limit) ftile += m;
                     else { psw_sub_flag[k] |= 0x80; dropped = 1; }
@@ -9583,14 +9758,14 @@ static void vdp1_walls_flush(void)
                 psw_sub_lumps(k, &fl, &cl, &fdom);
                 if (fl >= 0 && !(psw_sub_flag[k] & 0x41) && !(psw_sub_flag[k] & 0x10))
                 {
-                    int e = 2 * (int)psw_sub_fe[k] + 1;
+                    int e = (int)psw_sub_fe[k] + ((psw_sub_soft[k] & 1) ? 9 : 1);
                     if (e <= 4)                        psw_slot_get(fl);
                     else if (ftile + (e - 4) <= limit) { ftile += e - 4; psw_slot_get(fl); }
                     else                               psw_sub_flag[k] |= 0x10;
                 }
                 if (cl >= 0 && !(psw_sub_flag[k] & 0x84) && !(psw_sub_flag[k] & 0x20))
                 {
-                    int e = 2 * (int)psw_sub_ce[k] + 1;
+                    int e = (int)psw_sub_ce[k] + ((psw_sub_soft[k] & 2) ? 9 : 1);
                     if (e <= 4)                        psw_slot_get(cl);
                     else if (ftile + (e - 4) <= limit) { ftile += e - 4; psw_slot_get(cl); }
                     else                               psw_sub_flag[k] |= 0x20;
@@ -12369,7 +12544,9 @@ extern "C" void DG_DrawFrame(void)
         sat_psw_t_last = sat_psw_tiers; sat_psw_r_last = sat_psw_ref;
         psw_wall_cull_last = sat_psw_wcull;             /* round 9: core band culls */
         psw_sub_ovf_last = psw_sub_ovf;                 /* round 21: recorder overflow */
-        sat_psw_tiers = 0; sat_psw_ref = 0; sat_psw_wcull = 0; psw_sub_ovf = 0;
+        psw_leaf_bad_last = psw_leaf_bad;               /* round 22: invalid leaf polys */
+        sat_psw_tiers = 0; sat_psw_ref = 0; sat_psw_wcull = 0;
+        psw_sub_ovf = 0; psw_leaf_bad = 0;
         psw_sub_n = 0; psw_sub_tail = 0x7fff;   /* step 2: fresh recorder for the next walk
                                                    (this frame's records were consumed at the kick) */
         psw_spr_tail = 0x7fff;                  /* step 3: sprite-watermark tail, same lifecycle */

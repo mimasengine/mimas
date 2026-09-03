@@ -308,6 +308,24 @@ StoreWallRange, curline/frontsector/backsector/rw_angle1 vivants).
 > de 8u, l'alternative (warp exact) = le swimmer prouvé. PowerSlave n'a pas ce problème
 > parce que ses niveaux sont dessinés sur la grille. Attendu : triangle mort (ou o>0 le
 > désigne), rose → orange/texturé, `o` à surveiller en priorité.
+> **Round 22 (2026-09-03) — LE MODÈLE PLEIN-CARRÉ (design owner, adopté intégralement)** :
+> « on peut tout faire avec les 64×64 en carré, quitte à déborder derrière le mur ».
+> Prouvé dans le peintre : le seg couvrant fait toujours face au joueur = côté proche =
+> peint APRÈS le débordement ; chords de split = même secteur = texels identiques alignés
+> grille. SEULE exception = segs 2-côtés dos-au-joueur ouverts au-delà du plan (sol qui
+> CHUTE derrière, plafond qui MONTE, CIEL) — scannés par sub côté core (`R_PswSoftLines`,
+> ~10 segs) : seules les tuiles coupées par CES lignes gardent le chemin clippé exact
+> (bandes + sous-bandes fines round 20, leur vrai périmètre) ; toute autre tuile = UN
+> quad plein, 1 cmd, zéro fenêtre, zéro clip (reject SAT). L'escalier meurt par
+> construction sur les bords couverts (le mur EST la silhouette). Sondes 3→5 points
+> (spec owner : 4 coins + centre). **Super-tuiles 128** (« plus gros quads à distance ») :
+> plan non-mixte, diagonale projetée ≤ 2×28 px, sans ligne molle ⇒ UN quad — le char 64
+> sur 128 monde, continu inter-super-tuiles (VDP1 ne wrappe pas ; sur grille 2× alignée
+> le même char EST sa répétition, zoomé ×2 ; mip vrai = +4 Ko/slot plus tard). LOD-aplat
+> ≤16 px SUPPRIMÉ. Facture : tuile = 1 cmd ⇒ e = fe + (mou ? 9 : 1) aux 4 sites. `o` →
+> `o<ovf>/<leafbad>` (leafbad = polygones de feuille pvn<3 = la classe déterministe du
+> triangle ; o0/0 + triangle = re-diagnostic). L+X : le ROUGE devient dominant. Pool PSW
+> 17,61 Ko (surveiller ; plancher ~5 Ko), normal 61,33 bit-intact.
 
 ## Étape 2 — sols non-dominants + plafonds (quads de sous-secteurs)
 

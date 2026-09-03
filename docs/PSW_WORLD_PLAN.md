@@ -631,6 +631,46 @@ StoreWallRange, curline/frontsector/backsector/rw_angle1 vivants).
 > statique par niveau, ~6-8 Ko de zone) documentée comme round 32. NON validé
 > console.
 
+> **Statut 2026-09-03 (round 32 — GO owner « a+b, je veux le moteur le plus
+> optimisé possible » ; verdict P31 : fast tire 24-35 mais B INCHANGÉ ⇒ la
+> facture est la queue d'émission entière + l'empreinte code, pas le clip).**
+> **LE BAKE** : la décomposition feuille∩grille-64 est de la géométrie MONDE —
+> la recalculer chaque frame était la facture. Cuite UNE fois par feuille,
+> paresseusement (2 feuilles/frame), dans une arène PU_LEVEL de 12 Ko gardée
+> par Z_TrueFree (Z_Malloc2 sans purge, NULL gracieux ; libérée à la sortie de
+> niveau ; psw_pvx + chute de leveltime surveillés contre l'allocateur
+> déterministe qui rend les mêmes adresses) : 1 octet de CLASSE par tuile
+> (out/sliver/full/live/record), 8 octets par tuile de bord (bande
+> pleine-largeur v0/vend ; pièce axiale alignée +ua/uwd/qx ; diag = rangées de
+> bande + bbox texel arrondie VERS L'EXTÉRIEUR pour la window), 16 octets par
+> tuile diag orientée U (les 8 plages v des sous-bandes FINE, précuites). Au
+> flush le walk ne garde que le travail VUE : les masques de coins sur TROIS
+> demi-plans (near dur, côtés frustum soft — nmask=3 au lieu des n≤28 arêtes),
+> le gate de masque de note, les projections (cache cproj), le staging. Une
+> tuile de bord cuite = lecture de table + 4 projections + 1-2 commandes.
+> FALLBACK LIVE (l'ancien chemin, verbatim) : rangées near-cut, pièces axiales
+> mal alignées 8 (leur window de lip exige les sommets exacts), refines
+> V-orientés de près, slivers sous-rangée, feuilles non cuites (warm-up),
+> famine de slot. Strips : baked-full ∧ view-contained ≡ l'ancien cls3.
+> **Le fast-path r29/r31 d'emit64 est SUPPRIMÉ** (le bake possède exactement
+> ses tuiles ; ses octets de code étaient du pool que le boot exige — premier
+> build à 2,67 Ko < plancher 4,8 ; avec la suppression + MAXVISPLANES 64 en
+> build PSW + MQ 48→40 + MLRU 32→16 : **pool 6,78 Ko** — au-dessus du plancher
+> mesuré, sous le confort 7 : ⚠ CONFIRMER LE BOOT). Row 13 : **P32**
+> `e<ef>/<ew> B<ms>/<bord> K<baked>/<live> j<ms>/<n> f<cmds>` — B = résiduel
+> live, K = couverture du bake. Extraction prouvée (r32_bake_check.py : arbre
+> de décision + round-trip des records + containment de la bbox extérieure +
+> plages de strips ; ⚠ la distribution aléatoire montre `win`≫`axis` — en
+> géométrie NON alignée-8 le fallback live domine ; Doom réel est aligné-8,
+> `K<live>` console tranchera, v2 = baker aussi les pièces win). Build normal
+> bit-intact. Commit 9e2fb82, core intouché. Attendu console : B ≤ 3-6 ms
+> (résiduel live), ew ~8-14, P ~22-28 après warm-up ; ensuite **round 33 =
+> TOUT le côté flats sur le slave SH-2** (owner : « si on peut tout donner à
+> ssh2, allons-y ») — réservation des plages d'index VDP1 par la loi 2e+1,
+> pads no-op dans les trous, master = murs/things/kick ; le bake rend la passe
+> flats du slave assez courte pour se cacher sous les murs du master. NON
+> validé console.
+
 - **Polygones de sous-secteurs au level-load** (p_setup.c après :1234, PU_LEVEL zone
   LWRAM) : clip récursif du bbox map par les splitlines ancêtres (node_t x16/y16/dx16/
   dy16 exacts) + les segs de la feuille. ~150 lignes, une fois par niveau.

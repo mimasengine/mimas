@@ -3436,7 +3436,7 @@ static void fps_update(void)
                        K61/16, K100/14 across the r34 discs) and the ceiling
                        holes are the live question.  The K latches keep running,
                        unprinted. */
-                    snprintf(ovbuf, sizeof ovbuf, "P34 e%d/%d h%d/%d F%s f%d d%d/%d ",
+                    snprintf(ovbuf, sizeof ovbuf, "P35 e%d/%d h%d/%d F%s f%d d%d/%d ",
                              psw_ef_ms_last > 99 ? 99 : psw_ef_ms_last,
                              psw_ew_ms_last > 99 ? 99 : psw_ew_ms_last,
                              psw_ceil_hid_last > 999 ? 999 : psw_ceil_hid_last,
@@ -11658,11 +11658,46 @@ static void vdp1_walls_flush(void)
                (charge e-4) and assigns the 4 texture slots -- quality
                degrades near-last, presence is near-universal.
                (psw_punch_frame was resolved in the walls-yield scan.) */
+            /* ROUND 35 -- FLOORS YIELD TO CEILINGS.  Round A's single sweep let
+               a floor and a ceiling compete for the same command on equal
+               terms, and under saturation (console: c456 of 487, ~120 candidate
+               planes against a ~225-command budget) roughly half of BOTH lose.
+               But the two losses are not worth the same, and this engine
+               already has the law for that -- "un mur coupe DEGRADE, un sprite
+               coupe DISPARAIT", which is why the walls yield to the things:
+                 - a lost FLOOR is covered by the RBG0 hardware floor underneath
+                   (wrong height or tint at worst -- a degrade);
+                 - a lost CEILING is covered by NOTHING.  VDP1 sits above VDP2
+                   and the sky/RBG0 shows straight through: a HOLE.
+               So the ceilings get their guaranteed pass FIRST, near->far, and
+               the floors then spend what is left.  Ceilings are capped at half
+               the budget so a ceiling-rich view cannot starve the near floors
+               outright, and anything the ceilings do not take stays available:
+               the reserve is a CAP on the ceiling sweep, not a floor for it.
+               (`kill` counts PLANES since r34e, so the two sweeps still pair
+               1:1 with round C's per-pass rescues.) */
+            {
+            int csweep = limit >> 1;
             for (int k = 0; k < psw_sub_n; ++k)
             {
-                int fl, cl, fdom;   /* r34e: `dropped` retired -- see below */
+                int fl, cl, fdom;
                 psw_sub_lumps(k, &fl, &cl, &fdom);
-                if (fl < 0 && cl < 0 && !fdom) continue;
+                if (cl < 0 || (psw_sub_flag[k] & 4)) continue;
+                {
+                    int e = (psw_sub_flag[k] & 0x20) ? 4
+                          : 2 * (int)psw_sub_ce[k] + 1;
+                    int m = (e < 4) ? e : 4;
+                    if (ftile + m <= csweep)
+                    { ftile += m; if (sf_ok) psw_sf_bill[k] += (unsigned short)m; }
+                    else { psw_sub_flag[k] |= 0x80; psw_kill_n++; }
+                }
+            }
+            }
+            for (int k = 0; k < psw_sub_n; ++k)
+            {
+                int fl, cl, fdom;
+                psw_sub_lumps(k, &fl, &cl, &fdom);
+                if (fl < 0 && !fdom) continue;
                 /* punch paper: UNCONDITIONAL 4 (round 16) -- the emitter never
                    consults the budget flags for punches; the fan is DECIMATED
                    to <=4 quads (billing-law violation fixed, console u26). */
@@ -11681,20 +11716,6 @@ static void vdp1_walls_flush(void)
                     if (ftile + m <= limit) { ftile += m; if (sf_ok) psw_sf_bill[k] += (unsigned short)m; }
                     else { psw_sub_flag[k] |= 0x40; psw_kill_n++; }  /* STANDBY */
                 }
-                if (cl >= 0 && !(psw_sub_flag[k] & 4))
-                {
-                    int e = (psw_sub_flag[k] & 0x20) ? 4
-                          : 2 * (int)psw_sub_ce[k] + 1;
-                    int m = (e < 4) ? e : 4;
-                    if (ftile + m <= limit) { ftile += m; if (sf_ok) psw_sf_bill[k] += (unsigned short)m; }
-                    else { psw_sub_flag[k] |= 0x80; psw_kill_n++; }
-                }
-                /* ROUND 34e -- `kill` now counts PLANES, not subsectors.  It
-                   was incremented ONCE per sub even when BOTH passes dropped,
-                   while round C decrements once per RESCUED PASS -- so a sub
-                   that lost both and got one back read 0, and `kill 0` stopped
-                   meaning "nothing on standby".  That is the digit the whole
-                   d0/0 elimination rests on, so it has to pair 1:1. */
             }
             for (int k = 0; k < psw_sub_n; ++k)
             {   /* round B: upgrades + slots, near->far.  A pass already billed

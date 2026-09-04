@@ -714,6 +714,24 @@ StoreWallRange, curline/frontsector/backsector/rw_angle1 vivants).
 > latch F!) + gate 1p. Arène 15,4→22,5 Ko PU_LEVEL. Leçon : MESURER les
 > frames (objdump) avant de mettre une chaîne sur une pile bornée — la passe
 > objdump existe maintenant. NON validé console (2e disque).
+>
+> **ROUND 33b (2026-09-04, 9088c0d)** — 2e disque console : 15 fps, SLV b2%,
+> `F0/0` constant, e16-25 non-nuls = master-inline chaque frame. Cause lue
+> DANS les captures : row LIM `zf4-27` (vraiment libre) vs `lg~263`
+> (obtenable en purgeant) — l'arène sf (recette Z_Malloc2 NO-PURGE + garde
+> Z_TrueFree, héritée du bake) était REFUSÉE à chaque niveau : au premier
+> flush, le cache de lumps possède déjà la zone. Refus silencieux : aucun
+> glyphe ne distinguait « arène absente » de « ça tourne ». Fix : gate
+> `Z_CanAllocate` (run contigu libre+purgeable) + allocation PURGEANTE
+> `Z_Malloc` (quelques lumps refaultent une fois par niveau) — pour les DEUX
+> arènes (le bake ne passait que par chance de timing) ; row 13 gagne `F-`
+> = arène refusée (la classe ne peut plus se cacher). WADs vraiment saturés
+> → déclin gracieux inchangé (chemin r32 inline). Pool 6,2 Ko ; build normal
+> bit-intact. NON validé console (3e disque). Attendu inchangé : SLV b%
+> 30-60, P ≈ 20-29, ~20 fps ; ensuite r34 = l'ÉMISSION DES MURS rejoint les
+> flats sur le slave (même modèle de réservation ; resolve wtex au pre-pass
+> master), puis le plafond master résiduel = Bw+tic+blit ≈ 25-30 fps (verdict
+> POWERSLAVE_GAP : le plancher d'archi).
 
 - **Polygones de sous-secteurs au level-load** (p_setup.c après :1234, PU_LEVEL zone
   LWRAM) : clip récursif du bbox map par les splitlines ancêtres (node_t x16/y16/dx16/

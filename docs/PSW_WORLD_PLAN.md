@@ -836,6 +836,58 @@ StoreWallRange, curline/frontsector/backsector/rw_angle1 vivants).
 > choisi ; **les deux à 0 = arithmétique d'occlusion** (cull LOS / bandes
 > portales / masque) — c'est là qu'il faudra creuser ensuite. Pool 5,64 Ko ;
 > build normal bit-intact. NON validé console (6e disque).
+>
+> **ROUND 34c/d/e (2026-09-04, 5df5236)** — 6e disque : `d0/0` aux deux
+> endroits ⇒ par la partition r34b, il ne restait que **l'arithmétique
+> d'occlusion**. Audit multi-agents (5 auditeurs, un par mécanisme, chaque
+> constat vérifié de façon ADVERSE) : deux défauts confirmés, les hypothèses
+> « cache de masques » réfutées.
+> **(1) LA FENÊTRE DE JOB PARTAGÉE — la cause, spécifique aux plafonds PAR
+> CONSTRUCTION.** En mode slave, le sol et le plafond d'un sous-secteur
+> partagent UNE réservation d'indices : la pré-passe les facture ensemble dans
+> `psw_sf_bill[k]` et `psw_cmd_left()` est le reste de TOUT le job. La passe 0
+> (SOL) tourne d'abord et peut dépasser sa part — le bras fines V-bands émet
+> jusqu'à 8 × (fenêtre + quad) = 16 commandes contre une réserve de +9 — et
+> chaque commande prise en trop sort de celle du PLAFOND. La passe 1 trouve
+> alors `psw_cmd_left() <= 0`, tous les émetteurs sortent sur leur garde, et le
+> plafond n'émet RIEN : aucun slot refusé, aucun verdict de budget = `d0/0`.
+> Correctif : retenir la garantie round-A du plafond hors de portée de la passe
+> sol, la lui rendre (plus ce que le sol a laissé) à la passe 1 ; plafonner la
+> boucle V-bands au bord de la fenêtre.
+> **(2) LE CULL DE PLAN ENTIER, RESSUSCITÉ (dg:9863).** Le chemin rapide
+> own-quad du round 25 applique la spec des 5 sondes de l'owner — donnée pour
+> UNE tuile 64×64 — à une pièce fusionnant jusqu'à TROIS rangées de tuiles, et
+> fait `return` de `psw_emit_plane_tiles` sur un positif : le plan ENTIER est
+> abandonné. C'est mot pour mot le cull que le round 20 avait SUPPRIMÉ comme
+> non fondé (« un trou de la taille d'un triangle avec k0 d0 r0 … échantillonner
+> des points n'est PAS une preuve qu'une RÉGION est cachée »), et l'échec
+> enregistré au round 20 est exactement ce symptôme-ci. Correctif : le chemin
+> rapide refuse les pièces multi-rangées sur plan mixte ⇒ la marche de grille
+> les cull par tuile, comme elle le fait déjà.
+> **Aussi** : le crédit de repêchage r34b est restreint aux frames
+> master-inline (en slave la FACTURE EST la banque, donc une facture gonflée
+> faisait jeter des jobs PROCHES entiers par la ceinture — console `F15/66`
+> alors que le disque précédent lisait `F../0`) ; le packer d'arène rationnait
+> loin→proche et gardait donc les jobs LOINTAINS en jetant les PROCHES (ses
+> trois limites : cap de jobs, ceinture de prefix-sum, ceinture de banque) ;
+> `psw_kill_n` compte désormais des PLANS et non des sous-secteurs (appairage
+> 1:1 avec les repêchages par passe du round C) ; la clé du LRU de masques
+> gagne le pavage contre lequel le masque est indexé (64 o).
+> **Row 13 → `P34 e<ef>/<ew> h<hid>/<zero> F<join>/<drop> f<cmds>
+> d<denied>/<kill>`** — `h` partitionne les pertes de plafonds : `hid` =
+> déclaré caché au NOTE, `zero` = arrivé à l'émetteur et n'a rien émis.
+> `x<wd>` est COUPÉ (question soldée : `x-` sur neuf captures) et `K` cède sa
+> colonne.
+> **POOL** : r34e mesurait 4,81 Ko, au ras du plancher de boot 4,8. Récupéré à
+> **6,55 Ko** en coupant la sonde `x` et en ramenant le tas newlib
+> sur-provisionné (console `hp1256/4096!0` = pic 1256 o) de 4096 à 2560 o,
+> **gardé par `SAT_PSW`**. Ce gate a révélé un piège de build : make suit les
+> SOURCES, pas les CFLAGS, donc builder -Psw puis normal relinkait le
+> `syscalls.o` PSW et le pool « bit-intact » lisait 62,83 Ko au lieu de 61,33.
+> `src/syscalls.c` rejoint la liste des fichiers TOUJOURS retouchés de
+> `build.ps1` ; vérifié en enchaînant les deux builds : normal bit-intact.
+> NON validé console (7e disque). Attendu : plafonds pleins ; si des trous
+> persistent, `h<hid>/<zero>` dit lequel des deux étages accuser.
 
 - **Polygones de sous-secteurs au level-load** (p_setup.c après :1234, PU_LEVEL zone
   LWRAM) : clip récursif du bbox map par les splitlines ancêtres (node_t x16/y16/dx16/

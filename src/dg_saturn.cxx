@@ -704,6 +704,9 @@ static int  psw_sf_drop_last = 0;          /* round 33 `F../<drop>`: flat cmds r
 static int  sat_psw_sf = 1;                /* round 33 master switch: flats emit on the slave
                                               SH-2.  Latched OFF for the session if the flat
                                               body ever wedges at the fence (row 13 `F!`). */
+static int  psw_sf_arena_last = 0;         /* round 33b: 1 = the sf arena exists (row `F-`
+                                              when it does not -- the silent-refusal class
+                                              that ate the first r33 console round) */
 #endif
 extern "C" int            sat_sky_view;         /* core Part 5: elected split view for the HW sky (-1 = none => all software) */
 extern "C" unsigned int   sat_sky_px_view[4];   /* core Part 5: per-view SKY pixel coverage (election metric) */
@@ -3393,6 +3396,7 @@ static void fps_update(void)
                 {
                     char sfb[10];
                     if (!sat_psw_sf) { sfb[0] = '!'; sfb[1] = 0; }
+                    else if (!psw_sf_arena_last) { sfb[0] = '-'; sfb[1] = 0; }
                     else snprintf(sfb, sizeof sfb, "%d/%d",
                                   psw_sf_join_ms_last > 99 ? 99 : psw_sf_join_ms_last,
                                   psw_sf_drop_last > 999 ? 999 : psw_sf_drop_last);
@@ -9179,6 +9183,7 @@ static int psw_clip_axis(const int *ax, const int *ay, int n, int *bx, int *by,
    reservation it needs. */
 extern "C" void *Z_MainZone(void);
 extern "C" void *Z_Malloc2(void *zone, int size, int tag);   /* NULL on exhaustion, no purge */
+extern "C" void *Z_Malloc(int size, int tag, void *user);    /* purging (gate via Z_CanAllocate) */
 extern "C" int   Z_CanAllocate(int size);
 extern "C" int   numsubsectors;
 extern "C" int   leveltime;
@@ -9236,12 +9241,13 @@ static void psw_bake_frame(void)
 	psw_bk_pool = 0; psw_bk_off = 0; psw_bk_size = 0; psw_bk_used = 0;
 	psw_bk_nsub = 0; psw_bk_watch = psw_pvx; psw_bk_age = 0;
 	if (psw_polys_ok && numsubsectors > 0
-	    && Z_TrueFree() > PSW_BK_ZONE_MIN + PSW_BK_POOL_REQ + 2 * numsubsectors + 256)
-	{
-	    void *mz = Z_MainZone();
-	    psw_bk_off = (unsigned short *)Z_Malloc2(mz, 2 * numsubsectors, PSW_BK_PU_LEVEL);
+	    && Z_CanAllocate(PSW_BK_POOL_REQ + 2 * numsubsectors + 8 * 1024))
+	{   /* round 33b: PURGING allocation, like the sf arena -- the old
+	       no-purge Z_TrueFree recipe only ever succeeded when the lump
+	       cache happened not to own the zone yet (see psw_sf_frame). */
+	    psw_bk_off = (unsigned short *)Z_Malloc(2 * numsubsectors, PSW_BK_PU_LEVEL, 0);
 	    psw_bk_pool = psw_bk_off
-	        ? (unsigned char *)Z_Malloc2(mz, PSW_BK_POOL_REQ, PSW_BK_PU_LEVEL) : 0;
+	        ? (unsigned char *)Z_Malloc(PSW_BK_POOL_REQ, PSW_BK_PU_LEVEL, 0) : 0;
 	    if (psw_bk_pool)
 	    {
 		int i;
@@ -9270,10 +9276,16 @@ static void psw_bake_frame(void)
     else psw_bk_age = 0;
 }
 
-/* round 33: the slave-flat arena -- bill table + job list + command staging,
-   one PU_LEVEL block on the same watch/guard pattern as the bake arena.  No
-   arena (zone-starved big WAD) => psw_sf_mode stays 0 and the master emits
-   inline, exactly the r32 path. */
+/* round 33: the slave-flat arena -- bill table + job list + command staging
+   + the dedicated stack, one PU_LEVEL block.  PURGING allocation (round-33b,
+   console 2026-09-04): the first disc used the bake arena's Z_Malloc2 recipe
+   (no-purge, Z_TrueFree guard) and NEVER allocated -- by the first flush the
+   lump cache owns the zone (`zf` 4-27 KB truly free vs `lg` ~263 KB
+   obtainable by purging), so a no-purge ask of 22.5K+20K was refused on
+   every level and the whole round silently ran master-inline (SLV b2%,
+   F0/0).  Z_CanAllocate answers the PURGE-AWARE question and Z_Malloc
+   evicts a few cache lumps that simply re-fault once.  Truly zone-starved
+   WADs still decline gracefully => the r32 inline path (row `F-`). */
 static void psw_sf_frame(void)
 {
     if (psw_pvx != psw_sf_watch || !psw_polys_ok || leveltime < psw_sf_lt)
@@ -9282,10 +9294,10 @@ static void psw_sf_frame(void)
 	psw_sf_canary = 0; psw_sf_stktop = 0;
 	psw_sf_watch = psw_pvx;
 	if (psw_polys_ok && numsubsectors > 0
-	    && Z_TrueFree() > PSW_BK_ZONE_MIN + PSW_SF_POOL_REQ + 256)
+	    && Z_CanAllocate(PSW_SF_POOL_REQ + 8 * 1024))
 	{
 	    unsigned char *a = (unsigned char *)
-		Z_Malloc2(Z_MainZone(), PSW_SF_POOL_REQ, PSW_BK_PU_LEVEL);
+		Z_Malloc(PSW_SF_POOL_REQ, PSW_BK_PU_LEVEL, 0);
 	    if (a)
 	    {
 		psw_sf_bill = (unsigned short *)a;
@@ -11407,6 +11419,7 @@ static void vdp1_walls_flush(void)
                index reservation the slave fills. */
             int sf_ok = (sat_psw_sf && sat_psw_slave && psw_sf_stg != 0
                          && psw_polys_ok && sat_local_players <= 1);
+            psw_sf_arena_last = (psw_sf_stg != 0);     /* row `F-` = arena refused */
             if (sf_ok)
                 for (int k = 0; k < psw_sub_n; ++k) psw_sf_bill[k] = 0;
             psw_kill_n = 0; psw_punch_frame = 0;

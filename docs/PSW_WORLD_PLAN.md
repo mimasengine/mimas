@@ -760,6 +760,49 @@ StoreWallRange, curline/frontsector/backsector/rw_angle1 vivants).
 > page 4 Ko = preuve d'errance) — le prochain wedge se localise sur photo.
 > Pool 6,14 Ko ; build normal bit-intact. NON validé console (4e disque).
 > Attendu : `x-` (jamais de wd), F<j>/<drop faible>, SLV b% 30-60, ~20 fps.
+>
+> **ROUND 34 (2026-09-04, 81f7774)** — 4e disque console : **r33c VALIDÉ**
+> (`x-` sur 9 captures, `w0`, `to0:-`, 17-20 fps en scène ouverte, 48 en
+> couloir, SLV b27-43 %, F4-20/0). Trois défauts restants, trois mécanismes
+> distincts, tous corrigés :
+> **(1) ZONES FINES — règle owner** : « la face horizontale ne devrait jamais
+> être traitée comme un flat, c'est toujours *fin* comme zone ; les murs
+> double faces ne devraient avoir que deux quads ». Une marche/rebord/seuil
+> ne peut JAMAIS contenir une tuile 64 pleine ⇒ toutes ses tuiles sont des
+> bords ; une pièce ni pleine-largeur ni rect-axe tombe sur *bande grossière
+> + fenêtre UserClip* = un quad pleine tuile découpé par un rectangle
+> ÉCRAN — sur une arête projetée oblique c'est le fabricant d'escaliers, et
+> quand la pièce est un éclat dans un coin la fenêtre laisse la bande
+> peindre le reste de la tuile (« gros escaliers moches, tuiles entières qui
+> débordent »). Désormais une feuille plus fine que `PSW_THIN_U`=32 u ET
+> plus longue qu'une tuile prend les bits SOLID existants : facturée 4, PAS
+> de slot texture (les vrais sols le récupèrent), l'émetteur dessine le
+> polygone clippé VRAI — exactement UN quad pour le rect n==4. Verdict pris
+> sur la feuille NON clippée ⇒ pas de scintillement tuilé/solide quand la
+> coupe frustum bouge. ⚠ bbox alignée axes : un rebord OBLIQUE tuile encore.
+> **(2) RÉSERVE THINGS invisible à son bénéficiaire** : `sat_walls_kick`
+> rabote `vdp1_wall_cap` de `MARGIN + 3·res` pour que murs+flats s'arrêtent
+> sous la facture de la queue ; en split ça marche car le flush things tourne
+> APRÈS la restauration du cap. En PSW le drain est ENTRELACÉ dans
+> `vdp1_walls_flush` ⇒ il se testait contre le cap DÉJÀ raboté, et comme
+> l'émission est loin→proche les sprites jetés étaient les PLUS PROCHES
+> (console `THp x12`, `x40` = monstres qui disparaissent à bout portant —
+> jumeau exact du bug split soldé le 2026-08-21). Le drain garde maintenant
+> sur `psw_thing_cap`, la banque non rabotée.
+> **(3) DALLES DE FLATS chargées PROCHE-D'ABORD** : `psw_sub` est en ordre de
+> visite BSP, donc `R_PswFrameFlats` faisait des flats proches les entrées
+> les PLUS VIEILLES du LRU ; une frame avec plus de flats distincts que le
+> cache n'en tient (row FLT `r16 ld31`) évinçait exactement ceux dont le
+> peintre a besoin en DERNIER. Un plan dont la dalle a disparu n'a ni slot ni
+> texel central et est sauté ENTIÈREMENT = un trou, et un trou PROCHE.
+> Inversé : une frame en débordement perd désormais ses flats les plus
+> LOINTAINS, comme tous les autres budgets du moteur.
+> **Sonde** : row 13 gagne `d<n>` (`psw_flat_denied`) = plans sautés faute de
+> slot ET de dalle. `d>0` = famine cache/slot ; `d0` = les trous restants
+> sont géométriques. Pool 5,86 Ko ; build normal bit-intact. NON validé
+> console (5e disque). Attendu : escaliers de rebords partis, `THp x0`,
+> `d0`, fps inchangé ou légèrement meilleur (les zones fines coûtent 1 cmd
+> au lieu de plusieurs).
 
 - **Polygones de sous-secteurs au level-load** (p_setup.c après :1234, PU_LEVEL zone
   LWRAM) : clip récursif du bbox map par les splitlines ancêtres (node_t x16/y16/dx16/

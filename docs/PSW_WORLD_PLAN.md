@@ -732,6 +732,34 @@ StoreWallRange, curline/frontsector/backsector/rw_angle1 vivants).
 > flats sur le slave (même modèle de réservation ; resolve wtex au pre-pass
 > master), puis le plafond master résiduel = Bw+tic+blit ≈ 25-30 fps (verdict
 > POWERSLAVE_GAP : le plancher d'archi).
+>
+> **ROUND 33c (2026-09-04, 6df2f5f)** — 3e disque console : premiers frames
+> ARMÉS (F11-14/0, e15-19 slave, f196-232) mais ~8 fps, écran quasi vide,
+> VD1 `g56/w↑` = force-swap 4 fields CHAQUE frame : le plot ne finit jamais.
+> Cause : psw_emit_subthings pose UN restore de clip PAR APPEL (un appel par
+> sub avec things) mais `treserve` facturait +8 forfaitaire ; la réservation
+> r33 dépense la facture ENTIÈRE (en r32 les gardes d'émission absorbaient
+> la dette en silence) ⇒ `vdp1_wnext` — dont l'incrément de réservation
+> était le SEUL non gardé du fichier — dépassait les 495 slots ; le
+> TERMINATEUR (écrit sans garde lui aussi) atterrissait en VRAM étrangère
+> (wbank1 → textures d'arme !), la liste ne se terminait jamais, le VDP1
+> errait, et chaque PTMR pendant un dessin actif était perdu : UNE frame
+> chargée empoisonnait la session (l'arme absente des captures = le même
+> débordement, garde CMD_GUARD). Fix : (1) treserve = 3n+8 (borne honnête :
+> ≤ 1 restore par thing) ; (2) CEINTURE réservation (job qui ne tient plus
+> → vbase 0xFFFF, compté dans F../<drop>) ; (3) CEINTURE terminateur (clamp
+> slot 494 : perdre un quad, garder la machine) ; (4) pose des jobs à la
+> fence par COPIE CPU fenêtre non-cachée — les ~30-100 DMA ch0 dos-à-dos de
+> la fence étaient un usage que le staging r28 n'exerce jamais (latence
+> DSTA après le start ⇒ le job j+1 peut déchirer le j en vol), et le
+> fallback distrust lisait l'arène écrite-slave par lignes MAÎTRE périmées ;
+> le port B-bus borne les deux chemins ([[blit-dma-lever]]) et la fence n'a
+> rien à recouvrir ⇒ même temps, trois inconnues matérielles retirées ;
+> (5) SONDE : row 13 `B` cède sa colonne à `x<n>` = COPR décodé au tir du
+> watchdog (`-` jamais, 0-494 slot de banque, `E` root, `?n` VRAM étrangère
+> page 4 Ko = preuve d'errance) — le prochain wedge se localise sur photo.
+> Pool 6,14 Ko ; build normal bit-intact. NON validé console (4e disque).
+> Attendu : `x-` (jamais de wd), F<j>/<drop faible>, SLV b% 30-60, ~20 fps.
 
 - **Polygones de sous-secteurs au level-load** (p_setup.c après :1234, PU_LEVEL zone
   LWRAM) : clip récursif du bbox map par les splitlines ancêtres (node_t x16/y16/dx16/

@@ -701,6 +701,12 @@ static int  psw_sf_join_ms_last = 0;       /* round 33 `F<join>/..`: master wait
                                               flat pass at the fence, ms */
 static int  psw_sf_drop_last = 0;          /* round 33 `F../<drop>`: flat cmds refused by a
                                               full per-sub index reservation */
+static int  sat_mp_wd_copr = -1;           /* r33c row 13 `x`: WHERE the plot was when the
+                                              4-field watchdog force-swapped (sticky; -1 =
+                                              never fired).  0..494 = logical wall-bank slot,
+                                              1000 = root/empty-bank region, 2000+n = FOREIGN
+                                              VRAM at n*4KB = the list wandered out of the
+                                              command banks. */
 static int  sat_psw_sf = 1;                /* round 33 master switch: flats emit on the slave
                                               SH-2.  Latched OFF for the session if the flat
                                               body ever wedges at the fence (row 13 `F!`). */
@@ -3393,18 +3399,25 @@ static void fps_update(void)
                    FRT (forced phi/128 at body entry).  `F!` = the flat body
                    wedged once and flats are back on the master for the
                    session (expect e/B/K to keep reading, F frozen at !). */
-                {
-                    char sfb[10];
+                {   /* r33c: `B<ms>/<bord>` yields its column to `x<wd-slot>`
+                       for the wedge hunt (the bake stays readable via K; the
+                       eb latches keep running unprinted). */
+                    char sfb[10], wdb[8];
                     if (!sat_psw_sf) { sfb[0] = '!'; sfb[1] = 0; }
                     else if (!psw_sf_arena_last) { sfb[0] = '-'; sfb[1] = 0; }
                     else snprintf(sfb, sizeof sfb, "%d/%d",
                                   psw_sf_join_ms_last > 99 ? 99 : psw_sf_join_ms_last,
                                   psw_sf_drop_last > 999 ? 999 : psw_sf_drop_last);
-                    snprintf(ovbuf, sizeof ovbuf, "P33 e%d/%d B%d/%d K%d/%d F%s f%d ",
+                    if (sat_mp_wd_copr < 0)          { wdb[0] = '-'; wdb[1] = 0; }
+                    else if (sat_mp_wd_copr == 1000) { wdb[0] = 'E'; wdb[1] = 0; }
+                    else if (sat_mp_wd_copr >= 2000)
+                        snprintf(wdb, sizeof wdb, "?%d", sat_mp_wd_copr - 2000);
+                    else
+                        snprintf(wdb, sizeof wdb, "%d", sat_mp_wd_copr);
+                    snprintf(ovbuf, sizeof ovbuf, "P33 x%s e%d/%d K%d/%d F%s f%d ",
+                             wdb,
                              psw_ef_ms_last > 99 ? 99 : psw_ef_ms_last,
                              psw_ew_ms_last > 99 ? 99 : psw_ew_ms_last,
-                             psw_eb_ms_last > 99 ? 99 : psw_eb_ms_last,
-                             psw_eb_bord_last > 999 ? 999 : psw_eb_bord_last,
                              psw_bk_baked_last > 999 ? 999 : psw_bk_baked_last,
                              psw_bk_live_last > 999 ? 999 : psw_bk_live_last,
                              sfb,
@@ -8899,6 +8912,8 @@ static unsigned int   *psw_sf_stg = 0;  /* arena: staged commands, 8 words each 
 static int psw_sf_njobs = 0;
 static int psw_sf_cur = 0, psw_sf_end = 0;   /* current job window (slave-side) */
 static int psw_sf_drop = 0;             /* cmds refused by a full reservation   */
+static int psw_sf_res_drop = 0;         /* r33c: whole jobs refused at the BANK belt
+                                           (master-side; folded into F../<drop>) */
 static const int *psw_sf_watch = 0;     /* level watch, the bake-arena pattern  */
 static int psw_sf_lt = -1;
 static volatile unsigned int *psw_sf_canary = 0;   /* arena: stack-base guard   */
@@ -9312,7 +9327,7 @@ static void psw_sf_frame(void)
     }
     psw_sf_lt = leveltime;
     psw_sf_mode = 0; psw_sf_njobs = 0;
-    psw_sf_drop = 0; psw_sf_join_ms_last = 0;
+    psw_sf_drop = 0; psw_sf_res_drop = 0; psw_sf_join_ms_last = 0;
 }
 
 static int psw_bake_build(int sn)        /* >= 0 pool offset | -1 no room | -2 never */
@@ -11067,11 +11082,23 @@ static void psw_sf_body(void)
 }
 
 /* copy one job's staged block to its reserved VDP1 slots -- the bank-split
-   translation mirrors vdp1_cmd_at; same SCU ch0 + distrust latch as the
-   round-28 staging (fence-before-start keeps the channel strictly serial
-   with the master's own staging kicks). */
+   translation mirrors vdp1_cmd_at.  ROUND 33c: by CPU, through the UNCACHED
+   window, no SCU-DMA.  The r33 fence started one ch0 DMA per job in a TIGHT
+   loop -- a use the proven round-28 staging never exercises (its kicks are
+   spaced by refilling a 12-command batch): if DSTA lags the start poke by a
+   few cycles, job j+1's busy-wait passes early and its register pokes tear
+   job j's transfer mid-flight.  The old channel-distrust CPU fallback was
+   also latently wrong HERE (cached reads of a SLAVE-written arena = stale
+   master lines).  The landing is B-bus write-port bound either way
+   ([[blit-dma-lever]]: DMA buys nothing on this port), and the fence has
+   nothing left to overlap -- so the CPU copy costs the same wall-time,
+   removes the back-to-back start race, the stale-cache fallback and the
+   law-08 CPU-vs-DMA B-bus exposure in one move. */
 static void psw_sf_dma_range(int idx, int n, const unsigned int *src)
 {
+    const unsigned int *s =
+        (const unsigned int *)((unsigned long)src | 0x20000000u);
+    if (idx + n > VDP1_BANK_CMDS) n = VDP1_BANK_CMDS - idx;   /* region belt */
     while (n > 0)
     {
 	unsigned int dst; int take = n;
@@ -11083,27 +11110,10 @@ static void psw_sf_dma_range(int idx, int n, const unsigned int *src)
 	else
 	    dst = VDP1_BANK_EXT[vdp1_wbank] + (unsigned int)(idx - VDP1_BANK_SPLIT) * 32u;
 	{
-	    volatile unsigned int *scu = (volatile unsigned int *)0x25FE0000u;
-	    int g = 0;
-	    while (vdp1_scu0_busy() && ++g < 2000000) { }
-	    if (g >= 2000000) psw_stage_dma = 0;
-	    if (psw_stage_dma)
-	    {
-		scu[0] = (unsigned int)(unsigned long)src;              /* D0R */
-		scu[1] = dst;                                           /* D0W */
-		scu[2] = (unsigned int)take * 32u;                      /* D0C */
-		scu[3] = 0x00000101u;
-		scu[5] = 0x00000007u;
-		scu[4] = 0x00000100u;
-		scu[4] = 0x00000101u;
-	    }
-	    else
-	    {
-		volatile unsigned int *d = (volatile unsigned int *)dst;
-		for (int w2 = 0; w2 < take * 8; ++w2) d[w2] = src[w2];
-	    }
+	    volatile unsigned int *d = (volatile unsigned int *)dst;
+	    for (int w2 = 0; w2 < take * 8; ++w2) d[w2] = s[w2];
 	}
-	idx += take; src += (unsigned int)take * 8u; n -= take;
+	idx += take; s += (unsigned int)take * 8u; n -= take;
     }
 }
 
@@ -11437,7 +11447,19 @@ static void vdp1_walls_flush(void)
             for (int i = 0; i < wall_acc_n; ++i)
                 wall_cmds += psw_wall_paper(i);
 #if SAT_WORLD_THINGS_VDP1
-            treserve = 2 * thing_acc_n + 8;   /* 2 cmds/thing + the per-batch clip restores */
+            /* ROUND 33c -- the restore is billed PER THING, not per frame: the
+               drain appends ONE view-window restore per emit_subthings CALL
+               that drew (one call per sub with things + the tail call), so the
+               old flat "+8" under-billed by (subs-with-things - 8) commands.
+               In r32 the flats' emit-time guards silently absorbed that debt;
+               in r33 the index reservation spends the FULL bill, so the debt
+               became a vdp1_wnext overrun past the bank extension -- the
+               frame terminator landed in FOREIGN VRAM (wbank0 -> the OTHER
+               bank's extension, wbank1 -> the weapon textures), the list
+               never terminated, and the VDP1 wandered (console 2026-09-04:
+               g56/w-climbing, near-empty frames).  <= 1 restore per thing is
+               an honest upper bound (a restore needs >= 1 thing). */
+            treserve = 3 * thing_acc_n + 8;
 #endif
             fbudget = (vdp1_wall_cap - (int)vdp1_wnext) - wall_cmds - treserve - 4;
             if (fbudget < 0) fbudget = 0;
@@ -11622,9 +11644,20 @@ static void vdp1_walls_flush(void)
             {   /* round 33: RESERVE this sub's flat slots -- the slave is
                    filling their staged image right now, the fence lands it.
                    The staging DMA sees the non-contiguous next wall write
-                   and closes its batch: one boundary per gap, no drain. */
-                psw_sf_jobs[sfjc].vbase = (unsigned short)vdp1_wnext;
-                vdp1_wnext += (int)psw_sf_jobs[sfjc].bill;
+                   and closes its batch: one boundary per gap, no drain.
+                   ROUND 33c BELT: this was the ONLY unguarded vdp1_wnext
+                   increment in the file (every emitter checks the cap) --
+                   any billing under-read overran the bank extension through
+                   it.  A job that no longer fits keeps vbase 0xFFFF (the
+                   fence skips it; its flats are the loss, counted in
+                   F../<drop>), never the bank. */
+                if ((int)vdp1_wnext + (int)psw_sf_jobs[sfjc].bill <= vdp1_wall_cap)
+                {
+                    psw_sf_jobs[sfjc].vbase = (unsigned short)vdp1_wnext;
+                    vdp1_wnext += (int)psw_sf_jobs[sfjc].bill;
+                }
+                else
+                    psw_sf_res_drop += (int)psw_sf_jobs[sfjc].bill;
                 sfjc++;
             }
             for (int i = wend - 1; i >= wbeg; --i)
@@ -11653,7 +11686,8 @@ static void vdp1_walls_flush(void)
         psw_ew_frt = 0;
         psw_eb_ms_last = (int)(psw_ucr32((const volatile void *)&psw_eb_frt) / 224u);
         psw_eb_bord_last = (int)psw_ucr32((const volatile void *)&psw_eb_bord);
-        psw_sf_drop_last = (int)psw_ucr32((const volatile void *)&psw_sf_drop);
+        psw_sf_drop_last = (int)psw_ucr32((const volatile void *)&psw_sf_drop)
+                         + psw_sf_res_drop;   /* r33c: + jobs refused at the bank belt */
         psw_bk_baked_last = (int)psw_ucr32((const volatile void *)&psw_bk_baked_n);
         psw_bk_live_last = (int)psw_ucr32((const volatile void *)&psw_bk_live_n);
         psw_frame_no++;                       /* the mask-reuse clock (PSW_MASK_AGE) */
@@ -11850,7 +11884,31 @@ static void sat_mp_fence(void)
         {
             unsigned short c = VDP1_COPR;
             if (c == sat_mp_end_ca || c == sat_mp_copr_kick) break;
-            if ((vbl_count - t0) >= SAT_MP_WD_VBL) { sat_mp_wd++; break; }
+            if ((vbl_count - t0) >= SAT_MP_WD_VBL)
+            {
+                sat_mp_wd++;
+#if SAT_PSW
+                {   /* r33c probe: decode COPR to a logical slot at the moment
+                       the watchdog gives up -- row 13 `x` answers WHERE a
+                       never-finishing plot is stuck (reserved flat range?
+                       walls? foreign VRAM = unterminated list wandering). */
+                    unsigned int off = (unsigned int)c << 3;
+                    int v = 2000 + (int)(off >> 12);
+                    if (off < 0x80u) v = 1000;
+                    for (int b = 0; b < 2; ++b)
+                    {
+                        unsigned int wb = VDP1_BANK[b] - VDP1_VRAM_BASE;
+                        unsigned int xb = VDP1_BANK_EXT[b] - VDP1_VRAM_BASE;
+                        if (off >= wb && off < wb + (unsigned int)(VDP1_BANK_SPLIT + 1) * 32u)
+                            v = (int)((off - wb) >> 5);
+                        else if (off >= xb && off < xb + (unsigned int)VDP1_BANK_EXT_CMDS * 32u)
+                            v = VDP1_BANK_SPLIT + (int)((off - xb) >> 5);
+                    }
+                    sat_mp_wd_copr = v;
+                }
+#endif
+                break;
+            }
         }
         sat_mp_gate_ms = (int)(DG_GetTicksMs() - g0);   /* >0 = the plot made the frame WAIT;
                                                            feeds the emission budget back-off
@@ -12856,6 +12914,15 @@ static void vdp1_wpn_kick(void)
         end[0]  = 0x0009 | 0x1000;                   /* sysclip (non-drawing) + JUMP_ASSIGN */
         end[1]  = (unsigned short)((VDP1_BANKE_ADDR - VDP1_VRAM_BASE) >> 3);
         end[10] = 319; end[11] = 223;                /* keep the sysclip values (== root's) */
+#if SAT_PSW
+        /* ROUND 33c BELT: the terminator write was unguarded.  With every
+           emitter capped this only fires on an accounting bug -- but when it
+           does, slot >= 495 is FOREIGN VRAM (wbank0 -> the other bank's
+           extension, wbank1 -> WPN_TEX_BASE) and the unterminated list sends
+           the VDP1 wandering; overwriting the last real command instead
+           loses one quad and keeps the machine. */
+        if (vdp1_wnext > VDP1_BANK_CMDS - 1) vdp1_wnext = VDP1_BANK_CMDS - 1;
+#endif
         vdp1_cmd_at(VDP1_BANK[vdp1_wbank], vdp1_wnext, end);
         vdp1_bank = vdp1_wbank;
         *((volatile unsigned short *)VDP1_ROOT_ADDR + 1) =

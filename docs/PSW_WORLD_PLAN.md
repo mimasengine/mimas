@@ -888,6 +888,28 @@ StoreWallRange, curline/frontsector/backsector/rw_angle1 vivants).
 > `build.ps1` ; vérifié en enchaînant les deux builds : normal bit-intact.
 > NON validé console (7e disque). Attendu : plafonds pleins ; si des trous
 > persistent, `h<hid>/<zero>` dit lequel des deux étages accuser.
+>
+> **ROUND 35 (2026-09-04, 6be210a)** — 7e disque : aucun changement. Et
+> l'audit avait déjà signalé pourquoi je cherchais au mauvais endroit :
+> **`kill 0` n'a jamais prouvé « rien en standby »** — `psw_kill_n`
+> s'incrémentait une fois par SOUS-SECTEUR même quand les DEUX passes
+> tombaient, alors que le round C décrémente par PASSE repêchée. Un sub qui
+> perd les deux et en récupère une lit 0. Toutes les captures `d0/0`
+> précèdent le fix r34e du compteur ⇒ **la classe BUDGET n'a jamais été
+> éliminée**. Les défauts corrigés en 34b/34c/34e étaient réels et vérifiés,
+> mais rien ne prouvait qu'ils étaient LA cause.
+> **Correctif : LES SOLS CÈDENT AUX PLAFONDS.** Round A passe en deux
+> balayages — les plafonds prennent leur garantie `min(4,e)` d'abord,
+> proche→loin, plafonnés à la moitié du budget ; les sols dépensent ensuite
+> le reste (le plafonnement est un CAP sur le balayage plafonds, pas un
+> plancher). Raison : sous saturation (`c456` sur 487, ~120 plans candidats
+> pour ~225 commandes) la moitié des plans tombe quoi qu'il arrive — la
+> question est LESQUELS. Un SOL perdu est recouvert par le sol matériel RBG0
+> (dégrade) ; un PLAFOND perdu n'est recouvert par RIEN (trou). Même loi que
+> « les murs cèdent aux things », et **cette asymétrie explique aussi
+> pourquoi le symptôme a toujours été spécifique aux plafonds** : les sols
+> se trouent autant, RBG0 le masque. Marqueur `P35`, format inchangé. Pool
+> 6,58 Ko ; build normal bit-intact. NON validé console (8e disque).
 
 - **Polygones de sous-secteurs au level-load** (p_setup.c après :1234, PU_LEVEL zone
   LWRAM) : clip récursif du bbox map par les splitlines ancêtres (node_t x16/y16/dx16/

@@ -3414,14 +3414,21 @@ static void fps_update(void)
                         snprintf(wdb, sizeof wdb, "?%d", sat_mp_wd_copr - 2000);
                     else
                         snprintf(wdb, sizeof wdb, "%d", sat_mp_wd_copr);
-                    snprintf(ovbuf, sizeof ovbuf, "P33 x%s e%d/%d K%d/%d F%s f%d ",
+                    /* r34 `d` = PLANES SKIPPED ENTIRELY (psw_flat_denied): no
+                       texture slot AND the flat dalle not resident, so the
+                       emitter has neither a texture nor a centre texel and
+                       draws NOTHING.  That is a hole with a name -- the first
+                       question to ask of any "trous dans les plans" capture:
+                       d>0 = cache/slot famine, d0 = the holes are geometric. */
+                    snprintf(ovbuf, sizeof ovbuf, "P33 x%s e%d/%d K%d/%d F%s f%d d%d ",
                              wdb,
                              psw_ef_ms_last > 99 ? 99 : psw_ef_ms_last,
                              psw_ew_ms_last > 99 ? 99 : psw_ew_ms_last,
                              psw_bk_baked_last > 999 ? 999 : psw_bk_baked_last,
                              psw_bk_live_last > 999 ? 999 : psw_bk_live_last,
                              sfb,
-                             psw_flat_last  > 999 ? 999 : psw_flat_last);
+                             psw_flat_last  > 999 ? 999 : psw_flat_last,
+                             psw_flat_denied_last > 999 ? 999 : psw_flat_denied_last);
                 }
 #endif
             if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 13, ovbuf);
@@ -8193,6 +8200,9 @@ static void vdp1_floors_flush(void) {}
 static const unsigned int psw_slot_vram[PSW_FLAT_SLOTS] =
     { 0x25C7D000u, 0x25C7E000u, 0x25C7F000u, 0x25C7C000u,
       0x25C59E00u, 0x25C5AE00u, 0x25C5BE00u, 0x25C5CE00u };
+#define PSW_THIN_U       32          /* r34: a leaf thinner than this (and longer than
+                                        one tile) is a step tread / sill / ledge -- a
+                                        ZONE, never a flat.  See sat_psw_sub_note_body. */
 #define PSW_FLAT_CAP     420         /* belt: whole-frame flat command hard cap
                                         (the DYNAMIC budget is the real law).
                                         Round 19: raised 232 -> 420 with the bank
@@ -8463,6 +8473,45 @@ static void sat_psw_sub_note_body(int subnum, int fh, int ch, int fpic,
     if (psw_polys_ok && subnum >= 0)
     {
 	int cxv[PSW_FAN_MAX], cyv[PSW_FAN_MAX];
+	/* ROUND 34 -- THIN ZONES ARE NEVER FLATS (owner, console 2026-09-04:
+	   "la face horizontale ne devrait jamais etre traitee comme un flat,
+	   c'est toujours fin comme zone ... les murs double faces ne devraient
+	   avoir que deux quads").  A step tread / sill / ledge is the top of a
+	   two-sided line: a strip a few units deep and many long.  Sent through
+	   the 64-grid it can never contain a full tile, so EVERY tile is a
+	   border piece, and a border piece that is neither full-tile-width nor
+	   an aligned axis rect falls to the coarse band + UserClip WINDOW --
+	   a full-tile-wide quad cropped by a SCREEN-ALIGNED rectangle.  On a
+	   slanted projected edge that rect is the stair maker, and where the
+	   piece is a sliver in the corner of its tile the window lets the band
+	   paint the rest of the tile: "des rebords qui font de gros escaliers
+	   moches, tuiles entieres qui debordent".
+	   The verdict is taken on the UNCLIPPED leaf (view-independent, so a
+	   plane cannot flicker between tiled and solid as the frustum cut moves
+	   across it) and routed through the existing SOLID bits: round A bills
+	   it 4, round B never upgrades it and takes NO texture slot (which the
+	   real floors get instead), and the emitter's decimated fan draws the
+	   TRUE clipped polygon -- for the n==4 rect that is exactly ONE quad.
+	   Geometry exact, no grid, no window, no overflow; the price is the
+	   texture on a strip whose texels are a grazing-angle blur anyway.
+	   Elongation is required (mx >= 64u) so a small SQUARE leaf keeps its
+	   texture -- it fits one char and the own-quad path already draws it
+	   exactly.  Axis-aligned bbox: a DIAGONAL thin ledge still tiles. */
+	int psw_thin = 0;
+	if (psw_polys_ok && subnum >= 0 && psw_pvn[subnum] >= 3)
+	{
+	    int i0 = psw_pvi[subnum], nv = psw_pvn[subnum];
+	    int lx0 = psw_pvx[i0], lx1 = lx0, ly0 = psw_pvy[i0], ly1 = ly0, mn, mx;
+	    for (int v2 = 1; v2 < nv; ++v2)
+	    {
+		int X = psw_pvx[i0 + v2], Y = psw_pvy[i0 + v2];
+		if (X < lx0) lx0 = X; if (X > lx1) lx1 = X;
+		if (Y < ly0) ly0 = Y; if (Y > ly1) ly1 = Y;
+	    }
+	    mn = (lx1 - lx0 < ly1 - ly0) ? (lx1 - lx0) : (ly1 - ly0);
+	    mx = (lx1 - lx0 < ly1 - ly0) ? (ly1 - ly0) : (lx1 - lx0);
+	    psw_thin = (mn <= (PSW_THIN_U << 16) && mx >= (64 << 16));
+	}
 	for (int pass = 0; pass < 2; ++pass)
 	{
 	    int h, psn, bit, nn, tt, e, v;
@@ -8482,6 +8531,7 @@ static void sat_psw_sub_note_body(int subnum, int fh, int ch, int fpic,
 	    }
 	    nn = psw_plane_poly(subnum, psn > 0 ? viewz - h : h - viewz, psn, cxv, cyv);
 	    if (nn < 3) { psw_sub_flag[k] |= bit; continue; }
+	    if (psw_thin) psw_sub_flag[k] |= (pass == 0) ? 0x10 : 0x20;   /* r34: one quad */
 	    /* round 21: the ladder is back for FLOORS too -- round 20 removed it
 	       arguing fill is free on an idle VDP1, but every overdrawn tile is
 	       also 2 COMMANDS, and the bank is 495, not infinite: open scenes
@@ -8620,7 +8670,18 @@ extern "C" unsigned char *R_FlatCacheGet(int lumpnum);
 extern "C" void R_PswFrameFlats(void)
 {
     int seen[16], ns = 0, k, i;
-    for (k = 0; k < psw_sub_n; ++k)
+    /* ROUND 34 -- FAR->NEAR, the project's standing famine rule.  psw_sub is in
+       BSP VISIT order, so k=0 is the NEAREST subsector; loading in that order
+       made the near flats the OLDEST entries in the dalle LRU, and a frame with
+       more distinct flats than the cache holds (console 2026-09-04: row FLT
+       `r16 ld31` = 16 resident, 31 loads in the window) evicted precisely the
+       ones the painter needs LAST and most visibly.  A plane whose dalle is
+       gone at emit time has neither a slot nor a centre texel and is skipped
+       ENTIRELY (row 13 `d`) -- a hole, and a NEAR one.  Reversed, the nearest
+       flats are the most-recently-used, so an overflowing frame loses its
+       FARTHEST flats instead: the same near-field guarantee the command,
+       tile and slot budgets all keep. */
+    for (k = psw_sub_n - 1; k >= 0; --k)
     {
 	int l2[2];
 	l2[0] = psw_sub[k].flump; l2[1] = psw_sub[k].clump;
@@ -11159,6 +11220,16 @@ static void psw_sf_fence(void)
 #if SAT_WORLD_THINGS_VDP1
 static int psw_thing_cmds = 0;   /* commands this drain wrote this flush (things + restores) */
 static int psw_thing_drop = 0;   /* queued things dropped at the bank guard (vanish 1 frame) */
+/* ROUND 34 -- the things' own guard reads the FULL bank, never the shaved one.
+   sat_walls_kick shaves vdp1_wall_cap by MARGIN + 3*res so walls+flats stop
+   short of the queue's bill; in the split that works because the things flush
+   runs AFTER the cap is restored.  Under PSW the drain is INTERLEAVED inside
+   vdp1_walls_flush, so it was testing itself against the SHAVED cap -- the
+   reserve was invisible to its own beneficiary, and since emission is far->near
+   the sprites it dropped were the NEAREST ones (console 2026-09-04: THp x12,
+   x40 = monsters vanishing at point-blank).  Same defect the 2026-08-21 round-2
+   note fixed for the split path; this is its PSW twin. */
+static int psw_thing_cap = 0;    /* the unshaved wall cap, set at the kick */
 static void psw_emit_subthings(int v0, int v1)
 {
     unsigned short cmd[16];
@@ -11167,7 +11238,7 @@ static void psw_emit_subthings(int v0, int v1)
     {
 	int v = (int)thing_acc[i].vis;
 	if (v < v0 || v >= v1) continue;
-	if (vdp1_wnext >= vdp1_wall_cap - THING_FLUSH_MARGIN) { psw_thing_drop++; continue; }
+	if (vdp1_wnext >= psw_thing_cap - THING_FLUSH_MARGIN) { psw_thing_drop++; continue; }
 	memset(cmd, 0, sizeof cmd);
 	cmd[0]  = 0x0008;                          /* FUNC_UserClip = visible box */
 	cmd[6]  = thing_acc[i].cx0; cmd[7]  = thing_acc[i].cy0;
@@ -13103,6 +13174,7 @@ extern "C" void sat_walls_kick(void)
 #endif
         int wall_cap_full = vdp1_wall_cap;
 #if SAT_PSW
+        psw_thing_cap = wall_cap_full;   /* r34: the interleaved drain guards on THIS */
         if (sat_psw_active && thing_acc_n > 0)
         {   /* same structural inversion as the split shave below: walls+flats stop below
                the DRAIN guard by the queue's bill -- 2 cmds/thing + 1 full-view clip

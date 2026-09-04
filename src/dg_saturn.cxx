@@ -3419,8 +3419,13 @@ static void fps_update(void)
                        emitter has neither a texture nor a centre texel and
                        draws NOTHING.  That is a hole with a name -- the first
                        question to ask of any "trous dans les plans" capture:
-                       d>0 = cache/slot famine, d0 = the holes are geometric. */
-                    snprintf(ovbuf, sizeof ovbuf, "P33 x%s e%d/%d K%d/%d F%s f%d d%d ",
+                       d>0 = cache/slot famine, d0 = the holes are geometric.
+                       r34b `d<denied>/<kill>`: `kill` = psw_kill_n = planes
+                       left on STANDBY after round C = whole-plane holes the
+                       BUDGET chose.  The two digits split the hole classes
+                       exhaustively: d>0 = famine, kill>0 = budget, both 0 =
+                       occlusion arithmetic (cull / band / mask). */
+                    snprintf(ovbuf, sizeof ovbuf, "P33 x%s e%d/%d K%d/%d F%s f%d d%d/%d ",
                              wdb,
                              psw_ef_ms_last > 99 ? 99 : psw_ef_ms_last,
                              psw_ew_ms_last > 99 ? 99 : psw_ew_ms_last,
@@ -3428,7 +3433,8 @@ static void fps_update(void)
                              psw_bk_live_last > 999 ? 999 : psw_bk_live_last,
                              sfb,
                              psw_flat_last  > 999 ? 999 : psw_flat_last,
-                             psw_flat_denied_last > 999 ? 999 : psw_flat_denied_last);
+                             psw_flat_denied_last > 999 ? 999 : psw_flat_denied_last,
+                             psw_kill_last > 999 ? 999 : psw_kill_last);
                 }
 #endif
             if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 13, ovbuf);
@@ -8200,6 +8206,9 @@ static void vdp1_floors_flush(void) {}
 static const unsigned int psw_slot_vram[PSW_FLAT_SLOTS] =
     { 0x25C7D000u, 0x25C7E000u, 0x25C7F000u, 0x25C7C000u,
       0x25C59E00u, 0x25C5AE00u, 0x25C5BE00u, 0x25C5CE00u };
+#define PSW_RESCUE_CREDIT 64         /* r34b: max commands round C may spend beyond the
+                                        bill ledger, funded by last frame's MEASURED
+                                        (billed - emitted) gap.  16 rescued planes. */
 #define PSW_THIN_U       32          /* r34: a leaf thinner than this (and longer than
                                         one tile) is a step tread / sill / ledge -- a
                                         ZONE, never a flat.  See sat_psw_sub_note_body. */
@@ -8284,6 +8293,9 @@ static int psw_sub_ovf = 0;          /* subs REJECTED by the recorder this walk 
                                         PSW_SUB_MAX again) */
 static int psw_spr_tail = 0x7fff;    /* vissprite watermark at the FIRST overflow */
 static int psw_flat_cmds = 0;
+static int psw_bill_prev = 0;        /* r34b: last frame's TOTAL flat bill (ftile).
+                                        (psw_bill_prev - psw_flat_last) = the measured
+                                        over-bill that funds round C's rescue credit. */
 static int psw_paint_idx = 176;  /* L+X flat paint, PER EMIT PATH (round 12 diagnostic):
                                     176 = RED full tile/exact strip, 4 = WHITE own-quad
                                     (small plane), 216 = ORANGE band+window, 250 =
@@ -11627,31 +11639,75 @@ static void vdp1_walls_flush(void)
             /* ROUND 33 -- round C: the STANDBY rescue moved HERE, from the
                budget's own leftover (near->far, +4 solid each) -- BOTH modes:
                on the slave the old emit-time ledger read raced the master's
-               wall plotting, and the only slack the ledger ever saw beyond
-               this leftover was the wall-DROP slack, marginal.  (This also
-               grants NEAR standbys first; the emit-time rescue served the
-               FARTHEST first, the wrong direction.)  Then, sf only: deal the
-               FINE reserve to the NEAREST tiled jobs -- fines no longer ride
-               the global headroom, a job pays its fines from its own
-               reservation (+9 = window + 8 strips). */
-            for (int k = 0; k < psw_sub_n && ftile + 4 <= limit; ++k)
+               wall plotting.  (This also grants NEAR standbys first; the
+               emit-time rescue served the FARTHEST first, the wrong
+               direction.)  Then, sf only: deal the FINE reserve to the
+               NEAREST tiled jobs -- fines no longer ride the global headroom,
+               a job pays its fines from its own reservation (+9 = window + 8
+               strips).
+               ROUND 34b -- THE RESCUE GOT ITS SLACK BACK.  r33 claimed "the
+               only slack the ledger ever saw beyond this leftover was the
+               wall-DROP slack, marginal".  That was WRONG, and it silently
+               disarmed the rescue: rounds A and B spend near->far until
+               `limit` is gone, so in any saturated frame `limit - ftile` is
+               ~0 and round C rescued NOTHING.  The slack the emit-time ledger
+               really saw was the flats' own BILL-vs-ACTUAL gap -- every bill
+               is an UPPER bound (2e+1 with e an over-estimate, a solid billed
+               4 that emits 1), and on console that gap is tens of commands.
+               It is measurable, so measure it: carry last frame's
+               (billed - emitted) as a CREDIT this frame.  Self-correcting
+               (over-spend shrinks next frame's credit), bounded by
+               PSW_RESCUE_CREDIT, and contained downstream by the r33c bank
+               belt + the emitter's own cap, so the worst case is far flats
+               dropped, never a bank overrun. */
+            {
+            int credit = psw_bill_prev - psw_flat_last;
+            int limC;
+            if (credit < 0) credit = 0;
+            if (credit > PSW_RESCUE_CREDIT) credit = PSW_RESCUE_CREDIT;
+            limC = limit + credit;
+            if (limC > PSW_FLAT_CAP) limC = PSW_FLAT_CAP;
+            /* ROUND 34b -- the mixed-ceiling refusal becomes PRECISE.  A solid
+               fan skips the per-tile probes, so where the plane is hidden
+               behind a SKY edge it would paint an unerasable patch over the
+               VDP2 sky (VDP1 sits above it and nothing repaints there) --
+               that reason is sound and stays.  But it was applied to EVERY
+               mixed ceiling, and "mixed" is the common case (any ceiling seen
+               past a nearer lower one), so every one of them that reached
+               standby stayed a whole-plane hole: the owner's "gros trous dans
+               les plafonds" (console 2026-09-04, with row 13 `d0` proving it
+               was not a dalle/slot famine).  The leak needs a sky ceiling
+               NEARER than the plane, and psw_sub is in near-first BSP order,
+               so a running OR over the subs already passed answers it exactly
+               -- and conservatively (nearer sky in view, not necessarily
+               overlapping).  No nearer sky => the fan cannot reach the sky =>
+               rescue it like a floor. */
+            int sky_near = 0;
+            for (int k = 0; k < psw_sub_n && ftile + 4 <= limC; ++k)
             {
                 int fl, cl, fdom;
-                if (!(psw_sub_flag[k] & 0xC0)) continue;
+                int had_sky = (psw_sub[k].clump < 0);
+                if (!(psw_sub_flag[k] & 0xC0)) { sky_near |= had_sky; continue; }
                 psw_sub_lumps(k, &fl, &cl, &fdom);
-                if ((psw_sub_flag[k] & 0x40) && fl >= 0 && ftile + 4 <= limit)
+                if ((psw_sub_flag[k] & 0x40) && fl >= 0 && ftile + 4 <= limC)
                 {
                     psw_sub_flag[k] = (unsigned char)((psw_sub_flag[k] & ~0x40) | 0x10);
                     ftile += 4; psw_kill_n--;
                     if (sf_ok) psw_sf_bill[k] += 4;
                 }
-                if ((psw_sub_flag[k] & 0x80) && cl >= 0 && !(psw_sub_flag[k] & 8)
-                    && ftile + 4 <= limit)
-                {   /* the b3 sky-hack refusal is mirrored from the old emitter */
+                if ((psw_sub_flag[k] & 0x80) && cl >= 0 && ftile + 4 <= limC
+                    && (!(psw_sub_flag[k] & 8) || !sky_near))
+                {
                     psw_sub_flag[k] = (unsigned char)((psw_sub_flag[k] & ~0x80) | 0x20);
                     ftile += 4; psw_kill_n--;
                     if (sf_ok) psw_sf_bill[k] += 4;
                 }
+                sky_near |= had_sky;
+            }
+            if (limC > limit) limit = limC;      /* the fine deal + belts below
+                                                    see the same ledger */
+            psw_flat_cap_dyn = limC;             /* or the emitter refuses the
+                                                    very commands just granted */
             }
             if (sf_ok)
             {
@@ -11690,6 +11746,7 @@ static void vdp1_walls_flush(void)
                     RP_AuxDispatch(psw_sf_body);
                 }
             }
+            psw_bill_prev = ftile;   /* r34b: what the NEXT frame's credit is measured against */
         }
         for (int i = wall_acc_n - 1; i >= tail; --i)
             VDP1_PLOT_WALL(i);   /* TAIL walls: the farthest of all, plot first */

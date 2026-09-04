@@ -803,6 +803,39 @@ StoreWallRange, curline/frontsector/backsector/rw_angle1 vivants).
 > console (5e disque). Attendu : escaliers de rebords partis, `THp x0`,
 > `d0`, fps inchangé ou légèrement meilleur (les zones fines coûtent 1 cmd
 > au lieu de plusieurs).
+>
+> **ROUND 34b (2026-09-04, cc258d9)** — 5e disque : `THp x0` ✔ (réserve
+> things soldée) et **`d0`** — la sonde ajoutée en r34 a payé immédiatement :
+> les gros trous de PLAFONDS ne sont **pas** une famine dalle/slot. Deux
+> défauts se composent, le second est une régression r33 de ma part.
+> **(1) LE REPÊCHAGE DU ROUND C ÉTAIT DÉSARMÉ EN SILENCE.** r33 a déplacé le
+> rescue standby de l'émetteur vers le round C en affirmant « la seule marge
+> que le ledger voyait au-delà de ce reliquat était la marge de DROP des
+> murs, marginale ». **Faux.** Les rounds A et B dépensent proche→loin
+> jusqu'à épuiser `limit`, donc dans toute frame saturée (console : `c456`
+> sur 487) `limit - ftile` ≈ 0 et le round C ne repêchait **RIEN** — sols
+> comme plafonds. La vraie marge que voyait l'ancien ledger, c'est l'écart
+> FACTURE-vs-RÉEL des flats : toute facture est une borne SUPÉRIEURE (2e+1
+> avec e surestimé ; un solide facturé 4 qui émet 1). C'est mesurable, donc
+> mesuré : l'écart (facturé − émis) de la frame précédente devient un CRÉDIT,
+> plafonné à `PSW_RESCUE_CREDIT`=64. Auto-correcteur (une sur-dépense réduit
+> le crédit suivant) et contenu par la ceinture de banque r33c ⇒ pire cas =
+> des flats lointains tombent, jamais un débordement.
+> **(2) LE REFUS DES PLAFONDS MIXTES ÉTAIT TROP LARGE.** Sa raison est
+> valide : un fan solide saute les sondes par-tuile, donc là où le plan est
+> caché derrière une arête de CIEL il peindrait une tache ineffaçable sur le
+> ciel VDP2 (VDP1 est au-dessus, rien ne repasse). Mais il s'appliquait à
+> TOUT plafond mixte — et « mixte » est le cas courant (tout plafond vu
+> par-dessus un plus bas plus proche) ⇒ chacun d'eux arrivé en standby
+> restait un trou de plan ENTIER. Or la fuite exige un plafond-ciel PLUS
+> PROCHE que le plan ; `psw_sub` étant en ordre BSP proche-d'abord, un OU
+> courant sur les subs déjà passés répond exactement, et de façon
+> conservatrice. Pas de ciel plus proche ⇒ repêché comme un sol.
+> **Sonde** : `d` devient `d<denied>/<kill>`. Les deux chiffres partitionnent
+> les classes de trous : `d>0` = famine cache/slot ; `kill>0` = le BUDGET a
+> choisi ; **les deux à 0 = arithmétique d'occlusion** (cull LOS / bandes
+> portales / masque) — c'est là qu'il faudra creuser ensuite. Pool 5,64 Ko ;
+> build normal bit-intact. NON validé console (6e disque).
 
 - **Polygones de sous-secteurs au level-load** (p_setup.c après :1234, PU_LEVEL zone
   LWRAM) : clip récursif du bbox map par les splitlines ancêtres (node_t x16/y16/dx16/

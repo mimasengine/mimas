@@ -368,7 +368,12 @@ try {
     # files changed (which otherwise leaves dg_saturn.o, and its __TIME__, stale).
     # core/p_setup.c is touched too: the M5 staging-order define lives there and make does
     # not track CFLAGS changes, so toggling -SegsFirst would otherwise leave a stale .o.
-    Invoke-Msys2 "cd '$rootMsys' && touch src/dg_saturn.cxx core/p_setup.c core/r_segs.c core/r_plane.c core/r_bsp.c$touchExtra && make $makeTarget $makeArgs"
+    # src/syscalls.c JOINED THE ALWAYS-TOUCHED LIST 2026-09-04 (PSW r34e): it now
+    # carries a `#if SAT_PSW` HEAP_SIZE gate (4096 normal / 2560 PSW).  Caught the
+    # moment it was added -- building -Psw then normal relinked the PSW syscalls.o
+    # and the "bit-intact" normal build read 62.83 KB of pool instead of 61.33.
+    # make tracks sources, not CFLAGS, so EVERY SAT_PSW-gated file has to be here.
+    Invoke-Msys2 "cd '$rootMsys' && touch src/dg_saturn.cxx src/syscalls.c core/p_setup.c core/r_segs.c core/r_plane.c core/r_bsp.c$touchExtra && make $makeTarget $makeArgs"
 
     # TLSF pre-flight: the HWRAM TLSF pool (_end..__heap_end in build/<CD_NAME>.map)
     # must keep >= 4 KB or SRL's tlsf_add_pool rejects it at boot -> black

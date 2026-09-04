@@ -696,17 +696,31 @@ static int  psw_ew_ms_last = 0;            /* round 28: tile-walk share of it, m
 static int  psw_eb_ms_last = 0, psw_eb_bord_last = 0;
 /* (round 33 cut the j and q brackets -- 5us/proj and 0-2 ms settled twice on
    console, and their frt pairs were self-bias on the new slave hot path) */
-static int  psw_bk_baked_last = 0, psw_bk_live_last = 0;   /* round 32 `K<a>/<b>` */
+static int  psw_bk_baked_last = 0, psw_bk_live_last = 0;   /* round 32 (off the row r34d) */
+/* ROUND 34d -- the CEILING-hole partition, row 13 `h<hid>/<zero>`.  With
+   `d0/0` proving neither famine nor budget, a lost ceiling can only be:
+   `hid`  = the pass was declared fully hidden at NOTE time (flag bit 2 set by
+            the projected-bbox portal-band test, the LOS ladder, or a
+            degenerate world-clipped polygon) -- an OCCLUSION verdict, and one
+            that deliberately never touches psw_kill_n;
+   `zero` = the pass survived every verdict, reached the emitter and emitted
+            ZERO commands (an all-hidden per-tile mask, an empty tile-class
+            run, an unprojectable fan).
+   h>0/0 => hunt the note verdicts.  h0/>0 => hunt the tile walk.  h0/0 =>
+   the ceilings ARE being emitted and the loss is downstream (VDP1 drop,
+   overpaint, geometry). */
+static int  psw_ceil_hid = 0, psw_ceil_zero = 0;
+static int  psw_ceil_hid_last = 0, psw_ceil_zero_last = 0;
 static int  psw_sf_join_ms_last = 0;       /* round 33 `F<join>/..`: master wait on the slave
                                               flat pass at the fence, ms */
 static int  psw_sf_drop_last = 0;          /* round 33 `F../<drop>`: flat cmds refused by a
                                               full per-sub index reservation */
-static int  sat_mp_wd_copr = -1;           /* r33c row 13 `x`: WHERE the plot was when the
-                                              4-field watchdog force-swapped (sticky; -1 =
-                                              never fired).  0..494 = logical wall-bank slot,
-                                              1000 = root/empty-bank region, 2000+n = FOREIGN
-                                              VRAM at n*4KB = the list wandered out of the
-                                              command banks. */
+/* (r33c's `x<wd>` COPR-at-watchdog probe CUT in r34e -- it answered its
+   question: `x-` on every capture of two console discs, i.e. the watchdog
+   never fires and the r33c bank overrun is dead.  Row 8 `VD1 ... w<n>` still
+   counts force-swaps cumulatively, so the regression detector survives for
+   free; only the WHERE decode is gone.  Cut for pool: the r34e build measured
+   4.81 KB, level with the 4.8 KB boot floor.) */
 static int  sat_psw_sf = 1;                /* round 33 master switch: flats emit on the slave
                                               SH-2.  Latched OFF for the session if the flat
                                               body ever wedges at the fence (row 13 `F!`). */
@@ -3399,21 +3413,13 @@ static void fps_update(void)
                    FRT (forced phi/128 at body entry).  `F!` = the flat body
                    wedged once and flats are back on the master for the
                    session (expect e/B/K to keep reading, F frozen at !). */
-                {   /* r33c: `B<ms>/<bord>` yields its column to `x<wd-slot>`
-                       for the wedge hunt (the bake stays readable via K; the
-                       eb latches keep running unprinted). */
-                    char sfb[10], wdb[8];
+                {
+                    char sfb[10];
                     if (!sat_psw_sf) { sfb[0] = '!'; sfb[1] = 0; }
                     else if (!psw_sf_arena_last) { sfb[0] = '-'; sfb[1] = 0; }
                     else snprintf(sfb, sizeof sfb, "%d/%d",
                                   psw_sf_join_ms_last > 99 ? 99 : psw_sf_join_ms_last,
                                   psw_sf_drop_last > 999 ? 999 : psw_sf_drop_last);
-                    if (sat_mp_wd_copr < 0)          { wdb[0] = '-'; wdb[1] = 0; }
-                    else if (sat_mp_wd_copr == 1000) { wdb[0] = 'E'; wdb[1] = 0; }
-                    else if (sat_mp_wd_copr >= 2000)
-                        snprintf(wdb, sizeof wdb, "?%d", sat_mp_wd_copr - 2000);
-                    else
-                        snprintf(wdb, sizeof wdb, "%d", sat_mp_wd_copr);
                     /* r34 `d` = PLANES SKIPPED ENTIRELY (psw_flat_denied): no
                        texture slot AND the flat dalle not resident, so the
                        emitter has neither a texture nor a centre texel and
@@ -3425,12 +3431,16 @@ static void fps_update(void)
                        BUDGET chose.  The two digits split the hole classes
                        exhaustively: d>0 = famine, kill>0 = budget, both 0 =
                        occlusion arithmetic (cull / band / mask). */
-                    snprintf(ovbuf, sizeof ovbuf, "P33 x%s e%d/%d K%d/%d F%s f%d d%d/%d ",
-                             wdb,
+                    /* r34d: `K<baked>/<live>` yields its column to the CEILING
+                       partition `h<hid>/<zero>` -- the bake is settled (console
+                       K61/16, K100/14 across the r34 discs) and the ceiling
+                       holes are the live question.  The K latches keep running,
+                       unprinted. */
+                    snprintf(ovbuf, sizeof ovbuf, "P34 e%d/%d h%d/%d F%s f%d d%d/%d ",
                              psw_ef_ms_last > 99 ? 99 : psw_ef_ms_last,
                              psw_ew_ms_last > 99 ? 99 : psw_ew_ms_last,
-                             psw_bk_baked_last > 999 ? 999 : psw_bk_baked_last,
-                             psw_bk_live_last > 999 ? 999 : psw_bk_live_last,
+                             psw_ceil_hid_last > 999 ? 999 : psw_ceil_hid_last,
+                             psw_ceil_zero_last > 999 ? 999 : psw_ceil_zero_last,
                              sfb,
                              psw_flat_last  > 999 ? 999 : psw_flat_last,
                              psw_flat_denied_last > 999 ? 999 : psw_flat_denied_last,
@@ -8446,6 +8456,18 @@ struct psw_mlru
 {
     short subnum; unsigned char pass, vis;
     int h, vx, vy, vz;
+    int bxy, bwh;      /* r34e: the TILING the mask is indexed against, packed
+                          like psw_maskjob (txa<<16|tya, tw<<16|th).  The mask
+                          is consumed POSITIONALLY (bit ti = tile (ty-tya)*tw +
+                          (tx-txa)), and its bbox comes from the polygon clipped
+                          against the two 45-degree frustum lines -- which ROTATE
+                          with the view.  The old key held only the eye POSITION,
+                          so turning in place kept the hit and re-indexed a stale
+                          word onto a different grid.  Latent (the verifiers
+                          refuted it as the console symptom: it needs stationary
+                          AND rotating, and the 8 direct-mapped slots are
+                          rewritten many times a frame) -- but 64 bytes to close
+                          a real hole class is the cheapest fix in this file. */
     unsigned int msk, stamp;
 };
 static struct psw_mlru psw_mlru_t[PSW_MLRU_N];
@@ -8542,7 +8564,7 @@ static void sat_psw_sub_note_body(int subnum, int fh, int ch, int fpic,
 		h = ch; psn = -1; bit = 4;
 	    }
 	    nn = psw_plane_poly(subnum, psn > 0 ? viewz - h : h - viewz, psn, cxv, cyv);
-	    if (nn < 3) { psw_sub_flag[k] |= bit; continue; }
+	    if (nn < 3) { psw_sub_flag[k] |= bit; if (pass) psw_ceil_hid++; continue; }
 	    if (psw_thin) psw_sub_flag[k] |= (pass == 0) ? 0x10 : 0x20;   /* r34: one quad */
 	    /* round 21: the ladder is back for FLOORS too -- round 20 removed it
 	       arguing fill is free on an idle VDP1, but every overdrawn tile is
@@ -8567,7 +8589,7 @@ static void sat_psw_sub_note_body(int subnum, int fh, int ch, int fpic,
 		    if (sy < yt) yt = sy; if (sy > yb) yb = sy;
 		}
 		if (okp && R_PswBandBoxHidden(xl, xr, yt, yb))
-		{ psw_sub_flag[k] |= bit; continue; }
+		{ psw_sub_flag[k] |= bit; if (pass) psw_ceil_hid++; continue; }
 	    }
 	    tt = 0;
 	    psw_plane_los_cull(cxv, cyv, nn, h, psn, &tt);
@@ -8607,6 +8629,8 @@ static void sat_psw_sub_note_body(int subnum, int fh, int ch, int fpic,
 		                                      | (unsigned)pass) & (PSW_MLRU_N - 1)];
 		    if (L->subnum == (short)subnum && L->pass == (unsigned char)pass
 		        && L->h == h && L->vx == viewx && L->vy == viewy && L->vz == viewz
+		        && L->bxy == ((txa << 16) | (tya & 0xffff))
+		        && L->bwh == ((tw << 16) | (th & 0xffff))
 		        && (psw_frame_no - L->stamp) <= PSW_MASK_AGE)
 		    {
 			if (pass == 0) psw_sub_fmask[k] = L->msk;
@@ -8640,6 +8664,8 @@ static void sat_psw_sub_note_body(int subnum, int fh, int ch, int fpic,
 			L->subnum = (short)subnum; L->pass = (unsigned char)pass;
 			L->vis = (unsigned char)vis; L->h = h;
 			L->vx = viewx; L->vy = viewy; L->vz = viewz;
+			L->bxy = (txa << 16) | (tya & 0xffff);   /* r34e */
+			L->bwh = (tw << 16) | (th & 0xffff);
 			L->msk = msk; L->stamp = psw_frame_no;
 		    }
 		}
@@ -9827,7 +9853,28 @@ static void psw_emit_plane_tiles(int slot, unsigned short colr,
 		int v0 = (-(wyT >> 16)) & 63;
 		int vh = (wyT - wyB) >> 16;
 		int vmax = 64 + psw_cur_tall * 64;
-		if (uw > 0 && vh > 0 && u0 + uw <= 64 && v0 + vh <= vmax)
+		/* ROUND 34e -- the own-quad fast path may not take an OCCLUSION
+		   verdict over more than ONE grid tile.  Its `hid` below is the
+		   owner's 5-point coverage spec ("si les quatre coins et le
+		   milieu sont couverts, elle ne sert a rien"), which he gave for
+		   one 64x64 TILE: over a tile the occlusion boundary is
+		   near-monotone in depth, so the 5-point AND is near-exact.  But
+		   this branch merges up to THREE tile rows (v0 + vh <= vmax,
+		   vmax = 64 + tall*64 = up to 192) into one piece and abandons
+		   the WHOLE plane on a single positive -- verbatim the
+		   whole-plane cull round 20 deleted as unsound (see the note at
+		   psw_plane_los_cull: "console: a triangle-sized hole with k0 d0
+		   r0 ... sampling points is NOT a proof that a REGION is
+		   hidden").  A non-monotone occluder -- a window, a gap between
+		   two low rooms -- fits entirely between the samples of a
+		   192-deep piece.  The grid walk already enforces the one-tile
+		   rule for mixed planes (strips are gated on cull_h ==
+		   0x7fffffff); the fast path now obeys it too.  Cost: a MIXED
+		   multi-row axis piece emits 2-3 commands instead of 1 and is
+		   culled per tile.  Unmixed planes -- the strip case rounds
+		   24/25 were built for -- are untouched. */
+		if (uw > 0 && vh > 0 && u0 + uw <= 64 && v0 + vh <= vmax
+		    && (cull_h == 0x7fffffff || (by0 >> 22) == ((by1 - 1) >> 22)))
 		{
 		    int hid = 0;
 		    if (cull_h != 0x7fffffff)
@@ -10213,6 +10260,14 @@ static void psw_emit_plane_tiles(int slot, unsigned short colr,
 						{
 						    int v0b = v0 + s * 8, v1b;
 						    if (v0b >= vend) break;
+						    /* r34e: this arm costs 2 cmds
+						       per band, up to 16 against a
+						       +9 fine reserve -- the
+						       overspend that starved the
+						       ceiling pass of the SHARED
+						       job window.  Stop at the
+						       window edge, not past it. */
+						    if (psw_cmd_left() < 2) break;
 						    v1b = v0b + 8; if (v1b > vend) v1b = vend;
 						    {
 							int gy1b = y1 - (v0b << 16), gy0b = y1 - (v1b << 16);
@@ -10767,6 +10822,7 @@ static void psw_mask_fence(void)
 		L->subnum = (short)jsub;      L->pass = (unsigned char)pass;
 		L->vis = (unsigned char)vis;  L->h = J->h;
 		L->vx = viewx; L->vy = viewy; L->vz = viewz;
+		L->bxy = J->bxy; L->bwh = J->bwh;        /* r34e: already packed */
 		L->msk = msk;  L->stamp = psw_frame_no;
 	    }
 	}
@@ -10909,8 +10965,35 @@ static void psw_emit_subflats(int k)
     {
     int fl, cl, fdom;
     psw_sub_lumps(k, &fl, &cl, &fdom);
+    /* ROUND 34e -- THE FLOOR PASS WAS EATING THE CEILING'S RESERVATION.  In
+       slave mode a sub's floor and ceiling share ONE index window: the
+       pre-pass bills them together into psw_sf_bill[k] and psw_cmd_left() is
+       the whole job's remaining room.  Pass 0 (FLOOR) runs first and can
+       overspend its own share -- the fine strips are the worst offender (the
+       V-band arm emits up to 8 x (window + quad) = 16 commands against a +9
+       reserve) -- and every command it takes beyond its grant comes out of the
+       CEILING's.  Pass 1 then finds psw_cmd_left() <= 0 and every emitter
+       returns at its guard: the ceiling emits NOTHING, with no slot denied and
+       no budget verdict taken.  That is a whole-plane ceiling hole reading
+       `d0/0`, ceiling-specific BY CONSTRUCTION (the floor is pass 0 and never
+       starves), large, and deterministic at a fixed viewpoint -- the owner's
+       two stable spots.  Withhold the ceiling's round-A guarantee from the
+       floor pass and hand it back, plus whatever the floor left, at pass 1. */
+    int cres = 0;
+    if (psw_sf_mode && cl >= 0 && !(psw_sub_flag[k] & (4 | 0x80)))
+    {
+	int ce_ = (psw_sub_flag[k] & 0x20) ? 4 : 2 * (int)psw_sub_ce[k] + 1;
+	cres = (ce_ < 4) ? ce_ : 4;
+	if (psw_sf_cur + cres > psw_sf_end) cres = psw_sf_end - psw_sf_cur;
+	if (cres < 0) cres = 0;
+	psw_sf_end -= cres;                  /* invisible to the floor pass */
+    }
     for (int pass = 0; pass < 2; ++pass)
     {
+	if (pass == 1) { psw_sf_end += cres; cres = 0; }   /* r34e: give it back --
+	                   FIRST statement, so every `continue` in pass 0 still
+	                   restores the window (the JP-pad loop reads psw_sf_end
+	                   again after this function returns) */
 	int ph, psign, lump;
 	if (pass == 0)                                  /* FLOOR */
 	{
@@ -10979,6 +11062,7 @@ static void psw_emit_subflats(int k)
 	    n = psw_plane_poly(sn, ph, psign, cx, cy);  /* world-clipped: no offscreen tail */
 	    if (n < 3) continue;
 	{
+	    int zc0 = psw_flat_cmds;   /* r34d `h../<zero>`: did this pass emit anything? */
 	    /* solid verdict FIRST (round 16): a solid plane needs the centre-texel
 	       peek, not a texture slot -- grabbing one anyway toothed the 4-slot
 	       LRU away from the near tiled flats.  fanbit folds the standby-rescue
@@ -11091,6 +11175,7 @@ static void psw_emit_subflats(int k)
 		    }
 		}
 	    }
+	    if (pass && psw_flat_cmds == zc0) psw_ceil_zero++;   /* r34d partition */
 	}
 	}
     }
@@ -11484,6 +11569,7 @@ static void vdp1_walls_flush(void)
         vdp1_stage_begin(); /* ROUND 28: the whole append stream below rides the
                                SlaveDriver staging buffer; the kick fences it */
         psw_flat_cmds = 0; psw_flat_denied = 0; psw_punch_cmds = 0;
+        psw_ceil_zero = 0;                   /* r34d (psw_ceil_hid resets at note) */
         psw_band_n = 0; psw_fanq_n = 0; psw_fine_cmds = 0;
         /* round 30: ew-interior probes reset at flush ENTRY (j+q cut in r33) */
         psw_eb_frt = 0; psw_eb_bord = 0;
@@ -11574,7 +11660,7 @@ static void vdp1_walls_flush(void)
                (psw_punch_frame was resolved in the walls-yield scan.) */
             for (int k = 0; k < psw_sub_n; ++k)
             {
-                int fl, cl, fdom, dropped = 0;
+                int fl, cl, fdom;   /* r34e: `dropped` retired -- see below */
                 psw_sub_lumps(k, &fl, &cl, &fdom);
                 if (fl < 0 && cl < 0 && !fdom) continue;
                 /* punch paper: UNCONDITIONAL 4 (round 16) -- the emitter never
@@ -11593,7 +11679,7 @@ static void vdp1_walls_flush(void)
                           : 2 * (int)psw_sub_fe[k] + 1;
                     int m = (e < 4) ? e : 4;
                     if (ftile + m <= limit) { ftile += m; if (sf_ok) psw_sf_bill[k] += (unsigned short)m; }
-                    else { psw_sub_flag[k] |= 0x40; dropped = 1; }   /* STANDBY: rescue at emit */
+                    else { psw_sub_flag[k] |= 0x40; psw_kill_n++; }  /* STANDBY */
                 }
                 if (cl >= 0 && !(psw_sub_flag[k] & 4))
                 {
@@ -11601,9 +11687,14 @@ static void vdp1_walls_flush(void)
                           : 2 * (int)psw_sub_ce[k] + 1;
                     int m = (e < 4) ? e : 4;
                     if (ftile + m <= limit) { ftile += m; if (sf_ok) psw_sf_bill[k] += (unsigned short)m; }
-                    else { psw_sub_flag[k] |= 0x80; dropped = 1; }
+                    else { psw_sub_flag[k] |= 0x80; psw_kill_n++; }
                 }
-                if (dropped) psw_kill_n++;
+                /* ROUND 34e -- `kill` now counts PLANES, not subsectors.  It
+                   was incremented ONCE per sub even when BOTH passes dropped,
+                   while round C decrements once per RESCUED PASS -- so a sub
+                   that lost both and got one back read 0, and `kill 0` stopped
+                   meaning "nothing on standby".  That is the digit the whole
+                   d0/0 elimination rests on, so it has to pair 1:1. */
             }
             for (int k = 0; k < psw_sub_n; ++k)
             {   /* round B: upgrades + slots, near->far.  A pass already billed
@@ -11661,7 +11752,19 @@ static void vdp1_walls_flush(void)
                belt + the emitter's own cap, so the worst case is far flats
                dropped, never a bank overrun. */
             {
-            int credit = psw_bill_prev - psw_flat_last;
+            /* ROUND 34c -- THE CREDIT IS ONLY REAL WHEN THE BILL IS NOT.  On a
+               MASTER-inline frame the emitter spends ACTUALS, so an over-bill
+               is free headroom and the credit is honest.  On a SLAVE frame the
+               bill IS the bank: the master reserves bill command SLOTS per sub
+               and the slave pads the unused tail with JP-skips, so an inflated
+               bill consumes real VDP1 slots and the r33c bank belt then refuses
+               whole jobs -- and the k loop walks far->near, so the jobs it
+               refuses are the NEAREST.  Console 2026-09-04 read `F15/66` on the
+               very first r34b disc (the disc before it read `F../0` on every
+               capture): 66 commands of near flats thrown away to fund a rescue
+               that the same frame's `kill 0` proves was not needed.  Credit
+               only where over-billing is genuinely free. */
+            int credit = sf_ok ? 0 : (psw_bill_prev - psw_flat_last);
             int limC;
             if (credit < 0) credit = 0;
             if (credit > PSW_RESCUE_CREDIT) credit = PSW_RESCUE_CREDIT;
@@ -11714,26 +11817,55 @@ static void vdp1_walls_flush(void)
                 {
                     int fres = limit - ftile;
                     if (fres > PSW_FINE_CAP) fres = PSW_FINE_CAP;
+                    /* ROUND 34c -- THE JOB PACKER RATIONED THE WRONG END.  All
+                       three of its limits (PSW_SF_JOB_CAP, the arena prefix-sum
+                       belt, and the bank belt in the k loop) were applied while
+                       walking in EMISSION order, which is far->near -- so each
+                       of them kept the FARTHEST jobs and threw away the
+                       NEAREST, the exact inversion the command, tile, slot and
+                       dalle budgets all had and all had fixed.  Build the list
+                       NEAR-first so the job cap keeps the near field, then
+                       reverse it into emission order; choose which jobs get
+                       arena space NEAR-first too, and only then lay out the
+                       prefix sums over the survivors. */
                     psw_sf_njobs = 0;
-                    for (int k = psw_sub_n - 1; k >= 0; --k)   /* emission order */
+                    for (int k = 0; k < psw_sub_n; ++k)        /* NEAR -> far */
                         if (psw_sf_bill[k] > 0 && psw_sf_njobs < PSW_SF_JOB_CAP)
                         {
                             struct psw_sfjob *J = &psw_sf_jobs[psw_sf_njobs++];
                             J->k = (short)k; J->bill = psw_sf_bill[k];
                             J->aoff = 0; J->vbase = 0xFFFFu;
                         }
+                    for (int a = 0, b = psw_sf_njobs - 1; a < b; ++a, --b)
+                    {   /* -> emission order (far first), near field already in */
+                        struct psw_sfjob t = psw_sf_jobs[a];
+                        psw_sf_jobs[a] = psw_sf_jobs[b]; psw_sf_jobs[b] = t;
+                    }
                     for (int j = psw_sf_njobs - 1; j >= 0 && fres >= 9; --j)
                         if (psw_sf_jobs[j].bill >= 5)      /* has a tiled pass */
                         { psw_sf_jobs[j].bill += 9; ftile += 9; fres -= 9; }
-                    {   /* arena offsets = prefix sums; belt on the staging size */
-                        int ao = 0;
-                        for (int j = 0; j < psw_sf_njobs; ++j)
+                    {   /* arena space granted NEAR->far, then prefix sums over
+                           the survivors (a refused job is dropped from the list,
+                           never left with bill 0 -- the slave would still walk
+                           its whole plane just to have every command refused) */
+                        int room = PSW_FLAT_CAP, ao = 0, nj = 0;
+                        for (int j = psw_sf_njobs - 1; j >= 0; --j)
                         {
-                            if (ao + (int)psw_sf_jobs[j].bill > PSW_FLAT_CAP)
-                            { psw_sf_njobs = j; break; }
-                            psw_sf_jobs[j].aoff = (unsigned short)ao;
-                            ao += (int)psw_sf_jobs[j].bill;
+                            if ((int)psw_sf_jobs[j].bill <= room)
+                                room -= (int)psw_sf_jobs[j].bill;
+                            else
+                            { psw_sf_res_drop += psw_sf_jobs[j].bill;
+                              psw_sf_jobs[j].bill = 0; }
                         }
+                        for (int j = 0; j < psw_sf_njobs; ++j)
+                            if (psw_sf_jobs[j].bill > 0)
+                            {
+                                psw_sf_jobs[nj] = psw_sf_jobs[j];
+                                psw_sf_jobs[nj].aoff = (unsigned short)ao;
+                                ao += (int)psw_sf_jobs[nj].bill;
+                                nj++;
+                            }
+                        psw_sf_njobs = nj;
                     }
                 }
                 if (psw_sf_njobs > 0)
@@ -11803,6 +11935,8 @@ static void vdp1_walls_flush(void)
            current, so this is also correct on master-fallback frames). */
         psw_flat_last = (int)psw_ucr32((const volatile void *)&psw_flat_cmds);
         psw_flat_denied_last = (int)psw_ucr32((const volatile void *)&psw_flat_denied);
+        psw_ceil_zero_last = (int)psw_ucr32((const volatile void *)&psw_ceil_zero);
+        psw_ceil_hid_last = psw_ceil_hid; psw_ceil_hid = 0;   /* r34d: note-side, master */
         psw_kill_last = (int)psw_ucr32((const volatile void *)&psw_kill_n);
         psw_punch_last = (int)psw_ucr32((const volatile void *)&psw_punch_cmds);
         psw_band_last = (int)psw_ucr32((const volatile void *)&psw_band_n);
@@ -12012,31 +12146,7 @@ static void sat_mp_fence(void)
         {
             unsigned short c = VDP1_COPR;
             if (c == sat_mp_end_ca || c == sat_mp_copr_kick) break;
-            if ((vbl_count - t0) >= SAT_MP_WD_VBL)
-            {
-                sat_mp_wd++;
-#if SAT_PSW
-                {   /* r33c probe: decode COPR to a logical slot at the moment
-                       the watchdog gives up -- row 13 `x` answers WHERE a
-                       never-finishing plot is stuck (reserved flat range?
-                       walls? foreign VRAM = unterminated list wandering). */
-                    unsigned int off = (unsigned int)c << 3;
-                    int v = 2000 + (int)(off >> 12);
-                    if (off < 0x80u) v = 1000;
-                    for (int b = 0; b < 2; ++b)
-                    {
-                        unsigned int wb = VDP1_BANK[b] - VDP1_VRAM_BASE;
-                        unsigned int xb = VDP1_BANK_EXT[b] - VDP1_VRAM_BASE;
-                        if (off >= wb && off < wb + (unsigned int)(VDP1_BANK_SPLIT + 1) * 32u)
-                            v = (int)((off - wb) >> 5);
-                        else if (off >= xb && off < xb + (unsigned int)VDP1_BANK_EXT_CMDS * 32u)
-                            v = VDP1_BANK_SPLIT + (int)((off - xb) >> 5);
-                    }
-                    sat_mp_wd_copr = v;
-                }
-#endif
-                break;
-            }
+            if ((vbl_count - t0) >= SAT_MP_WD_VBL) { sat_mp_wd++; break; }
         }
         sat_mp_gate_ms = (int)(DG_GetTicksMs() - g0);   /* >0 = the plot made the frame WAIT;
                                                            feeds the emission budget back-off

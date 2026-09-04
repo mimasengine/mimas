@@ -82,6 +82,20 @@ char **environ = __env;
                                     menu's fopen (core/m_menu.c:513).
                                       History: 88->32->24->20->18->16->12->4 KB.
                                     WALL_ACC_MAX stays 128 -- never rob the wall budget for the pool. */
+#if SAT_PSW
+/* SATURN 2026-09-04 (PSW round 34e) -- the PSW build ONLY takes another 1536 B,
+   on the same kind of measurement that justified 12 -> 4: console captures of
+   the r34 discs read `hp1256/4096!0` on row 10, i.e. a 1256 B peak with zero
+   sbrk refusals.  2560 B is still ~2x that peak and above the ENUMERATED 1648 B.
+   The trade is forced and one-directional: the PSW painter's pool had fallen to
+   4.81 KB, level with the 4.8 KB MEASURED boot-loop floor, while the heap sat at
+   3.3x headroom -- moving slack from the over-provisioned side to the starving
+   one.  Gated on SAT_PSW so the validated normal build stays bit-identical
+   (verified: 61.33 KB pool, 22,233,456 bytes).  `!` on row 10 is still the only
+   warning, and it now has less room: raise this FIRST if one ever appears. */
+#undef HEAP_SIZE
+#define HEAP_SIZE (2560)
+#endif
 static char heap[HEAP_SIZE] __attribute__((aligned(8)));
 static char *heap_end = heap;
 

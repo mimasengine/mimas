@@ -957,6 +957,26 @@ StoreWallRange, curline/frontsector/backsector/rw_angle1 vivants).
 > auto-descriptive. Application de [[interbuild-perf-noise]] : exiger un
 > toggle vif, les photos build-contre-build ne sont pas admissibles.
 > Pool 6,33 Ko. NON validé console (10e disque).
+>
+> **ROUND 37 (2026-09-06, 7e57c97 + core 71eef15)** — verdict de l'A/B R+X :
+> **le triangle ne se referme dans AUCUN des quatre modes, mais certaines
+> parties du plafond au spawn SE REFERMENT.** Deux défauts distincts ; le
+> triangle n'a jamais été dans la classe chassée.
+> **Le triangle = effondrement au LOAD.** `psw_leaf_poly` découpe la cellule
+> BSP par chaque seg du sous-secteur en gardant le côté du secteur avant. Un
+> seg qui ne tourne pas ainsi (mal orienté, longueur nulle après les splits,
+> ou numériquement limite sur une feuille déjà pincée) élimine la cellule
+> ENTIÈREMENT : `psw_pvn` → 0, plus aucun polygone, sol ET plafond refusés au
+> note pour toute la vie du niveau. C'est le « c'est du calcul » du round 22 —
+> un verdict de load, d'où l'immunité à tout A/B runtime.
+> **Fix : le seg est SAUTÉ, pas obéi.** Garder la cellule ne peut que rendre le
+> polygone trop grand, et un flat trop grand est repeint par la géométrie plus
+> proche (même troc que l'overflow de path). Un trou n'est pas rattrapable, un
+> overdraw si. Sonde `s<segskip>` en fin de row 13, CONSTANTE PAR NIVEAU.
+> Fermé au passage : `psw_plane_poly` copiait `psw_pvn[sn]` sommets dans des
+> tableaux `PSW_FAN_MAX` sans cap à lui (débordement de pile latent).
+> Marqueur `P37<lettre>`. Pool 6,11 Ko ; build normal bit-intact. NON validé
+> console (11e disque).
 
 - **Polygones de sous-secteurs au level-load** (p_setup.c après :1234, PU_LEVEL zone
   LWRAM) : clip récursif du bbox map par les splitlines ancêtres (node_t x16/y16/dx16/

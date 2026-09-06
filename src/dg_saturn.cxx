@@ -672,6 +672,9 @@ extern "C" int sat_psw_wcull;   /* core r_segs.c: tier quads culled by the porta
 /* round 36: what the note hook really KEPT for the subsector being stored, read
    by the portal-band fold so it never claims a region the painter refused */
 extern "C" int sat_psw_fold_cvis, sat_psw_fold_fvis;
+/* round 37: segs whose keep-line would have emptied their own leaf's cell at
+   level build -- skipped instead of obeyed.  Row 13 `s<n>`, constant per level. */
+extern "C" int sat_psw_segskip;
 static int sat_psw_t_last = 0, sat_psw_r_last = 0;  /* frame-boundary snapshot (overlay row 13) */
 /* step 2: per-subsector flats (recorder installed at init; machinery near vdp1_walls_flush) */
 extern "C" void (*sat_psw_sub_hook)(int subnum, int fh, int ch, int fpic,
@@ -3462,7 +3465,7 @@ static void fps_update(void)
                        K61/16, K100/14 across the r34 discs) and the ceiling
                        holes are the live question.  The K latches keep running,
                        unprinted. */
-                    snprintf(ovbuf, sizeof ovbuf, "P36%c e%d/%d h%d.%d/%d F%s f%d d%d/%d ",
+                    snprintf(ovbuf, sizeof ovbuf, "P37%c e%d/%d h%d.%d/%d F%s f%d d%d/%d s%d ",
                              "abcd"[sat_psw_ceilab & 3],   /* r36b: pad R+X state */
                              psw_ef_ms_last > 99 ? 99 : psw_ef_ms_last,
                              psw_ew_ms_last > 99 ? 99 : psw_ew_ms_last,
@@ -3472,7 +3475,8 @@ static void fps_update(void)
                              sfb,
                              psw_flat_last  > 999 ? 999 : psw_flat_last,
                              psw_flat_denied_last > 999 ? 999 : psw_flat_denied_last,
-                             psw_kill_last > 999 ? 999 : psw_kill_last);
+                             psw_kill_last > 999 ? 999 : psw_kill_last,
+                             sat_psw_segskip > 999 ? 999 : sat_psw_segskip);
                 }
 #endif
             if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 13, ovbuf);
@@ -9227,6 +9231,9 @@ static int psw_plane_poly(int sn, int ph, int psign, int *ox, int *oy)
     unsigned char ta[PSW_FAN_MAX], tb[PSW_FAN_MAX];
     int n0 = psw_pvn[sn], i, n;
     if (n0 < 3) return 0;
+    if (n0 > PSW_FAN_MAX) n0 = PSW_FAN_MAX;   /* r37: wx/wy are FAN_MAX deep and the
+                                                 core cap (20) is the only thing that
+                                                 has been keeping this copy in bounds */
     for (i = 0; i < n0; ++i)
     { wx[i] = psw_pvx[psw_pvi[sn] + i]; wy[i] = psw_pvy[psw_pvi[sn] + i];
       ta[i] = 0; }
@@ -15196,9 +15203,11 @@ static void poll_pad(void)
        P36a/b/c/d, see sat_psw_ceilab).  R+X was freed 2026-08-28 when the
        wall-fill rung was baked; predicate `TL && !TR`, disjoint from L+X's
        `!TL && TR` and split-X's `TL && TR`. */
+#if SAT_PSW
     if ((cur & PER_DGT_TL) && !(cur & PER_DGT_TR)
         && (changed & PER_DGT_TX) && !(cur & PER_DGT_TX))
         sat_psw_ceilab = (sat_psw_ceilab + 1) & 3;
+#endif
     /* (Pad L+Down SKY/FLOOR BOUNDARY MODE REMOVED 2026-08-26 -- baked at 1, the shipped fix
        (window before the fence, map deferred to just after it).  0 was the A/B reference and 2
        the geometric fallback "if 1 is not enough"; 1 was enough.  L+Down is free.) */

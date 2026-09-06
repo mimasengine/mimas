@@ -977,6 +977,24 @@ StoreWallRange, curline/frontsector/backsector/rw_angle1 vivants).
 > tableaux `PSW_FAN_MAX` sans cap à lui (débordement de pile latent).
 > Marqueur `P37<lettre>`. Pool 6,11 Ko ; build normal bit-intact. NON validé
 > console (11e disque).
+>
+> **ROUND 38 (2026-09-06, e679a9d)** — round 37 raté aussi. Le propriétaire
+> propose la bonne instrumentation : **peindre chaque plan refusé dans la
+> couleur de son site de refus**. Un compteur dit combien sans dire lequel ni
+> où ; le marqueur rend le trou auto-descriptif (forme = le plan, couleur = la
+> cause).
+> **Pad L+DOWN, row 13 `P38.<digit>`** : 0 shipping · **1 FLATS SUR LE MASTER**
+> (passe slave OFF — le bisect « pas là avant le déport au slave » devient un
+> toggle : ce qui disparaît condamne le chemin r33, ce qui reste l'innocente)
+> · **2** + plafonds refusés peints · **3** + sols refusés aussi (invisibles en
+> shipping sous RBG0). Couleurs : 176 ROUGE clip monde · 112 VERT bandes ·
+> 198 BLEU standby · 163 JAUNE denied · 216 ORANGE non projetable · 250
+> MAGENTA émis zéro. Trou NOIR = refusé par aucun site ⇒ perte en aval. Le
+> ROUGE retombe sur la feuille BRUTE (donc il prouve que la feuille existe).
+> Payé : A/B R+X supprimé, `e<ef>/<ew>` retiré de la row, `HEAP_SIZE`
+> 2560→1792 sur slack mesuré (`hp1256/2560!0`) ⇒ pool 4,95→5,70 Ko contre le
+> plancher 4,8. Surveiller `!` sur row 10. Build normal bit-intact. NON validé
+> console (12e disque).
 
 - **Polygones de sous-secteurs au level-load** (p_setup.c après :1234, PU_LEVEL zone
   LWRAM) : clip récursif du bbox map par les splitlines ancêtres (node_t x16/y16/dx16/

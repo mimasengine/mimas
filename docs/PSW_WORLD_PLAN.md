@@ -1012,6 +1012,24 @@ StoreWallRange, curline/frontsector/backsector/rw_angle1 vivants).
 > `s0` console = le fix seg-skip du round 37 ne se déclenche jamais.
 > Pool 5,19 Ko contre le plancher 4,8. Build normal bit-intact. NON validé
 > console (13e disque).
+>
+> **ROUND 39 (2026-09-06, 493c79d)** — audit à 12 agents du chemin r33 ; TROIS
+> auditeurs indépendants convergent, le vérificateur adverse ne casse pas.
+> **LA PASSE SOL MANGEAIT LA DOTATION DU PLAFOND.** `psw_sf_bill[k]` est la
+> SOMME sol+plafond et le slave la donne à UNE fenêtre par job, sol d'abord
+> (en mode slave `psw_cmd_left()` EST la fenêtre). r34e retenait une réserve
+> plafond mais la plafonnait à 4, alors que le round B facture au plafond son
+> `2*ce+1` complet (17, 25, 33) : le sol dépensait toute la montée en gamme et
+> le plafond rentrait avec 4 commandes pour 16 tuiles. La marche de tuiles ne
+> s'interrompait même pas (son `stop` suit le cap GLOBAL, jamais la fenêtre).
+> Exempt sur le master PAR CONSTRUCTION — d'où le résultat console.
+> **Correctifs** : `psw_sf_cbill[k]` (moitié plafond seule) devient la réserve
+> retenue ; la loi du solide consulte la FENÊTRE (dégrade au lieu de tronquer) ;
+> `psw_sf_drop` était INATTEIGNABLE et compte enfin ; `PSW_SF_JOB_CAP` 144→288
+> avec sa troncature comptée ; le marqueur voit les pertes PARTIELLES.
+> Pool : pré-vol ÉCHOUÉ à 4,69 Ko, récupéré à **6,50 Ko** (psw_sub lumps
+> int→short = 1536 o, psw_no_room non-inline, champ `s` coupé, HEAP_SIZE
+> 1792→1536). Marqueur `P39`. Build normal bit-intact. NON validé (14e disque).
 
 - **Polygones de sous-secteurs au level-load** (p_setup.c après :1234, PU_LEVEL zone
   LWRAM) : clip récursif du bbox map par les splitlines ancêtres (node_t x16/y16/dx16/

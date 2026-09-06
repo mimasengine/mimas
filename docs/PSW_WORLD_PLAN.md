@@ -995,6 +995,23 @@ StoreWallRange, curline/frontsector/backsector/rw_angle1 vivants).
 > 2560→1792 sur slack mesuré (`hp1256/2560!0`) ⇒ pool 4,95→5,70 Ko contre le
 > plancher 4,8. Surveiller `!` sur row 10. Build normal bit-intact. NON validé
 > console (12e disque).
+>
+> **ROUND 38b (2026-09-06, 0aa639c)** — 12e disque, deux résultats.
+> **(1) LES FLATS SUR LE MASTER CORRIGENT LES PLAFONDS DU SPAWN** ⇒ le chemin
+> jobs/réservation du round 33 est CONDAMNÉ pour cette famille ; le bisect du
+> propriétaire est prouvé par un toggle. Chercher désormais dans la
+> réservation d'index / la fenêtre de job / l'arène / le landing au fence —
+> pas dans les verdicts d'occlusion.
+> **(2) Le triangle : RIEN n'est peint dessus** — un fait sur la SONDE, pas sur
+> le plan. Le marqueur r38 avait quatre sorties muettes. r38b : retry sans le
+> terme hauteur du plan proche → feuille brute → **repli sur la bbox écran des
+> MURS du sous-secteur** ; le CIEL (`clump < 0`, jamais un plan PSW donc sans
+> verdict) est peint BLANC ; et **`m<want>/<got>`** rend la sonde
+> auto-contrôlée (`want > got` = le marqueur n'a pas pu être dessiné).
+> `o<ovf>` entre (subs jamais pris par le recorder) ; `d<denied>/<kill>` sort.
+> `s0` console = le fix seg-skip du round 37 ne se déclenche jamais.
+> Pool 5,19 Ko contre le plancher 4,8. Build normal bit-intact. NON validé
+> console (13e disque).
 
 - **Polygones de sous-secteurs au level-load** (p_setup.c après :1234, PU_LEVEL zone
   LWRAM) : clip récursif du bbox map par les splitlines ancêtres (node_t x16/y16/dx16/

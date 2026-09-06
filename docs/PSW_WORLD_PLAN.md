@@ -1030,6 +1030,24 @@ StoreWallRange, curline/frontsector/backsector/rw_angle1 vivants).
 > Pool : pré-vol ÉCHOUÉ à 4,69 Ko, récupéré à **6,50 Ko** (psw_sub lumps
 > int→short = 1536 o, psw_no_room non-inline, champ `s` coupé, HEAP_SIZE
 > 1792→1536). Marqueur `P39`. Build normal bit-intact. NON validé (14e disque).
+>
+> **ROUND 40 (2026-09-06, 8d20242 + core)** — **LE TRIANGLE : LE RABOTAGE DE
+> FEUILLE RETIRAIT DE L'AIRE.** Masque du trou fourni par le propriétaire : un
+> long triangle fin, ciel visible derrière, même endroit, immunisé à tous les
+> A/B, **peint par aucun marqueur de refus** — donc RIEN n'a été refusé : le
+> plan est émis, simplement plus petit que sa feuille.
+> `psw_poly_shave` ramenait un polygone de feuille sous le cap de sommets en
+> supprimant le coin le plus plat ; supprimer un sommet remplace deux arêtes
+> par une CORDE et retire un triangle. Aire perdue = région jamais peinte,
+> décidée au CHARGEMENT — d'où l'immunité aux toggles et l'absence de compteur.
+> La fonction portait déjà ce bug deux fois (tail-chop, puis coins plus petits) :
+> toujours vers l'intérieur.
+> **Fix : supprimer une ARÊTE**, en prolongeant les deux arêtes voisines jusqu'à
+> leur intersection. Sur un convexe cela AJOUTE de l'aire ⇒ plus jamais de trou ;
+> le prix est un sliver de surdessin que le peintre absorbe.
+> Sonde `s<shaved>` (feuilles rabotées, constante par niveau) — le champ `s`
+> change de sens (ce n'est plus segskip). Marqueur `P40`. Pool 5,44 Ko. Build
+> normal bit-intact. NON validé console (15e disque).
 
 - **Polygones de sous-secteurs au level-load** (p_setup.c après :1234, PU_LEVEL zone
   LWRAM) : clip récursif du bbox map par les splitlines ancêtres (node_t x16/y16/dx16/

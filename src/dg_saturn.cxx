@@ -758,6 +758,17 @@ static int  psw_ceil_hid_last = 0, psw_ceil_zero_last = 0, psw_ceil_clip_last = 
    A hole that stays BLACK in mode 2 is refused by NONE of these -- the plane was
    emitted and the loss is downstream (VDP1 budget, overpaint, geometry). */
 static int  sat_psw_diag = 0;   /* (psw_sub_why[] lives with the sub arrays) */
+/* ROUND 38b -- A DIAGNOSTIC THAT CAN FAIL SILENTLY IS NOT A DIAGNOSTIC.  The r38
+   marker had four silent `return`s (no clipped polygon, raw leaf under 3 verts,
+   any vertex unprojectable, and the whole `cl < 0` sky branch), and the console
+   answer was "rien n'est peint" -- which said nothing about the plane and
+   everything about my probe.  Every exit now either paints or is COUNTED:
+   `m<want>/<got>` on row 13.  want > got = the marker was asked for and could
+   not be drawn, and that gap is itself the next lead. */
+static int  psw_pp_base_near = 0;   /* psw_plane_poly: drop the height-dependent
+                                       near plane (marker retry only) */
+static int  psw_mk_want = 0, psw_mk_got = 0;
+static int  psw_mk_want_last = 0, psw_mk_got_last = 0;
 static int  psw_sf_join_ms_last = 0;       /* round 33 `F<join>/..`: master wait on the slave
                                               flat pass at the fence, ms */
 static int  psw_sf_drop_last = 0;          /* round 33 `F../<drop>`: flat cmds refused by a
@@ -3486,16 +3497,23 @@ static void fps_update(void)
                     /* r38: `e<ef>/<ew>` (ms) DROPPED from this row -- it is a
                        performance probe and this is a correctness hunt; the two
                        state characters and `s` needed the width. */
-                    snprintf(ovbuf, sizeof ovbuf, "P38.%d h%d.%d/%d F%s f%d d%d/%d s%d ",
+                    /* r38b: `d<denied>/<kill>` LEAVES the row -- both halves have
+                       read 0 on every console capture since the kill counter was
+                       made honest, and both budget classes are eliminated on
+                       evidence.  `o` and `m` are the two silent classes that
+                       replace it: a sub the recorder never took, and a marker
+                       asked for but never drawn. */
+                    snprintf(ovbuf, sizeof ovbuf, "P38.%d h%d.%d/%d F%s f%d o%d m%d/%d s%d ",
                              sat_psw_diag & 3,             /* r38: pad L+Down state */
                              psw_ceil_clip_last > 99 ? 99 : psw_ceil_clip_last,
                              psw_ceil_hid_last > 99 ? 99 : psw_ceil_hid_last,
                              psw_ceil_zero_last > 99 ? 99 : psw_ceil_zero_last,
                              sfb,
                              psw_flat_last  > 999 ? 999 : psw_flat_last,
-                             psw_flat_denied_last > 999 ? 999 : psw_flat_denied_last,
-                             psw_kill_last > 999 ? 999 : psw_kill_last,
-                             sat_psw_segskip > 999 ? 999 : sat_psw_segskip);
+                             psw_sub_ovf_last > 999 ? 999 : psw_sub_ovf_last,
+                             psw_mk_want_last > 99 ? 99 : psw_mk_want_last,
+                             psw_mk_got_last  > 99 ? 99 : psw_mk_got_last,
+                             sat_psw_segskip > 99 ? 99 : sat_psw_segskip);
                 }
 #endif
             if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 13, ovbuf);
@@ -9278,7 +9296,9 @@ static int psw_plane_poly(int sn, int ph, int psign, int *ox, int *oy)
 	int hw2  = (viewwidth << detailshift) >> 1;
 	int rows = (psign > 0) ? (viewheight - centery + 2) : (centery + 2);
 	int lim  = PSW_TZ_NEAR + (8 << 16);
-	if (rows > 0)
+	if (rows > 0 && !psw_pp_base_near)   /* r38b: the marker retries without the
+	                                       height term, so a plane thrown away by
+	                                       it still has geometry to be painted with */
 	{
 	    int l2 = (int)(((long long)ph * hw2) / rows);
 	    if (l2 > lim) lim = l2;
@@ -11038,27 +11058,66 @@ static void psw_sub_lumps(int k, int *fl, int *cl, int *fdom)
 
 /* ROUND 38: one REFUSAL MARKER -- the plane's own shape, flat-filled in the
    colour of the site that refused it (see sat_psw_diag).  w 1..6. */
-static void psw_paint_reject(int sn, int ph, int psign, int w)
+static void psw_paint_reject(int k, int sn, int ph, int psign, int w)
 {
-    static const unsigned char why_col[7] = { 0, 176, 112, 198, 163, 216, 250 };
+    static const unsigned char why_col[8] = { 0, 176, 112, 198, 163, 216, 250, 4 };
     int cx[PSW_FAN_MAX], cy[PSW_FAN_MAX];
     int sxv[PSW_FAN_MAX], syv[PSW_FAN_MAX];
-    int n, i;
+    int n = 0, i, ok = 0;
     unsigned short col;
-    if (w < 1 || w > 6 || !psw_polys_ok || sn < 0) return;
-    n = psw_plane_poly(sn, ph, psign, cx, cy);
-    if (n < 3)
-    {   /* reason 1 by definition has no clipped polygon: fall back to the RAW
-	   baked leaf.  That is the point -- a red marker where the ceiling is
-	   missing proves the leaf exists and the CLIP threw it away. */
-	n = psw_pvn[sn];
-	if (n < 3) return;                       /* nothing exists at all: leaf_bad */
-	if (n > PSW_FAN_MAX) n = PSW_FAN_MAX;
-	for (i = 0; i < n; ++i)
-	{ cx[i] = psw_pvx[psw_pvi[sn] + i]; cy[i] = psw_pvy[psw_pvi[sn] + i]; }
+    if (w < 1 || w > 7) return;
+    psw_mk_want++;                       /* r38b: counted BEFORE anything can fail */
+    if (psw_polys_ok && sn >= 0)
+    {
+	n = psw_plane_poly(sn, ph, psign, cx, cy);
+	if (n < 3)
+	{   /* retry without the height-dependent near plane: a ceiling sits ~2x
+	       further from the eye than a floor, so that term alone can empty a
+	       plane the base frustum keeps */
+	    psw_pp_base_near = 1;
+	    n = psw_plane_poly(sn, ph, psign, cx, cy);
+	    psw_pp_base_near = 0;
+	}
+	if (n < 3)
+	{   /* still nothing: the RAW baked leaf.  A marker drawn from it proves
+	       the leaf exists and the CLIP is what threw the plane away. */
+	    n = psw_pvn[sn];
+	    if (n > PSW_FAN_MAX) n = PSW_FAN_MAX;
+	    for (i = 0; i < n; ++i)
+	    { cx[i] = psw_pvx[psw_pvi[sn] + i]; cy[i] = psw_pvy[psw_pvi[sn] + i]; }
+	}
+	if (n >= 3)
+	{
+	    ok = 1;
+	    for (i = 0; i < n; ++i)
+		if (!psw_project(cx[i], cy[i], ph, psign, &sxv[i], &syv[i]))
+		{ ok = 0; break; }
+	}
     }
-    for (i = 0; i < n; ++i)
-	if (!psw_project(cx[i], cy[i], ph, psign, &sxv[i], &syv[i])) return;
+    if (!ok)
+    {   /* LAST RESORT -- this subsector's own WALLS.  They are on screen by
+	   construction (they were just plotted), so their screen bbox says WHERE
+	   the sub is even when the plane has no usable geometry at all.  Without
+	   this the whole "no polygon" family paints nothing, which is exactly the
+	   answer the console gave and exactly the answer that teaches nothing. */
+	int wbeg = (int)psw_sub[k].w0;
+	int wend = (k + 1 < psw_sub_n) ? (int)psw_sub[k + 1].w0 : wall_acc_n;
+	int xl = 0x7fff, xr = -0x7fff, yt = 0x7fff, yb = -0x7fff;
+	if (wend > wall_acc_n) wend = wall_acc_n;
+	for (i = wbeg; i < wend; ++i)
+	{
+	    int ax[2] = { wall_acc[i].x1,  wall_acc[i].x2  };
+	    int ay[4] = { wall_acc[i].yl1, wall_acc[i].yh1,
+	                  wall_acc[i].yl2, wall_acc[i].yh2 };
+	    int s;
+	    for (s = 0; s < 2; ++s) { if (ax[s] < xl) xl = ax[s]; if (ax[s] > xr) xr = ax[s]; }
+	    for (s = 0; s < 4; ++s) { if (ay[s] < yt) yt = ay[s]; if (ay[s] > yb) yb = ay[s]; }
+	}
+	if (xr < xl || yb < yt) return;      /* no walls either: want > got says so */
+	sxv[0] = xl; syv[0] = yt;  sxv[1] = xr; syv[1] = yt;
+	sxv[2] = xr; syv[2] = yb;  sxv[3] = xl; syv[3] = yb;
+	n = 4;
+    }
     col = (unsigned short)(0x0100u | (unsigned)why_col[w]);
     psw_paint_idx = why_col[w];          /* so L+X cannot repaint the marker */
     {   /* decimated fan, <= 4 quads, exactly like the solid path */
@@ -11076,6 +11135,7 @@ static void psw_paint_reject(int sn, int ph, int psign, int w)
 	    psw_emit_flatquad(-1, col, qx, qy);
 	}
     }
+    psw_mk_got++;
 }
 
 /* emit one recorded subsector's floor + ceiling (skips: sky, dominant triple,
@@ -11328,12 +11388,16 @@ static void psw_emit_subflats(int k)
     {
 	int w = psw_why_get(k);
 	if (w == 0 && (psw_sub_flag[k] & 0x80)) w = 3;      /* BLUE: standby */
-	if (w && cl >= 0) psw_paint_reject(sn, psw_sub[k].ch - viewz, -1, w);
+	if (cl < 0 && psw_sub[k].ch > viewz && psw_sub[k].clump < 0)
+	    w = 7;   /* r38b WHITE: SKY ceiling.  Never a PSW plane, so it carried
+	                no verdict and the r38 marker skipped it entirely -- the
+	                one refusal class that was invisible to its own probe. */
+	if (w) psw_paint_reject(k, sn, psw_sub[k].ch - viewz, -1, w);
 	if (sat_psw_diag >= 3 && (fl >= 0 || fdom))
 	{   /* the floor twin, normally invisible under RBG0 -- the asymmetry that
 	       has made this hunt look ceiling-only from the start */
 	    int wf = (psw_sub_flag[k] & 1) ? 2 : (psw_sub_flag[k] & 0x40) ? 3 : 0;
-	    if (wf) psw_paint_reject(sn, viewz - psw_sub[k].fh, 1, wf);
+	    if (wf) psw_paint_reject(k, sn, viewz - psw_sub[k].fh, 1, wf);
 	}
     }
     /* (the round-16 paper release died with the ledger in round 33 -- the
@@ -12123,6 +12187,8 @@ static void vdp1_walls_flush(void)
         psw_ceil_zero_last = (int)psw_ucr32((const volatile void *)&psw_ceil_zero);
         psw_ceil_hid_last = psw_ceil_hid; psw_ceil_hid = 0;   /* r34d: note-side, master */
         psw_ceil_clip_last = psw_ceil_clip; psw_ceil_clip = 0;   /* r36: same, world-clip half */
+        psw_mk_want_last = psw_mk_want; psw_mk_got_last = psw_mk_got;   /* r38b */
+        psw_mk_want = 0; psw_mk_got = 0;
         psw_kill_last = (int)psw_ucr32((const volatile void *)&psw_kill_n);
         psw_punch_last = (int)psw_ucr32((const volatile void *)&psw_punch_cmds);
         psw_band_last = (int)psw_ucr32((const volatile void *)&psw_band_n);

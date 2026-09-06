@@ -724,6 +724,19 @@ static int  psw_bk_baked_last = 0, psw_bk_live_last = 0;   /* round 32 (off the 
    The two want opposite fixes, hence the dot. */
 static int  psw_ceil_hid = 0, psw_ceil_zero = 0, psw_ceil_clip = 0;
 static int  psw_ceil_hid_last = 0, psw_ceil_zero_last = 0, psw_ceil_clip_last = 0;
+/* ROUND 36b -- LIVE A/B ON THE TWO CEILING REFUSALS (pad R+X).  Four discs went
+   on GUESSING which of the two note verdicts loses the ceilings, and
+   build-vs-build photos are not admissible evidence in this project
+   ([[interbuild-perf-noise]]: demand a live toggle).  The row marker carries the
+   state so a single photo is self-describing:
+     P36a  shipping: band cull ON, height-dependent near clip ON
+     P36b  the ceiling band cull is OFF   (R_PswBandBoxHidden skipped, pass 1)
+     P36c  the near clip's HEIGHT term is OFF for ceilings (psw_plane_poly)
+     P36d  both OFF
+   A hole that closes at b convicts the bands; at c, the near plane; only at d,
+   the two are jointly necessary; at none of them, the loss is downstream of the
+   note entirely and both counters are innocent. */
+static int  sat_psw_ceilab = 0;
 static int  psw_sf_join_ms_last = 0;       /* round 33 `F<join>/..`: master wait on the slave
                                               flat pass at the fence, ms */
 static int  psw_sf_drop_last = 0;          /* round 33 `F../<drop>`: flat cmds refused by a
@@ -3449,7 +3462,8 @@ static void fps_update(void)
                        K61/16, K100/14 across the r34 discs) and the ceiling
                        holes are the live question.  The K latches keep running,
                        unprinted. */
-                    snprintf(ovbuf, sizeof ovbuf, "P36 e%d/%d h%d.%d/%d F%s f%d d%d/%d ",
+                    snprintf(ovbuf, sizeof ovbuf, "P36%c e%d/%d h%d.%d/%d F%s f%d d%d/%d ",
+                             "abcd"[sat_psw_ceilab & 3],   /* r36b: pad R+X state */
                              psw_ef_ms_last > 99 ? 99 : psw_ef_ms_last,
                              psw_ew_ms_last > 99 ? 99 : psw_ew_ms_last,
                              psw_ceil_clip_last > 99 ? 99 : psw_ceil_clip_last,
@@ -8607,7 +8621,8 @@ static void sat_psw_sub_note_body(int subnum, int fh, int ch, int fpic,
 		    if (sx < xl) xl = sx; if (sx > xr) xr = sx;
 		    if (sy < yt) yt = sy; if (sy > yb) yb = sy;
 		}
-		if (okp && R_PswBandBoxHidden(xl, xr, yt, yb))
+		if (okp && !(pass && (sat_psw_ceilab & 1))   /* r36b: P36b/d */
+		    && R_PswBandBoxHidden(xl, xr, yt, yb))
 		{ psw_sub_flag[k] |= bit; if (pass) psw_ceil_hid++; continue; }
 	    }
 	    tt = 0;
@@ -9219,7 +9234,11 @@ static int psw_plane_poly(int sn, int ph, int psign, int *ox, int *oy)
 	int hw2  = (viewwidth << detailshift) >> 1;
 	int rows = (psign > 0) ? (viewheight - centery + 2) : (centery + 2);
 	int lim  = PSW_TZ_NEAR + (8 << 16);
-	if (rows > 0)
+	/* r36b P36c/d: drop the HEIGHT term for ceilings.  ph is ~2x bigger for a
+	   ceiling than for a floor, so this term pushes the ceiling's near plane
+	   ~2x further out -- the one refusal in this file that is ceiling-heavy by
+	   arithmetic.  The base near plane still guards the projection. */
+	if (rows > 0 && !(psign < 0 && (sat_psw_ceilab & 2)))
 	{
 	    int l2 = (int)(((long long)ph * hw2) / rows);
 	    if (l2 > lim) lim = l2;
@@ -15173,6 +15192,13 @@ static void poll_pad(void)
     if (!(cur & PER_DGT_TL) && (cur & PER_DGT_TR)
         && (changed & PER_DGT_TX) && !(cur & PER_DGT_TX))
         sat_wall_paint = (sat_wall_paint + 1) & 3;
+    /* ROUND 36b -- PAD R+X: cycle the ceiling-refusal A/B (row 13 marker
+       P36a/b/c/d, see sat_psw_ceilab).  R+X was freed 2026-08-28 when the
+       wall-fill rung was baked; predicate `TL && !TR`, disjoint from L+X's
+       `!TL && TR` and split-X's `TL && TR`. */
+    if ((cur & PER_DGT_TL) && !(cur & PER_DGT_TR)
+        && (changed & PER_DGT_TX) && !(cur & PER_DGT_TX))
+        sat_psw_ceilab = (sat_psw_ceilab + 1) & 3;
     /* (Pad L+Down SKY/FLOOR BOUNDARY MODE REMOVED 2026-08-26 -- baked at 1, the shipped fix
        (window before the fence, map deferred to just after it).  0 was the A/B reference and 2
        the geometric fallback "if 1 is not enough"; 1 was enough.  L+Down is free.) */

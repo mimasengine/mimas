@@ -94,7 +94,14 @@ char **environ = __env;
    (verified: 61.33 KB pool, 22,233,456 bytes).  `!` on row 10 is still the only
    warning, and it now has less room: raise this FIRST if one ever appears. */
 #undef HEAP_SIZE
-#define HEAP_SIZE (2560)
+/* ROUND 38: 2560 -> 1792 = +768 B of pool, taken from MEASURED slack, not from a
+   guess: the last four console captures all read `hp1256/2560!0` -- 1256 bytes of
+   high-water against 2560 reserved, and ZERO sbrk failures ever.  1792 keeps 536
+   bytes over that high-water.  The pool needed it: the round-38 marker paint put
+   it at 4.95 KB against the 4.8 KB measured boot-loop floor, which is not a
+   margin.  `hp<peak>/<cap>!<n>` on row 10 is still the only warning -- ANY digit
+   after `!` means this went one step too far and 2560 comes back. */
+#define HEAP_SIZE (1792)
 #endif
 static char heap[HEAP_SIZE] __attribute__((aligned(8)));
 static char *heap_end = heap;

@@ -727,19 +727,37 @@ static int  psw_bk_baked_last = 0, psw_bk_live_last = 0;   /* round 32 (off the 
    The two want opposite fixes, hence the dot. */
 static int  psw_ceil_hid = 0, psw_ceil_zero = 0, psw_ceil_clip = 0;
 static int  psw_ceil_hid_last = 0, psw_ceil_zero_last = 0, psw_ceil_clip_last = 0;
-/* ROUND 36b -- LIVE A/B ON THE TWO CEILING REFUSALS (pad R+X).  Four discs went
-   on GUESSING which of the two note verdicts loses the ceilings, and
-   build-vs-build photos are not admissible evidence in this project
-   ([[interbuild-perf-noise]]: demand a live toggle).  The row marker carries the
-   state so a single photo is self-describing:
-     P36a  shipping: band cull ON, height-dependent near clip ON
-     P36b  the ceiling band cull is OFF   (R_PswBandBoxHidden skipped, pass 1)
-     P36c  the near clip's HEIGHT term is OFF for ceilings (psw_plane_poly)
-     P36d  both OFF
-   A hole that closes at b convicts the bands; at c, the near plane; only at d,
-   the two are jointly necessary; at none of them, the loss is downstream of the
-   note entirely and both counters are innocent. */
-static int  sat_psw_ceilab = 0;
+/* (ROUND 36b's R+X A/B on the two ceiling refusals is REMOVED -- it did its job
+   on console: the spawn ceilings moved, the triangle did not, which is how the
+   two defects were finally told apart.  Round 38's marker paint answers the same
+   question WITHOUT a four-state toggle and names the PLANE as well, and the pool
+   was 200 bytes off the measured boot floor.) */
+/* ROUND 38 -- PAINT THE REFUSAL, NOT THE EMISSION (owner: "tu ne peux pas les
+   peindre dans un nouveau mode, chacune avec sa couleur ?").  Every probe so far
+   has been a COUNTER, and a counter says how many without saying WHICH or WHERE,
+   so five rounds went on matching numbers to a hole by eye.  A refused ceiling
+   painted in a colour keyed to its refusal site turns the hole itself into the
+   answer: the shape names the plane and the colour names the cause, in one
+   photograph, with nothing left to infer.
+   Pad L+Down cycles sat_psw_diag:
+     0  off (shipping)
+     1  MASTER FLATS: the slave flat pass is disabled.  This is the owner's own
+        bisect made runnable -- "ces trous n'etaient pas la avant le deport au
+        slave".  Holes that vanish here convict round 33's job/reservation path;
+        holes that stay exonerate it, and that is worth more than any counter.
+     2  master flats + every refused CEILING painted in its reason colour
+     3  same, plus the refused FLOORS (normally invisible: RBG0 fills them, which
+        is exactly why this hunt has always looked ceiling-only)
+   Reason colours (PLAYPAL, the L+X triad's family):
+     176 RED     world clip / bad leaf   (psw_plane_poly < 3 verts)
+     112 GREEN   portal-band hidden      (R_PswBandBoxHidden)
+     198 BLUE    budget standby          (flag 0x40/0x80)
+     163 YELLOW  denied: no texture slot AND no resident dalle
+     216 ORANGE  unprojectable at the emitter
+     250 MAGENTA reached the emitter and emitted ZERO commands
+   A hole that stays BLACK in mode 2 is refused by NONE of these -- the plane was
+   emitted and the loss is downstream (VDP1 budget, overpaint, geometry). */
+static int  sat_psw_diag = 0;   /* (psw_sub_why[] lives with the sub arrays) */
 static int  psw_sf_join_ms_last = 0;       /* round 33 `F<join>/..`: master wait on the slave
                                               flat pass at the fence, ms */
 static int  psw_sf_drop_last = 0;          /* round 33 `F../<drop>`: flat cmds refused by a
@@ -3465,10 +3483,11 @@ static void fps_update(void)
                        K61/16, K100/14 across the r34 discs) and the ceiling
                        holes are the live question.  The K latches keep running,
                        unprinted. */
-                    snprintf(ovbuf, sizeof ovbuf, "P37%c e%d/%d h%d.%d/%d F%s f%d d%d/%d s%d ",
-                             "abcd"[sat_psw_ceilab & 3],   /* r36b: pad R+X state */
-                             psw_ef_ms_last > 99 ? 99 : psw_ef_ms_last,
-                             psw_ew_ms_last > 99 ? 99 : psw_ew_ms_last,
+                    /* r38: `e<ef>/<ew>` (ms) DROPPED from this row -- it is a
+                       performance probe and this is a correctness hunt; the two
+                       state characters and `s` needed the width. */
+                    snprintf(ovbuf, sizeof ovbuf, "P38.%d h%d.%d/%d F%s f%d d%d/%d s%d ",
+                             sat_psw_diag & 3,             /* r38: pad L+Down state */
                              psw_ceil_clip_last > 99 ? 99 : psw_ceil_clip_last,
                              psw_ceil_hid_last > 99 ? 99 : psw_ceil_hid_last,
                              psw_ceil_zero_last > 99 ? 99 : psw_ceil_zero_last,
@@ -8359,6 +8378,19 @@ static int psw_cur_sub = -1;     /* round 22: subnum of the plane being emitted 
 static int psw_cur_tall = 0;     /* round 23/24: the emitting plane's slot CHAIN length
                                     minus one (0 = single, 1 = pair, 2 = triple) --
                                     interior tile columns emit 64x128 / 64x192 strips */
+/* round 38: per-sub CEILING refusal reason, 4 bits each (see sat_psw_diag for the
+   code/colour table).  192 bytes -- a whole byte per sub would have cost 384 and
+   the pool is at 6 KB against a measured 4.8 KB boot floor. */
+static unsigned char psw_sub_why[PSW_SUB_MAX / 2];
+static inline void psw_why_set(int k, int w)
+{
+    unsigned char *p = &psw_sub_why[k >> 1];
+    int sh = (k & 1) << 2;
+    *p = (unsigned char)((*p & ~(0xf << sh)) | (w << sh));
+}
+static inline int psw_why_get(int k)
+{ return (psw_sub_why[k >> 1] >> ((k & 1) << 2)) & 0xf; }
+
 static int psw_leaf_bad = 0;     /* round 22: noted subs whose LEAF POLYGON is invalid
                                     (pvn < 3) -- the deterministic same-spot hole class
                                     (owner: "le triangle est la systematiquement, c'est
@@ -8537,6 +8569,7 @@ static void sat_psw_sub_note_body(int subnum, int fh, int ch, int fpic,
     psw_sub[k].w0    = (short)wall_acc_n;
     psw_sub[k].s0    = (short)vis0;
     psw_sub_flag[k] = 0; psw_sub_fe[k] = 8; psw_sub_ce[k] = 8;  /* 8 = unknown-est default */
+    psw_why_set(k, 0);                                          /* r38: no verdict yet */
     if (psw_polys_ok && subnum >= 0 && psw_pvn[subnum] < 3)
 	psw_leaf_bad++;              /* round 22: INVALID leaf polygon = the
 	                                deterministic same-spot hole class
@@ -8601,7 +8634,10 @@ static void sat_psw_sub_note_body(int subnum, int fh, int ch, int fpic,
 		h = ch; psn = -1; bit = 4;
 	    }
 	    nn = psw_plane_poly(subnum, psn > 0 ? viewz - h : h - viewz, psn, cxv, cyv);
-	    if (nn < 3) { psw_sub_flag[k] |= bit; if (pass) psw_ceil_clip++; continue; }  /* r36 */
+	    if (nn < 3)   /* r36 */
+	    { psw_sub_flag[k] |= bit;
+	      if (pass) { psw_ceil_clip++; psw_why_set(k, 1); }   /* r38 RED */
+	      continue; }
 	    if (psw_thin) psw_sub_flag[k] |= (pass == 0) ? 0x10 : 0x20;   /* r34: one quad */
 	    /* round 21: the ladder is back for FLOORS too -- round 20 removed it
 	       arguing fill is free on an idle VDP1, but every overdrawn tile is
@@ -8625,9 +8661,10 @@ static void sat_psw_sub_note_body(int subnum, int fh, int ch, int fpic,
 		    if (sx < xl) xl = sx; if (sx > xr) xr = sx;
 		    if (sy < yt) yt = sy; if (sy > yb) yb = sy;
 		}
-		if (okp && !(pass && (sat_psw_ceilab & 1))   /* r36b: P36b/d */
-		    && R_PswBandBoxHidden(xl, xr, yt, yb))
-		{ psw_sub_flag[k] |= bit; if (pass) psw_ceil_hid++; continue; }
+		if (okp && R_PswBandBoxHidden(xl, xr, yt, yb))
+		{ psw_sub_flag[k] |= bit;
+		  if (pass) { psw_ceil_hid++; psw_why_set(k, 2); }   /* r38 GREEN */
+		  continue; }
 	    }
 	    tt = 0;
 	    psw_plane_los_cull(cxv, cyv, nn, h, psn, &tt);
@@ -9241,11 +9278,7 @@ static int psw_plane_poly(int sn, int ph, int psign, int *ox, int *oy)
 	int hw2  = (viewwidth << detailshift) >> 1;
 	int rows = (psign > 0) ? (viewheight - centery + 2) : (centery + 2);
 	int lim  = PSW_TZ_NEAR + (8 << 16);
-	/* r36b P36c/d: drop the HEIGHT term for ceilings.  ph is ~2x bigger for a
-	   ceiling than for a floor, so this term pushes the ceiling's near plane
-	   ~2x further out -- the one refusal in this file that is ceiling-heavy by
-	   arithmetic.  The base near plane still guards the projection. */
-	if (rows > 0 && !(psign < 0 && (sat_psw_ceilab & 2)))
+	if (rows > 0)
 	{
 	    int l2 = (int)(((long long)ph * hw2) / rows);
 	    if (l2 > lim) lim = l2;
@@ -11003,6 +11036,48 @@ static void psw_sub_lumps(int k, int *fl, int *cl, int *fdom)
 	*cl = psw_sub[k].clump;
 }
 
+/* ROUND 38: one REFUSAL MARKER -- the plane's own shape, flat-filled in the
+   colour of the site that refused it (see sat_psw_diag).  w 1..6. */
+static void psw_paint_reject(int sn, int ph, int psign, int w)
+{
+    static const unsigned char why_col[7] = { 0, 176, 112, 198, 163, 216, 250 };
+    int cx[PSW_FAN_MAX], cy[PSW_FAN_MAX];
+    int sxv[PSW_FAN_MAX], syv[PSW_FAN_MAX];
+    int n, i;
+    unsigned short col;
+    if (w < 1 || w > 6 || !psw_polys_ok || sn < 0) return;
+    n = psw_plane_poly(sn, ph, psign, cx, cy);
+    if (n < 3)
+    {   /* reason 1 by definition has no clipped polygon: fall back to the RAW
+	   baked leaf.  That is the point -- a red marker where the ceiling is
+	   missing proves the leaf exists and the CLIP threw it away. */
+	n = psw_pvn[sn];
+	if (n < 3) return;                       /* nothing exists at all: leaf_bad */
+	if (n > PSW_FAN_MAX) n = PSW_FAN_MAX;
+	for (i = 0; i < n; ++i)
+	{ cx[i] = psw_pvx[psw_pvi[sn] + i]; cy[i] = psw_pvy[psw_pvi[sn] + i]; }
+    }
+    for (i = 0; i < n; ++i)
+	if (!psw_project(cx[i], cy[i], ph, psign, &sxv[i], &syv[i])) return;
+    col = (unsigned short)(0x0100u | (unsigned)why_col[w]);
+    psw_paint_idx = why_col[w];          /* so L+X cannot repaint the marker */
+    {   /* decimated fan, <= 4 quads, exactly like the solid path */
+	int idx[9], nn = (n < 9) ? n : 9, s;
+	for (s = 0; s < nn; ++s) idx[s] = (s * (n - 1)) / (nn - 1);
+	for (i = 1; i + 1 < nn; i += 2)
+	{
+	    int qx[4], qy[4];
+	    int i2 = (i + 2 < nn) ? i + 2 : i + 1;
+	    if (psw_cmd_left() < 1) return;
+	    qx[0] = sxv[idx[0]];     qy[0] = syv[idx[0]];
+	    qx[1] = sxv[idx[i]];     qy[1] = syv[idx[i]];
+	    qx[2] = sxv[idx[i + 1]]; qy[2] = syv[idx[i + 1]];
+	    qx[3] = sxv[idx[i2]];    qy[3] = syv[idx[i2]];
+	    psw_emit_flatquad(-1, col, qx, qy);
+	}
+    }
+}
+
 /* emit one recorded subsector's floor + ceiling (skips: sky, dominant triple,
    wrong side of the eye).  Slot famine degrades to a solid lit POLYGON in the
    flat's centre-texel colour (a wrong-ish tint beats a hole -- the wall path's
@@ -11142,7 +11217,10 @@ static void psw_emit_subflats(int k)
 		   degrade, and unprojectable band pieces (round 13) */
 		const unsigned char *src = R_FlatCachePeek(lump);
 		if (src) fb = src[32*64 + 32];
-		else if (slot < 0) { psw_flat_denied++; continue; }
+		else if (slot < 0)
+		{ psw_flat_denied++;
+		  if (pass) psw_why_set(k, 4);      /* r38 YELLOW */
+		  continue; }
 	    }
 	    if (solid)
 	    {   /* the fan needs every projected vertex; the offscreen cull rides
@@ -11151,7 +11229,7 @@ static void psw_emit_subflats(int k)
 		    if (!psw_project(cx[i], cy[i], ph, psign, &sxv[i], &syv[i])) { ok = 0; break; }
 		/* r36: an unprojectable fan leaves the pass with NOTHING -- count
 		   it, or `zero` reads 0 for a ceiling that plainly vanished */
-		if (!ok) { if (pass) psw_ceil_zero++; continue; }
+		if (!ok) { if (pass) { psw_ceil_zero++; psw_why_set(k, 5); } continue; }
 		{
 		    int xl = sxv[0], xr = sxv[0], yt = syv[0], yb = syv[0];
 		    for (i = 1; i < n; ++i)
@@ -11184,7 +11262,7 @@ static void psw_emit_subflats(int k)
 		    if (i == 0 || d < dmin) { dmin = d; vi = i; }
 		}
 		if (!psw_project(cx[vi], cy[vi], ph, psign, &sxv[0], &syv[0]))
-		{ if (pass) psw_ceil_zero++; continue; }   /* r36: same, tiled path */
+		{ if (pass) { psw_ceil_zero++; psw_why_set(k, 5); } continue; }   /* r36 */
 		nr = syv[0];
 	    }
 	    if (nr < 0) nr = 0; else if (nr >= viewheight) nr = viewheight - 1;
@@ -11231,8 +11309,31 @@ static void psw_emit_subflats(int k)
 		    }
 		}
 	    }
-	    if (pass && psw_flat_cmds == zc0) psw_ceil_zero++;   /* r34d partition */
+	    if (pass && psw_flat_cmds == zc0)
+	    { psw_ceil_zero++; psw_why_set(k, 6); }   /* r34d partition, r38 MAGENTA */
 	}
+	}
+    }
+    /* ROUND 38 -- PAINT THE REFUSAL.  One marker per refused plane, at this
+       sub's own painter rank (so it lands exactly where the plane would have,
+       under the same nearer geometry), in the colour of the site that refused
+       it.  Runs at the END of the sub: every verdict of both passes is readable
+       here, and no `continue` above can skip it.
+       Geometry: the world-clipped polygon, decimated to <= 4 quads like the
+       solid path.  Reason 1 (the clip itself returned nothing) has no clipped
+       polygon by definition, so it falls back to the RAW baked leaf -- which is
+       the whole point: if a red marker appears where the ceiling is missing,
+       the leaf exists and the CLIP is what threw it away. */
+    if (sat_psw_diag >= 2)
+    {
+	int w = psw_why_get(k);
+	if (w == 0 && (psw_sub_flag[k] & 0x80)) w = 3;      /* BLUE: standby */
+	if (w && cl >= 0) psw_paint_reject(sn, psw_sub[k].ch - viewz, -1, w);
+	if (sat_psw_diag >= 3 && (fl >= 0 || fdom))
+	{   /* the floor twin, normally invisible under RBG0 -- the asymmetry that
+	       has made this hunt look ceiling-only from the start */
+	    int wf = (psw_sub_flag[k] & 1) ? 2 : (psw_sub_flag[k] & 0x40) ? 3 : 0;
+	    if (wf) psw_paint_reject(sn, viewz - psw_sub[k].fh, 1, wf);
 	}
     }
     /* (the round-16 paper release died with the ledger in round 33 -- the
@@ -11653,7 +11754,14 @@ static void vdp1_walls_flush(void)
                command counts it grants -- which becomes the per-sub VDP1
                index reservation the slave fills. */
             int sf_ok = (sat_psw_sf && sat_psw_slave && psw_sf_stg != 0
-                         && psw_polys_ok && sat_local_players <= 1);
+                         && psw_polys_ok && sat_local_players <= 1
+                         && !sat_psw_diag);   /* r38: diag runs the flats on the
+                                                 MASTER -- the owner's own bisect
+                                                 ("pas la avant le deport au
+                                                 slave") made runnable, and the
+                                                 markers need a live bank, not a
+                                                 job window a refused plane never
+                                                 gets */
             psw_sf_arena_last = (psw_sf_stg != 0);     /* row `F-` = arena refused */
             if (sf_ok)
                 for (int k = 0; k < psw_sub_n; ++k) psw_sf_bill[k] = 0;
@@ -15199,14 +15307,15 @@ static void poll_pad(void)
     if (!(cur & PER_DGT_TL) && (cur & PER_DGT_TR)
         && (changed & PER_DGT_TX) && !(cur & PER_DGT_TX))
         sat_wall_paint = (sat_wall_paint + 1) & 3;
-    /* ROUND 36b -- PAD R+X: cycle the ceiling-refusal A/B (row 13 marker
-       P36a/b/c/d, see sat_psw_ceilab).  R+X was freed 2026-08-28 when the
-       wall-fill rung was baked; predicate `TL && !TR`, disjoint from L+X's
-       `!TL && TR` and split-X's `TL && TR`. */
 #if SAT_PSW
-    if ((cur & PER_DGT_TL) && !(cur & PER_DGT_TR)
-        && (changed & PER_DGT_TX) && !(cur & PER_DGT_TX))
-        sat_psw_ceilab = (sat_psw_ceilab + 1) & 3;
+    /* ROUND 38 -- PAD L+DOWN: the diagnostic ladder (sat_psw_diag), row 13
+       `P38<letter><digit>`.  0 shipping / 1 MASTER flats / 2 + refused ceilings
+       painted by reason / 3 + refused floors too.  L+Down was freed 2026-08-26
+       when the sky/floor boundary mode was baked; predicate `!TL && TR`, the
+       same shoulder as L+X, on a direction key nothing else claims. */
+    if (!(cur & PER_DGT_TL) && (cur & PER_DGT_TR)
+        && (changed & PER_DGT_KD) && !(cur & PER_DGT_KD))
+        sat_psw_diag = (sat_psw_diag + 1) & 3;
 #endif
     /* (Pad L+Down SKY/FLOOR BOUNDARY MODE REMOVED 2026-08-26 -- baked at 1, the shipped fix
        (window before the fence, map deferred to just after it).  0 was the A/B reference and 2

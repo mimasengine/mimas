@@ -669,6 +669,9 @@ static int sat_psw_req = 1;     /* owner 2026-09-02: the R+C toggle is GONE -- t
 extern "C" int sat_psw_tiers;   /* core r_segs.c: tier quads accepted this frame */
 extern "C" int sat_psw_ref;     /* core r_segs.c: tier quads shed (budget/list full) */
 extern "C" int sat_psw_wcull;   /* core r_segs.c: tier quads culled by the portal bands (round 9) */
+/* round 36: what the note hook really KEPT for the subsector being stored, read
+   by the portal-band fold so it never claims a region the painter refused */
+extern "C" int sat_psw_fold_cvis, sat_psw_fold_fvis;
 static int sat_psw_t_last = 0, sat_psw_r_last = 0;  /* frame-boundary snapshot (overlay row 13) */
 /* step 2: per-subsector flats (recorder installed at init; machinery near vdp1_walls_flush) */
 extern "C" void (*sat_psw_sub_hook)(int subnum, int fh, int ch, int fpic,
@@ -708,9 +711,19 @@ static int  psw_bk_baked_last = 0, psw_bk_live_last = 0;   /* round 32 (off the 
             run, an unprojectable fan).
    h>0/0 => hunt the note verdicts.  h0/>0 => hunt the tile walk.  h0/0 =>
    the ceilings ARE being emitted and the loss is downstream (VDP1 drop,
-   overpaint, geometry). */
-static int  psw_ceil_hid = 0, psw_ceil_zero = 0;
-static int  psw_ceil_hid_last = 0, psw_ceil_zero_last = 0;
+   overpaint, geometry).
+   ROUND 36 -- `hid` lumped TWO unrelated refusals and the console differential
+   (same spot, ceilings present h2/2 vs absent h5/3) could not name which one
+   moved.  Split: `h<clip>.<band>/<zero>`.
+   `clip` = psw_plane_poly returned < 3 verts -- the leaf did not survive the
+            three world clips, chiefly the HEIGHT-dependent near plane
+            (ph*hw2/rows).  A ceiling sits ~2x further from the eye than a
+            floor, so its near-clip radius is ~2x bigger: this counter is
+            ceiling-heavy BY ARITHMETIC and is the first suspect.
+   `band` = R_PswBandBoxHidden said the projected bbox meets no open band.
+   The two want opposite fixes, hence the dot. */
+static int  psw_ceil_hid = 0, psw_ceil_zero = 0, psw_ceil_clip = 0;
+static int  psw_ceil_hid_last = 0, psw_ceil_zero_last = 0, psw_ceil_clip_last = 0;
 static int  psw_sf_join_ms_last = 0;       /* round 33 `F<join>/..`: master wait on the slave
                                               flat pass at the fence, ms */
 static int  psw_sf_drop_last = 0;          /* round 33 `F../<drop>`: flat cmds refused by a
@@ -3436,11 +3449,12 @@ static void fps_update(void)
                        K61/16, K100/14 across the r34 discs) and the ceiling
                        holes are the live question.  The K latches keep running,
                        unprinted. */
-                    snprintf(ovbuf, sizeof ovbuf, "P35 e%d/%d h%d/%d F%s f%d d%d/%d ",
+                    snprintf(ovbuf, sizeof ovbuf, "P36 e%d/%d h%d.%d/%d F%s f%d d%d/%d ",
                              psw_ef_ms_last > 99 ? 99 : psw_ef_ms_last,
                              psw_ew_ms_last > 99 ? 99 : psw_ew_ms_last,
-                             psw_ceil_hid_last > 999 ? 999 : psw_ceil_hid_last,
-                             psw_ceil_zero_last > 999 ? 999 : psw_ceil_zero_last,
+                             psw_ceil_clip_last > 99 ? 99 : psw_ceil_clip_last,
+                             psw_ceil_hid_last > 99 ? 99 : psw_ceil_hid_last,
+                             psw_ceil_zero_last > 99 ? 99 : psw_ceil_zero_last,
                              sfb,
                              psw_flat_last  > 999 ? 999 : psw_flat_last,
                              psw_flat_denied_last > 999 ? 999 : psw_flat_denied_last,
@@ -8484,6 +8498,11 @@ static void sat_psw_sub_note_body(int subnum, int fh, int ch, int fpic,
                                   int flump, int clump, int light, int vis0)
 {
     int k;
+    /* ROUND 36: default = "this subsector paints NOTHING", so every early exit
+       below (note-table overflow, no leaf polygons) leaves the fold making no
+       claim at all.  Conservative in the safe direction: the bands only shrink,
+       so an un-made claim can never cull something that was visible. */
+    sat_psw_fold_cvis = 0; sat_psw_fold_fvis = 0;
     if (psw_sub_n >= PSW_SUB_MAX)
     {
 	if (psw_sub_tail == 0x7fff) { psw_sub_tail = wall_acc_n;   /* tail walls = farther subs */
@@ -8564,7 +8583,7 @@ static void sat_psw_sub_note_body(int subnum, int fh, int ch, int fpic,
 		h = ch; psn = -1; bit = 4;
 	    }
 	    nn = psw_plane_poly(subnum, psn > 0 ? viewz - h : h - viewz, psn, cxv, cyv);
-	    if (nn < 3) { psw_sub_flag[k] |= bit; if (pass) psw_ceil_hid++; continue; }
+	    if (nn < 3) { psw_sub_flag[k] |= bit; if (pass) psw_ceil_clip++; continue; }  /* r36 */
 	    if (psw_thin) psw_sub_flag[k] |= (pass == 0) ? 0x10 : 0x20;   /* r34: one quad */
 	    /* round 21: the ladder is back for FLOORS too -- round 20 removed it
 	       arguing fill is free on an idle VDP1, but every overdrawn tile is
@@ -8676,6 +8695,14 @@ static void sat_psw_sub_note_body(int subnum, int fh, int ch, int fpic,
 	    if (pass == 0) psw_sub_fe[k] = (unsigned char)e;
 	    else           psw_sub_ce[k] = (unsigned char)e;
 	}
+	/* ROUND 36: publish what survived, for the portal-band fold that runs on
+	   this subsector's segs in a moment.  A plane the passes above never even
+	   considered (sky ceiling -> HW sky; dominant floor -> RBG0; wrong side of
+	   the eye -> the fold's own predicate is false anyway) set no bit and
+	   reads 1: those regions ARE filled, just not by us.  Only a plane the
+	   note REFUSED (bit 1 / bit 4) clears the claim. */
+	sat_psw_fold_fvis = !(psw_sub_flag[k] & 1);
+	sat_psw_fold_cvis = !(psw_sub_flag[k] & 4);
     }
     psw_sub_n++;
 }
@@ -11096,7 +11123,9 @@ static void psw_emit_subflats(int k)
 		   the same loop for free */
 		for (i = 0; i < n; ++i)
 		    if (!psw_project(cx[i], cy[i], ph, psign, &sxv[i], &syv[i])) { ok = 0; break; }
-		if (!ok) continue;
+		/* r36: an unprojectable fan leaves the pass with NOTHING -- count
+		   it, or `zero` reads 0 for a ceiling that plainly vanished */
+		if (!ok) { if (pass) psw_ceil_zero++; continue; }
 		{
 		    int xl = sxv[0], xr = sxv[0], yt = syv[0], yb = syv[0];
 		    for (i = 1; i < n; ++i)
@@ -11128,7 +11157,8 @@ static void psw_emit_subflats(int k)
 		          + FixedMul(cy[i] - viewy, viewsin);
 		    if (i == 0 || d < dmin) { dmin = d; vi = i; }
 		}
-		if (!psw_project(cx[vi], cy[vi], ph, psign, &sxv[0], &syv[0])) continue;
+		if (!psw_project(cx[vi], cy[vi], ph, psign, &sxv[0], &syv[0]))
+		{ if (pass) psw_ceil_zero++; continue; }   /* r36: same, tiled path */
 		nr = syv[0];
 	    }
 	    if (nr < 0) nr = 0; else if (nr >= viewheight) nr = viewheight - 1;
@@ -11958,6 +11988,7 @@ static void vdp1_walls_flush(void)
         psw_flat_denied_last = (int)psw_ucr32((const volatile void *)&psw_flat_denied);
         psw_ceil_zero_last = (int)psw_ucr32((const volatile void *)&psw_ceil_zero);
         psw_ceil_hid_last = psw_ceil_hid; psw_ceil_hid = 0;   /* r34d: note-side, master */
+        psw_ceil_clip_last = psw_ceil_clip; psw_ceil_clip = 0;   /* r36: same, world-clip half */
         psw_kill_last = (int)psw_ucr32((const volatile void *)&psw_kill_n);
         psw_punch_last = (int)psw_ucr32((const volatile void *)&psw_punch_cmds);
         psw_band_last = (int)psw_ucr32((const volatile void *)&psw_band_n);

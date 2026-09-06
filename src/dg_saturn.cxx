@@ -672,6 +672,12 @@ extern "C" int sat_psw_wcull;   /* core r_segs.c: tier quads culled by the porta
 /* round 36: what the note hook really KEPT for the subsector being stored, read
    by the portal-band fold so it never claims a region the painter refused */
 extern "C" int sat_psw_fold_cvis, sat_psw_fold_fvis;
+/* round 40: leaves whose polygon exceeded the vertex cap and had to be shaved at
+   level build.  Row 13 `s<n>`, CONSTANT PER LEVEL.  The shave is outward now, so
+   s>0 is no longer a hole -- it is overdraw.  It stays on the row because the
+   count is what says whether the old inward shave could ever have been the
+   triangle: s0 would have exonerated it. */
+extern "C" int sat_psw_shaved;
 static int sat_psw_t_last = 0, sat_psw_r_last = 0;  /* frame-boundary snapshot (overlay row 13) */
 /* step 2: per-subsector flats (recorder installed at init; machinery near vdp1_walls_flush) */
 extern "C" void (*sat_psw_sub_hook)(int subnum, int fh, int ch, int fpic,
@@ -3500,7 +3506,7 @@ static void fps_update(void)
                        evidence.  `o` and `m` are the two silent classes that
                        replace it: a sub the recorder never took, and a marker
                        asked for but never drawn. */
-                    snprintf(ovbuf, sizeof ovbuf, "P39.%d h%d.%d/%d F%s f%d o%d m%d/%d ",
+                    snprintf(ovbuf, sizeof ovbuf, "P40.%d h%d.%d/%d F%s f%d o%d m%d/%d s%d ",
                              sat_psw_diag & 3,             /* r38: pad L+Down state */
                              psw_ceil_clip_last > 99 ? 99 : psw_ceil_clip_last,
                              psw_ceil_hid_last > 99 ? 99 : psw_ceil_hid_last,
@@ -3509,7 +3515,8 @@ static void fps_update(void)
                              psw_flat_last  > 999 ? 999 : psw_flat_last,
                              psw_sub_ovf_last > 999 ? 999 : psw_sub_ovf_last,
                              psw_mk_want_last > 99 ? 99 : psw_mk_want_last,
-                             psw_mk_got_last  > 99 ? 99 : psw_mk_got_last);
+                             psw_mk_got_last  > 99 ? 99 : psw_mk_got_last,
+                             sat_psw_shaved > 99 ? 99 : sat_psw_shaved);
                 }
 #endif
             if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 13, ovbuf);

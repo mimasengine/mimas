@@ -937,6 +937,26 @@ StoreWallRange, curline/frontsector/backsector/rw_angle1 vivants).
 > n'étaient comptées nulle part — un plafond disparu pouvait lire `h0/0`.
 > Marqueur `P36`. Pool 6,48 Ko ; build normal bit-intact. NON validé console
 > (9e disque).
+>
+> **ROUND 36b (2026-09-06, f9361e7)** — 9e disque : rien changé. Le
+> propriétaire apporte un bisect : **ces trous n'existaient pas avant le
+> déport des flats au slave (r33)**. Les 7 captures règlent déjà ceci :
+> `band` DOMINE (1 à 12 plafonds refusés/frame), `clip` 0-2, `zero` 0-3, et
+> **`denied`, `kill`, `drop` lisent ZÉRO dans les sept** ⇒ toutes les classes
+> « pas assez de place » sont mortes ; ce qui reste est un refus
+> d'occlusion. Deux découvertes de lecture : **`V1- B` =
+> `vdp1_budget_cmds`** (B0 = frame propre ; B>0 = transfer-over, budget HW
+> latché — `c395 B459` et `c288 B247`, donc 41 commandes jamais tracées et,
+> l'émission allant loin→proche, ce sont les PLUS PROCHES) ; et **les
+> captures L+X ne sont pas un miroir fidèle** (`sat_wall_paint` re-route tous
+> les murs vers `wall_emit_flat`, un quad plat vert chacun : c370 contre
+> c456 sur la même scène).
+> **Levier : pad R+X**, marqueur `P36a/b/c/d` (`sat_psw_ceilab`) — a
+> shipping, b cull par bandes des plafonds coupé, c terme HAUTEUR du plan
+> proche coupé pour les plafonds, d les deux. Une photo est
+> auto-descriptive. Application de [[interbuild-perf-noise]] : exiger un
+> toggle vif, les photos build-contre-build ne sont pas admissibles.
+> Pool 6,33 Ko. NON validé console (10e disque).
 
 - **Polygones de sous-secteurs au level-load** (p_setup.c après :1234, PU_LEVEL zone
   LWRAM) : clip récursif du bbox map par les splitlines ancêtres (node_t x16/y16/dx16/

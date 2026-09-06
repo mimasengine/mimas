@@ -101,7 +101,9 @@ char **environ = __env;
    it at 4.95 KB against the 4.8 KB measured boot-loop floor, which is not a
    margin.  `hp<peak>/<cap>!<n>` on row 10 is still the only warning -- ANY digit
    after `!` means this went one step too far and 2560 comes back. */
-#define HEAP_SIZE (1792)
+#define HEAP_SIZE (1536)   /* r39: 1792 -> 1536, still 280 B over the measured
+                              1256 peak.  ANY digit after `!` on row 10 and this
+                              goes straight back to 2560. */
 #endif
 static char heap[HEAP_SIZE] __attribute__((aligned(8)));
 static char *heap_end = heap;

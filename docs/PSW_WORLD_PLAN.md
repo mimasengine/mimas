@@ -910,6 +910,33 @@ StoreWallRange, curline/frontsector/backsector/rw_angle1 vivants).
 > pourquoi le symptôme a toujours été spécifique aux plafonds** : les sols
 > se trouent autant, RBG0 le masque. Marqueur `P35`, format inchangé. Pool
 > 6,58 Ko ; build normal bit-intact. NON validé console (8e disque).
+>
+> **ROUND 36 (2026-09-06, f38d556 + core d0e6b9d)** — 8e disque, 3 captures :
+> `d0/0` partout avec le `kill` désormais honnête ⇒ **la classe BUDGET est
+> éliminée SUR PREUVE** (r35 était donc un no-op, comme observé). Restent
+> `hid` (5/2/1) et `zero` (3/2/0), et les deux suivent le symptôme : les
+> deux captures du MÊME endroit lisent `h5/3` sans les plafonds et `h2/2`
+> avec ; le triangle derrière le pilone lit `h1/0`.
+> **1. LE FOLD RÉCLAMAIT CE QUE LE PEINTRE REFUSAIT** (core d0e6b9d). Le
+> portal-band fold ferme la bande d'une colonne sur la région plafond/sol du
+> secteur avant sur la seule foi de `ceilvis`/`floorvis` — prédicats
+> géométriques « un renderer vanilla dessinerait ça ». Dans le peintre cette
+> région est un candidat VDP1 séparé que le hook de note peut REFUSER : le
+> plan refusé voyait quand même sa région déclarée opaque, donc tout ce qui
+> était derrière était cullé par une promesse que personne n'honorait — un
+> refus en germe = un COULOIR de plans perdus, la forme d'un « gros trou ».
+> `sat_psw_fold_cvis`/`_fvis` publient ce que le hook a vraiment gardé. Sûr
+> par construction : les bandes ne font que rétrécir, une promesse plus
+> faible ne peut pas créer de trou (elle peut coûter des commandes).
+> **2. `hid` SPLITÉ** — row 13 `h<clip>.<band>/<zero>`. `clip` =
+> `psw_plane_poly` < 3 sommets ; `band` = `R_PswBandBoxHidden`. `clip` est le
+> premier suspect : son plan proche vaut `ph*hw2/rows`, et un plafond est ~2×
+> plus loin de l'œil qu'un sol ⇒ rayon ~2× plus grand (~162 u contre ~78 u) :
+> **plafond-lourd par arithmétique**, la forme exacte du symptôme.
+> **3. `zero` EXHAUSTIF** : les deux sorties « non projetable » de l'émetteur
+> n'étaient comptées nulle part — un plafond disparu pouvait lire `h0/0`.
+> Marqueur `P36`. Pool 6,48 Ko ; build normal bit-intact. NON validé console
+> (9e disque).
 
 - **Polygones de sous-secteurs au level-load** (p_setup.c après :1234, PU_LEVEL zone
   LWRAM) : clip récursif du bbox map par les splitlines ancêtres (node_t x16/y16/dx16/

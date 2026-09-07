@@ -669,8 +669,6 @@ static int sat_psw_req = 1;     /* owner 2026-09-02: the R+C toggle is GONE -- t
 extern "C" int sat_psw_tiers;   /* core r_segs.c: tier quads accepted this frame */
 extern "C" int sat_psw_ref;     /* core r_segs.c: tier quads shed (budget/list full) */
 extern "C" int sat_psw_wcull;   /* core r_segs.c: tier quads culled by the portal bands (round 9) */
-extern "C" int sat_psw_noleaf;  /* core r_bsp.c: subsectors with NO leaf polygon (per LEVEL) */
-extern "C" int sat_psw_pathskip;/* core r_bsp.c: partition clips that would have emptied a cell */
 /* round 36: what the note hook really KEPT for the subsector being stored, read
    by the portal-band fold so it never claims a region the painter refused */
 extern "C" int sat_psw_fold_cvis, sat_psw_fold_fvis;
@@ -770,15 +768,10 @@ static int  sat_psw_diag = 0;   /* (psw_sub_why[] lives with the sub arrays) */
      the hole STAYS     => the polygon itself does not reach there, and no amount
                            of work downstream can ever paint it
    Either way the next round starts with half the search space instead of six. */
-static int  psw_peek_miss = 0, psw_peek_miss_last = 0;   /* r46: planes the ladder
-                       granted TILED whose slot the SLAVE could only peek at, and missed.
-                       The master calls psw_slot_get and UPLOADS; the slave cannot touch
-                       the zone, so the same plane falls back to a flat colour.  Owner:
-                       "tu as le chemin du master en reference, ssh2 doit faire la meme
-                       chose" -- this counts exactly how often it cannot. */
 static int  psw_cover_n = 0, psw_cover_last = 0;   /* r42: planes whose slave
                        window ran dry mid-walk and were covered by the fan */
-
+static int  psw_tile_cull = 0, psw_tile_cull_last = 0;   /* ceiling tiles the mask
+                                                            or cull_h skipped */
 /* ROUND 38b -- A DIAGNOSTIC THAT CAN FAIL SILENTLY IS NOT A DIAGNOSTIC.  The r38
    marker had four silent `return`s (no clipped polygon, raw leaf under 3 verts,
    any vertex unprojectable, and the whole `cl < 0` sky branch), and the console
@@ -3523,20 +3516,19 @@ static void fps_update(void)
                        evidence.  `o` and `m` are the two silent classes that
                        replace it: a sub the recorder never took, and a marker
                        asked for but never drawn. */
-                    snprintf(ovbuf, sizeof ovbuf, "P47.%d%s h%d.%d/%d.%d F%s f%d c%d x%d L%d/%d.%d ",
+                    snprintf(ovbuf, sizeof ovbuf, "P48.%d%s h%d.%d/%d.%d F%s f%d w%d/%d t%d c%d ",
                              sat_psw_diag & 3,             /* r38: pad L+Down state */
-                             psw_pp_base_near ? "N" : "",  /* r47: pad L+Up */
+                             psw_pp_base_near ? "N" : "",  /* r48: pad L+Up */
                              psw_ceil_clip_last > 99 ? 99 : psw_ceil_clip_last,
                              psw_ceil_hid_last > 99 ? 99 : psw_ceil_hid_last,
                              psw_ceil_zero_last > 99 ? 99 : psw_ceil_zero_last,
                              psw_ceil_sky_last > 99 ? 99 : psw_ceil_sky_last,
                              sfb,
                              psw_flat_last  > 999 ? 999 : psw_flat_last,
-                             psw_cover_last > 99 ? 99 : psw_cover_last,
-                             psw_peek_miss_last > 99 ? 99 : psw_peek_miss_last,
-                             sat_psw_noleaf > 999 ? 999 : sat_psw_noleaf,
-                             sat_psw_pathskip > 999 ? 999 : sat_psw_pathskip,
-                             psw_sub_ovf_last > 99 ? 99 : psw_sub_ovf_last);
+                             psw_wall_cull_last > 999 ? 999 : psw_wall_cull_last,
+                             sat_psw_r_last > 999 ? 999 : sat_psw_r_last,
+                             psw_tile_cull_last > 999 ? 999 : psw_tile_cull_last,
+                             psw_cover_last > 99 ? 99 : psw_cover_last);
                 }
 #endif
             if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 13, ovbuf);
@@ -8290,7 +8282,7 @@ static void vdp1_floors_flush(void) {}
    KNOWN one-frame artifact: a slot eviction re-uploads texels the still-plotting
    previous bank may read (same acceptance as the parked design; LRU keeps
    resident flats stable below 3 distinct lumps/frame). */
-#define PSW_SUB_MAX  320   /* round 21: 240 -> 384.  The recorder overflow is the
+#define PSW_SUB_MAX      384   /* round 21: 240 -> 384.  The recorder overflow is the
                                   LAST mechanism standing for the owner's triangle hole
                                   (a ceiling partially occluded by a wall, k0 d0 r0,
                                   UNMOVED by every cull/budget change): a sub past the
@@ -8445,29 +8437,6 @@ static unsigned char psw_sub_flag[PSW_SUB_MAX];   /* NOTE-time verdicts: b0 floo
                                                      paper famine -- emit-time slack rescue) */
 static unsigned char psw_sub_fe[PSW_SUB_MAX];     /* note-time tile estimate, floor (255-clamped) */
 static unsigned char psw_sub_ce[PSW_SUB_MAX];     /* note-time tile estimate, ceiling */
-/* ROUND 45 -- THE SOLID BILL, EXACT.  Console P44: the grant ledger reached
-   `limit` (~420) while the frame really emitted f254, and the bank read
-   c456/487.  On a MASTER frame that 40% over-bill is free -- the emitter
-   spends actuals.  On a SLAVE frame it is NOT: the master reserves BILL
-   command slots per sub and the slave pads the unused tail with JP-skips, so
-   every over-billed command burns a real VDP1 bank slot.  Round A billed a
-   blanket 4 for EVERY eligible plane while the solid fan emits
-   (min(n,9)-1)/2 quads -- 1 for a triangle leaf, 2 for a pentagon.  That is
-   the structural reason the slave is poorer than the master at the same
-   bank, and why round B then had nothing left to upgrade ceilings with.
-   Low nibble = floor solid quads, high nibble = ceiling.  Master-side only
-   (the pre-pass ladder); the emitter derives the same count from n. */
-static unsigned char psw_sub_q[PSW_SUB_MAX];
-/* ROUND 47 -- THE r45 RECLAIM MUST BE CAPPED.  Billing solids honestly freed
-   ~200 commands and round B spent every one of them on tiled upgrades: from
-   ~10-15 planes to dozens.  Each tiled plane pays note-time per-tile LOS
-   probes and a texture-slot upload, and the master collapsed (console
-   2026-09-07: FMp ../352 vs ../32-64, mx361 vs 33-65, MST666, 1.5 fps).  The
-   slots also bound what upgrading can BUY: 8 slots serve ~8 distinct flats,
-   and an upgrade past that peek-misses on the slave (x on row 13) and paints
-   solid anyway.  Cap the population near-first; the freed commands now buy
-   PRESENCE (more planes granted their real solid cost), not probe storms. */
-#define PSW_UPGRADE_CAP 10
 static unsigned int  psw_sub_fmask[PSW_SUB_MAX];  /* round 17: MIXED planes only -- per-tile
                                                      LOS verdicts of the first PSW_PROBE_TILES
                                                      bbox tiles (bit set = PROVEN hidden), in
@@ -8628,7 +8597,6 @@ static void sat_psw_sub_note_body(int subnum, int fh, int ch, int fpic,
     psw_sub[k].w0    = (short)wall_acc_n;
     psw_sub[k].s0    = (short)vis0;
     psw_sub_flag[k] = 0; psw_sub_fe[k] = 8; psw_sub_ce[k] = 8;  /* 8 = unknown-est default */
-    psw_sub_q[k] = 0x44;                    /* r45: 4+4 until the note measures */
     if (psw_polys_ok && subnum >= 0 && psw_pvn[subnum] < 3)
 	psw_leaf_bad++;              /* round 22: INVALID leaf polygon = the
 	                                deterministic same-spot hole class
@@ -8697,13 +8665,6 @@ static void sat_psw_sub_note_body(int subnum, int fh, int ch, int fpic,
 	    { psw_sub_flag[k] |= bit;
 	      if (pass) psw_ceil_clip++;
 	      continue; }
-	    {   /* r45: the fan loop is `for (i = 1; i + 1 < nn; i += 2)` over
-	           nn = min(n, 9) -- that is exactly (nn - 1) / 2 quads. */
-		int q = (((nn < 9) ? nn : 9) - 1) >> 1;
-		if (q < 1) q = 1;
-		psw_sub_q[k] = (unsigned char)(pass ? ((psw_sub_q[k] & 0x0f) | (q << 4))
-		                                    : ((psw_sub_q[k] & 0xf0) | q));
-	    }
 	    if (psw_thin) psw_sub_flag[k] |= (pass == 0) ? 0x10 : 0x20;   /* r34: one quad */
 	    /* round 21: the ladder is back for FLOORS too -- round 20 removed it
 	       arguing fill is free on an idle VDP1, but every overdrawn tile is
@@ -10659,12 +10620,13 @@ static void psw_emit_plane_tiles(int slot, unsigned short colr,
 			       same as the live mixed walk) */
 			    int ti = (ty - tya) * tw + (tx - txa);
 			    if (ti >= 0 && ti < PSW_PROBE_TILES)
-			    { if ((psw_cur_mask >> ti) & 1u) { ++ty; continue; } }
+			    { if ((psw_cur_mask >> ti) & 1u)
+			      { if (psign < 0) psw_tile_cull++; ++ty; continue; } }   /* r41 */
 			    else
 			    {
 				if (psw_tile_hidden(tx << 22, ty << 22, 64 << 16,
 				                    psign, cull_h))
-				++ty; continue;
+				{ if (psign < 0) psw_tile_cull++; ++ty; continue; }        /* r41 */
 			    }
 			}
 			if (cls == 1 || bcls == PSW_BKC_LIVE)
@@ -10728,14 +10690,15 @@ static void psw_emit_plane_tiles(int slot, unsigned short colr,
 			       row-major order, walk order free to differ) */
 			    int ti = (ty - tya) * tw + (tx - txa);
 			    if (ti >= 0 && ti < PSW_PROBE_TILES)
-			    { if ((psw_cur_mask >> ti) & 1u) continue; }
+			    { if ((psw_cur_mask >> ti) & 1u)
+			      { if (psign < 0) psw_tile_cull++; continue; } }        /* r41 */
 			    else
 			    {   /* beyond-prefix tiles pay LIVE 5-point BSP probes
 				   inside ew (the `q` bracket answered 0-2 ms twice
 				   on console and left with round 33) */
 				if (psw_tile_hidden(tx << 22, ty << 22, 64 << 16,
 				                    psign, cull_h))
-				continue;
+				{ if (psign < 0) psw_tile_cull++; continue; }             /* r41 */
 			    }
 			}
 			if (cls >= 2) emitfull(ty);
@@ -11258,9 +11221,17 @@ static void psw_emit_subflats(int k)
 	    }
 	    else
 	    {
-		if (psw_sub_flag[k] & 4) continue;
-		if (psw_sub_flag[k] & 0x80) continue;
-		if (psw_sub_flag[k] & 8) cull_h = psw_sub[k].ch;
+		if (sat_psw_diag < 2)      /* r44 cran 2: NOTHING refuses a ceiling.
+		       r41 called this "raw ceilings" and still honoured flag 4 --
+		       the note's own hidden verdict, set by the world clip (nn<3)
+		       AND by R_PswBandBoxHidden.  `h../<band>/..` reads 1 at the
+		       pylon, so that verdict is the last refusal standing there
+		       and the r41 fork was never actually bought. */
+		{
+		    if (psw_sub_flag[k] & 4) continue;
+		    if (psw_sub_flag[k] & 0x80) continue;
+		    if (psw_sub_flag[k] & 8) cull_h = psw_sub[k].ch;
+		}
 	    }
 	    n = psw_plane_poly(sn, ph, psign, cx, cy);  /* world-clipped: no offscreen tail */
 	    if (n < 3) continue;
@@ -11287,13 +11258,13 @@ static void psw_emit_subflats(int k)
 	       whole remaining bank, so the term is inert there. */
 	    int solid = (psw_sub_flag[k] & fanbit)
 	           || (psw_flat_cmds + ebill > psw_flat_cap_dyn)
-	           || (psw_sf_mode && psw_cmd_left() < ebill);
+	           || (psw_sf_mode && psw_cmd_left() < ebill)
+	           || (sat_psw_diag >= 2 && pass);   /* r41: raw ceilings */
 	    int fe_ = (int)((pass == 0) ? psw_sub_fe[k] : psw_sub_ce[k]);
 	    int slot = solid ? -1
 	             : psw_sf_mode ? psw_slot_peek(lump)   /* round 33: pure -- never
 	                               uploads / touches the zone on the slave */
 	             : psw_slot_get(lump, (fe_ >= 18) ? 2 : (fe_ >= 12) ? 1 : 0);
-	    if (!solid && slot < 0 && psw_sf_mode) psw_peek_miss++;   /* r46 */
 	    psw_cur_tall = (slot >= 0) ? (int)psw_slot[slot].tall : 0;  /* round 24:
 	                       chain length - 1 -> 64x128 / 64x192 strips */
 	    int nr, li, zi, ok = 1, fb = 0;
@@ -11405,7 +11376,11 @@ static void psw_emit_subflats(int k)
 		       guard truncated it mid-plane = chunks missing).  Skipped
 		       verts are the near-collinear clip artifacts; the corner
 		       shave is invisible at degrade distance.  Billed 4. */
-		    int idx[9], nn = (n < 9) ? n : 9, s;
+		    int idx[PSW_FAN_MAX], nn = (n < 9) ? n : 9, s;
+		    if (sat_psw_diag >= 2 && pass) nn = n;   /* r41: NO decimation --
+		            dropping verts to 9 is the same INWARD simplification that
+		            round 40 removed from the leaf shave, and a probe must not
+		            carry the bug it is hunting */
 		    psw_paint_idx = 250; psw_fanq_n++;  /* L+X: solids MAGENTA */
 		    for (s = 0; s < nn; ++s) idx[s] = (s * (n - 1)) / (nn - 1);
 		    for (i = 1; i + 1 < nn; i += 2)
@@ -11972,10 +11947,9 @@ static void vdp1_walls_flush(void)
                 psw_sub_lumps(k, &fl, &cl, &fdom);
                 if (cl < 0 || (psw_sub_flag[k] & 4)) continue;
                 {
-                    int sq = (int)(psw_sub_q[k] >> 4);   /* r45: exact solid cost */
-                    int e = (psw_sub_flag[k] & 0x20) ? sq
+                    int e = (psw_sub_flag[k] & 0x20) ? 4
                           : 2 * (int)psw_sub_ce[k] + 1;
-                    int m = (e < sq) ? e : sq;
+                    int m = (e < 4) ? e : 4;
                     if (ftile + m <= csweep)
                     { ftile += m;
                       if (sf_ok) { psw_sf_bill[k]  += (unsigned short)m;
@@ -12001,15 +11975,13 @@ static void vdp1_walls_flush(void)
                    ride the headroom). */
                 if (fl >= 0 && !(psw_sub_flag[k] & 1))
                 {
-                    int sq = (int)(psw_sub_q[k] & 0x0f);   /* r45 */
-                    int e = (psw_sub_flag[k] & 0x10) ? sq
+                    int e = (psw_sub_flag[k] & 0x10) ? 4
                           : 2 * (int)psw_sub_fe[k] + 1;
-                    int m = (e < sq) ? e : sq;
+                    int m = (e < 4) ? e : 4;
                     if (ftile + m <= limit) { ftile += m; if (sf_ok) psw_sf_bill[k] += (unsigned short)m; }
                     else { psw_sub_flag[k] |= 0x40; psw_kill_n++; }  /* STANDBY */
                 }
             }
-            int nup = 0;   /* r47: tiled upgrades granted this frame */
             for (int k = 0; k < psw_sub_n; ++k)
             {   /* round B: upgrades + slots, near->far.  A pass already billed
                    its full e (e <= 4) is tiled as-is and only needs its slot;
@@ -12026,24 +11998,20 @@ static void vdp1_walls_flush(void)
                        emission-time-only hint found every neighbour taken and
                        strips silently degraded to singles */
                     int wnt = (psw_sub_fe[k] >= 18) ? 2 : (psw_sub_fe[k] >= 12) ? 1 : 0;
-                    int sq = (int)(psw_sub_q[k] & 0x0f);   /* r45 */
-                    if (e <= sq)                       psw_slot_get(fl, wnt);
-                    else if (nup < PSW_UPGRADE_CAP
-                             && ftile + (e - sq) <= limit) { ftile += e - sq; psw_slot_get(fl, wnt); nup++;
-                                                         if (sf_ok) psw_sf_bill[k] += (unsigned short)(e - sq); }
+                    if (e <= 4)                        psw_slot_get(fl, wnt);
+                    else if (ftile + (e - 4) <= limit) { ftile += e - 4; psw_slot_get(fl, wnt);
+                                                         if (sf_ok) psw_sf_bill[k] += (unsigned short)(e - 4); }
                     else                               psw_sub_flag[k] |= 0x10;
                 }
                 if (cl >= 0 && !(psw_sub_flag[k] & 0x84) && !(psw_sub_flag[k] & 0x20))
                 {
                     int e = 2 * (int)psw_sub_ce[k] + 1;
                     int wnt = (psw_sub_ce[k] >= 18) ? 2 : (psw_sub_ce[k] >= 12) ? 1 : 0;
-                    int sq = (int)(psw_sub_q[k] >> 4);   /* r45 */
-                    if (e <= sq)                       psw_slot_get(cl, wnt);
-                    else if (nup < PSW_UPGRADE_CAP
-                             && ftile + (e - sq) <= limit) { ftile += e - sq; psw_slot_get(cl, wnt); nup++;
+                    if (e <= 4)                        psw_slot_get(cl, wnt);
+                    else if (ftile + (e - 4) <= limit) { ftile += e - 4; psw_slot_get(cl, wnt);
                                                          if (sf_ok)
-                                                         { psw_sf_bill[k]  += (unsigned short)(e - sq);
-                                                           psw_sf_cbill[k] += (unsigned short)(e - sq); } }  /* r39 */
+                                                         { psw_sf_bill[k]  += (unsigned short)(e - 4);
+                                                           psw_sf_cbill[k] += (unsigned short)(e - 4); } }  /* r39 */
                     else                               psw_sub_flag[k] |= 0x20;
                 }
             }
@@ -12112,22 +12080,19 @@ static void vdp1_walls_flush(void)
                 int had_sky = (psw_sub[k].clump < 0);
                 if (!(psw_sub_flag[k] & 0xC0)) { sky_near |= had_sky; continue; }
                 psw_sub_lumps(k, &fl, &cl, &fdom);
-                if ((psw_sub_flag[k] & 0x40) && fl >= 0
-                    && ftile + (int)(psw_sub_q[k] & 0x0f) <= limC)
+                if ((psw_sub_flag[k] & 0x40) && fl >= 0 && ftile + 4 <= limC)
                 {
-                    int sq = (int)(psw_sub_q[k] & 0x0f);   /* r45 */
                     psw_sub_flag[k] = (unsigned char)((psw_sub_flag[k] & ~0x40) | 0x10);
-                    ftile += sq; psw_kill_n--;
-                    if (sf_ok) psw_sf_bill[k] += (unsigned short)sq;
+                    ftile += 4; psw_kill_n--;
+                    if (sf_ok) psw_sf_bill[k] += 4;
                 }
                 if ((psw_sub_flag[k] & 0x80) && cl >= 0 && ftile + 4 <= limC
                     && (!(psw_sub_flag[k] & 8) || !sky_near))
                 {
-                    int sq = (int)(psw_sub_q[k] >> 4);   /* r45 */
                     psw_sub_flag[k] = (unsigned char)((psw_sub_flag[k] & ~0x80) | 0x20);
-                    ftile += sq; psw_kill_n--;
-                    if (sf_ok) psw_sf_cbill[k] += (unsigned short)sq;   /* r39: CEILING */
-                    if (sf_ok) psw_sf_bill[k] += (unsigned short)sq;
+                    ftile += 4; psw_kill_n--;
+                    if (sf_ok) psw_sf_cbill[k] += 4;   /* r39: a CEILING grant */
+                    if (sf_ok) psw_sf_bill[k] += 4;
                 }
                 sky_near |= had_sky;
             }
@@ -12276,10 +12241,10 @@ static void vdp1_walls_flush(void)
         psw_ceil_clip_last = psw_ceil_clip; psw_ceil_clip = 0;   /* r36: same, world-clip half */
         psw_ceil_sky_last = (int)psw_ucr32((const volatile void *)&psw_ceil_sky);
         psw_ceil_sky = 0;                     /* r44: emitter-side, slave-written */
+        psw_tile_cull_last = (int)psw_ucr32((const volatile void *)&psw_tile_cull);
+        psw_tile_cull = 0;                    /* r41: slave-written, read uncached */
         psw_cover_last = (int)psw_ucr32((const volatile void *)&psw_cover_n);
         psw_cover_n = 0;                      /* r42: slave-written too */
-        psw_peek_miss_last = (int)psw_ucr32((const volatile void *)&psw_peek_miss);
-        psw_peek_miss = 0;                    /* r46: slave-written too */
         psw_kill_last = (int)psw_ucr32((const volatile void *)&psw_kill_n);
         psw_punch_last = (int)psw_ucr32((const volatile void *)&psw_punch_cmds);
         psw_band_last = (int)psw_ucr32((const volatile void *)&psw_band_n);
@@ -15470,25 +15435,26 @@ static void poll_pad(void)
        painted by reason / 3 + refused floors too.  L+Down was freed 2026-08-26
        when the sky/floor boundary mode was baked; predicate `!TL && TR`, the
        same shoulder as L+X, on a direction key nothing else claims. */
-    /* Pad L+UP (same shoulder as L+Down, 1p): psw_pp_base_near live A/B --
-       drops the HEIGHT TERM of psw_plane_poly's near clip (lim = ph*hw2/rows),
-       the one clip stage no toggle has EVER exercised: the flag was declared
-       in r38b, read at the clip, and its only writer died with the r41 marker
-       (workflow audit 2026-09-07, verified: declared+read, never written).
-       Marker shows `N` while active.  The verdict at the pylon:
-         triangle FILLS with N => the height term over-clips: fix the formula
-         (rows/centery vs psw_project's real row math);
-         stays => the term is innocent, A/B the two 45-degree side clips next.
-       Slave note: the slave emitter re-reads this through its own cache; the
-       clean read is N + cran 1 (master flats), one shoulder apart. */
+    /* Pad L+UP (same shoulder as L+Down, 1p) -- ROUND 48: psw_pp_base_near
+       live A/B, the FIRST ever.  It drops the HEIGHT TERM of psw_plane_poly's
+       near clip (lim = ph*hw2/rows) -- the one clip stage no toggle has ever
+       exercised: the flag was declared in r38b, read at the clip, and its only
+       writer died with the r41 marker (19-agent audit 2026-09-07, verified:
+       declared + read, never written).  Marker shows `N` while active.
+       At the pylon: triangle FILLS with N => the height term over-clips (fix
+       the formula: rows/centery vs psw_project's real row math);
+       stays => the term is innocent, A/B the two 45-degree side clips next.
+       NOTE r48 is deliberately P44 + THIS CHORD ONLY: r45..r47 (solid billing,
+       PSW_SUB_MAX 320, the counters, the upgrade cap) are OFF THE DISC -- two
+       consecutive console crashes sit somewhere in that window and the last
+       console-proven state is P44 (19.7/14.3 fps).  Re-bisect them one at a
+       time AFTER the triangle verdict. */
     if (!(cur & PER_DGT_TL) && (cur & PER_DGT_TR)
         && (changed & PER_DGT_KU) && !(cur & PER_DGT_KU))
         psw_pp_base_near ^= 1;
     if (!(cur & PER_DGT_TL) && (cur & PER_DGT_TR)
         && (changed & PER_DGT_KD) && !(cur & PER_DGT_KD))
-        sat_psw_diag = (sat_psw_diag + 1) & 1;   /* r46: 0 ship, 1 master flats --
-                       cran 2 answered (the hole survives EVERY ceiling refusal
-                       being disarmed) and its code bought the pool back */
+        sat_psw_diag = (sat_psw_diag + 1) % 3;   /* r41: 0..2 */
 #endif
     /* (Pad L+Down SKY/FLOOR BOUNDARY MODE REMOVED 2026-08-26 -- baked at 1, the shipped fix
        (window before the fence, map deferred to just after it).  0 was the A/B reference and 2

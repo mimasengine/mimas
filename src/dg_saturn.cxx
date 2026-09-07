@@ -677,7 +677,6 @@ extern "C" int sat_psw_fold_cvis, sat_psw_fold_fvis;
    s>0 is no longer a hole -- it is overdraw.  It stays on the row because the
    count is what says whether the old inward shave could ever have been the
    triangle: s0 would have exonerated it. */
-extern "C" int sat_psw_shaved;
 static int sat_psw_t_last = 0, sat_psw_r_last = 0;  /* frame-boundary snapshot (overlay row 13) */
 /* step 2: per-subsector flats (recorder installed at init; machinery near vdp1_walls_flush) */
 extern "C" void (*sat_psw_sub_hook)(int subnum, int fh, int ch, int fpic,
@@ -766,6 +765,8 @@ static int  sat_psw_diag = 0;   /* (psw_sub_why[] lives with the sub arrays) */
      the hole STAYS     => the polygon itself does not reach there, and no amount
                            of work downstream can ever paint it
    Either way the next round starts with half the search space instead of six. */
+static int  psw_cover_n = 0, psw_cover_last = 0;   /* r42: planes whose slave
+                       window ran dry mid-walk and were covered by the fan */
 static int  psw_tile_cull = 0, psw_tile_cull_last = 0;   /* ceiling tiles the mask
                                                             or cull_h skipped */
 /* ROUND 38b -- A DIAGNOSTIC THAT CAN FAIL SILENTLY IS NOT A DIAGNOSTIC.  The r38
@@ -3512,7 +3513,7 @@ static void fps_update(void)
                        evidence.  `o` and `m` are the two silent classes that
                        replace it: a sub the recorder never took, and a marker
                        asked for but never drawn. */
-                    snprintf(ovbuf, sizeof ovbuf, "P41.%d h%d.%d/%d F%s f%d o%d t%d s%d ",
+                    snprintf(ovbuf, sizeof ovbuf, "P42.%d h%d.%d/%d F%s f%d o%d t%d c%d ",
                              sat_psw_diag & 3,             /* r38: pad L+Down state */
                              psw_ceil_clip_last > 99 ? 99 : psw_ceil_clip_last,
                              psw_ceil_hid_last > 99 ? 99 : psw_ceil_hid_last,
@@ -3521,7 +3522,7 @@ static void fps_update(void)
                              psw_flat_last  > 999 ? 999 : psw_flat_last,
                              psw_sub_ovf_last > 999 ? 999 : psw_sub_ovf_last,
                              psw_tile_cull_last > 999 ? 999 : psw_tile_cull_last,
-                             sat_psw_shaved > 99 ? 99 : sat_psw_shaved);
+                             psw_cover_last > 99 ? 99 : psw_cover_last);
                 }
 #endif
             if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 13, ovbuf);
@@ -9170,6 +9171,7 @@ static void *psw_sf_stktop = 0;         /* arena: dedicated stack top (grows dow
    psw_tile_short also arms the r38 marker, so a plane that emitted a few pieces
    and then lost the rest is no longer invisible to a whole-plane probe. */
 static int psw_tile_short = 0;
+#define PSW_COVER 4                   /* r42: the solid fan is <= 4 quads (round 14) */
 static int psw_no_room(void)          /* deliberately NOT inline: six call sites,
                                          and the pool is at the boot floor */
 { psw_sf_drop++; psw_tile_short = 1; return 1; }
@@ -11322,12 +11324,40 @@ static void psw_emit_subflats(int k)
 		if (!solid)
 		{
 		    unsigned short ew0 = frt_read();   /* round 28 `e../<ew>`: the tile walk */
+		    int cov = 0;
+		    if (psw_sf_mode)
+		    {   /* ROUND 42 -- THE WINDOW MUST DEGRADE MID-WALK TOO.  Round 39 read
+		           that law onto the ENTRY decision only: a plane whose window cannot
+		           pay for its tiles now goes solid up front.  A plane that PASSES the
+		           entry test and runs dry halfway simply stopped -- psw_tile_short
+		           recorded it and nothing ever acted on it (its one reader, the r38
+		           marker, left with round 41).  Every piece past the guard was a
+		           geometric HOLE, and only on the slave: master-side psw_cmd_left()
+		           is the whole remaining bank, so the term is inert there.  That is
+		           the owner's console law verbatim -- "the slave path does not paint
+		           all the ceilings, unlike the master".  Hold PSW_COVER back so the
+		           fan below can always cover the leaf, whatever the bill got wrong. */
+		        cov = PSW_COVER;
+		        if (psw_sf_cur + cov > psw_sf_end) cov = psw_sf_end - psw_sf_cur;
+		        if (cov < 0) cov = 0;
+		        psw_sf_end -= cov;
+		    }
 		    psw_cur_mask = (pass == 0) ? psw_sub_fmask[k] : psw_sub_cmask[k];
 		    psw_cur_sub  = sn;          /* round 22: soft-line rescan key */
 		    psw_emit_plane_tiles(slot, pc, cx, cy, n, ph, psign, cull_h, scolr);
+		    psw_sf_end += cov;
 		    psw_ew_frt += (unsigned short)(frt_read() - ew0);
+		    if (psw_tile_short)
+		    {   /* the walk lost pieces: cover the WHOLE leaf with the solid fan --
+		           a wrong tint is a degrade, a missing plane is not */
+		        int okc = 1;
+		        for (i = 0; i < n; ++i)
+		            if (!psw_project(cx[i], cy[i], ph, psign, &sxv[i], &syv[i]))
+		            { okc = 0; break; }
+		        if (okc) { solid = 1; psw_cover_n++; }
+		    }
 		}
-		else
+		if (solid)
 		{   /* round 14: the solid fan is DECIMATED to <= 4 quads (a many-
 		       vert clipped poly fanned 13 quads while billed 2, and the cap
 		       guard truncated it mid-plane = chunks missing).  Skipped
@@ -12173,6 +12203,8 @@ static void vdp1_walls_flush(void)
         psw_ceil_clip_last = psw_ceil_clip; psw_ceil_clip = 0;   /* r36: same, world-clip half */
         psw_tile_cull_last = (int)psw_ucr32((const volatile void *)&psw_tile_cull);
         psw_tile_cull = 0;                    /* r41: slave-written, read uncached */
+        psw_cover_last = (int)psw_ucr32((const volatile void *)&psw_cover_n);
+        psw_cover_n = 0;                      /* r42: slave-written too */
         psw_kill_last = (int)psw_ucr32((const volatile void *)&psw_kill_n);
         psw_punch_last = (int)psw_ucr32((const volatile void *)&psw_punch_cmds);
         psw_band_last = (int)psw_ucr32((const volatile void *)&psw_band_n);

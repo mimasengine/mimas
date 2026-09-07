@@ -1062,6 +1062,26 @@ StoreWallRange, curline/frontsector/backsector/rw_angle1 vivants).
 > **Peinture des refus supprimée** (verdict `m0/0` rendu ; 960 o + 192 o).
 > Pool 4,91 → **7,11 Ko**, au-dessus de la cible de confort, sans avertissement.
 > Marqueur `P41`. Build normal bit-intact. NON validé console (16e disque).
+>
+> **ROUND 42 (2026-09-07, bd2ac37 + core 19e17b2)** — **les deux défauts
+> démontrés par lecture.** (1) **Le triangle** : le fold des bandes réclamait
+> le tier opaque même quand le tier n'était jamais peint (refus `sat_psw_ref`,
+> abandon du chemin magnifié, cull de bande) → tout plafond derrière répondait
+> `R_PswBandBoxHidden` = plan ENTIER perdu. Preuve : `h../<band>` = 4 sur
+> toutes les captures **y compris au cran 2**, où rien d'autre ne peut tuer un
+> plafond. Fix `psw_tier_endx` (borne de colonne réellement peinte) ; le round
+> 36 avait cette loi et ne l'avait appliquée qu'aux PLANS. Le jumeau SOL ment
+> pareil mais RBG0 le remplit — d'où neuf rounds « plafonds seulement ».
+> (2) **Les plafonds du spawn** : le round 39 a câblé « dégrader, pas tronquer »
+> sur la seule décision d'ENTRÉE ; un plan qui vide sa fenêtre à mi-marche
+> s'arrêtait net (`psw_tile_short` sans lecteur depuis r41), sur le SLAVE
+> seulement — `F15/13` contre `F0/0` au cran 1. Fix **`PSW_COVER` = 4
+> commandes retenues par job** ⇒ un manque repeint la feuille en fan solide,
+> sans avoir à savoir quel terme de `2*ce+1` est faux. Nouveau `c<cover>` ;
+> `s<shaved>` sort (0 partout, le rabotage r40 ne se déclenche jamais).
+> ⚠ Un fold plus faible cull moins ⇒ plus de commandes : surveiller `f` et
+> `V1- c`. Pool 5,83 Ko. Marqueur `P42`. Build normal bit-intact. NON validé
+> console (17e disque).
 
 - **Polygones de sous-secteurs au level-load** (p_setup.c après :1234, PU_LEVEL zone
   LWRAM) : clip récursif du bbox map par les splitlines ancêtres (node_t x16/y16/dx16/

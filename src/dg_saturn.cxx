@@ -728,6 +728,9 @@ static int  psw_bk_baked_last = 0, psw_bk_live_last = 0;   /* round 32 (off the 
    `band` = R_PswBandBoxHidden said the projected bbox meets no open band.
    The two want opposite fixes, hence the dot. */
 static int  psw_ceil_hid = 0, psw_ceil_zero = 0, psw_ceil_clip = 0;
+static int  psw_ceil_sky = 0, psw_ceil_sky_last = 0;   /* r44: above-eye ceilings
+                       skipped for `cl < 0` (sky / no flat lump) -- the ONE ceiling
+                       exit that never had a counter, and the sky is what shows */
 static int  psw_ceil_hid_last = 0, psw_ceil_zero_last = 0, psw_ceil_clip_last = 0;
 /* (ROUND 36b's R+X A/B on the two ceiling refusals is REMOVED -- it did its job
    on console: the spawn ceilings moved, the triangle did not, which is how the
@@ -3513,11 +3516,12 @@ static void fps_update(void)
                        evidence.  `o` and `m` are the two silent classes that
                        replace it: a sub the recorder never took, and a marker
                        asked for but never drawn. */
-                    snprintf(ovbuf, sizeof ovbuf, "P43.%d h%d.%d/%d F%s f%d w%d/%d t%d c%d ",
+                    snprintf(ovbuf, sizeof ovbuf, "P44.%d h%d.%d/%d.%d F%s f%d w%d/%d t%d c%d ",
                              sat_psw_diag & 3,             /* r38: pad L+Down state */
                              psw_ceil_clip_last > 99 ? 99 : psw_ceil_clip_last,
                              psw_ceil_hid_last > 99 ? 99 : psw_ceil_hid_last,
                              psw_ceil_zero_last > 99 ? 99 : psw_ceil_zero_last,
+                             psw_ceil_sky_last > 99 ? 99 : psw_ceil_sky_last,
                              sfb,
                              psw_flat_last  > 999 ? 999 : psw_flat_last,
                              psw_wall_cull_last > 999 ? 999 : psw_wall_cull_last,
@@ -11196,7 +11200,9 @@ static void psw_emit_subflats(int k)
 	}
 	else                                            /* CEILING */
 	{
-	    if (cl < 0) continue;
+	    if (cl < 0)
+	    { if (psw_sub[k].ch > viewz) psw_ceil_sky++;   /* r44: was SILENT */
+	      continue; }
 	    ph = psw_sub[k].ch - viewz; psign = -1; lump = cl;
 	}
 	{
@@ -11214,9 +11220,14 @@ static void psw_emit_subflats(int k)
 	    }
 	    else
 	    {
-		if (psw_sub_flag[k] & 4) continue;
-		if (sat_psw_diag < 2)      /* r41 cran 2: no standby, no cull_h */
+		if (sat_psw_diag < 2)      /* r44 cran 2: NOTHING refuses a ceiling.
+		       r41 called this "raw ceilings" and still honoured flag 4 --
+		       the note's own hidden verdict, set by the world clip (nn<3)
+		       AND by R_PswBandBoxHidden.  `h../<band>/..` reads 1 at the
+		       pylon, so that verdict is the last refusal standing there
+		       and the r41 fork was never actually bought. */
 		{
+		    if (psw_sub_flag[k] & 4) continue;
 		    if (psw_sub_flag[k] & 0x80) continue;
 		    if (psw_sub_flag[k] & 8) cull_h = psw_sub[k].ch;
 		}
@@ -11873,6 +11884,30 @@ static void vdp1_walls_flush(void)
                cap ran dry).  Bill 2e+1 for a tiled plane, 4 for a solid
                degrade; the budget DEGRADES before it kills, near->far. */
             int limit = fbudget;
+            /* ROUND 44 -- THE FINE RESERVE MUST BE FUNDED BEFORE THE GRANTS.
+               The emitter's FINE strips (the sub-band pieces a diagonal border
+               tile needs beyond its window+quad) are NOT billed by 2e+1: on a
+               master frame they ride the global headroom, which is free, and
+               round 33 replaced that with a per-job "+9 = window + 8 strips"
+               reserve dealt from `limit - ftile`.  But rounds A and B spend
+               near->far until `limit` is GONE -- the round-34b comment says so
+               in as many words -- and r34c deliberately zeroes the credit on
+               slave frames.  So on every slave frame `fres` was 0 and NOT ONE
+               job ever got its fine allowance: every tiled plane was held to
+               exactly 2e+1, ran dry on its first fine strip, and truncated.
+               That is the whole of the owner's console law -- "there is NO
+               reason the slave cannot emit these tiles if the master did".
+               The master pays this term out of headroom; the slave must be
+               given it, so carve it off the top where the grants cannot eat
+               it.  A tiled plane that is COMPLETE is worth more than one more
+               partial upgrade: the budget must degrade before it kills. */
+            int finepot = 0;
+            if (sf_ok)
+            {
+                finepot = limit >> 2;
+                if (finepot > PSW_FINE_CAP) finepot = PSW_FINE_CAP;
+                limit -= finepot;
+            }
             /* ROUND 18: GUARANTEED-MINIMUM ALLOCATION (owner: "c'est si
                complique de ne pas avoir de trous ?").  The old greedy grant
                gave near planes their FULL tiled cost first, so in a heavy
@@ -12062,13 +12097,14 @@ static void vdp1_walls_flush(void)
             }
             if (limC > limit) limit = limC;      /* the fine deal + belts below
                                                     see the same ledger */
-            psw_flat_cap_dyn = limC;             /* or the emitter refuses the
-                                                    very commands just granted */
+            psw_flat_cap_dyn = limC + finepot;   /* or the emitter refuses the
+                                                    very commands just granted
+                                                    (r44: the pot is part of it) */
             }
             if (sf_ok)
             {
                 {
-                    int fres = limit - ftile;
+                    int fres = finepot + (limit - ftile);   /* r44: guaranteed */
                     if (fres > PSW_FINE_CAP) fres = PSW_FINE_CAP;
                     /* ROUND 34c -- THE JOB PACKER RATIONED THE WRONG END.  All
                        three of its limits (PSW_SF_JOB_CAP, the arena prefix-sum
@@ -12202,6 +12238,8 @@ static void vdp1_walls_flush(void)
         psw_ceil_zero_last = (int)psw_ucr32((const volatile void *)&psw_ceil_zero);
         psw_ceil_hid_last = psw_ceil_hid; psw_ceil_hid = 0;   /* r34d: note-side, master */
         psw_ceil_clip_last = psw_ceil_clip; psw_ceil_clip = 0;   /* r36: same, world-clip half */
+        psw_ceil_sky_last = (int)psw_ucr32((const volatile void *)&psw_ceil_sky);
+        psw_ceil_sky = 0;                     /* r44: emitter-side, slave-written */
         psw_tile_cull_last = (int)psw_ucr32((const volatile void *)&psw_tile_cull);
         psw_tile_cull = 0;                    /* r41: slave-written, read uncached */
         psw_cover_last = (int)psw_ucr32((const volatile void *)&psw_cover_n);

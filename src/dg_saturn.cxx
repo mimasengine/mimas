@@ -3523,8 +3523,9 @@ static void fps_update(void)
                        evidence.  `o` and `m` are the two silent classes that
                        replace it: a sub the recorder never took, and a marker
                        asked for but never drawn. */
-                    snprintf(ovbuf, sizeof ovbuf, "P46.%d h%d.%d/%d.%d F%s f%d c%d x%d L%d/%d.%d ",
+                    snprintf(ovbuf, sizeof ovbuf, "P47.%d%s h%d.%d/%d.%d F%s f%d c%d x%d L%d/%d.%d ",
                              sat_psw_diag & 3,             /* r38: pad L+Down state */
+                             psw_pp_base_near ? "N" : "",  /* r47: pad L+Up */
                              psw_ceil_clip_last > 99 ? 99 : psw_ceil_clip_last,
                              psw_ceil_hid_last > 99 ? 99 : psw_ceil_hid_last,
                              psw_ceil_zero_last > 99 ? 99 : psw_ceil_zero_last,
@@ -8457,6 +8458,16 @@ static unsigned char psw_sub_ce[PSW_SUB_MAX];     /* note-time tile estimate, ce
    Low nibble = floor solid quads, high nibble = ceiling.  Master-side only
    (the pre-pass ladder); the emitter derives the same count from n. */
 static unsigned char psw_sub_q[PSW_SUB_MAX];
+/* ROUND 47 -- THE r45 RECLAIM MUST BE CAPPED.  Billing solids honestly freed
+   ~200 commands and round B spent every one of them on tiled upgrades: from
+   ~10-15 planes to dozens.  Each tiled plane pays note-time per-tile LOS
+   probes and a texture-slot upload, and the master collapsed (console
+   2026-09-07: FMp ../352 vs ../32-64, mx361 vs 33-65, MST666, 1.5 fps).  The
+   slots also bound what upgrading can BUY: 8 slots serve ~8 distinct flats,
+   and an upgrade past that peek-misses on the slave (x on row 13) and paints
+   solid anyway.  Cap the population near-first; the freed commands now buy
+   PRESENCE (more planes granted their real solid cost), not probe storms. */
+#define PSW_UPGRADE_CAP 10
 static unsigned int  psw_sub_fmask[PSW_SUB_MAX];  /* round 17: MIXED planes only -- per-tile
                                                      LOS verdicts of the first PSW_PROBE_TILES
                                                      bbox tiles (bit set = PROVEN hidden), in
@@ -11998,6 +12009,7 @@ static void vdp1_walls_flush(void)
                     else { psw_sub_flag[k] |= 0x40; psw_kill_n++; }  /* STANDBY */
                 }
             }
+            int nup = 0;   /* r47: tiled upgrades granted this frame */
             for (int k = 0; k < psw_sub_n; ++k)
             {   /* round B: upgrades + slots, near->far.  A pass already billed
                    its full e (e <= 4) is tiled as-is and only needs its slot;
@@ -12016,7 +12028,8 @@ static void vdp1_walls_flush(void)
                     int wnt = (psw_sub_fe[k] >= 18) ? 2 : (psw_sub_fe[k] >= 12) ? 1 : 0;
                     int sq = (int)(psw_sub_q[k] & 0x0f);   /* r45 */
                     if (e <= sq)                       psw_slot_get(fl, wnt);
-                    else if (ftile + (e - sq) <= limit) { ftile += e - sq; psw_slot_get(fl, wnt);
+                    else if (nup < PSW_UPGRADE_CAP
+                             && ftile + (e - sq) <= limit) { ftile += e - sq; psw_slot_get(fl, wnt); nup++;
                                                          if (sf_ok) psw_sf_bill[k] += (unsigned short)(e - sq); }
                     else                               psw_sub_flag[k] |= 0x10;
                 }
@@ -12026,7 +12039,8 @@ static void vdp1_walls_flush(void)
                     int wnt = (psw_sub_ce[k] >= 18) ? 2 : (psw_sub_ce[k] >= 12) ? 1 : 0;
                     int sq = (int)(psw_sub_q[k] >> 4);   /* r45 */
                     if (e <= sq)                       psw_slot_get(cl, wnt);
-                    else if (ftile + (e - sq) <= limit) { ftile += e - sq; psw_slot_get(cl, wnt);
+                    else if (nup < PSW_UPGRADE_CAP
+                             && ftile + (e - sq) <= limit) { ftile += e - sq; psw_slot_get(cl, wnt); nup++;
                                                          if (sf_ok)
                                                          { psw_sf_bill[k]  += (unsigned short)(e - sq);
                                                            psw_sf_cbill[k] += (unsigned short)(e - sq); } }  /* r39 */
@@ -15456,6 +15470,20 @@ static void poll_pad(void)
        painted by reason / 3 + refused floors too.  L+Down was freed 2026-08-26
        when the sky/floor boundary mode was baked; predicate `!TL && TR`, the
        same shoulder as L+X, on a direction key nothing else claims. */
+    /* Pad L+UP (same shoulder as L+Down, 1p): psw_pp_base_near live A/B --
+       drops the HEIGHT TERM of psw_plane_poly's near clip (lim = ph*hw2/rows),
+       the one clip stage no toggle has EVER exercised: the flag was declared
+       in r38b, read at the clip, and its only writer died with the r41 marker
+       (workflow audit 2026-09-07, verified: declared+read, never written).
+       Marker shows `N` while active.  The verdict at the pylon:
+         triangle FILLS with N => the height term over-clips: fix the formula
+         (rows/centery vs psw_project's real row math);
+         stays => the term is innocent, A/B the two 45-degree side clips next.
+       Slave note: the slave emitter re-reads this through its own cache; the
+       clean read is N + cran 1 (master flats), one shoulder apart. */
+    if (!(cur & PER_DGT_TL) && (cur & PER_DGT_TR)
+        && (changed & PER_DGT_KU) && !(cur & PER_DGT_KU))
+        psw_pp_base_near ^= 1;
     if (!(cur & PER_DGT_TL) && (cur & PER_DGT_TR)
         && (changed & PER_DGT_KD) && !(cur & PER_DGT_KD))
         sat_psw_diag = (sat_psw_diag + 1) & 1;   /* r46: 0 ship, 1 master flats --

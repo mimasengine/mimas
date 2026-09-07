@@ -1082,6 +1082,20 @@ StoreWallRange, curline/frontsector/backsector/rw_angle1 vivants).
 > ⚠ Un fold plus faible cull moins ⇒ plus de commandes : surveiller `f` et
 > `V1- c`. Pool 5,83 Ko. Marqueur `P42`. Build normal bit-intact. NON validé
 > console (17e disque).
+>
+> **ROUNDS 43–47 (2026-09-07, 6597363…32fb7eb)** — consolidé. r43 : côté MUR
+> sur la ligne (retiré en r46, w3/0 hors de cause). r44 : pot de réserve fine
+> financé en amont — famine de fenêtre ÉTEINTE, **prouvé console `F16/0 c0`**.
+> r45 : facture des solides exacte (`psw_sub_q`) — juste mais SANS PLAFOND ⇒
+> régression 1,5 fps (FMp ../352, mx361, MST666). r46 : garde r37 sur la boucle
+> du CHEMIN BSP + `L<noleaf>/<pathskip>.<ovf>` + `x<peekmiss>` (le slave ne peut
+> que PEEK les slots, le master CHARGE) ; PSW_SUB_MAX 384→320 ; **console
+> `L0/0` = théorie feuille-manquante morte sur données**. r47 (GO propriétaire) :
+> **`PSW_UPGRADE_CAP 10`** (fixe la régression) + **pad L+HAUT =
+> `psw_pp_base_near`** — premier A/B réel du near-clip (l'audit 19 agents a
+> confirmé que tous les « cran 2 » re-dérivaient le verdict qu'ils
+> désarmaient, et que ce flag n'a JAMAIS été écrit). Marqueur `P47<N?>`.
+> Pool 6,36 Ko. Build normal bit-intact. NON validé console (21e disque).
 
 - **Polygones de sous-secteurs au level-load** (p_setup.c après :1234, PU_LEVEL zone
   LWRAM) : clip récursif du bbox map par les splitlines ancêtres (node_t x16/y16/dx16/

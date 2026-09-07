@@ -1048,6 +1048,20 @@ StoreWallRange, curline/frontsector/backsector/rw_angle1 vivants).
 > Sonde `s<shaved>` (feuilles rabotées, constante par niveau) — le champ `s`
 > change de sens (ce n'est plus segskip). Marqueur `P40`. Pool 5,44 Ko. Build
 > normal bit-intact. NON validé console (15e disque).
+>
+> **ROUND 41 (2026-09-07, d8196ae)** — 15e disque : spawn ET triangle toujours
+> absents. **Neuf rounds, neuf défauts réels corrigés, zéro mouvement** ⇒ je
+> devine l'ÉTAGE. On achète la bifurcation au lieu d'un 10e correctif.
+> **Pad L+bas, 3 crans** : 0 shipping · 1 flats sur le MASTER · **2 PLAFONDS
+> BRUTS** (chaque plafond = UN fan solide de son polygone de feuille COMPLET,
+> masque LOS par tuile / `cull_h` / standby / marche de tuiles tous coupés ; le
+> fan garde TOUS ses sommets). Trou qui se remplit ⇒ la perte est dans
+> `psw_emit_plane_tiles` ; trou qui reste ⇒ le polygone n'atteint pas la zone.
+> **Nouveau `t<n>`** = tuiles de plafond sautées par le masque ou `cull_h` — le
+> mécanisme « le code pense qu'on couvre tout », jamais affiché jusqu'ici.
+> **Peinture des refus supprimée** (verdict `m0/0` rendu ; 960 o + 192 o).
+> Pool 4,91 → **7,11 Ko**, au-dessus de la cible de confort, sans avertissement.
+> Marqueur `P41`. Build normal bit-intact. NON validé console (16e disque).
 
 - **Polygones de sous-secteurs au level-load** (p_setup.c après :1234, PU_LEVEL zone
   LWRAM) : clip récursif du bbox map par les splitlines ancêtres (node_t x16/y16/dx16/

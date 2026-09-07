@@ -3516,7 +3516,7 @@ static void fps_update(void)
                        evidence.  `o` and `m` are the two silent classes that
                        replace it: a sub the recorder never took, and a marker
                        asked for but never drawn. */
-                    snprintf(ovbuf, sizeof ovbuf, "P44.%d h%d.%d/%d.%d F%s f%d w%d/%d t%d c%d ",
+                    snprintf(ovbuf, sizeof ovbuf, "P45.%d h%d.%d/%d.%d F%s f%d w%d/%d t%d c%d ",
                              sat_psw_diag & 3,             /* r38: pad L+Down state */
                              psw_ceil_clip_last > 99 ? 99 : psw_ceil_clip_last,
                              psw_ceil_hid_last > 99 ? 99 : psw_ceil_hid_last,
@@ -8436,6 +8436,19 @@ static unsigned char psw_sub_flag[PSW_SUB_MAX];   /* NOTE-time verdicts: b0 floo
                                                      paper famine -- emit-time slack rescue) */
 static unsigned char psw_sub_fe[PSW_SUB_MAX];     /* note-time tile estimate, floor (255-clamped) */
 static unsigned char psw_sub_ce[PSW_SUB_MAX];     /* note-time tile estimate, ceiling */
+/* ROUND 45 -- THE SOLID BILL, EXACT.  Console P44: the grant ledger reached
+   `limit` (~420) while the frame really emitted f254, and the bank read
+   c456/487.  On a MASTER frame that 40% over-bill is free -- the emitter
+   spends actuals.  On a SLAVE frame it is NOT: the master reserves BILL
+   command slots per sub and the slave pads the unused tail with JP-skips, so
+   every over-billed command burns a real VDP1 bank slot.  Round A billed a
+   blanket 4 for EVERY eligible plane while the solid fan emits
+   (min(n,9)-1)/2 quads -- 1 for a triangle leaf, 2 for a pentagon.  That is
+   the structural reason the slave is poorer than the master at the same
+   bank, and why round B then had nothing left to upgrade ceilings with.
+   Low nibble = floor solid quads, high nibble = ceiling.  Master-side only
+   (the pre-pass ladder); the emitter derives the same count from n. */
+static unsigned char psw_sub_q[PSW_SUB_MAX];
 static unsigned int  psw_sub_fmask[PSW_SUB_MAX];  /* round 17: MIXED planes only -- per-tile
                                                      LOS verdicts of the first PSW_PROBE_TILES
                                                      bbox tiles (bit set = PROVEN hidden), in
@@ -8596,6 +8609,7 @@ static void sat_psw_sub_note_body(int subnum, int fh, int ch, int fpic,
     psw_sub[k].w0    = (short)wall_acc_n;
     psw_sub[k].s0    = (short)vis0;
     psw_sub_flag[k] = 0; psw_sub_fe[k] = 8; psw_sub_ce[k] = 8;  /* 8 = unknown-est default */
+    psw_sub_q[k] = 0x44;                    /* r45: 4+4 until the note measures */
     if (psw_polys_ok && subnum >= 0 && psw_pvn[subnum] < 3)
 	psw_leaf_bad++;              /* round 22: INVALID leaf polygon = the
 	                                deterministic same-spot hole class
@@ -8664,6 +8678,13 @@ static void sat_psw_sub_note_body(int subnum, int fh, int ch, int fpic,
 	    { psw_sub_flag[k] |= bit;
 	      if (pass) psw_ceil_clip++;
 	      continue; }
+	    {   /* r45: the fan loop is `for (i = 1; i + 1 < nn; i += 2)` over
+	           nn = min(n, 9) -- that is exactly (nn - 1) / 2 quads. */
+		int q = (((nn < 9) ? nn : 9) - 1) >> 1;
+		if (q < 1) q = 1;
+		psw_sub_q[k] = (unsigned char)(pass ? ((psw_sub_q[k] & 0x0f) | (q << 4))
+		                                    : ((psw_sub_q[k] & 0xf0) | q));
+	    }
 	    if (psw_thin) psw_sub_flag[k] |= (pass == 0) ? 0x10 : 0x20;   /* r34: one quad */
 	    /* round 21: the ladder is back for FLOORS too -- round 20 removed it
 	       arguing fill is free on an idle VDP1, but every overdrawn tile is
@@ -11946,9 +11967,10 @@ static void vdp1_walls_flush(void)
                 psw_sub_lumps(k, &fl, &cl, &fdom);
                 if (cl < 0 || (psw_sub_flag[k] & 4)) continue;
                 {
-                    int e = (psw_sub_flag[k] & 0x20) ? 4
+                    int sq = (int)(psw_sub_q[k] >> 4);   /* r45: exact solid cost */
+                    int e = (psw_sub_flag[k] & 0x20) ? sq
                           : 2 * (int)psw_sub_ce[k] + 1;
-                    int m = (e < 4) ? e : 4;
+                    int m = (e < sq) ? e : sq;
                     if (ftile + m <= csweep)
                     { ftile += m;
                       if (sf_ok) { psw_sf_bill[k]  += (unsigned short)m;
@@ -11974,9 +11996,10 @@ static void vdp1_walls_flush(void)
                    ride the headroom). */
                 if (fl >= 0 && !(psw_sub_flag[k] & 1))
                 {
-                    int e = (psw_sub_flag[k] & 0x10) ? 4
+                    int sq = (int)(psw_sub_q[k] & 0x0f);   /* r45 */
+                    int e = (psw_sub_flag[k] & 0x10) ? sq
                           : 2 * (int)psw_sub_fe[k] + 1;
-                    int m = (e < 4) ? e : 4;
+                    int m = (e < sq) ? e : sq;
                     if (ftile + m <= limit) { ftile += m; if (sf_ok) psw_sf_bill[k] += (unsigned short)m; }
                     else { psw_sub_flag[k] |= 0x40; psw_kill_n++; }  /* STANDBY */
                 }
@@ -11997,20 +12020,22 @@ static void vdp1_walls_flush(void)
                        emission-time-only hint found every neighbour taken and
                        strips silently degraded to singles */
                     int wnt = (psw_sub_fe[k] >= 18) ? 2 : (psw_sub_fe[k] >= 12) ? 1 : 0;
-                    if (e <= 4)                        psw_slot_get(fl, wnt);
-                    else if (ftile + (e - 4) <= limit) { ftile += e - 4; psw_slot_get(fl, wnt);
-                                                         if (sf_ok) psw_sf_bill[k] += (unsigned short)(e - 4); }
+                    int sq = (int)(psw_sub_q[k] & 0x0f);   /* r45 */
+                    if (e <= sq)                       psw_slot_get(fl, wnt);
+                    else if (ftile + (e - sq) <= limit) { ftile += e - sq; psw_slot_get(fl, wnt);
+                                                         if (sf_ok) psw_sf_bill[k] += (unsigned short)(e - sq); }
                     else                               psw_sub_flag[k] |= 0x10;
                 }
                 if (cl >= 0 && !(psw_sub_flag[k] & 0x84) && !(psw_sub_flag[k] & 0x20))
                 {
                     int e = 2 * (int)psw_sub_ce[k] + 1;
                     int wnt = (psw_sub_ce[k] >= 18) ? 2 : (psw_sub_ce[k] >= 12) ? 1 : 0;
-                    if (e <= 4)                        psw_slot_get(cl, wnt);
-                    else if (ftile + (e - 4) <= limit) { ftile += e - 4; psw_slot_get(cl, wnt);
+                    int sq = (int)(psw_sub_q[k] >> 4);   /* r45 */
+                    if (e <= sq)                       psw_slot_get(cl, wnt);
+                    else if (ftile + (e - sq) <= limit) { ftile += e - sq; psw_slot_get(cl, wnt);
                                                          if (sf_ok)
-                                                         { psw_sf_bill[k]  += (unsigned short)(e - 4);
-                                                           psw_sf_cbill[k] += (unsigned short)(e - 4); } }  /* r39 */
+                                                         { psw_sf_bill[k]  += (unsigned short)(e - sq);
+                                                           psw_sf_cbill[k] += (unsigned short)(e - sq); } }  /* r39 */
                     else                               psw_sub_flag[k] |= 0x20;
                 }
             }
@@ -12079,19 +12104,22 @@ static void vdp1_walls_flush(void)
                 int had_sky = (psw_sub[k].clump < 0);
                 if (!(psw_sub_flag[k] & 0xC0)) { sky_near |= had_sky; continue; }
                 psw_sub_lumps(k, &fl, &cl, &fdom);
-                if ((psw_sub_flag[k] & 0x40) && fl >= 0 && ftile + 4 <= limC)
+                if ((psw_sub_flag[k] & 0x40) && fl >= 0
+                    && ftile + (int)(psw_sub_q[k] & 0x0f) <= limC)
                 {
+                    int sq = (int)(psw_sub_q[k] & 0x0f);   /* r45 */
                     psw_sub_flag[k] = (unsigned char)((psw_sub_flag[k] & ~0x40) | 0x10);
-                    ftile += 4; psw_kill_n--;
-                    if (sf_ok) psw_sf_bill[k] += 4;
+                    ftile += sq; psw_kill_n--;
+                    if (sf_ok) psw_sf_bill[k] += (unsigned short)sq;
                 }
                 if ((psw_sub_flag[k] & 0x80) && cl >= 0 && ftile + 4 <= limC
                     && (!(psw_sub_flag[k] & 8) || !sky_near))
                 {
+                    int sq = (int)(psw_sub_q[k] >> 4);   /* r45 */
                     psw_sub_flag[k] = (unsigned char)((psw_sub_flag[k] & ~0x80) | 0x20);
-                    ftile += 4; psw_kill_n--;
-                    if (sf_ok) psw_sf_cbill[k] += 4;   /* r39: a CEILING grant */
-                    if (sf_ok) psw_sf_bill[k] += 4;
+                    ftile += sq; psw_kill_n--;
+                    if (sf_ok) psw_sf_cbill[k] += (unsigned short)sq;   /* r39: CEILING */
+                    if (sf_ok) psw_sf_bill[k] += (unsigned short)sq;
                 }
                 sky_near |= had_sky;
             }

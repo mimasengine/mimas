@@ -3513,14 +3513,15 @@ static void fps_update(void)
                        evidence.  `o` and `m` are the two silent classes that
                        replace it: a sub the recorder never took, and a marker
                        asked for but never drawn. */
-                    snprintf(ovbuf, sizeof ovbuf, "P42.%d h%d.%d/%d F%s f%d o%d t%d c%d ",
+                    snprintf(ovbuf, sizeof ovbuf, "P43.%d h%d.%d/%d F%s f%d w%d/%d t%d c%d ",
                              sat_psw_diag & 3,             /* r38: pad L+Down state */
                              psw_ceil_clip_last > 99 ? 99 : psw_ceil_clip_last,
                              psw_ceil_hid_last > 99 ? 99 : psw_ceil_hid_last,
                              psw_ceil_zero_last > 99 ? 99 : psw_ceil_zero_last,
                              sfb,
                              psw_flat_last  > 999 ? 999 : psw_flat_last,
-                             psw_sub_ovf_last > 999 ? 999 : psw_sub_ovf_last,
+                             psw_wall_cull_last > 999 ? 999 : psw_wall_cull_last,
+                             sat_psw_r_last > 999 ? 999 : sat_psw_r_last,
                              psw_tile_cull_last > 999 ? 999 : psw_tile_cull_last,
                              psw_cover_last > 99 ? 99 : psw_cover_last);
                 }

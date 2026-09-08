@@ -3533,7 +3533,7 @@ static void fps_update(void)
                        takes the column: solid FAN emissions this frame (piece
                        fans + plane fans), the counter of the magenta the
                        console keeps showing while every other counter is 0. */
-                    snprintf(ovbuf, sizeof ovbuf, "P54.%d%s h%d.%d/%d.%d F%s f%d n%d s%d c%d ",
+                    snprintf(ovbuf, sizeof ovbuf, "P55.%d%s h%d.%d/%d.%d F%s f%d n%d s%d c%d ",
                              sat_psw_diag & 3,             /* r38: pad L+Down state */
                              psw_pp_base_near ? "N" : "",  /* r48: pad L+Up */
                              psw_ceil_clip_last > 99 ? 99 : psw_ceil_clip_last,
@@ -8319,9 +8319,8 @@ static const unsigned int psw_slot_vram[PSW_FLAT_SLOTS] =
 #define PSW_RESCUE_CREDIT 64         /* r34b: max commands round C may spend beyond the
                                         bill ledger, funded by last frame's MEASURED
                                         (billed - emitted) gap.  16 rescued planes. */
-#define PSW_THIN_U       32          /* r34: a leaf thinner than this (and longer than
-                                        one tile) is a step tread / sill / ledge -- a
-                                        ZONE, never a flat.  See sat_psw_sub_note_body. */
+/* (PSW_THIN_U deleted in ROUND 55 -- the r34 thin-solid note-LOD was the spawn
+   aplat; thin leaves ride the normal grid walk now.  See the note body.) */
 #define PSW_FLAT_CAP     420         /* belt: whole-frame flat command hard cap
                                         (the DYNAMIC budget is the real law).
                                         Round 19: raised 232 -> 420 with the bank
@@ -8644,21 +8643,16 @@ static void sat_psw_sub_note_body(int subnum, int fh, int ch, int fpic,
 	   Elongation is required (mx >= 64u) so a small SQUARE leaf keeps its
 	   texture -- it fits one char and the own-quad path already draws it
 	   exactly.  Axis-aligned bbox: a DIAGONAL thin ledge still tiles. */
-	int psw_thin = 0;
-	if (psw_polys_ok && subnum >= 0 && psw_pvn[subnum] >= 3)
-	{
-	    int i0 = psw_pvi[subnum], nv = psw_pvn[subnum];
-	    int lx0 = psw_pvx[i0], lx1 = lx0, ly0 = psw_pvy[i0], ly1 = ly0, mn, mx;
-	    for (int v2 = 1; v2 < nv; ++v2)
-	    {
-		int X = psw_pvx[i0 + v2], Y = psw_pvy[i0 + v2];
-		if (X < lx0) lx0 = X; if (X > lx1) lx1 = X;
-		if (Y < ly0) ly0 = Y; if (Y > ly1) ly1 = Y;
-	    }
-	    mn = (lx1 - lx0 < ly1 - ly0) ? (lx1 - lx0) : (ly1 - ly0);
-	    mx = (lx1 - lx0 < ly1 - ly0) ? (ly1 - ly0) : (lx1 - lx0);
-	    psw_thin = (mn <= (PSW_THIN_U << 16) && mx >= (64 << 16));
-	}
+	/* ROUND 55 -- THE THIN RULE IS DELETED (owner GO, 2026-09-08).  The r34
+	   "thin leaf => one solid quad" note-LOD was the SPAWN APLAT: every
+	   perimeter ceiling band (<= 32u wide, >= 64u long) went flag-solid AT
+	   THE NOTE, in both modes, before any budget/slot/window mechanism ran
+	   -- which is why twelve rounds of those fixes moved nothing and `s`
+	   read a constant 14.  The artifact the rule fixed (round-24-era coarse
+	   band + rect window = stairs on slanted edges) has since been solved
+	   by the r20 FINE 8-texel sub-bands and the r25 axis pieces: thin
+	   leaves now ride the normal grid walk, texel-exact, no swim.  Price:
+	   billed 2e+1 instead of 4 -- the budget degrades floors first (r35). */
 	for (int pass = 0; pass < 2; ++pass)
 	{
 	    int h, psn, bit, nn, tt, e, v;
@@ -8681,7 +8675,7 @@ static void sat_psw_sub_note_body(int subnum, int fh, int ch, int fpic,
 	    { psw_sub_flag[k] |= bit;
 	      if (pass) psw_ceil_clip++;
 	      continue; }
-	    if (psw_thin) psw_sub_flag[k] |= (pass == 0) ? 0x10 : 0x20;   /* r34: one quad */
+	    /* (r55: the r34 thin-solid flag is gone -- see the block above) */
 	    /* round 21: the ladder is back for FLOORS too -- round 20 removed it
 	       arguing fill is free on an idle VDP1, but every overdrawn tile is
 	       also 2 COMMANDS, and the bank is 495, not infinite: open scenes

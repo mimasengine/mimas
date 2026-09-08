@@ -1166,6 +1166,24 @@ StoreWallRange, curline/frontsector/backsector/rw_angle1 vivants).
 > = cc7f109 (r46 parké) ; le gitlink pointe `psw-world-r54` ; réconciliation
 > = décision owner. Attendu : spawn s→~0 + plafonds texturés ; triangle :
 > h.band 4→0-1 et remplissage orange. Marqueur `P54`. 28e disque.
+> **Verdict console : RÉFUTÉ, avec le fait décisif** — `s14` IDENTIQUE sur
+> P52/P53/P54 = population constante ⇒ **la règle fine r34** (feuille ≤32u ×
+> ≥64u ⇒ solide à la note, les deux modes) = l'aplat du spawn PAR DESIGN,
+> hors de portée de tout fix budget/slot/fenêtre. Et h.band=4 avec le gate
+> seal prouvé dans le binaire ⇒ le dernier menteur = **la revendication de
+> région** (ceilvis/floorvis).
+
+> **ROUND 55 (2026-09-08, GO owner explicite)** — les deux règles
+> renversées : (1) règle fine r34 SUPPRIMÉE (psw_thin/PSW_THIN_U effacés) —
+> les feuilles fines prennent la marche normale, texel-exacte (r20 fines +
+> r25 axis couvrent les artefacts d'époque) ; facture 2e+1 au lieu de 4.
+> (2) revendication de région SUPPRIMÉE du fold (core) — les bandes ne
+> plient QUE le peint ; un tier peint n'étend la bande que s'il la touche.
+> Prix assumé : culls plans-derrière-plans perdus → `f` monte, le budget
+> honnête dégrade les sols d'abord ; si la perf s'effondre en scène ouverte,
+> le levier de retour = une occlusion par-feuille SAINE (rangées projetées),
+> jamais la revendication. Attendu : spawn TEXTURÉ (s→~0), triangle REMPLI
+> (h.band→0-1). Marqueur `P55`. 29e disque.
 
 - **Polygones de sous-secteurs au level-load** (p_setup.c après :1234, PU_LEVEL zone
   LWRAM) : clip récursif du bbox map par les splitlines ancêtres (node_t x16/y16/dx16/

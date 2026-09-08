@@ -1242,6 +1242,24 @@ StoreWallRange, curline/frontsector/backsector/rw_angle1 vivants).
 > protecteur de chaînes fossiles ; ~300 o rendus à un pool passé sous le
 > plancher). Round B near→far redevient l'allocateur de slots.
 
+> **ROUND 59 (2026-09-08, 32e disque, marqueur `P59`) — VERDICT P58 :
+> L'APLAT EST MORT (« je vois bien les textures au spawn ») = le cover
+> r42 était l'aplat, hypothèse owner validée console.** `miss=0` partout
+> (slots innocentés), esol = échelle+LOD (pas un défaut), déficit résiduel
+> ~5 cmds/frame (`c0/0-1.0-4`) = les tuiles manquantes. **`o0` ET `x0`
+> avec le triangle à l'écran = recorder et cap-stop ACQUITTÉS** ⇒ r59 :
+> (1) **prédicat psw_clip_dir en 64-bit, UTILISÉ** (wedge par fausse
+> corde = dernier candidat des arbres ; `y` = sommets au signe 32-bit
+> menteur, garde ε, fdiv normalisé par shift commun r31) ; (2) **covf
+> plafond +2** = le déficit mesuré financé (la taxe se lirait en esol).
+> Pourquoi le déficit existait : fenêtre par-sub PRÉ-FACTURÉE du slave
+> (obligatoire pour émettre en parallèle dans des plages d'index
+> réservées, loi 2e+1) vs banque entière du master — les pièces de bord
+> en chemin fin coûtent jusqu'à 10-16 cmds contre 2 facturées. Owner
+> sceptique sur la direction triangle : P59 (in)valide le candidat 3 à
+> coût nul ; si y0 + triangle ⇒ P60 = probe visuel CONTOUR du polygone
+> clippé (trou dans/hors contour = walker/amont), conçu, non câblé. */
+
 - **Polygones de sous-secteurs au level-load** (p_setup.c après :1234, PU_LEVEL zone
   LWRAM) : clip récursif du bbox map par les splitlines ancêtres (node_t x16/y16/dx16/
   dy16 exacts) + les segs de la feuille. ~150 lignes, une fois par niveau.

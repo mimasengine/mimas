@@ -795,6 +795,12 @@ static int  psw_cap_stop_n = 0, psw_cap_stop_last = 0;     /* P58: global-cap
                        mid-walk stops (the uncounted class, hole candidate #2) --
                        row 13 `x`; fires BOTH modes, so x>0 while the triangle
                        shows names the cap, x0 acquits it */
+static int  psw_clip_wrap = 0, psw_clip_wrap_last = 0;     /* P59: clip-predicate
+                       vertices whose 32-bit sign wrapped vs the 64-bit truth
+                       (row 13 `y`) -- console P58 read o0 AND x0 with the
+                       triangle on screen, so the wedge-by-false-chord is the
+                       last candidate standing; the 64-bit sign is USED, y just
+                       names the crime scene */
 static int  psw_tile_cull = 0, psw_tile_cull_last = 0;   /* tiles the mask or
                        cull_h skipped.  P58: the psign<0 gate is GONE -- r49 made
                        ceiling culls unreachable, so the r41 gate had turned this
@@ -3582,7 +3588,10 @@ static void fps_update(void)
                          o<ovf>/<subn>   note-recorder overflow / subs noted
                                          (o was latched but UNPRINTED since
                                          r38b; subn near 384 = saturation) */
-                    snprintf(ovbuf, sizeof ovbuf, "P58.%d%s%s s%d/%d c%d/%d.%d x%d o%d/%d f%d n%d ",
+                    /* P59: `y<wrap>` = 32-bit clip-predicate sign wraps vs the
+                       64-bit truth (now used) -- y>0 where the triangle was =
+                       candidate 3 named; triangle gone + y>0 = fixed. */
+                    snprintf(ovbuf, sizeof ovbuf, "P59.%d%s%s s%d/%d c%d/%d.%d x%d y%d o%d/%d f%d n%d ",
                              sat_psw_diag & 3,             /* r38: pad L+Down state */
                              psw_pp_base_near ? "N" : "",  /* r48: pad L+Up */
                              sfb,
@@ -3592,6 +3601,7 @@ static void fps_update(void)
                              psw_cover_skip_last > 99 ? 99 : psw_cover_skip_last,
                              psw_fan_skip_last > 99 ? 99 : psw_fan_skip_last,
                              psw_cap_stop_last > 99 ? 99 : psw_cap_stop_last,
+                             psw_clip_wrap_last > 99 ? 99 : psw_clip_wrap_last,
                              psw_sub_ovf_last > 99 ? 99 : psw_sub_ovf_last,
                              psw_sub_n_last > 999 ? 999 : psw_sub_n_last,
                              psw_flat_last  > 999 ? 999 : psw_flat_last,
@@ -8349,7 +8359,15 @@ static void vdp1_floors_flush(void) {}
    KNOWN one-frame artifact: a slot eviction re-uploads texels the still-plotting
    previous bank may read (same acceptance as the parked design; LRU keeps
    resident flats stable below 3 distinct lumps/frame). */
-#define PSW_SUB_MAX      384   /* round 21: 240 -> 384.  The recorder overflow is the
+#define PSW_SUB_MAX      320   /* P59: 384 -> 320 (~2.2 KB of .bss back to a pool the
+                                  64-bit clip predicate pushed under the boot floor).
+                                  Console P58 read subn 20-33 NOTED per frame against
+                                  the 384 cap -- a 10x margin kept out of fear, from
+                                  the r21 era when the overflow was UNCOUNTED.  It is
+                                  on the row now (`o<ovf>/<subn>`): if any WAD ever
+                                  climbs, o>0 says so the same frame, and the fix is
+                                  a constant, not a hunt. */
+                               /* round 21: 240 -> 384.  The recorder overflow is the
                                   LAST mechanism standing for the owner's triangle hole
                                   (a ceiling partially occluded by a wall, k0 d0 r0,
                                   UNMOVED by every cull/budget change): a sub past the
@@ -9005,17 +9023,46 @@ static int psw_clip_dir(const int *ax, const int *ay, const unsigned char *at,
                         int n, int *bx, int *by, unsigned char *bt,
                         int fcx, int fcy, int lim, unsigned char newtag)
 {
+    /* P59 -- THE PREDICATE GOES 64-BIT (hole candidate #3, the last one
+       standing after console P58 read o0 AND x0 with the triangle on screen).
+       The 32-bit FixedMul(dx,fcx)+FixedMul(dy,fcy) wraps when a leaf vertex
+       sits far enough from the eye (each product saturates int at ~32768u/
+       |coef|; the padded map-bbox verts of open/boundary leaves qualify, and
+       lim itself can be huge near eye-level planes).  A wrapped-sign vertex
+       reads OUTSIDE: the pass drops it and manufactures crossings against a
+       FALSE CHORD -- a view-dependent WEDGE cut out of the polygon, n stays
+       >= 3, floor and ceiling identically, no counter.  Same family as the
+       psw_clip_line ca<<16 overflow (r33's STEP-2 console TRAITS, fixed by
+       renormalization).  psw_clip_wrap (row 13 `y`) counts every vertex whose
+       32-bit sign disagrees beyond rounding epsilon: y>0 while the triangle
+       shows = candidate named -- and already fixed, the 64-bit sign is the
+       one used.  Crossing ratio: r31 precedent, common shift until the pair
+       fits psw_fdiv (the 16.16 ratio is shift-invariant). */
     int i, m = 0;
-    int fa  = FixedMul(ax[0] - viewx, fcx) + FixedMul(ay[0] - viewy, fcy) - lim;
+    long long fa = ((((long long)(ax[0] - viewx) * fcx)
+                   + ((long long)(ay[0] - viewy) * fcy)) >> 16) - lim;
+    {
+	int f32 = FixedMul(ax[0] - viewx, fcx) + FixedMul(ay[0] - viewy, fcy) - lim;
+	if ((f32 >= 0) != (fa >= 0) && (fa > 4 || fa < -4)) psw_clip_wrap++;
+    }
     for (i = 0; i < n; ++i)
     {
 	int j  = (i + 1 == n) ? 0 : i + 1;
-	int fb = FixedMul(ax[j] - viewx, fcx) + FixedMul(ay[j] - viewy, fcy) - lim;
+	long long fb = ((((long long)(ax[j] - viewx) * fcx)
+	               + ((long long)(ay[j] - viewy) * fcy)) >> 16) - lim;
+	{
+	    int f32 = FixedMul(ax[j] - viewx, fcx) + FixedMul(ay[j] - viewy, fcy) - lim;
+	    if ((f32 >= 0) != (fb >= 0) && (fb > 4 || fb < -4)) psw_clip_wrap++;
+	}
 	if (fa >= 0 && m < PSW_FAN_MAX)
 	{ bx[m] = ax[i]; by[m] = ay[i]; bt[m] = at[i]; m++; }
 	if ((fa >= 0) != (fb >= 0) && m < PSW_FAN_MAX)
 	{
-	    int t = psw_fdiv(fa, fa - fb);            /* 16.16, 0..1 (signs differ) */
+	    long long da = fa, dd = fa - fb;
+	    while (da > 0x3FFFFFFFll || da < -0x3FFFFFFFll
+	        || dd > 0x3FFFFFFFll || dd < -0x3FFFFFFFll)
+	    { da >>= 1; dd >>= 1; }
+	    int t = psw_fdiv((int)da, (int)dd);       /* 16.16, 0..1 (signs differ) */
 	    bx[m] = ax[i] + (int)(((long long)(ax[j] - ax[i]) * t) >> 16);
 	    by[m] = ay[i] + (int)(((long long)(ay[j] - ay[i]) * t) >> 16);
 	    bt[m] = newtag;
@@ -12264,7 +12311,11 @@ static void vdp1_walls_flush(void)
                     int e = 2 * (int)psw_sub_ce[k] + 1;
                     int wnt = sf_ok ? 0   /* r54: no chains on slave frames */
                             : (psw_sub_ce[k] >= 18) ? 2 : (psw_sub_ce[k] >= 12) ? 1 : 0;
-                    int covf = sf_ok ? PSW_COVER : 0;   /* r52: see the floor twin */
+                    int covf = sf_ok ? PSW_COVER + 2 : 0;   /* r52 twin; P59: the
+                            cover is dead for ceilings so covf is pure walk
+                            margin now -- console P58 measured the residual
+                            deficit at cs0-1/fs0-4 per frame, +2/plane funds it;
+                            the trade is counted (esol) if the bank tightens */
                     if (e <= 4)
                     { if (psw_slot_get(cl, wnt) < 0) psw_sub_flag[k] |= 0x20;
                       else if (covf && ftile + covf <= limit)
@@ -12520,6 +12571,8 @@ static void vdp1_walls_flush(void)
         psw_fan_skip = 0;                     /* P58 */
         psw_cap_stop_last = (int)psw_ucr32((const volatile void *)&psw_cap_stop_n);
         psw_cap_stop_n = 0;                   /* P58 */
+        psw_clip_wrap_last = (int)psw_ucr32((const volatile void *)&psw_clip_wrap);
+        psw_clip_wrap = 0;                    /* P59: master (note) + slave (emit) */
         psw_kill_last = (int)psw_ucr32((const volatile void *)&psw_kill_n);
         psw_punch_last = (int)psw_ucr32((const volatile void *)&psw_punch_cmds);
         psw_band_last = (int)psw_ucr32((const volatile void *)&psw_band_n);

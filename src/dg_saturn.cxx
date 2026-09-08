@@ -3591,7 +3591,7 @@ static void fps_update(void)
                     /* P59: `y<wrap>` = 32-bit clip-predicate sign wraps vs the
                        64-bit truth (now used) -- y>0 where the triangle was =
                        candidate 3 named; triangle gone + y>0 = fixed. */
-                    snprintf(ovbuf, sizeof ovbuf, "P60.%d%s%s s%d/%d c%d/%d.%d x%d y%d o%d/%d f%d n%d ",
+                    snprintf(ovbuf, sizeof ovbuf, "P61.%d%s%s s%d/%d c%d/%d.%d x%d y%d o%d/%d f%d n%d ",
                              sat_psw_diag & 3,             /* r38: pad L+Down state */
                              psw_pp_base_near ? "N" : "",  /* r48: pad L+Up */
                              sfb,
@@ -11386,10 +11386,49 @@ static void psw_probe_outline(const int *vx, const int *vy, int nv,
 	if (!okv[i] || !okv[j]) continue;
 	qx[0] = ex[i]; qy[0] = ey[i];
 	qx[1] = ex[j]; qy[1] = ey[j];
-	qx[2] = ex[j]; qy[2] = ey[j] + 2;
-	qx[3] = ex[i]; qy[3] = ey[i] + 2;
+	qx[2] = ex[j]; qy[2] = ey[j] + 3;   /* P61: 2px was sub-visible on console */
+	qx[3] = ex[i]; qy[3] = ey[i] + 3;
 	psw_paint_idx = colidx;
 	psw_emit_flatquad(-1, 0, qx, qy);
+    }
+}
+/* P61 -- the rings are drawn by a DEDICATED pass at the very END of the flush:
+   staged inline (r60) they were buried by every later command in VDP1 list
+   order (console: "je ne vois que quelques pixels bleus").  Emitted last =
+   painted on top of the whole world.  Master-flats cran only (diag 1), so the
+   slave windows never see a probe command. */
+static void psw_probe_pass(void)
+{
+    if (sat_psw_diag != 1 || !(sat_wall_paint & 1) || !psw_polys_ok) return;
+    psw_probe_frame = 0;
+    for (int k = 0; k < psw_sub_n && psw_probe_frame < 4; ++k)
+    {
+	int sn = psw_sub[k].subnum;
+	if (sn < 0) continue;
+	{
+	    int n0 = psw_pvn[sn], base = psw_pvi[sn];
+	    if (n0 < 3) continue;
+	    {
+		int bx0, by0, bx1, by1, i;
+		bx0 = bx1 = psw_pvx[base]; by0 = by1 = psw_pvy[base];
+		for (i = 1; i < n0; ++i)
+		{
+		    int wxx = psw_pvx[base + i], wyy = psw_pvy[base + i];
+		    if (wxx < bx0) bx0 = wxx; if (wxx > bx1) bx1 = wxx;
+		    if (wyy < by0) by0 = wyy; if (wyy > by1) by1 = wyy;
+		}
+		if (!psw_probe_ray(bx0, by0, bx1, by1)) continue;
+	    }
+	    psw_probe_frame++;
+	    {
+		int ph = psw_sub[k].ch - viewz;
+		int cx[PSW_FAN_MAX], cy[PSW_FAN_MAX];
+		int n = psw_plane_poly(sn, ph, -1, cx, cy);
+		psw_probe_outline(psw_pvx + base, psw_pvy + base, n0, ph, -1, 198);
+		if (n >= 3)
+		    psw_probe_outline(cx, cy, n, ph, -1, 163);
+	    }
+	}
     }
 }
 
@@ -11436,7 +11475,7 @@ static void psw_emit_subflats(int k)
 	                   FIRST statement, so every `continue` in pass 0 still
 	                   restores the window (the JP-pad loop reads psw_sf_end
 	                   again after this function returns) */
-	int ph, psign, lump, prb = 0;   /* P60: this plane is outline-probed */
+	int ph, psign, lump;
 	if (pass == 0)                                  /* FLOOR */
 	{
 	    if (fl < 0)
@@ -11480,29 +11519,9 @@ static void psw_emit_subflats(int k)
 	}
 	else                                            /* CEILING */
 	{
-	    /* P60: LEAF outline BEFORE any skip (sky included) -- see the probe
-	       block above psw_emit_subflats */
-	    if (sat_psw_diag == 1 && (sat_wall_paint & 1) && psw_probe_frame < 6)
-	    {
-		int n0 = psw_pvn[sn], base = psw_pvi[sn];
-		if (n0 >= 3)
-		{
-		    int bx0, by0, bx1, by1;
-		    bx0 = bx1 = psw_pvx[base]; by0 = by1 = psw_pvy[base];
-		    for (i = 1; i < n0; ++i)
-		    {
-			int wxx = psw_pvx[base + i], wyy = psw_pvy[base + i];
-			if (wxx < bx0) bx0 = wxx; if (wxx > bx1) bx1 = wxx;
-			if (wyy < by0) by0 = wyy; if (wyy > by1) by1 = wyy;
-		    }
-		    if (psw_probe_ray(bx0, by0, bx1, by1))
-		    {
-			psw_probe_frame++; prb = 1;
-			psw_probe_outline(psw_pvx + base, psw_pvy + base, n0,
-			                  psw_sub[k].ch - viewz, -1, 198);
-		    }
-		}
-	    }
+	    /* (P60's inline ring moved to psw_probe_pass at the END of the flush
+	       -- staged here it was buried by every later command, console P60:
+	       "je ne vois que quelques pixels bleus") */
 	    if (cl < 0)
 	    { if (psw_sub[k].ch > viewz) psw_ceil_sky++;   /* r44: was SILENT */
 	      continue; }
@@ -11553,8 +11572,6 @@ static void psw_emit_subflats(int k)
 		/* (cull_h simply stays 0x7fffffff here) */
 	    }
 	    n = psw_plane_poly(sn, ph, psign, cx, cy);  /* world-clipped: no offscreen tail */
-	    if (prb && n >= 3)
-		psw_probe_outline(cx, cy, n, ph, psign, 163);   /* P60: clipped ring */
 	    if (n < 3) continue;
 	{
 	    int zc0 = psw_flat_cmds;   /* r34d `h../<zero>`: did this pass emit anything? */
@@ -12143,7 +12160,6 @@ static void vdp1_walls_flush(void)
         psw_flat_cmds = 0; psw_flat_denied = 0; psw_punch_cmds = 0;
         psw_ceil_zero = 0;                   /* r34d (psw_ceil_hid resets at note) */
         psw_band_n = 0; psw_fanq_n = 0; psw_fine_cmds = 0;
-        psw_probe_frame = 0;             /* P60: outline probe budget */
         /* round 30: ew-interior probes reset at flush ENTRY (j+q cut in r33) */
         psw_eb_frt = 0; psw_eb_bord = 0;
         psw_ef_frt = 0;                  /* r33: ef now accumulates on the SLAVE */
@@ -12635,6 +12651,8 @@ static void vdp1_walls_flush(void)
 #endif
         }
         }
+        psw_probe_pass();  /* P61: probe rings LAST = on top of the whole world
+                              (no-op outside cran 1 + L+X) */
         psw_sf_fence();    /* round 33: join the slave + land every job's block
                               (before ANY read of a slave-written counter) */
         /* r33 latches: the slave wrote these -- the master's cached lines are

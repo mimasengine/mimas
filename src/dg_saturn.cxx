@@ -3528,7 +3528,12 @@ static void fps_update(void)
                        column: ceiling passes emitted without a texture slot =
                        the aplat, counted.  Expected ~0 at rest with the r51
                        memo gate; steady s>0 = the 8-slot famine (next round). */
-                    snprintf(ovbuf, sizeof ovbuf, "P52.%d%s h%d.%d/%d.%d F%s f%d k%d s%d c%d ",
+                    /* r53: `k<kill>` LEAVES the row (k0 on every capture since
+                       the r50 guarantee; the latch keeps running) -- `n<fanq>`
+                       takes the column: solid FAN emissions this frame (piece
+                       fans + plane fans), the counter of the magenta the
+                       console keeps showing while every other counter is 0. */
+                    snprintf(ovbuf, sizeof ovbuf, "P53.%d%s h%d.%d/%d.%d F%s f%d n%d s%d c%d ",
                              sat_psw_diag & 3,             /* r38: pad L+Down state */
                              psw_pp_base_near ? "N" : "",  /* r48: pad L+Up */
                              psw_ceil_clip_last > 99 ? 99 : psw_ceil_clip_last,
@@ -3537,7 +3542,7 @@ static void fps_update(void)
                              psw_ceil_sky_last > 99 ? 99 : psw_ceil_sky_last,
                              sfb,
                              psw_flat_last  > 999 ? 999 : psw_flat_last,
-                             psw_kill_last > 99 ? 99 : psw_kill_last,
+                             psw_fan_last > 999 ? 999 : psw_fan_last,
                              psw_ceil_solid_last > 99 ? 99 : psw_ceil_solid_last,
                              psw_cover_last > 99 ? 99 : psw_cover_last);
                 }
@@ -10263,6 +10268,24 @@ static void psw_emit_plane_tiles(int slot, unsigned short colr,
 	    else
 	    {
 		int done = 0;
+		/* ROUND 53 -- PAINT THE FAN'S WHY, NOT ITS PATH.  Console P52: the
+		   spawn ceilings are STILL magenta with s0 c0 drop~0 -- every
+		   counted route to a solid is excluded on hardware, so the fan is
+		   entered through one of its three uncounted doors, and three
+		   rounds of inference could not name which.  One L+X capture now
+		   does: the door picks the colour.
+		     WHITE 4    = okq failed (a snapped band corner under the near
+		                  guard -- the projection bound was wrong somewhere)
+		     GREY 88    = vend <= v0 (empty snapped row range -- the piece
+		                  y-arithmetic)
+		     RED 176    = both emission gates refused (fine + coarse) with
+		                  no drop -- the gate arithmetic
+		     MAGENTA 250 = slot famine piece, and the PLANE-level fan
+		                  (solid verdict / r42 cover) keeps 250 too.
+		   (RED overloads the full-tile paint; per the legend full tiles
+		   are near-nonexistent on real leaves, and a wrong-red here means
+		   the gates -- both readings send round 54 to the same file.) */
+		int whyfan = (slot >= 0) ? 3 : 0;
 		int sxv[PSW_FAN_MAX], syv[PSW_FAN_MAX], okv = 1, sprj = 0;
 		/* ROUND 30 -- the piece-vertex projections go LAZY.  This upfront
 		   loop projected ALL m verts for EVERY border tile, but the most
@@ -10313,6 +10336,7 @@ static void psw_emit_plane_tiles(int slot, unsigned short colr,
 			    int vend = (y1 - pby0 + 0xFFFF) >> 16;
 			    if (v0 < 0) v0 = 0;
 			    if (vend > 64) vend = 64;
+			    if (vend <= v0) whyfan = 2;   /* r53: empty row range */
 			    if (vend > v0)
 			    {   /* band corners snapped to the texel rows they map:
 				   the texture is exact and world-pinned */
@@ -10322,6 +10346,7 @@ static void psw_emit_plane_tiles(int slot, unsigned short colr,
 				okq &= psw_project(x1, by1s, ph, psign, &qx[1], &qy[1]);
 				okq &= psw_project(x1, by0s, ph, psign, &qx[2], &qy[2]);
 				okq &= psw_project(x0, by0s, ph, psign, &qx[3], &qy[3]);
+				if (!okq) whyfan = 1;         /* r53: near-guard corner */
 				if (okq)
 				{
 				    int allaxis = (m == 4);
@@ -10511,7 +10536,11 @@ static void psw_emit_plane_tiles(int slot, unsigned short colr,
 		{   /* band unprojectable / slot famine: SOLID piece -- exact
 		       geometry, textureless, cannot swim */
 		    if (!sxv_ensure()) return;          /* round 30: lazy (the fan IS the verts) */
-		    psw_paint_idx = 250; psw_fanq_n++;  /* L+X: solids MAGENTA */
+		    psw_paint_idx = (whyfan == 1) ? 4        /* r53: WHITE  = okq   */
+		                  : (whyfan == 2) ? 88       /*      GREY   = rows  */
+		                  : (whyfan == 3) ? 176      /*      RED    = gates */
+		                  : 250;                     /*      MAGENTA = famine */
+		    psw_fanq_n++;
 		    for (i = 1; i + 1 < m; i += 2)
 		    {
 			int qx[4], qy[4];

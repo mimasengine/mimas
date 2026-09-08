@@ -1138,6 +1138,19 @@ StoreWallRange, curline/frontsector/backsector/rw_angle1 vivants).
 > sans mécanisme confirmé — à relire sur ce disque. Discriminateur : cran 1
 > au spot du triangle ⇒ h.band reste ~4 + trou disparu = cascade confirmée.
 > Marqueur `P52`. 26e disque.
+> **Verdict console : RÉFUTÉ sur les deux symptômes** (spawn magenta s0/c0 ;
+> trou h1.4 F14/4 s14 c1) — toutes les routes comptées vers le solide sont
+> exclues sur console.
+
+> **ROUND 53 (2026-09-08)** — plus d'inférence : **le fan par-pièce est peint
+> par sa CAUSE D'ENTRÉE en L+X** (BLANC = okq/near-guard, GRIS = vend≤v0,
+> ROUGE = portes fine+coarse refusées sans drop, MAGENTA = famine par-pièce
+> et fan plan-entier/cover). Row : `k` (k0 depuis r50) → `n<fanq>` = fans
+> émis par frame. Une capture L+X au spawn désigne la porte ; magenta
+> persistant avec s0/c0 ⇒ auditer les compteurs s/c eux-mêmes. Triangle :
+> le discriminateur cran 1 au spot reste À FAIRE (« master fixe les trous »
+> date des trous r34, jamais vérifié sur LE triangle). Marqueur `P53`.
+> 27e disque.
 
 - **Polygones de sous-secteurs au level-load** (p_setup.c après :1234, PU_LEVEL zone
   LWRAM) : clip récursif du bbox map par les splitlines ancêtres (node_t x16/y16/dx16/

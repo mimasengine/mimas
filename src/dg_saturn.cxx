@@ -3601,10 +3601,13 @@ static void fps_update(void)
                     /* P59: `y<wrap>` = 32-bit clip-predicate sign wraps vs the
                        64-bit truth (now used) -- y>0 where the triangle was =
                        candidate 3 named; triangle gone + y>0 = fixed. */
-                    /* P63: `y` (clip wrap, 0 twice on console) cedes its column
-                       to `z<skip>/<sliver>` = emit64's silent exits, counted in
-                       BOTH modes (the y latch keeps running unprinted). */
-                    snprintf(ovbuf, sizeof ovbuf, "P63.%d%s%s s%d/%d c%d/%d.%d x%d z%d/%d o%d/%d f%d n%d ",
+                    /* P63: `y` (clip wrap, 0 twice on console) ceded its column
+                       to `z<skip>/<sliver>` = emit64's silent exits, both modes.
+                       P64: `o` drops its /subn half (max read 33, recorder
+                       dieted twice, ovf guard stays) and `t<cull>` returns to
+                       the row = mask/probe tile culls -- FLOOR-only now, the
+                       ceiling consult is gone (the r49 second door). */
+                    snprintf(ovbuf, sizeof ovbuf, "P64.%d%s%s s%d/%d c%d/%d.%d x%d z%d/%d t%d o%d f%d n%d ",
                              sat_psw_diag & 3,             /* r38: pad L+Down state */
                              psw_pp_base_near ? "N" : "",  /* r48: pad L+Up */
                              sfb,
@@ -3616,8 +3619,8 @@ static void fps_update(void)
                              psw_cap_stop_last > 99 ? 99 : psw_cap_stop_last,
                              psw_e64_skip_last > 99 ? 99 : psw_e64_skip_last,
                              psw_e64_sliv_last > 99 ? 99 : psw_e64_sliv_last,
+                             psw_tile_cull_last > 99 ? 99 : psw_tile_cull_last,
                              psw_sub_ovf_last > 99 ? 99 : psw_sub_ovf_last,
-                             psw_sub_n_last > 999 ? 999 : psw_sub_n_last,
                              psw_flat_last  > 999 ? 999 : psw_flat_last,
                              psw_fan_last > 999 ? 999 : psw_fan_last);
                 }
@@ -10935,9 +10938,28 @@ static void psw_emit_plane_tiles(int slot, unsigned short colr,
 		    {
 			int cls = tclass(ty);
 			if (!cls) continue;
+			if (psw_cur_pass == 0)
 			{   /* the note's cached verdicts, POSITIONAL index
 			       (round 22: keyed by cell position in the bbox's
-			       row-major order, walk order free to differ) */
+			       row-major order, walk order free to differ).
+			       P64 -- FLOORS ONLY: the r49 law closes its SECOND
+			       door.  r49 proved on console (t9->t13, the owner's
+			       capture pair) that the note's sampled verdicts kill
+			       plainly-visible CEILING tiles -- one midpoint probe
+			       lands in the pillar's low ceiling -- and disarmed
+			       cull_h; but this LIVE walk kept consuming the SAME
+			       verdicts through psw_cur_mask, ungated, and its
+			       counter (psw_tile_cull) has run unprinted since.
+			       Console P63 completed the conviction: z0/0 = the
+			       tiles never reach emit64; they die HERE.  A wrongly
+			       KEPT ceiling tile is bounded overdraw painted over
+			       by nearer geometry; a wrongly CULLED one is the
+			       owner's triangle (textured face-on, 'forgotten'
+			       from the side -- the probes are view-dependent).
+			       WATCH ITEM (same as r49's): a mixed ceiling tile at
+			       a sky edge can now ghost over the VDP2 sky; if the
+			       console shows it, the fix is a targeted sky guard,
+			       not these verdicts. */
 			    int ti = (ty - tya) * tw + (tx - txa);
 			    if (ti >= 0 && ti < PSW_PROBE_TILES)
 			    { if ((psw_cur_mask >> ti) & 1u)

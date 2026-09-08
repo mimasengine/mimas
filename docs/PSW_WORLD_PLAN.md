@@ -1184,6 +1184,26 @@ StoreWallRange, curline/frontsector/backsector/rw_angle1 vivants).
 > le levier de retour = une occlusion par-feuille SAINE (rangées projetées),
 > jamais la revendication. Attendu : spawn TEXTURÉ (s→~0), triangle REMPLI
 > (h.band→0-1). Marqueur `P55`. 29e disque.
+> **Verdict console : les COMPTEURS ont suivi (band 4→0-1 ✔, s dynamique ✔),
+> le VISUEL non** — « c'est toujours du ciel » (trou, pas aplat) + magenta
+> spawn persistant. Élimination finale : la seule sortie non blanchie d'un
+> plafond jamais-émis = **`h.clip` = 1-2, CONSTANT depuis 15 rounds** — le
+> kill `psw_plane_poly < 3` ; l'A/B des clips latéraux 45° planifié en r47
+> n'avait jamais tourné.
+
+> **ROUND 57 (2026-09-08, disque unique = r56+r57)** — méthode owner
+> (« comment on avance pour de vrai ») : chaque round SUPPRIME UNE CLASSE
+> PAR CONSTRUCTION. (r56) les 8 slots texture aux 8 lumps les plus demandés
+> (agrégat par lump des factures round-B, sf seulement — le master churne
+> déjà). (r57) **un collapse des clips latéraux ne tue plus jamais un
+> plan** : retry near-seul depuis les sommets monde (le 2e clip latéral
+> clobber son buffer — le fallback re-clippe), `psw_pp_nearfb` ⇒ solide
+> forcé facturé 4 ; coût borné par le compteur (1-2 plans/frame). Classes
+> mortes par construction : sondes (r49), standby (r50), mémo (r51), stops
+> baked (r52), seal (r54), revendication+règle fine (r55), premier-arrivé
+> slots (r56), collapse latéral (r57). Attendu : `h.clip`→0-1 résiduel,
+> triangle rempli (aplat accepté), spawn s en chute. Marqueur `P57`.
+> 30e disque.
 
 - **Polygones de sous-secteurs au level-load** (p_setup.c après :1234, PU_LEVEL zone
   LWRAM) : clip récursif du bbox map par les splitlines ancêtres (node_t x16/y16/dx16/

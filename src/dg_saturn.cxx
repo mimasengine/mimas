@@ -785,6 +785,9 @@ static int  psw_tile_cull = 0, psw_tile_cull_last = 0;   /* ceiling tiles the ma
    everything about my probe.  Every exit now either paints or is COUNTED:
    `m<want>/<got>` on row 13.  want > got = the marker was asked for and could
    not be drawn, and that gap is itself the next lead. */
+static int  psw_pp_nearfb = 0;      /* r57: last psw_plane_poly took the near-only
+                                       fallback (side-clip collapse) -- the note
+                                       routes that plane to the SOLID fan */
 static int  psw_pp_base_near = 0;   /* psw_plane_poly: drop the height-dependent
                                        near plane (marker retry only) */
 
@@ -3533,7 +3536,7 @@ static void fps_update(void)
                        takes the column: solid FAN emissions this frame (piece
                        fans + plane fans), the counter of the magenta the
                        console keeps showing while every other counter is 0. */
-                    snprintf(ovbuf, sizeof ovbuf, "P55.%d%s h%d.%d/%d.%d F%s f%d n%d s%d c%d ",
+                    snprintf(ovbuf, sizeof ovbuf, "P57.%d%s h%d.%d/%d.%d F%s f%d n%d s%d c%d ",
                              sat_psw_diag & 3,             /* r38: pad L+Down state */
                              psw_pp_base_near ? "N" : "",  /* r48: pad L+Up */
                              psw_ceil_clip_last > 99 ? 99 : psw_ceil_clip_last,
@@ -8675,6 +8678,8 @@ static void sat_psw_sub_note_body(int subnum, int fh, int ch, int fpic,
 	    { psw_sub_flag[k] |= bit;
 	      if (pass) psw_ceil_clip++;
 	      continue; }
+	    if (psw_pp_nearfb)   /* r57: near-only fallback => SOLID fan, billed 4 */
+		psw_sub_flag[k] |= (pass == 0) ? 0x10 : 0x20;
 	    /* (r55: the r34 thin-solid flag is gone -- see the block above) */
 	    /* round 21: the ladder is back for FLOORS too -- round 20 removed it
 	       arguing fill is free on an idle VDP1, but every overdrawn tile is
@@ -9357,6 +9362,7 @@ static int psw_plane_poly(int sn, int ph, int psign, int *ox, int *oy)
     int tx[PSW_FAN_MAX], ty[PSW_FAN_MAX];
     unsigned char ta[PSW_FAN_MAX], tb[PSW_FAN_MAX];
     int n0 = psw_pvn[sn], i, n;
+    psw_pp_nearfb = 0;                 /* r57: fresh verdict per call */
     if (n0 < 3) return 0;
     if (n0 > PSW_FAN_MAX) n0 = PSW_FAN_MAX;   /* r37: wx/wy are FAN_MAX deep and the
                                                  core cap (20) is the only thing that
@@ -9378,13 +9384,51 @@ static int psw_plane_poly(int sn, int ph, int psign, int *ox, int *oy)
 	n = psw_clip_dir(wx, wy, ta, n0, tx, ty, tb, viewcos, viewsin, lim, 1);
     }
     if (n < 3) return 0;
-    n = psw_clip_dir(tx, ty, tb, n, ox, oy, ta,
-                     viewcos + viewsin, viewsin - viewcos, -(8 << 16), 2);
-    if (n < 3) return 0;
-    n = psw_clip_dir(ox, oy, ta, n, tx, ty, tb,
-                     viewcos - viewsin, viewsin + viewcos, -(8 << 16), 3);
-    if (n < 3) return 0;
-    for (i = 0; i < n; ++i) { ox[i] = tx[i]; oy[i] = ty[i]; psw_pp_tag[i] = tb[i]; }
+    /* ROUND 57 -- A SIDE-CLIP COLLAPSE NEVER KILLS A PLANE.  h.clip has read a
+       constant 1-2 on every console capture for fifteen rounds, and with the
+       band kills dead (r55, band 0-1) it is the LAST un-cleared exit for a
+       never-emitted ceiling: mode-independent, no L+X paint, and pass 0 dies
+       identically (same polygon, same clips) -- the owner's floor/ceiling
+       punch symmetry.  The r47 plan (A/B the two 45-degree side clips after N
+       cleared the near height term) died with the r48 crash and was never
+       run.  The two side clips are an OPTIMIZATION (bound the offscreen tail)
+       -- never a correctness gate: on collapse, retry with the NEAR clip only
+       and flag the plane for the SOLID fan (psw_pp_nearfb -> the note sets
+       0x10/0x20): a clamped-projection aplat covers the region, the painter
+       overpaints it near-first, and the cost is bounded by the very counter
+       that exposed this (1-2 planes a frame).  A plane the near clip itself
+       refuses is genuinely behind the eye and still dies. */
+    {
+	int n2 = psw_clip_dir(tx, ty, tb, n, ox, oy, ta,
+	                      viewcos + viewsin, viewsin - viewcos, -(8 << 16), 2);
+	if (n2 >= 3)
+	{
+	    n2 = psw_clip_dir(ox, oy, ta, n2, tx, ty, tb,
+	                      viewcos - viewsin, viewsin + viewcos, -(8 << 16), 3);
+	    if (n2 >= 3)
+	    {
+		for (i = 0; i < n2; ++i)
+		{ ox[i] = tx[i]; oy[i] = ty[i]; psw_pp_tag[i] = tb[i]; }
+		return n2;
+	    }
+	}
+    }
+    /* r57 fallback: the second side clip CLOBBERED tx/ty (its output buffer),
+       so re-run the near clip from the untouched world verts. */
+    psw_pp_nearfb = 1;
+    {
+	int hw2  = (viewwidth << detailshift) >> 1;
+	int rows = (psign > 0) ? (viewheight - centery + 2) : (centery + 2);
+	int lim  = PSW_TZ_NEAR + (8 << 16);
+	if (rows > 0 && !psw_pp_base_near)
+	{
+	    int l2 = (int)(((long long)ph * hw2) / rows);
+	    if (l2 > lim) lim = l2;
+	}
+	for (i = 0; i < n0; ++i) ta[i] = 0;
+	n = psw_clip_dir(wx, wy, ta, n0, ox, oy, tb, viewcos, viewsin, lim, 1);
+    }
+    for (i = 0; i < n; ++i) psw_pp_tag[i] = tb[i];
     return n;
 }
 
@@ -12072,6 +12116,57 @@ static void vdp1_walls_flush(void)
                     int m = (e < 4) ? e : 4;
                     if (ftile + m <= limit) { ftile += m; if (sf_ok) psw_sf_bill[k] += (unsigned short)m; }
                     else { psw_sub_flag[k] |= 0x40; psw_kill_n++; }  /* STANDBY */
+                }
+            }
+            /* ROUND 56 -- THE 8 SLOTS GO TO THE 8 MOST-DEMANDED LUMPS (console
+               P55: band kills dead at 0-1 and the thin rule gone, yet the
+               ceilings stay solid with s3-20 -- the slave frame can only ever
+               texture the lumps the pre-pass pins, and the near->far
+               first-come grab spent them on whichever floor lumps came first.
+               The master frame has no such wall: its emitter re-uploads slots
+               plane by plane.  So rank the frame's demand by LUMP -- summed
+               round-B bills, floors and ceilings alike -- and pre-pin the top
+               8 in rank order.  Round B's own grabs then HIT for ranked lumps
+               and fail cleanly to an honest counted solid for rank 9+.
+               sf frames only: pre-pinning on a master frame would block the
+               emit-time churn that already serves every lump there. */
+            if (sf_ok)
+            {
+                struct { int lump; int w; } lt[16];
+                int ln = 0;
+                for (int k = 0; k < psw_sub_n; ++k)
+                {
+                    int fl, cl, fdom, p2;
+                    psw_sub_lumps(k, &fl, &cl, &fdom);
+                    for (p2 = 0; p2 < 2; ++p2)
+                    {
+                        int lu, w;
+                        if (p2 == 0)
+                        {   /* the round-B floor condition, verbatim */
+                            if (fl < 0 || (psw_sub_flag[k] & 0x41) || (psw_sub_flag[k] & 0x10)) continue;
+                            lu = fl; w = 2 * (int)psw_sub_fe[k] + 1;
+                        }
+                        else
+                        {
+                            if (cl < 0 || (psw_sub_flag[k] & 0x84) || (psw_sub_flag[k] & 0x20)) continue;
+                            lu = cl; w = 2 * (int)psw_sub_ce[k] + 1;
+                        }
+                        {
+                            int t2;
+                            for (t2 = 0; t2 < ln; ++t2)
+                                if (lt[t2].lump == lu) { lt[t2].w += w; break; }
+                            if (t2 == ln && ln < 16) { lt[ln].lump = lu; lt[ln].w = w; ln++; }
+                        }
+                    }
+                }
+                for (int r2 = 0; r2 < 8 && r2 < ln; ++r2)
+                {   /* selection by weight; pin in rank order (wnt 0 = r54) */
+                    int b2 = r2;
+                    for (int t2 = r2 + 1; t2 < ln; ++t2)
+                        if (lt[t2].w > lt[b2].w) b2 = t2;
+                    { int tmp = lt[r2].lump; lt[r2].lump = lt[b2].lump; lt[b2].lump = tmp;
+                      tmp = lt[r2].w; lt[r2].w = lt[b2].w; lt[b2].w = tmp; }
+                    psw_slot_get(lt[r2].lump, 0);
                 }
             }
             for (int k = 0; k < psw_sub_n; ++k)

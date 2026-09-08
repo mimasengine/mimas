@@ -3591,7 +3591,7 @@ static void fps_update(void)
                     /* P59: `y<wrap>` = 32-bit clip-predicate sign wraps vs the
                        64-bit truth (now used) -- y>0 where the triangle was =
                        candidate 3 named; triangle gone + y>0 = fixed. */
-                    snprintf(ovbuf, sizeof ovbuf, "P61.%d%s%s s%d/%d c%d/%d.%d x%d y%d o%d/%d f%d n%d ",
+                    snprintf(ovbuf, sizeof ovbuf, "P62.%d%s%s s%d/%d c%d/%d.%d x%d y%d o%d/%d f%d n%d ",
                              sat_psw_diag & 3,             /* r38: pad L+Down state */
                              psw_pp_base_near ? "N" : "",  /* r48: pad L+Up */
                              sfb,
@@ -11392,16 +11392,54 @@ static void psw_probe_outline(const int *vx, const int *vy, int nv,
 	psw_emit_flatquad(-1, 0, qx, qy);
     }
 }
+static void psw_probe_fill(const int *vx, const int *vy, int nv,
+                           int ph, int psign, int colidx)
+{   /* filled, decimated fan (<=4 quads, the solid-fan recipe) -- unambiguous
+       "this whole region" marker where a ring can be misread */
+    int fx[PSW_FAN_MAX], fy[PSW_FAN_MAX], i, ok = 1;
+    if (nv < 3 || nv > PSW_FAN_MAX) return;
+    for (i = 0; i < nv; ++i)
+	if (!psw_project(vx[i], vy[i], ph, psign, &fx[i], &fy[i])) { ok = 0; break; }
+    if (!ok)
+    {   /* a vert behind the near guard: fall back to the ring */
+	psw_probe_outline(vx, vy, nv, ph, psign, colidx);
+	return;
+    }
+    {
+	int idx[9], nn = (nv < 9) ? nv : 9, s;
+	for (s = 0; s < nn; ++s) idx[s] = (s * (nv - 1)) / (nn - 1);
+	for (i = 1; i + 1 < nn; i += 2)
+	{
+	    int qx[4], qy[4];
+	    int i2 = (i + 2 < nn) ? i + 2 : i + 1;
+	    qx[0] = fx[idx[0]];     qy[0] = fy[idx[0]];
+	    qx[1] = fx[idx[i]];     qy[1] = fy[idx[i]];
+	    qx[2] = fx[idx[i + 1]]; qy[2] = fy[idx[i + 1]];
+	    qx[3] = fx[idx[i2]];    qy[3] = fy[idx[i2]];
+	    psw_paint_idx = colidx;
+	    psw_emit_flatquad(-1, 0, qx, qy);
+	}
+    }
+}
 /* P61 -- the rings are drawn by a DEDICATED pass at the very END of the flush:
    staged inline (r60) they were buried by every later command in VDP1 list
-   order (console: "je ne vois que quelques pixels bleus").  Emitted last =
-   painted on top of the whole world.  Master-flats cran only (diag 1), so the
-   slave windows never see a probe command. */
+   order.  Emitted last = painted on top of the whole world.  Master-flats
+   cran only (diag 1), so the slave windows never see a probe command.
+   P62 -- the pass now paints the ceiling's VERDICT, not just its shape.  The
+   offline r40-parity leaf check (tools/psw_leaf_check.py, r37+r40 modeled)
+   returned E1M1 0 oversize / 0 undersize / 0 bad on all 237 subs: the leaf
+   builder is INNOCENT, so a large never-painted region has exactly three
+   owners left, and each gets a colour:
+     RED 176 FILL  = the NOTE flagged this ceiling hidden/standby (bit 4/0x80:
+                     the band-box stage -- the r20 sampling sin one floor up)
+     GREY 88 RING  = the sub's ceiling is flagged SKY (clump < 0: attribution)
+     BLUE 198 ring + YELLOW 163 ring = the plane reached the walker; a hole
+                     inside these rings with no red = the WALKER under-covers */
 static void psw_probe_pass(void)
 {
     if (sat_psw_diag != 1 || !(sat_wall_paint & 1) || !psw_polys_ok) return;
     psw_probe_frame = 0;
-    for (int k = 0; k < psw_sub_n && psw_probe_frame < 4; ++k)
+    for (int k = 0; k < psw_sub_n && psw_probe_frame < 3; ++k)
     {
 	int sn = psw_sub[k].subnum;
 	if (sn < 0) continue;
@@ -11421,12 +11459,27 @@ static void psw_probe_pass(void)
 	    }
 	    psw_probe_frame++;
 	    {
+		int fl, cl, fdom;
 		int ph = psw_sub[k].ch - viewz;
 		int cx[PSW_FAN_MAX], cy[PSW_FAN_MAX];
 		int n = psw_plane_poly(sn, ph, -1, cx, cy);
-		psw_probe_outline(psw_pvx + base, psw_pvy + base, n0, ph, -1, 198);
-		if (n >= 3)
-		    psw_probe_outline(cx, cy, n, ph, -1, 163);
+		psw_sub_lumps(k, &fl, &cl, &fdom);
+		if (psw_sub_flag[k] & (4 | 0x80))
+		{   /* the note's verdict killed it: paint the WHOLE claim red */
+		    if (n >= 3) psw_probe_fill(cx, cy, n, ph, -1, 176);
+		    else psw_probe_outline(psw_pvx + base, psw_pvy + base, n0,
+		                           ph, -1, 176);
+		}
+		else if (cl < 0)
+		    psw_probe_outline(psw_pvx + base, psw_pvy + base, n0,
+		                      ph, -1, 88);
+		else
+		{
+		    psw_probe_outline(psw_pvx + base, psw_pvy + base, n0,
+		                      ph, -1, 198);
+		    if (n >= 3)
+			psw_probe_outline(cx, cy, n, ph, -1, 163);
+		}
 	    }
 	}
     }

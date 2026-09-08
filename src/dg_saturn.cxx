@@ -3641,7 +3641,11 @@ static void fps_update(void)
                        turn solid/counted) + u -> 0  =>  the prune IS the door;
                        bands stay void  =>  prune innocent.  u-rings now at the
                        TRUE per-sub ceiling height (R_PswSubCeilH). */
-                    snprintf(ovbuf, sizeof ovbuf, "P68.%d%s%s s%d/%d H%d+%s/u%d t%d o%d f%d n%d ",
+                    /* P69: node bboxes widened at LOAD to cover leaf POLYGONS
+                       (core psw_grow_walk) -- the P68 cran-3 verdict ("ENFIN
+                       texturé") shipped as a zero-per-frame fix.  Read at
+                       cran 1: bands textured + u->0 at the pylon. */
+                    snprintf(ovbuf, sizeof ovbuf, "P69.%d%s%s s%d/%d H%d+%s/u%d t%d o%d f%d n%d ",
                              sat_psw_diag & 3,             /* r38: pad L+Down state */
                              psw_pp_base_near ? "N" : "",  /* r48: pad L+Up */
                              sfb,

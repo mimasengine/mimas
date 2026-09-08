@@ -3533,7 +3533,7 @@ static void fps_update(void)
                        takes the column: solid FAN emissions this frame (piece
                        fans + plane fans), the counter of the magenta the
                        console keeps showing while every other counter is 0. */
-                    snprintf(ovbuf, sizeof ovbuf, "P53.%d%s h%d.%d/%d.%d F%s f%d n%d s%d c%d ",
+                    snprintf(ovbuf, sizeof ovbuf, "P54.%d%s h%d.%d/%d.%d F%s f%d n%d s%d c%d ",
                              sat_psw_diag & 3,             /* r38: pad L+Down state */
                              psw_pp_base_near ? "N" : "",  /* r48: pad L+Up */
                              psw_ceil_clip_last > 99 ? 99 : psw_ceil_clip_last,
@@ -12106,7 +12106,20 @@ static void vdp1_walls_flush(void)
                        this near-first pass is what reserves the 8 slots, so an
                        emission-time-only hint found every neighbour taken and
                        strips silently degraded to singles */
-                    int wnt = (psw_sub_fe[k] >= 18) ? 2 : (psw_sub_fe[k] >= 12) ? 1 : 0;
+                    /* ROUND 54 -- NO CHAINS ON SLAVE FRAMES.  Console P53 named
+                       the aplat: n25 s14 = 14 ceiling passes per frame with NO
+                       texture slot, magenta plane fans.  The chain hint let a
+                       single big floor lump pin up to THREE of the 8 slots, so
+                       the near->far, floor-first grab emptied the bank before
+                       the ceilings' lumps ever got one -- and the slave can
+                       only peek.  wnt=0 under sf: 8 slots serve 8 DISTINCT
+                       lumps (a spawn scene holds ~4-6), ceilings included.
+                       Cost: no 64x128/192 strips on slave frames (tall=0 gates
+                       them off) = more, smaller commands -- the bill 2e+1
+                       stays an upper bound either way.  Master frames keep
+                       their chains. */
+                    int wnt = sf_ok ? 0
+                            : (psw_sub_fe[k] >= 18) ? 2 : (psw_sub_fe[k] >= 12) ? 1 : 0;
                     if (e <= 4)
                     { if (psw_slot_get(fl, wnt) < 0) psw_sub_flag[k] |= 0x10;
                       else if (covf && ftile + covf <= limit)
@@ -12120,7 +12133,8 @@ static void vdp1_walls_flush(void)
                 if (cl >= 0 && !(psw_sub_flag[k] & 0x84) && !(psw_sub_flag[k] & 0x20))
                 {
                     int e = 2 * (int)psw_sub_ce[k] + 1;
-                    int wnt = (psw_sub_ce[k] >= 18) ? 2 : (psw_sub_ce[k] >= 12) ? 1 : 0;
+                    int wnt = sf_ok ? 0   /* r54: no chains on slave frames */
+                            : (psw_sub_ce[k] >= 18) ? 2 : (psw_sub_ce[k] >= 12) ? 1 : 0;
                     int covf = sf_ok ? PSW_COVER : 0;   /* r52: see the floor twin */
                     if (e <= 4)
                     { if (psw_slot_get(cl, wnt) < 0) psw_sub_flag[k] |= 0x20;

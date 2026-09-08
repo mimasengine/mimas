@@ -1151,6 +1151,21 @@ StoreWallRange, curline/frontsector/backsector/rw_angle1 vivants).
 > le discriminateur cran 1 au spot reste À FAIRE (« master fixe les trous »
 > date des trous r34, jamais vérifié sur LE triangle). Marqueur `P53`.
 > 27e disque.
+> **Verdict console : LES DEUX RÉPONSES.** Capture spawn L+X `h1.4 F14/4
+> f162 n25 s14 c1` ⇒ magenta = **famine de slots plan-entier** (s14). Et
+> « L+Bas ne remplit pas le trou » ⇒ le triangle est **mode-indépendant** ⇒
+> cascade slave réfutée pour le trou.
+
+> **ROUND 54 (2026-09-08, core e86f438 branche `psw-world-r54`)** — les deux
+> fixes nommés par la console : (1) **seal midtexture gaté sur les colonnes
+> peintes** (`psw_mid_endx`, r_segs.c — le dernier mensonge de fold
+> mode-aveugle ; conservateur par construction) ; (2) **wnt=0 sous sf** aux
+> grabs round B — plus de chaînes de slots en frames slave, 8 slots = 8
+> lumps distincts, les plafonds sont servis (coût : pas de strips 64×128/192
+> en slave ; la facture 2e+1 reste une borne sup). ⚠ pointe core `psw-world`
+> = cc7f109 (r46 parké) ; le gitlink pointe `psw-world-r54` ; réconciliation
+> = décision owner. Attendu : spawn s→~0 + plafonds texturés ; triangle :
+> h.band 4→0-1 et remplissage orange. Marqueur `P54`. 28e disque.
 
 - **Polygones de sous-secteurs au level-load** (p_setup.c après :1234, PU_LEVEL zone
   LWRAM) : clip récursif du bbox map par les splitlines ancêtres (node_t x16/y16/dx16/

@@ -3613,7 +3613,7 @@ static void fps_update(void)
                        dieted twice, ovf guard stays) and `t<cull>` returns to
                        the row = mask/probe tile culls -- FLOOR-only now, the
                        ceiling consult is gone (the r49 second door). */
-                    snprintf(ovbuf, sizeof ovbuf, "P65.%d%s%s s%d/%d c%d/%d.%d x%d z%d/%d t%d o%d f%d n%d ",
+                    snprintf(ovbuf, sizeof ovbuf, "P66.%d%s%s s%d/%d c%d/%d.%d x%d z%d/%d t%d o%d f%d n%d ",
                              sat_psw_diag & 3,             /* r38: pad L+Down state */
                              psw_pp_base_near ? "N" : "",  /* r48: pad L+Up */
                              sfb,
@@ -11534,7 +11534,15 @@ static void psw_probe_pass(void)
 {
     if (sat_psw_diag != 1 || !(sat_wall_paint & 1) || !psw_polys_ok) return;
     psw_probe_frame = 0;
-    for (int k = 0; k < psw_sub_n && psw_probe_frame < 6; ++k)   /* P65: cap 3->6 */
+    for (int k = 0; k < psw_sub_n; ++k)   /* P66: NO CAP -- the recorder is
+	    near-first and the hole is FAR down the view column, so caps 3/4/6
+	    exhausted on the nearest crossed planes and the probe NEVER examined
+	    the hole's plane (console P61-P65: "pas d'anneaux autour du trou",
+	    "je n'ai rien appris").  Every ray-crossed plane now gets its
+	    verdict; if even so NO ring of any colour surrounds the hole, the
+	    sub is NOT in the recorder -- the per-sub painter's structural gap
+	    (a sub whose segs are all rejected but whose interior is visible;
+	    vanilla covers it through the SECTOR-shared visplane). */
     {
 	int sn = psw_sub[k].subnum;
 	if (sn < 0) continue;
@@ -11852,9 +11860,11 @@ static void psw_emit_subflats(int k)
 		    psw_cur_pass = pass;        /* P58: emit64's ceiling famine skip */
 		    psw_probe_this = (pass && sat_psw_diag == 1
 		                      && (sat_wall_paint & 1)
-		                      && psw_probe_walkn < 2
+		                      && psw_probe_walkn < 8
 		                      && psw_probe_want(sn));   /* P65: class-0
-		                            tiles of THIS plane paint grey */
+		                            tiles of THIS plane paint grey.
+		                            P66: cap 2->8 (the near-first cap
+		                            starved the far hole plane) */
 		    if (psw_probe_this) psw_probe_walkn++;
 		    psw_emit_plane_tiles(slot, pc, cx, cy, n, ph, psign, cull_h, scolr);
 		    psw_sf_end += cov;

@@ -3516,7 +3516,7 @@ static void fps_update(void)
                        evidence.  `o` and `m` are the two silent classes that
                        replace it: a sub the recorder never took, and a marker
                        asked for but never drawn. */
-                    snprintf(ovbuf, sizeof ovbuf, "P49.%d%s h%d.%d/%d.%d F%s f%d w%d/%d t%d c%d ",
+                    snprintf(ovbuf, sizeof ovbuf, "P50.%d%s h%d.%d/%d.%d F%s f%d k%d t%d c%d ",
                              sat_psw_diag & 3,             /* r38: pad L+Down state */
                              psw_pp_base_near ? "N" : "",  /* r48: pad L+Up */
                              psw_ceil_clip_last > 99 ? 99 : psw_ceil_clip_last,
@@ -3525,8 +3525,7 @@ static void fps_update(void)
                              psw_ceil_sky_last > 99 ? 99 : psw_ceil_sky_last,
                              sfb,
                              psw_flat_last  > 999 ? 999 : psw_flat_last,
-                             psw_wall_cull_last > 999 ? 999 : psw_wall_cull_last,
-                             sat_psw_r_last > 999 ? 999 : sat_psw_r_last,
+                             psw_kill_last > 99 ? 99 : psw_kill_last,
                              psw_tile_cull_last > 999 ? 999 : psw_tile_cull_last,
                              psw_cover_last > 99 ? 99 : psw_cover_last);
                 }
@@ -11967,7 +11966,21 @@ static void vdp1_walls_flush(void)
                     int e = (psw_sub_flag[k] & 0x20) ? 4
                           : 2 * (int)psw_sub_ce[k] + 1;
                     int m = (e < 4) ? e : 4;
-                    if (ftile + m <= csweep)
+                    /* ROUND 50 -- THE CEILING GUARANTEE YIELDS ONLY TO THE BANK,
+                       never to the half-budget sweep cap.  The owner's four
+                       captures (plein / demi-trou / trou / trou+N) close every
+                       refusal class at once: h frozen at 1.0/0.0 across all
+                       three states, N a no-change, t 0 -- while F's job count
+                       falls 13 -> 6.  The only verdict that varies with the
+                       view and has NEVER been displayed is THIS standby.  And a
+                       standby CEILING is an uncovered hole by this engine's own
+                       r35 law ("a lost floor is covered by RBG0; a lost ceiling
+                       is covered by NOTHING") -- the half-drawn state is several
+                       leaves sharing the visual ceiling, some granted, some
+                       standby'd.  csweep still exists for round B's tiled
+                       UPGRADES; the 4-command PRESENCE guarantee outranks it:
+                       floors yield instead (they degrade, ceilings vanish). */
+                    if (ftile + m <= limit)
                     { ftile += m;
                       if (sf_ok) { psw_sf_bill[k]  += (unsigned short)m;
                                    psw_sf_cbill[k] += (unsigned short)m; } }   /* r39 */

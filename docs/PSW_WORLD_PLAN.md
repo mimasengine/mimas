@@ -1097,6 +1097,26 @@ StoreWallRange, curline/frontsector/backsector/rw_angle1 vivants).
 > désarmaient, et que ce flag n'a JAMAIS été écrit). Marqueur `P47<N?>`.
 > Pool 6,36 Ko. Build normal bit-intact. NON validé console (21e disque).
 
+> **ROUNDS 48–51 (2026-09-07/08, 5de8675…)** — r48 : hard crash console des
+> disques r45/r47 ⇒ **ROLLBACK à la base P44** + la corde L+HAUT seule (r45..r47
+> hors disque, à re-bisecter un par un). r49 (déclencheur = la géométrie du
+> propriétaire, mot pour mot) : un plafond n'arme JAMAIS `cull_h` (la loi r20
+> « un échantillon ne prouve pas une région » appliquée PAR TUILE) + round B :
+> tuilé ⇒ slot ACQUIS sinon solide honnête. r50 : les 4 captures d'états
+> (plein/demi/trou) ferment la famille des refus (h figé, N sans effet, t0) ⇒
+> garantie de présence plafond cède à la BANQUE seule, `k<kill>` sur la row —
+> **RÉFUTÉ console (k0 sur 6 captures)**. **r51 — LE FIX** : relecture complète
+> du chemin de verdict ⇒ le HIT DU MÉMO de masque refacturait le plafond à
+> `vis` (dg_saturn.cxx:~8739 sans gate `pass==0` — la moitié oubliée de r49,
+> qui avait gaté l'inline et la fence). Au REPOS (mémo hit) : fenêtre de job
+> ≈ `vis` ⇒ `ebill>fenêtre` ⇒ branche SOLIDE = **l'aplat slave** ; `vis` 0-1 ⇒
+> fenêtre < fan 4 quads ⇒ **fan tronqué = le trou triangulaire**, taille ∝ vis
+> = les états plein/demi/trou. Master exempt (fenêtre = banque), mouvement
+> exempt (mémo miss). Empreinte : `F../<drop>` 1-13 avec k0 t0 h figé. Fix =
+> 1 ligne (gate) ; row : `t` (mort r49) → **`s<solid>`** = passes plafond sans
+> slot texture (l'aplat compté ; s haut stable = famine 8 slots = round 52).
+> Marqueur `P51`. Pool 5,47 Ko. Build normal bit-intact. 25e disque.
+
 - **Polygones de sous-secteurs au level-load** (p_setup.c après :1234, PU_LEVEL zone
   LWRAM) : clip récursif du bbox map par les splitlines ancêtres (node_t x16/y16/dx16/
   dy16 exacts) + les segs de la feuille. ~150 lignes, une fois par niveau.

@@ -732,6 +732,12 @@ static int  psw_ceil_sky = 0, psw_ceil_sky_last = 0;   /* r44: above-eye ceiling
                        skipped for `cl < 0` (sky / no flat lump) -- the ONE ceiling
                        exit that never had a counter, and the sky is what shows */
 static int  psw_ceil_hid_last = 0, psw_ceil_zero_last = 0, psw_ceil_clip_last = 0;
+static int  psw_ceil_solid = 0, psw_ceil_solid_last = 0;   /* r51: ceiling passes
+                       emitted WITHOUT a texture slot -- the whole-plane solid
+                       degrade AND the per-tile famine fallback both land here
+                       (slot < 0 either way).  This is the APLAT, as a number:
+                       expected ~0 at rest once the memo bill is honest; a high
+                       steady read = slot famine (8 slots, chains, near->far). */
 /* (ROUND 36b's R+X A/B on the two ceiling refusals is REMOVED -- it did its job
    on console: the spawn ceilings moved, the triangle did not, which is how the
    two defects were finally told apart.  Round 38's marker paint answers the same
@@ -3516,7 +3522,13 @@ static void fps_update(void)
                        evidence.  `o` and `m` are the two silent classes that
                        replace it: a sub the recorder never took, and a marker
                        asked for but never drawn. */
-                    snprintf(ovbuf, sizeof ovbuf, "P50.%d%s h%d.%d/%d.%d F%s f%d k%d t%d c%d ",
+                    /* r51: `t<tilecull>` LEAVES the row -- dead by design since
+                       r49 disarmed the ceiling culls (read t0 on every capture;
+                       the latch keeps running, unprinted).  `s<solid>` takes the
+                       column: ceiling passes emitted without a texture slot =
+                       the aplat, counted.  Expected ~0 at rest with the r51
+                       memo gate; steady s>0 = the 8-slot famine (next round). */
+                    snprintf(ovbuf, sizeof ovbuf, "P51.%d%s h%d.%d/%d.%d F%s f%d k%d s%d c%d ",
                              sat_psw_diag & 3,             /* r38: pad L+Down state */
                              psw_pp_base_near ? "N" : "",  /* r48: pad L+Up */
                              psw_ceil_clip_last > 99 ? 99 : psw_ceil_clip_last,
@@ -3526,7 +3538,7 @@ static void fps_update(void)
                              sfb,
                              psw_flat_last  > 999 ? 999 : psw_flat_last,
                              psw_kill_last > 99 ? 99 : psw_kill_last,
-                             psw_tile_cull_last > 999 ? 999 : psw_tile_cull_last,
+                             psw_ceil_solid_last > 99 ? 99 : psw_ceil_solid_last,
                              psw_cover_last > 99 ? 99 : psw_cover_last);
                 }
 #endif
@@ -8736,7 +8748,23 @@ static void sat_psw_sub_note_body(int subnum, int fh, int ch, int fpic,
 		    {
 			if (pass == 0) psw_sub_fmask[k] = L->msk;
 			else           psw_sub_cmask[k] = L->msk;
-			if ((int)L->vis < e) e = (int)L->vis;
+			/* ROUND 51 -- THE MEMO KEPT THE LIE r49 KILLED EVERYWHERE ELSE.
+			   r49's law: a ceiling's bill stays the full touched estimate
+			   (the emitter paints every tile, so bill >= emit).  It gated
+			   the INLINE walk (below) and the FENCE apply -- but this memo
+			   hit still re-billed the ceiling at last walk's `vis`.  The
+			   memo hits exactly when the eye HOLDS STILL (same viewx/vy/vz
+			   within PSW_MASK_AGE), i.e. precisely when the owner captures:
+			   ce collapses to vis, the job window follows (round A bills
+			   min(2*vis+1,4)), and at emit `ebill = 2*ce+1 > window` takes
+			   the SOLID branch -- the spawn aplat -- while a vis of 0-1
+			   leaves a 1-3 command window that cannot even pay the 4-quad
+			   fan: a TRUNCATED fan, the triangle hole.  Both symptoms, one
+			   un-gated line, slave-only (master's window is the whole
+			   bank), rest-only (moving = memo miss = the gated inline
+			   path).  Console fingerprint: F../<drop> 1-13 with k0 t0 and
+			   h frozen across the owner's plein/demi-trou/trou states. */
+			if (pass == 0 && (int)L->vis < e) e = (int)L->vis;
 		    }
 		    else if (sat_psw_slave && psw_mq_n < PSW_MQ_MAX)
 		    {   /* defer: fe/ce hold the est upper bound until the fence */
@@ -11281,6 +11309,7 @@ static void psw_emit_subflats(int k)
 	             : psw_sf_mode ? psw_slot_peek(lump)   /* round 33: pure -- never
 	                               uploads / touches the zone on the slave */
 	             : psw_slot_get(lump, (fe_ >= 18) ? 2 : (fe_ >= 12) ? 1 : 0);
+	    if (pass && slot < 0) psw_ceil_solid++;   /* r51: the aplat has a number */
 	    psw_cur_tall = (slot >= 0) ? (int)psw_slot[slot].tall : 0;  /* round 24:
 	                       chain length - 1 -> 64x128 / 64x192 strips */
 	    int nr, li, zi, ok = 1, fb = 0;
@@ -12277,6 +12306,8 @@ static void vdp1_walls_flush(void)
         psw_ceil_clip_last = psw_ceil_clip; psw_ceil_clip = 0;   /* r36: same, world-clip half */
         psw_ceil_sky_last = (int)psw_ucr32((const volatile void *)&psw_ceil_sky);
         psw_ceil_sky = 0;                     /* r44: emitter-side, slave-written */
+        psw_ceil_solid_last = (int)psw_ucr32((const volatile void *)&psw_ceil_solid);
+        psw_ceil_solid = 0;                   /* r51: emitter-side, slave-written */
         psw_tile_cull_last = (int)psw_ucr32((const volatile void *)&psw_tile_cull);
         psw_tile_cull = 0;                    /* r41: slave-written, read uncached */
         psw_cover_last = (int)psw_ucr32((const volatile void *)&psw_cover_n);

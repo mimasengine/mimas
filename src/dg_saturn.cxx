@@ -795,6 +795,16 @@ static int  psw_cap_stop_n = 0, psw_cap_stop_last = 0;     /* P58: global-cap
                        mid-walk stops (the uncounted class, hole candidate #2) --
                        row 13 `x`; fires BOTH modes, so x>0 while the triangle
                        shows names the cap, x0 acquits it */
+static int  psw_e64_skip = 0, psw_e64_skip_last = 0;       /* P63: emit64 border
+                       pieces dropped by a SILENT exit (m<3 after the tile clips,
+                       or unprojectable fan verts) -- row 13 `z<skip>/<sliver>`,
+                       both modes.  Owner P62: the triangle's two bands are
+                       textured FACE-ON and forgotten from the side -- world and
+                       note innocent, so the walker's silent exits are the last
+                       doors standing.  On cran 1 + L+X each skip fills its tile
+                       GREY 88. */
+static int  psw_e64_sliv = 0, psw_e64_sliv_last = 0;       /* P63: the <2u^2
+                       sliver exit, counted apart (legit slivers exist) */
 static int  psw_clip_wrap = 0, psw_clip_wrap_last = 0;     /* P59: clip-predicate
                        vertices whose 32-bit sign wrapped vs the 64-bit truth
                        (row 13 `y`) -- console P58 read o0 AND x0 with the
@@ -3591,7 +3601,10 @@ static void fps_update(void)
                     /* P59: `y<wrap>` = 32-bit clip-predicate sign wraps vs the
                        64-bit truth (now used) -- y>0 where the triangle was =
                        candidate 3 named; triangle gone + y>0 = fixed. */
-                    snprintf(ovbuf, sizeof ovbuf, "P62.%d%s%s s%d/%d c%d/%d.%d x%d y%d o%d/%d f%d n%d ",
+                    /* P63: `y` (clip wrap, 0 twice on console) cedes its column
+                       to `z<skip>/<sliver>` = emit64's silent exits, counted in
+                       BOTH modes (the y latch keeps running unprinted). */
+                    snprintf(ovbuf, sizeof ovbuf, "P63.%d%s%s s%d/%d c%d/%d.%d x%d z%d/%d o%d/%d f%d n%d ",
                              sat_psw_diag & 3,             /* r38: pad L+Down state */
                              psw_pp_base_near ? "N" : "",  /* r48: pad L+Up */
                              sfb,
@@ -3601,7 +3614,8 @@ static void fps_update(void)
                              psw_cover_skip_last > 99 ? 99 : psw_cover_skip_last,
                              psw_fan_skip_last > 99 ? 99 : psw_fan_skip_last,
                              psw_cap_stop_last > 99 ? 99 : psw_cap_stop_last,
-                             psw_clip_wrap_last > 99 ? 99 : psw_clip_wrap_last,
+                             psw_e64_skip_last > 99 ? 99 : psw_e64_skip_last,
+                             psw_e64_sliv_last > 99 ? 99 : psw_e64_sliv_last,
                              psw_sub_ovf_last > 99 ? 99 : psw_sub_ovf_last,
                              psw_sub_n_last > 999 ? 999 : psw_sub_n_last,
                              psw_flat_last  > 999 ? 999 : psw_flat_last,
@@ -8359,7 +8373,10 @@ static void vdp1_floors_flush(void) {}
    KNOWN one-frame artifact: a slot eviction re-uploads texels the still-plotting
    previous bank may read (same acceptance as the parked design; LRU keeps
    resident flats stable below 3 distinct lumps/frame). */
-#define PSW_SUB_MAX      320   /* P59: 384 -> 320 (~2.2 KB of .bss back to a pool the
+#define PSW_SUB_MAX      288   /* P63: 320 -> 288 (~1.1 KB more, funding the silent-exit
+                                  probes; console still reads subn <= 33, margin x8,
+                                  `o<ovf>/<subn>` guards it live). */
+                               /* P59: 384 -> 320 (~2.2 KB of .bss back to a pool the
                                   64-bit clip predicate pushed under the boot floor).
                                   Console P58 read subn 20-33 NOTED per frame against
                                   the 384 cap -- a 10x margin kept out of fear, from
@@ -9383,6 +9400,23 @@ static void psw_emit_flatquad(int slot, unsigned short colr, const int *qx, cons
 /* round 9 -- one UserClip window (framebuffer coords, clamped to the view
    rect), billed as a flat command.  Modal VDP1 state: only Window_In commands
    read it, and every later Window_In user (walls, things) sets its own. */
+/* P63: paint an emit64 SILENT skip -- fill the whole tile grey (cran 1 + L+X
+   only).  A projection failure here just stays silent; the counter is the
+   ground truth, the paint is the map. */
+static void psw_probe_tile(int tx, int ty, int ph, int psign)
+{
+    int qx[4], qy[4];
+    int x0 = tx << 22, y0 = ty << 22;
+    int x1 = x0 + (64 << 16), y1 = y0 + (64 << 16);
+    if (sat_psw_diag != 1 || !(sat_wall_paint & 1)) return;
+    if (!psw_project(x0, y0, ph, psign, &qx[0], &qy[0])) return;
+    if (!psw_project(x1, y0, ph, psign, &qx[1], &qy[1])) return;
+    if (!psw_project(x1, y1, ph, psign, &qx[2], &qy[2])) return;
+    if (!psw_project(x0, y1, ph, psign, &qx[3], &qy[3])) return;
+    psw_paint_idx = 88;
+    psw_emit_flatquad(-1, 0, qx, qy);
+}
+
 static void psw_emit_clipwin(int xl, int yt, int xr, int yb)
 {
     unsigned short cmd[16];
@@ -10377,13 +10411,13 @@ static void psw_emit_plane_tiles(int slot, unsigned short colr,
 	    psw_eb_bord++;                       /* round 30 `B../<n>` */
 	    /* the exact clipped poly-cap-tile piece */
 	    m = psw_clip_axis(cx, cy, n, ax, ay, 0, +1, x0);
-	    if (m < 3) return;
+	    if (m < 3) { psw_e64_skip++; psw_probe_tile(tx, ty, ph, psign); return; }   /* P63 */
 	    m = psw_clip_axis(ax, ay, m, bxv, byv, 0, -1, x1);
-	    if (m < 3) return;
+	    if (m < 3) { psw_e64_skip++; psw_probe_tile(tx, ty, ph, psign); return; }   /* P63 */
 	    m = psw_clip_axis(bxv, byv, m, ax, ay, 1, +1, y0);
-	    if (m < 3) return;
+	    if (m < 3) { psw_e64_skip++; psw_probe_tile(tx, ty, ph, psign); return; }   /* P63 */
 	    m = psw_clip_axis(ax, ay, m, bxv, byv, 1, -1, y1);
-	    if (m < 3) return;
+	    if (m < 3) { psw_e64_skip++; psw_probe_tile(tx, ty, ph, psign); return; }   /* P63 */
 	    area2 = 0;                     /* shoelace x2, tile-local (coords <= 2^22) */
 	    for (i = 0; i < m; ++i)
 	    {
@@ -10392,7 +10426,8 @@ static void psw_emit_plane_tiles(int slot, unsigned short colr,
 		       - (long long)(bxv[j] - x0) * (byv[i] - y0);
 	    }
 	    if (area2 < 0) area2 = -area2;
-	    if ((area2 >> 33) < 2) return;               /* sliver < ~2 units^2 */
+	    if ((area2 >> 33) < 2)
+	    { psw_e64_sliv++; psw_probe_tile(tx, ty, ph, psign); return; }   /* P63: sliver */
 	    full = ((area2 >> 33) >= 64 * 64 - 2);       /* the whole tile (round 9: the old
 	                                                    -32 tolerance let a corner-cut tile
 	                                                    pass as full and its square OVERHANG
@@ -10530,7 +10565,7 @@ static void psw_emit_plane_tiles(int slot, unsigned short colr,
 					    int win2 = (wxa != pbx0 || wxb != pbx1);
 					    if (win2)
 					    {
-						if (!sxv_ensure()) return;   /* round 30: lazy (8-misaligned pieces only) */
+						if (!sxv_ensure()) { psw_e64_skip++; psw_probe_tile(tx, ty, ph, psign); return; }   /* P63 */
 						int wxl = sxv[0], wxr = sxv[0], wyt = syv[0], wyb = syv[0];
 						for (i = 1; i < m; ++i)
 						{
@@ -10548,7 +10583,7 @@ static void psw_emit_plane_tiles(int slot, unsigned short colr,
 				    {
 					int wxl, wxr, wyt, wyb;
 					int sdx = 0, sdy = 0;
-					if (!sxv_ensure()) return;   /* round 30: lazy (fine/coarse windows need the bbox) */
+					if (!sxv_ensure()) { psw_e64_skip++; psw_probe_tile(tx, ty, ph, psign); return; }   /* P63 */
 					wxl = sxv[0]; wxr = sxv[0]; wyt = syv[0]; wyb = syv[0];
 					for (i = 1; i < m; ++i)
 					{
@@ -10684,7 +10719,7 @@ static void psw_emit_plane_tiles(int slot, unsigned short colr,
 		           where the master paints texture was half the console's aplat.
 		           Counted (row 13 c../.<n>) so the next round can refund the
 		           window with the real deficit, not a guess. */
-		    if (!sxv_ensure()) return;          /* round 30: lazy (the fan IS the verts) */
+		    if (!sxv_ensure()) { psw_e64_skip++; psw_probe_tile(tx, ty, ph, psign); return; }   /* P63 */
 		    psw_paint_idx = (whyfan == 1) ? 4        /* r53: WHITE  = okq   */
 		                  : (whyfan == 2) ? 88       /*      GREY   = rows  */
 		                  : (whyfan == 3) ? 176      /*      RED    = gates */
@@ -12734,6 +12769,10 @@ static void vdp1_walls_flush(void)
         psw_cap_stop_n = 0;                   /* P58 */
         psw_clip_wrap_last = (int)psw_ucr32((const volatile void *)&psw_clip_wrap);
         psw_clip_wrap = 0;                    /* P59: master (note) + slave (emit) */
+        psw_e64_skip_last = (int)psw_ucr32((const volatile void *)&psw_e64_skip);
+        psw_e64_skip = 0;                     /* P63: slave-written */
+        psw_e64_sliv_last = (int)psw_ucr32((const volatile void *)&psw_e64_sliv);
+        psw_e64_sliv = 0;                     /* P63 */
         psw_kill_last = (int)psw_ucr32((const volatile void *)&psw_kill_n);
         psw_punch_last = (int)psw_ucr32((const volatile void *)&psw_punch_cmds);
         psw_band_last = (int)psw_ucr32((const volatile void *)&psw_band_n);

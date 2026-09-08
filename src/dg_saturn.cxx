@@ -801,6 +801,13 @@ static int  psw_probe_this = 0;   /* P65: the walk's CURRENT ceiling plane is th
                        die at CLASSING (z0/0 with the hole alive), so show the
                        classing's verdict tile by tile */
 static int  psw_probe_walkn = 0;  /* P65: probed planes this frame (walk side) */
+static char psw_ray_str[10] = "-";     /* P67: one verdict char per ray-crossed
+                       ceiling, NEAR->far (row 13 `H<drop>+<str>/u<un>`);
+                       overflow drops the NEAREST chars (psw_ray_drop counts
+                       them) -- the far end is where the hole lives, it must
+                       never be the end that is cut (the P66 blindness). */
+static int  psw_ray_drop = 0, psw_ray_un = 0;   /* un = ray-crossed subs ABSENT
+                       from the recorder (BSP prune) -- magenta-ringed */
 static int  psw_e64_skip = 0, psw_e64_skip_last = 0;       /* P63: emit64 border
                        pieces dropped by a SILENT exit (m<3 after the tile clips,
                        or unprojectable fan verts) -- row 13 `z<skip>/<sliver>`,
@@ -3613,18 +3620,25 @@ static void fps_update(void)
                        dieted twice, ovf guard stays) and `t<cull>` returns to
                        the row = mask/probe tile culls -- FLOOR-only now, the
                        ceiling consult is gone (the r49 second door). */
-                    snprintf(ovbuf, sizeof ovbuf, "P66.%d%s%s s%d/%d c%d/%d.%d x%d z%d/%d t%d o%d f%d n%d ",
+                    /* P67: the colour probes answered "tjs pas" six discs in a
+                       row -- the aim-column verdict is now a STRING.  `H<d>+<s>/u<n>`:
+                       s = one char per ray-crossed ceiling NEAR->far (n=note
+                       s=sky c=clip e=entry-solid 0=walker-staged-NOTHING
+                       w=painted), d = NEAREST chars dropped on overflow (the
+                       far end is never cut -- P66 lesson), u = ray-crossed subs
+                       ABSENT from the recorder (BSP prune; magenta rings).
+                       `c` trio, `x`, `z` pair leave the row (latches alive:
+                       cover/cskip/fskip stable since P58, x0 and z0/0 constant
+                       on every console capture since they appeared). */
+                    snprintf(ovbuf, sizeof ovbuf, "P67.%d%s%s s%d/%d H%d+%s/u%d t%d o%d f%d n%d ",
                              sat_psw_diag & 3,             /* r38: pad L+Down state */
                              psw_pp_base_near ? "N" : "",  /* r48: pad L+Up */
                              sfb,
                              psw_ceil_esol_last > 99 ? 99 : psw_ceil_esol_last,
                              psw_ceil_solid_last > 99 ? 99 : psw_ceil_solid_last,
-                             psw_cover_last > 99 ? 99 : psw_cover_last,
-                             psw_cover_skip_last > 99 ? 99 : psw_cover_skip_last,
-                             psw_fan_skip_last > 99 ? 99 : psw_fan_skip_last,
-                             psw_cap_stop_last > 99 ? 99 : psw_cap_stop_last,
-                             psw_e64_skip_last > 99 ? 99 : psw_e64_skip_last,
-                             psw_e64_sliv_last > 99 ? 99 : psw_e64_sliv_last,
+                             psw_ray_drop > 99 ? 99 : psw_ray_drop,
+                             psw_ray_str,
+                             psw_ray_un > 99 ? 99 : psw_ray_un,
                              psw_tile_cull_last > 99 ? 99 : psw_tile_cull_last,
                              psw_sub_ovf_last > 99 ? 99 : psw_sub_ovf_last,
                              psw_flat_last  > 999 ? 999 : psw_flat_last,
@@ -8382,7 +8396,10 @@ static void vdp1_floors_flush(void) {}
    KNOWN one-frame artifact: a slot eviction re-uploads texels the still-plotting
    previous bank may read (same acceptance as the parked design; LRU keeps
    resident flats stable below 3 distinct lumps/frame). */
-#define PSW_SUB_MAX      288   /* P63: 320 -> 288 (~1.1 KB more, funding the silent-exit
+#define PSW_SUB_MAX      256   /* P67: 288 -> 256 (~1.1 KB, funding the paint census
+                                  psw_sub_cem + the aim-column string; subn max
+                                  console 33, margin x7, `o<ovf>` guards live). */
+                               /* P63: 320 -> 288 (~1.1 KB more, funding the silent-exit
                                   probes; console still reads subn <= 33, margin x8,
                                   `o<ovf>/<subn>` guards it live). */
                                /* P59: 384 -> 320 (~2.2 KB of .bss back to a pool the
@@ -8548,6 +8565,14 @@ static unsigned char psw_sub_ecause[PSW_SUB_MAX]; /* P65: WHY the ladder refused
                        standby rescue (budget-A family).  The entry fan paints the
                        cause in L+X: magenta=slot, grey=budget, green=rescue,
                        red=emission-time window/cap (no flag). */
+static unsigned char psw_sub_cem[PSW_SUB_MAX]; /* P67: ceiling flat-quads ACCEPTED
+                       by psw_emit_flatquad for this sub this flush (fans + tiles,
+                       counted AFTER the room/cap guards).  The colour probes kept
+                       returning silence ("tjs pas", 6 discs) -- this turns the
+                       aim-column read into NUMBERS: a ray-crossed ceiling that
+                       reached the walker with cem 0 emitted NOTHING. */
+static signed short  psw_cur_k = -1;   /* P67: recorder index being emitted (-1 =
+                       outside psw_emit_subflats, e.g. the probe pass itself) */
 static unsigned char psw_sub_flag[PSW_SUB_MAX];   /* NOTE-time verdicts: b0 floor hidden,
                                                      b1 floor per-tile probe, b2/b3 = ceiling;
                                                      b4 floor SOLID (note-time distance LOD,
@@ -9388,6 +9413,9 @@ static void psw_emit_flatquad(int slot, unsigned short colr, const int *qx, cons
     int vx = viewwindowx, vy = viewwindowy, i;
     if (psw_cmd_left() <= 0 && psw_no_room()) return;   /* r39: counted */
     if (psw_flat_cmds >= psw_flat_cap_dyn) { psw_cap_stop(); return; }   /* P58 */
+    if (psw_cur_k >= 0 && psw_cur_pass && psw_sub_cem[psw_cur_k] < 255)
+	psw_sub_cem[psw_cur_k]++;   /* P67: a PAINT command really staged for this
+	                               sub's ceiling (windows excluded by site) */
     memset(cmd, 0, sizeof cmd);
     cmd[0] = 0x0002;                                  /* DISTORSP */
     cmd[2] = 0x00E0;                                  /* no clip | 8bpp bank | SPD | ECD */
@@ -9473,6 +9501,9 @@ static void psw_emit_rectquad(int slot, unsigned short colr,
     int vx = viewwindowx, vy = viewwindowy, i;
     if (psw_cmd_left() <= 0 && psw_no_room()) return;   /* r39: counted */
     if (psw_flat_cmds >= psw_flat_cap_dyn) { psw_cap_stop(); return; }   /* P58 */
+    if (psw_cur_k >= 0 && psw_cur_pass && psw_sub_cem[psw_cur_k] < 255)
+	psw_sub_cem[psw_cur_k]++;   /* P67: a PAINT command really staged for this
+	                               sub's ceiling (windows excluded by site) */
     memset(cmd, 0, sizeof cmd);
     cmd[0] = 0x0002;                                  /* DISTORSP */
     cmd[2] = (unsigned short)(win ? 0x04E0 : 0x00E0); /* (Window_In) | 8bpp bank | SPD | ECD */
@@ -11364,6 +11395,9 @@ static void psw_emit_punchquad(const int *qx, const int *qy)
     int vx = viewwindowx, vy = viewwindowy, i;
     if (psw_cmd_left() <= 0 && psw_no_room()) return;   /* r39: counted */
     if (psw_flat_cmds >= psw_flat_cap_dyn) { psw_cap_stop(); return; }   /* P58 */
+    if (psw_cur_k >= 0 && psw_cur_pass && psw_sub_cem[psw_cur_k] < 255)
+	psw_sub_cem[psw_cur_k]++;   /* P67: a PAINT command really staged for this
+	                               sub's ceiling (windows excluded by site) */
     memset(cmd, 0, sizeof cmd);
     cmd[0] = 0x0004;                   /* POLYGON */
     cmd[2] = 0x00C0;                   /* SPD: colour-0 pixels are WRITTEN (erase recipe) */
@@ -11532,8 +11566,12 @@ static void psw_probe_fill(const int *vx, const int *vy, int nv,
                      inside these rings with no red = the WALKER under-covers */
 static void psw_probe_pass(void)
 {
+    int rp = 0, mxch = 0, have_mxch = 0;
     if (sat_psw_diag != 1 || !(sat_wall_paint & 1) || !psw_polys_ok) return;
     psw_probe_frame = 0;
+    psw_cur_k = -1;                     /* P67: probe quads never count as paint */
+    psw_ray_drop = 0; psw_ray_un = 0;
+    psw_ray_str[0] = '-'; psw_ray_str[1] = 0;
     for (int k = 0; k < psw_sub_n; ++k)   /* P66: NO CAP -- the recorder is
 	    near-first and the hole is FAR down the view column, so caps 3/4/6
 	    exhausted on the nearest crossed planes and the probe NEVER examined
@@ -11567,6 +11605,28 @@ static void psw_probe_pass(void)
 		int cx[PSW_FAN_MAX], cy[PSW_FAN_MAX];
 		int n = psw_plane_poly(sn, ph, -1, cx, cy);
 		psw_sub_lumps(k, &fl, &cl, &fdom);
+		{   /* P67: the aim-column verdicts as a STRING (row 13 `H`) --
+		       six discs of colour probes came back "tjs pas" because a
+		       colour at the aimed spot is unreadable under the cran-1
+		       noise.  One char per ray-crossed ceiling, NEAR->far:
+		       n=note-flagged  s=sky  c=clip killed (plane_poly<3)
+		       e=entry-solid (ladder 0x20; fan cause colours still apply)
+		       0=reached the walker, staged NOTHING (psw_sub_cem == 0)
+		       w=painted.  Overflow drops the NEAREST char, never the
+		       far end -- the hole is far down the column (P66 lesson). */
+		    char cch;
+		    if (psw_sub_flag[k] & (4 | 0x80)) cch = 'n';
+		    else if (cl < 0) cch = 's';
+		    else if (n < 3) cch = 'c';
+		    else if (psw_sub_flag[k] & 0x20) cch = 'e';
+		    else if (psw_sub_cem[k] == 0) cch = '0';
+		    else cch = 'w';
+		    if (rp >= 8)
+		    { memmove(psw_ray_str, psw_ray_str + 1, 7); rp = 7; psw_ray_drop++; }
+		    psw_ray_str[rp++] = cch; psw_ray_str[rp] = 0;
+		    if (!have_mxch || psw_sub[k].ch > mxch)
+		    { mxch = psw_sub[k].ch; have_mxch = 1; }
+		}
 		if (psw_sub_flag[k] & (4 | 0x80))
 		{   /* the note's verdict killed it: paint the WHOLE claim red */
 		    if (n >= 3) psw_probe_fill(cx, cy, n, ph, -1, 176);
@@ -11586,6 +11646,37 @@ static void psw_probe_pass(void)
 	    }
 	}
     }
+    /* P67: THE CLASS EVERY PER-RECORDER PROBE IS STRUCTURALLY BLIND TO -- a sub
+       whose leaf crosses the aim ray but which the recorder NEVER noted this
+       frame (R_CheckBBox prune: the note hook at core r_bsp.c:937 is
+       unconditional at R_Subsector entry, so "not in psw_sub" can only mean
+       "BSP never reached it").  Each such sub gets a MAGENTA ring at the
+       tallest crossed ceiling height, and row 13 counts them (`/u`).  Read:
+       only a ring AROUND THE DEFECT means anything -- a legitimately occluded
+       pruned sub rings too, floating on the wall that hides it. */
+    if (have_mxch && mxch > viewz)
+	for (int s2 = 0; s2 < numsubsectors; ++s2)
+	{
+	    int n0 = psw_pvn[s2], base = psw_pvi[s2], inrec = 0;
+	    if (n0 < 3) continue;
+	    {
+		int bx0, by0, bx1, by1, i2;
+		bx0 = bx1 = psw_pvx[base]; by0 = by1 = psw_pvy[base];
+		for (i2 = 1; i2 < n0; ++i2)
+		{
+		    int wxx = psw_pvx[base + i2], wyy = psw_pvy[base + i2];
+		    if (wxx < bx0) bx0 = wxx; if (wxx > bx1) bx1 = wxx;
+		    if (wyy < by0) by0 = wyy; if (wyy > by1) by1 = wyy;
+		}
+		if (!psw_probe_ray(bx0, by0, bx1, by1)) continue;
+	    }
+	    for (int q = 0; q < psw_sub_n; ++q)
+		if (psw_sub[q].subnum == s2) { inrec = 1; break; }
+	    if (inrec) continue;
+	    psw_ray_un++;
+	    psw_probe_outline(psw_pvx + base, psw_pvy + base, n0,
+	                      mxch - viewz, -1, 250);
+	}
 }
 
 static void psw_emit_subflats(int k)
@@ -11594,6 +11685,7 @@ static void psw_emit_subflats(int k)
     int sxv[PSW_FAN_MAX], syv[PSW_FAN_MAX];
     int n, i, sn = psw_sub[k].subnum;
     if (!psw_polys_ok || sn < 0) return;
+    psw_cur_k = (signed short)k;   /* P67: attribute staged paint to this sub */
     {
     int fl, cl, fdom;
     psw_sub_lumps(k, &fl, &cl, &fdom);
@@ -12338,6 +12430,8 @@ static void vdp1_walls_flush(void)
         psw_ceil_zero = 0;                   /* r34d (psw_ceil_hid resets at note) */
         psw_band_n = 0; psw_fanq_n = 0; psw_fine_cmds = 0;
         psw_probe_walkn = 0; psw_probe_this = 0;   /* P65 */
+        psw_cur_k = -1;                            /* P67: fresh per-sub paint census */
+        memset(psw_sub_cem, 0, sizeof psw_sub_cem);
         /* round 30: ew-interior probes reset at flush ENTRY (j+q cut in r33) */
         psw_eb_frt = 0; psw_eb_bord = 0;
         psw_ef_frt = 0;                  /* r33: ef now accumulates on the SLAVE */

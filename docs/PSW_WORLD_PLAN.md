@@ -1260,6 +1260,19 @@ StoreWallRange, curline/frontsector/backsector/rw_angle1 vivants).
 > coût nul ; si y0 + triangle ⇒ P60 = probe visuel CONTOUR du polygone
 > clippé (trou dans/hors contour = walker/amont), conçu, non câblé. */
 
+> **ROUND 60 (2026-09-08, 33e disque, marqueur `P60`) — VERDICT P59 :
+> `y0` triangle vivant = les TROIS candidats des arbres MORTS (le
+> prédicat 64-bit reste, il est plus sûr) ; spawn `s0/0 c0/0.0` avec
+> tuiles manquantes = même signature que le triangle. FIN DU COMPTAGE →
+> LE PROBE CONTOUR** (cran 1 = flats master + L+X) : plafonds croisés
+> par le rayon de vue central (psw_probe_ray, slab 64-bit sur bbox de
+> feuille) → contour FEUILLE bleu 198 AVANT tout skip (ciel/flags
+> compris), contour CLIPPÉ jaune 163 après psw_plane_poly (blanc banni —
+> overlay). Cap 6 plans/frame. Lecture en visant le trou : DANS le jaune
+> = walker sous-couvre ; bleu sans jaune = ciel/flags/clip ; aucun bleu
+> = feuille/BSP/note. Si bleu autour du trou + sub flaggé ciel ⇒ la
+> piste devient l'attribution clump (r_bsp), pas la géométrie.
+
 - **Polygones de sous-secteurs au level-load** (p_setup.c après :1234, PU_LEVEL zone
   LWRAM) : clip récursif du bbox map par les splitlines ancêtres (node_t x16/y16/dx16/
   dy16 exacts) + les segs de la feuille. ~150 lignes, une fois par niveau.

@@ -3591,7 +3591,7 @@ static void fps_update(void)
                     /* P59: `y<wrap>` = 32-bit clip-predicate sign wraps vs the
                        64-bit truth (now used) -- y>0 where the triangle was =
                        candidate 3 named; triangle gone + y>0 = fixed. */
-                    snprintf(ovbuf, sizeof ovbuf, "P59.%d%s%s s%d/%d c%d/%d.%d x%d y%d o%d/%d f%d n%d ",
+                    snprintf(ovbuf, sizeof ovbuf, "P60.%d%s%s s%d/%d c%d/%d.%d x%d y%d o%d/%d f%d n%d ",
                              sat_psw_diag & 3,             /* r38: pad L+Down state */
                              psw_pp_base_near ? "N" : "",  /* r48: pad L+Up */
                              sfb,
@@ -11329,6 +11329,70 @@ static void psw_sub_lumps(int k, int *fl, int *cl, int *fdom)
    "at least a flat" philosophy); the drop counter only ticks when even the
    texel peek fails.  Fan by 2: quads (0,i,i+1,i+2). */
 static int psw_flat_denied = 0;
+/* ================= P60 -- THE OUTLINE PROBE (owner's right-edge instinct) ===
+   Console P59 read y0 with the triangle alive: all three fresh-eyes candidates
+   (recorder o, cap-stop x, clip wrap y) are DEAD, and the spawn's missing tiles
+   share the signature (nothing emitted, nothing counted).  So stop counting and
+   LOOK: on cran 1 (pad L+Down once = master flats, whole bank) with L+X, every
+   CEILING plane whose leaf bbox is crossed by the screen-centre view ray gets
+   its LEAF polygon outlined BLUE (198, drawn BEFORE any skip -- sky and flags
+   included) and its CLIPPED polygon outlined YELLOW (163, after psw_plane_poly
+   -- the punch mustard, which never lives on a ceiling; WHITE is banned, the
+   overlay text is white -- owner + the r15 law).  Aim the crosshair at the
+   hole and read:
+     hole INSIDE the yellow ring  = the tile walker under-covers it
+                                    (the owner's right-edge class)
+     blue ring, no yellow         = sky/flags/clip killed the plane there
+     no blue at all               = no recorded leaf covers the region
+                                    (leaf build / BSP / note)
+   Probe quads ride psw_emit_flatquad(-1) under psw_paint_idx; commands only
+   spent on the probe cran; capped at 6 planes/frame. */
+static int psw_probe_frame = 0;
+static int psw_probe_ray(int bx0, int by0, int bx1, int by1)
+{   /* does the centre view ray (2D, t in (0, 3000u]) cross this world bbox? */
+    long long tmin = 0, tmax = (long long)3000 << 16;
+    int dc[2] = { viewcos, viewsin };
+    int p0[2] = { viewx, viewy };
+    int b0[2] = { bx0, by0 }, b1[2] = { bx1, by1 };
+    for (int a = 0; a < 2; ++a)
+    {
+	if (dc[a] > -256 && dc[a] < 256)
+	{ if (p0[a] < b0[a] || p0[a] > b1[a]) return 0; }
+	else
+	{
+	    long long ta = ((long long)(b0[a] - p0[a]) << 16) / dc[a];
+	    long long tb = ((long long)(b1[a] - p0[a]) << 16) / dc[a];
+	    if (ta > tb) { long long tt = ta; ta = tb; tb = tt; }
+	    if (ta > tmin) tmin = ta;
+	    if (tb < tmax) tmax = tb;
+	    if (tmin > tmax) return 0;
+	}
+    }
+    return 1;
+}
+static void psw_probe_outline(const int *vx, const int *vy, int nv,
+                              int ph, int psign, int colidx)
+{
+    int ex[PSW_FAN_MAX], ey[PSW_FAN_MAX];
+    unsigned char okv[PSW_FAN_MAX];
+    int i;
+    if (nv < 3 || nv > PSW_FAN_MAX) return;
+    for (i = 0; i < nv; ++i)
+	okv[i] = (unsigned char)psw_project(vx[i], vy[i], ph, psign, &ex[i], &ey[i]);
+    for (i = 0; i < nv; ++i)
+    {
+	int j = (i + 1 == nv) ? 0 : i + 1;
+	int qx[4], qy[4];
+	if (!okv[i] || !okv[j]) continue;
+	qx[0] = ex[i]; qy[0] = ey[i];
+	qx[1] = ex[j]; qy[1] = ey[j];
+	qx[2] = ex[j]; qy[2] = ey[j] + 2;
+	qx[3] = ex[i]; qy[3] = ey[i] + 2;
+	psw_paint_idx = colidx;
+	psw_emit_flatquad(-1, 0, qx, qy);
+    }
+}
+
 static void psw_emit_subflats(int k)
 {
     int cx[PSW_FAN_MAX], cy[PSW_FAN_MAX];
@@ -11372,7 +11436,7 @@ static void psw_emit_subflats(int k)
 	                   FIRST statement, so every `continue` in pass 0 still
 	                   restores the window (the JP-pad loop reads psw_sf_end
 	                   again after this function returns) */
-	int ph, psign, lump;
+	int ph, psign, lump, prb = 0;   /* P60: this plane is outline-probed */
 	if (pass == 0)                                  /* FLOOR */
 	{
 	    if (fl < 0)
@@ -11416,6 +11480,29 @@ static void psw_emit_subflats(int k)
 	}
 	else                                            /* CEILING */
 	{
+	    /* P60: LEAF outline BEFORE any skip (sky included) -- see the probe
+	       block above psw_emit_subflats */
+	    if (sat_psw_diag == 1 && (sat_wall_paint & 1) && psw_probe_frame < 6)
+	    {
+		int n0 = psw_pvn[sn], base = psw_pvi[sn];
+		if (n0 >= 3)
+		{
+		    int bx0, by0, bx1, by1;
+		    bx0 = bx1 = psw_pvx[base]; by0 = by1 = psw_pvy[base];
+		    for (i = 1; i < n0; ++i)
+		    {
+			int wxx = psw_pvx[base + i], wyy = psw_pvy[base + i];
+			if (wxx < bx0) bx0 = wxx; if (wxx > bx1) bx1 = wxx;
+			if (wyy < by0) by0 = wyy; if (wyy > by1) by1 = wyy;
+		    }
+		    if (psw_probe_ray(bx0, by0, bx1, by1))
+		    {
+			psw_probe_frame++; prb = 1;
+			psw_probe_outline(psw_pvx + base, psw_pvy + base, n0,
+			                  psw_sub[k].ch - viewz, -1, 198);
+		    }
+		}
+	    }
 	    if (cl < 0)
 	    { if (psw_sub[k].ch > viewz) psw_ceil_sky++;   /* r44: was SILENT */
 	      continue; }
@@ -11466,6 +11553,8 @@ static void psw_emit_subflats(int k)
 		/* (cull_h simply stays 0x7fffffff here) */
 	    }
 	    n = psw_plane_poly(sn, ph, psign, cx, cy);  /* world-clipped: no offscreen tail */
+	    if (prb && n >= 3)
+		psw_probe_outline(cx, cy, n, ph, psign, 163);   /* P60: clipped ring */
 	    if (n < 3) continue;
 	{
 	    int zc0 = psw_flat_cmds;   /* r34d `h../<zero>`: did this pass emit anything? */
@@ -12054,6 +12143,7 @@ static void vdp1_walls_flush(void)
         psw_flat_cmds = 0; psw_flat_denied = 0; psw_punch_cmds = 0;
         psw_ceil_zero = 0;                   /* r34d (psw_ceil_hid resets at note) */
         psw_band_n = 0; psw_fanq_n = 0; psw_fine_cmds = 0;
+        psw_probe_frame = 0;             /* P60: outline probe budget */
         /* round 30: ew-interior probes reset at flush ENTRY (j+q cut in r33) */
         psw_eb_frt = 0; psw_eb_bord = 0;
         psw_ef_frt = 0;                  /* r33: ef now accumulates on the SLAVE */

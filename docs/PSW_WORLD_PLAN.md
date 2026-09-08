@@ -1205,6 +1205,43 @@ StoreWallRange, curline/frontsector/backsector/rw_angle1 vivants).
 > triangle rempli (aplat accepté), spawn s en chute. Marqueur `P57`.
 > 30e disque.
 
+> **ROUND 58 (2026-09-08, 31e disque, marqueur `P58`) — REBOOT FRESH-EYES
+> (demande owner : « repars de zéro, garde les faits ») + VERDICT P57 :
+> double échec (aplats ET trou inchangés ; couloir `s0 n8` = la famine de
+> slots N'ÉTAIT PAS l'aplat).** Deux traceurs indépendants, ZÉRO théorie
+> transmise, interdiction de croire les commentaires ; livrable = arbres
+> de décision exhaustifs. LES DEUX ARBRES ONT RENDU :
+> **(1) L'APLAT = LE COVER r42 (hypothèse owner « caché par un aplat »,
+> prouvée code)** — une SEULE commande perdue dans le walk plafond ⇒ fan
+> solide PLEINE FEUILLE stagé APRÈS les tuiles texturées ⇒ l'ordre de
+> liste VDP1 le peint PAR-DESSUS ; slave seulement (psw_cmd_left = fenêtre
+> de job vs banque entière master) ; s0 expliqué (le compteur ne tire qu'à
+> l'entrée, le cover tourne slot valide). Fix P58 : **le solide ne repeint
+> plus jamais par-dessus ni à la place de la texture plafond sur frame
+> slave** — cover plafond SUPPRIMÉ (compté `c../<cs>`), pièce famine
+> whyfan-3 SAUTÉE (compté `.<fs>`), holdback PSW_COVER rendu au walk
+> plafond (+4, +8 avec le covf r52 toujours facturé). Un déficit = TROU
+> compté, à refinancer sur mesure.
+> **(2) LE TROU : deux classes MUETTES jamais regardées en 57 rounds** —
+> (a) l'arrêt CAP-GLOBAL en plein walk (6 sites `return` nus, ni compteur
+> ni tile_short, LES DEUX MODES = colle au mode-indépendant ; le jumeau
+> baked avait été compté r52, les sites live oubliés) ⇒ compté `x` +
+> tile_short armé ; (b) l'overflow du recorder (compteur latché mais PLUS
+> IMPRIMÉ depuis r38b) ⇒ row `o<ovf>/<subn>`. Candidat 3 en réserve :
+> overflow 32-bit du prédicat de clip (>~23k unités, sonde si o0+x0).
+> Innocentés par les arbres : coherency slot slave (purge avant dispatch,
+> aucun write master post-dispatch), fallback r57 (flux de buffers propre),
+> `h.clip`=1 (kill near LÉGITIME — borne exacte vérifiée ⇒ le quatuor h
+> sort de la row). Bonus : psw_tile_cull recompte les culls SOLS (gate
+> psign<0 = 2e compteur qui ne pouvait pas tirer ; piste bande OR sol).
+> Row 13 refondue : `P58.<diag><N?><!/-> s<esol>/<miss> c<cov>/<cs>.<fs>
+> x<capstop> o<ovf>/<subn> f n` (`!` = corps slave coincé → flats master).
+> Lecture : plafonds slave TEXTURÉS + cs/fs>0 = cover était l'aplat ;
+> triangle : o>0 = recorder, x>0 = cap, o0+x0 = candidat 3.
+> **Pré-pin r56 SUPPRIMÉ** (console : s 14→20 = nuisible ; l'arbre le dit
+> protecteur de chaînes fossiles ; ~300 o rendus à un pool passé sous le
+> plancher). Round B near→far redevient l'allocateur de slots.
+
 - **Polygones de sous-secteurs au level-load** (p_setup.c après :1234, PU_LEVEL zone
   LWRAM) : clip récursif du bbox map par les splitlines ancêtres (node_t x16/y16/dx16/
   dy16 exacts) + les segs de la feuille. ~150 lignes, une fois par niveau.

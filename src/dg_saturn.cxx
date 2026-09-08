@@ -693,6 +693,7 @@ static int  psw_wall_cull_last = 0;        /* wall quads occlusion-culled last f
 static int  psw_band_last = 0;             /* clean band+window flat pieces (row 13 `b`) */
 static int  psw_fan_last = 0;              /* fan flat pieces/planes (row 13 `n`) */
 static int  psw_sub_ovf_last = 0;          /* subsector-recorder overflow (row 13 `o`) */
+static int  psw_sub_n_last = 0;            /* P58: subs noted last frame (row 13 `o../<subn>`) */
 static int  psw_leaf_bad_last = 0;         /* invalid leaf polygons noted (row 13 `o/x`) */
 static int  psw_note_ms_last = 0;          /* round 27: whole note cost last frame, ms (row 13 `N`) */
 static int  psw_fence_ms_last = 0;         /* round 27: flush wait on the slave masks, ms (`N.../x`) */
@@ -738,6 +739,11 @@ static int  psw_ceil_solid = 0, psw_ceil_solid_last = 0;   /* r51: ceiling passe
                        (slot < 0 either way).  This is the APLAT, as a number:
                        expected ~0 at rest once the memo bill is honest; a high
                        steady read = slot famine (8 slots, chains, near->far). */
+static int  psw_ceil_esol = 0, psw_ceil_esol_last = 0;   /* P58: the s field splits
+                       into s<esol>/<miss> -- esol = ceiling planes solid AT ENTRY
+                       (flag 0x20/0x80, global cap, window < ebill: the LADDER
+                       refused), miss = a live slot peek/get MISS on an otherwise
+                       tiled plane (slot-bank shortfall).  Different owners. */
 /* (ROUND 36b's R+X A/B on the two ceiling refusals is REMOVED -- it did its job
    on console: the spawn ceilings moved, the triangle did not, which is how the
    two defects were finally told apart.  Round 38's marker paint answers the same
@@ -775,9 +781,27 @@ static int  sat_psw_diag = 0;   /* (psw_sub_why[] lives with the sub arrays) */
                            of work downstream can ever paint it
    Either way the next round starts with half the search space instead of six. */
 static int  psw_cover_n = 0, psw_cover_last = 0;   /* r42: planes whose slave
-                       window ran dry mid-walk and were covered by the fan */
-static int  psw_tile_cull = 0, psw_tile_cull_last = 0;   /* ceiling tiles the mask
-                                                            or cull_h skipped */
+                       window ran dry mid-walk and were covered by the fan --
+                       P58: FLOORS only; a dry ceiling is a counted hole now */
+static int  psw_cover_skip = 0, psw_cover_skip_last = 0;   /* P58: ceiling covers
+                       SUPPRESSED (the cover fan was painting the console's aplat
+                       over the slave's own textured tiles -- owner's hypothesis,
+                       code-proven).  Row 13 c<cover>/<cskip>.<fskip>. */
+static int  psw_fan_skip = 0, psw_fan_skip_last = 0;       /* P58: whyfan-3
+                       (window-famine) ceiling pieces left unpainted on slave
+                       frames -- each is a small sky hole, counted to size the
+                       real window deficit */
+static int  psw_cap_stop_n = 0, psw_cap_stop_last = 0;     /* P58: global-cap
+                       mid-walk stops (the uncounted class, hole candidate #2) --
+                       row 13 `x`; fires BOTH modes, so x>0 while the triangle
+                       shows names the cap, x0 acquits it */
+static int  psw_tile_cull = 0, psw_tile_cull_last = 0;   /* tiles the mask or
+                       cull_h skipped.  P58: the psign<0 gate is GONE -- r49 made
+                       ceiling culls unreachable, so the r41 gate had turned this
+                       into a counter that cannot fire (2nd instance of that
+                       class); it now counts the FLOOR culls that actually run
+                       (the silent class behind the console's gold floor band).
+                       Latched, unprinted -- print it if the band survives P58. */
 /* ROUND 38b -- A DIAGNOSTIC THAT CAN FAIL SILENTLY IS NOT A DIAGNOSTIC.  The r38
    marker had four silent `return`s (no clipped polygon, raw leaf under 3 verts,
    any vertex unprojectable, and the whole `cl < 0` sky branch), and the console
@@ -3494,12 +3518,16 @@ static void fps_update(void)
                    wedged once and flats are back on the master for the
                    session (expect e/B/K to keep reading, F frozen at !). */
                 {
-                    char sfb[10];
-                    if (!sat_psw_sf) { sfb[0] = '!'; sfb[1] = 0; }
-                    else if (!psw_sf_arena_last) { sfb[0] = '-'; sfb[1] = 0; }
-                    else snprintf(sfb, sizeof sfb, "%d/%d",
-                                  psw_sf_join_ms_last > 99 ? 99 : psw_sf_join_ms_last,
-                                  psw_sf_drop_last > 999 ? 999 : psw_sf_drop_last);
+                    /* P58: the F pair leaves the row (fence ms stable for many
+                       rounds; drops fold into the new c/x fields) but its two
+                       STATE chars survive as a marker suffix -- `P58.0!` = the
+                       flat body wedged and flats fell back to the MASTER (an
+                       aplat "cured" under ! is a fallback, not a fix), `-` =
+                       no arena.  Latches keep running unprinted. */
+                    char sfb[4];
+                    sfb[0] = 0; sfb[1] = 0;
+                    if (!sat_psw_sf) sfb[0] = '!';
+                    else if (!psw_sf_arena_last) sfb[0] = '-';
                     /* r34 `d` = PLANES SKIPPED ENTIRELY (psw_flat_denied): no
                        texture slot AND the flat dalle not resident, so the
                        emitter has neither a texture nor a centre texel and
@@ -3536,18 +3564,38 @@ static void fps_update(void)
                        takes the column: solid FAN emissions this frame (piece
                        fans + plane fans), the counter of the magenta the
                        console keeps showing while every other counter is 0. */
-                    snprintf(ovbuf, sizeof ovbuf, "P57.%d%s h%d.%d/%d.%d F%s f%d n%d s%d c%d ",
+                    /* P58 -- the two fresh-eyes trees emptied the old row: the
+                       h quartet leaves (clip = the LEGITIMATE near kill -- the
+                       15-round "constant 1" was the leaf-overhead kill, verified
+                       against psw_project's exact boundary; band dead r55; zero
+                       0 everywhere; sky = real skies).  The row now reads both
+                       defects head-on:
+                         s<esol>/<miss>  ceilings solid at ENTRY (ladder refused:
+                                         flag/cap/window) vs live slot MISSES
+                         c<cov>/<cs>.<fs> floor covers / ceiling covers SKIPPED /
+                                         famine pieces SKIPPED -- ceiling texture
+                                         is never painted over any more; a
+                                         deficit is a counted hole
+                         x<capstop>      global-cap mid-walk stops, both modes --
+                                         x>0 with the triangle on screen names
+                                         the cap; x0 acquits it
+                         o<ovf>/<subn>   note-recorder overflow / subs noted
+                                         (o was latched but UNPRINTED since
+                                         r38b; subn near 384 = saturation) */
+                    snprintf(ovbuf, sizeof ovbuf, "P58.%d%s%s s%d/%d c%d/%d.%d x%d o%d/%d f%d n%d ",
                              sat_psw_diag & 3,             /* r38: pad L+Down state */
                              psw_pp_base_near ? "N" : "",  /* r48: pad L+Up */
-                             psw_ceil_clip_last > 99 ? 99 : psw_ceil_clip_last,
-                             psw_ceil_hid_last > 99 ? 99 : psw_ceil_hid_last,
-                             psw_ceil_zero_last > 99 ? 99 : psw_ceil_zero_last,
-                             psw_ceil_sky_last > 99 ? 99 : psw_ceil_sky_last,
                              sfb,
-                             psw_flat_last  > 999 ? 999 : psw_flat_last,
-                             psw_fan_last > 999 ? 999 : psw_fan_last,
+                             psw_ceil_esol_last > 99 ? 99 : psw_ceil_esol_last,
                              psw_ceil_solid_last > 99 ? 99 : psw_ceil_solid_last,
-                             psw_cover_last > 99 ? 99 : psw_cover_last);
+                             psw_cover_last > 99 ? 99 : psw_cover_last,
+                             psw_cover_skip_last > 99 ? 99 : psw_cover_skip_last,
+                             psw_fan_skip_last > 99 ? 99 : psw_fan_skip_last,
+                             psw_cap_stop_last > 99 ? 99 : psw_cap_stop_last,
+                             psw_sub_ovf_last > 99 ? 99 : psw_sub_ovf_last,
+                             psw_sub_n_last > 999 ? 999 : psw_sub_n_last,
+                             psw_flat_last  > 999 ? 999 : psw_flat_last,
+                             psw_fan_last > 999 ? 999 : psw_fan_last);
                 }
 #endif
             if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 13, ovbuf);
@@ -8426,6 +8474,8 @@ static int psw_paint_idx = 176;  /* L+X flat paint, PER EMIT PATH (round 12 diag
                                     is (255,0,0). */
 static int psw_band_n = 0;       /* clean band+window pieces this flush (row 13 `b`) */
 static int psw_fanq_n = 0;       /* fan pieces/planes this flush (row 13 `n`) */
+static int psw_cur_pass = 0;     /* P58: 0 = floor, 1 = ceiling -- the emit64 famine
+                                    skip must know which pass is walking */
 static unsigned int psw_cur_mask = 0;   /* round 17: the emitting plane's cached tile-LOS
                                            prefix (psw_sub_fmask/cmask), read only when
                                            cull_h is armed (mixed plane) */
@@ -9212,6 +9262,14 @@ static int psw_tile_short = 0;
 static int psw_no_room(void)          /* deliberately NOT inline: six call sites,
                                          and the pool is at the boot floor */
 { psw_sf_drop++; psw_tile_short = 1; return 1; }
+/* P58 -- THE UNCOUNTED CAP-STOP (fresh-eyes trace, hole candidate #2): six
+   emission sites bounced off the GLOBAL psw_flat_cap_dyn with a bare return --
+   no counter, no psw_tile_short, BOTH modes -- so the highest-tx columns of a
+   plane could vanish against a leaf edge with every printed counter innocent
+   (the baked twin of this class was found and counted at r52; the live sites
+   were left bare).  Row 13 `x`. */
+static int psw_cap_stop(void)
+{ psw_cap_stop_n++; psw_tile_short = 1; return 1; }
 
 /* every flat emitter writes through here; walls/things keep vdp1_cmd_at */
 static inline int psw_cmd_left(void)
@@ -9248,7 +9306,7 @@ static void psw_emit_flatquad(int slot, unsigned short colr, const int *qx, cons
     extern int detailshift, viewwindowx, viewwindowy;
     int vx = viewwindowx, vy = viewwindowy, i;
     if (psw_cmd_left() <= 0 && psw_no_room()) return;   /* r39: counted */
-    if (psw_flat_cmds >= psw_flat_cap_dyn) return;
+    if (psw_flat_cmds >= psw_flat_cap_dyn) { psw_cap_stop(); return; }   /* P58 */
     memset(cmd, 0, sizeof cmd);
     cmd[0] = 0x0002;                                  /* DISTORSP */
     cmd[2] = 0x00E0;                                  /* no clip | 8bpp bank | SPD | ECD */
@@ -9316,7 +9374,7 @@ static void psw_emit_rectquad(int slot, unsigned short colr,
     extern int detailshift, viewwindowx, viewwindowy;
     int vx = viewwindowx, vy = viewwindowy, i;
     if (psw_cmd_left() <= 0 && psw_no_room()) return;   /* r39: counted */
-    if (psw_flat_cmds >= psw_flat_cap_dyn) return;
+    if (psw_flat_cmds >= psw_flat_cap_dyn) { psw_cap_stop(); return; }   /* P58 */
     memset(cmd, 0, sizeof cmd);
     cmd[0] = 0x0002;                                  /* DISTORSP */
     cmd[2] = (unsigned short)(win ? 0x04E0 : 0x00E0); /* (Window_In) | 8bpp bank | SPD | ECD */
@@ -10268,7 +10326,7 @@ static void psw_emit_plane_tiles(int slot, unsigned short colr,
 	    int x1 = x0 + (64 << 16), y1 = y0 + (64 << 16);
 	    int m, full;
 	    long long area2;
-	    if (psw_flat_cmds >= psw_flat_cap_dyn) { stop = 1; return; }
+	    if (psw_flat_cmds >= psw_flat_cap_dyn) { psw_cap_stop(); stop = 1; return; }   /* P58 */
 	    psw_eb_bord++;                       /* round 30 `B../<n>` */
 	    /* the exact clipped poly-cap-tile piece */
 	    m = psw_clip_axis(cx, cy, n, ax, ay, 0, +1, x0);
@@ -10573,6 +10631,12 @@ static void psw_emit_plane_tiles(int slot, unsigned short colr,
 		if (!done)
 		{   /* band unprojectable / slot famine: SOLID piece -- exact
 		       geometry, textureless, cannot swim */
+		    if (whyfan == 3 && psw_sf_mode && psw_cur_pass)
+		    { psw_fan_skip++; return; }   /* P58: a window-famine ceiling piece on a
+		           slave frame is a HOLE, not an aplat -- the solid piece painted
+		           where the master paints texture was half the console's aplat.
+		           Counted (row 13 c../.<n>) so the next round can refund the
+		           window with the real deficit, not a guess. */
 		    if (!sxv_ensure()) return;          /* round 30: lazy (the fan IS the verts) */
 		    psw_paint_idx = (whyfan == 1) ? 4        /* r53: WHITE  = okq   */
 		                  : (whyfan == 2) ? 88       /*      GREY   = rows  */
@@ -10677,7 +10741,7 @@ static void psw_emit_plane_tiles(int slot, unsigned short colr,
 		       the corner cache -- same projections, same command */
 		    int r = ty - cy0r;
 		    int qx[4], qy[4];
-		    if (psw_flat_cmds >= psw_flat_cap_dyn) { stop = 1; return; }
+		    if (psw_flat_cmds >= psw_flat_cap_dyn) { psw_cap_stop(); stop = 1; return; }   /* P58 */
 		    if (!cproj(0, r + 1, &qx[0], &qy[0])) return;
 		    if (!cproj(1, r + 1, &qx[1], &qy[1])) return;
 		    if (!cproj(1, r,     &qx[2], &qy[2])) return;
@@ -10691,7 +10755,7 @@ static void psw_emit_plane_tiles(int slot, unsigned short colr,
 		       whole-rect SAT) */
 		    int r = ty - cy0r;
 		    int sqx[4], sqy[4];
-		    if (psw_flat_cmds >= psw_flat_cap_dyn) { stop = 1; return 1; }
+		    if (psw_flat_cmds >= psw_flat_cap_dyn) { psw_cap_stop(); stop = 1; return 1; }   /* P58 */
 		    if (!cproj(0, r + cnt, &sqx[0], &sqy[0])) return 0;
 		    if (!cproj(1, r + cnt, &sqx[1], &sqy[1])) return 0;
 		    if (!cproj(1, r,       &sqx[2], &sqy[2])) return 0;
@@ -10725,12 +10789,12 @@ static void psw_emit_plane_tiles(int slot, unsigned short colr,
 			    int ti = (ty - tya) * tw + (tx - txa);
 			    if (ti >= 0 && ti < PSW_PROBE_TILES)
 			    { if ((psw_cur_mask >> ti) & 1u)
-			      { if (psign < 0) psw_tile_cull++; ++ty; continue; } }   /* r41 */
+			      { psw_tile_cull++; ++ty; continue; } }   /* r41 */
 			    else
 			    {
 				if (psw_tile_hidden(tx << 22, ty << 22, 64 << 16,
 				                    psign, cull_h))
-				{ if (psign < 0) psw_tile_cull++; ++ty; continue; }        /* r41 */
+				{ psw_tile_cull++; ++ty; continue; }        /* r41 */
 			    }
 			}
 			if (cls == 1 || bcls == PSW_BKC_LIVE)
@@ -10795,14 +10859,14 @@ static void psw_emit_plane_tiles(int slot, unsigned short colr,
 			    int ti = (ty - tya) * tw + (tx - txa);
 			    if (ti >= 0 && ti < PSW_PROBE_TILES)
 			    { if ((psw_cur_mask >> ti) & 1u)
-			      { if (psign < 0) psw_tile_cull++; continue; } }        /* r41 */
+			      { psw_tile_cull++; continue; } }        /* r41 */
 			    else
 			    {   /* beyond-prefix tiles pay LIVE 5-point BSP probes
 				   inside ew (the `q` bracket answered 0-2 ms twice
 				   on console and left with round 33) */
 				if (psw_tile_hidden(tx << 22, ty << 22, 64 << 16,
 				                    psign, cull_h))
-				{ if (psign < 0) psw_tile_cull++; continue; }             /* r41 */
+				{ psw_tile_cull++; continue; }             /* r41 */
 			    }
 			}
 			if (cls >= 2) emitfull(ty);
@@ -11172,7 +11236,7 @@ static void psw_emit_punchquad(const int *qx, const int *qy)
     extern int detailshift, viewwindowx, viewwindowy;
     int vx = viewwindowx, vy = viewwindowy, i;
     if (psw_cmd_left() <= 0 && psw_no_room()) return;   /* r39: counted */
-    if (psw_flat_cmds >= psw_flat_cap_dyn) return;
+    if (psw_flat_cmds >= psw_flat_cap_dyn) { psw_cap_stop(); return; }   /* P58 */
     memset(cmd, 0, sizeof cmd);
     cmd[0] = 0x0004;                   /* POLYGON */
     cmd[2] = 0x00C0;                   /* SPD: colour-0 pixels are WRITTEN (erase recipe) */
@@ -11386,7 +11450,9 @@ static void psw_emit_subflats(int k)
 	             : psw_sf_mode ? psw_slot_peek(lump)   /* round 33: pure -- never
 	                               uploads / touches the zone on the slave */
 	             : psw_slot_get(lump, (fe_ >= 18) ? 2 : (fe_ >= 12) ? 1 : 0);
-	    if (pass && slot < 0) psw_ceil_solid++;   /* r51: the aplat has a number */
+	    if (pass && slot < 0)
+	    { if (solid) psw_ceil_esol++;      /* P58: the LADDER refused (flag/cap/window) */
+	      else       psw_ceil_solid++; }   /* P58: live slot miss -- bank shortfall */
 	    psw_cur_tall = (slot >= 0) ? (int)psw_slot[slot].tall : 0;  /* round 24:
 	                       chain length - 1 -> 64x128 / 64x192 strips */
 	    int nr, li, zi, ok = 1, fb = 0;
@@ -11460,7 +11526,10 @@ static void psw_emit_subflats(int k)
 		{
 		    unsigned short ew0 = frt_read();   /* round 28 `e../<ew>`: the tile walk */
 		    int cov = 0;
-		    if (psw_sf_mode)
+		    if (psw_sf_mode && pass == 0)   /* P58: the ceiling cover is dead
+		           (below) -- its 4-cmd holdback goes back to the ceiling walk;
+		           with the r52 covf still in the bill, a slave ceiling gains up
+		           to 8 commands of real room */
 		    {   /* ROUND 42 -- THE WINDOW MUST DEGRADE MID-WALK TOO.  Round 39 read
 		           that law onto the ENTRY decision only: a plane whose window cannot
 		           pay for its tiles now goes solid up front.  A plane that PASSES the
@@ -11479,17 +11548,31 @@ static void psw_emit_subflats(int k)
 		    }
 		    psw_cur_mask = (pass == 0) ? psw_sub_fmask[k] : psw_sub_cmask[k];
 		    psw_cur_sub  = sn;          /* round 22: soft-line rescan key */
+		    psw_cur_pass = pass;        /* P58: emit64's ceiling famine skip */
 		    psw_emit_plane_tiles(slot, pc, cx, cy, n, ph, psign, cull_h, scolr);
 		    psw_sf_end += cov;
 		    psw_ew_frt += (unsigned short)(frt_read() - ew0);
 		    if (psw_tile_short)
-		    {   /* the walk lost pieces: cover the WHOLE leaf with the solid fan --
-		           a wrong tint is a degrade, a missing plane is not */
-		        int okc = 1;
-		        for (i = 0; i < n; ++i)
-		            if (!psw_project(cx[i], cy[i], ph, psign, &sxv[i], &syv[i]))
-		            { okc = 0; break; }
-		        if (okc) { solid = 1; psw_cover_n++; }
+		    {   /* P58 -- THE COVER WAS THE APLAT (owner's hypothesis, proven by
+		           the fresh trace): this fan is staged AFTER the walk's textured
+		           tiles, so VDP1 list order paints it ON TOP -- one lost command
+		           repainted the whole ceiling solid, and only where windows are
+		           finite (master psw_cmd_left = whole bank), which is exactly the
+		           console's "textured on master, aplat on slave".  A ceiling
+		           shortfall now stays a counted HOLE (row 13 c../<n>.) so the
+		           console can size the real deficit; floors keep the cover (the
+		           degrade is invisible under/next to RBG0 and a floor hole is
+		           worse). */
+		        if (pass) psw_cover_skip++;
+		        else
+		        {   /* the walk lost pieces: cover the WHOLE leaf with the solid
+		               fan -- a wrong tint is a degrade, a missing plane is not */
+		            int okc = 1;
+		            for (i = 0; i < n; ++i)
+		                if (!psw_project(cx[i], cy[i], ph, psign, &sxv[i], &syv[i]))
+		                { okc = 0; break; }
+		            if (okc) { solid = 1; psw_cover_n++; }
+		        }
 		    }
 		}
 		if (solid)
@@ -12118,57 +12201,14 @@ static void vdp1_walls_flush(void)
                     else { psw_sub_flag[k] |= 0x40; psw_kill_n++; }  /* STANDBY */
                 }
             }
-            /* ROUND 56 -- THE 8 SLOTS GO TO THE 8 MOST-DEMANDED LUMPS (console
-               P55: band kills dead at 0-1 and the thin rule gone, yet the
-               ceilings stay solid with s3-20 -- the slave frame can only ever
-               texture the lumps the pre-pass pins, and the near->far
-               first-come grab spent them on whichever floor lumps came first.
-               The master frame has no such wall: its emitter re-uploads slots
-               plane by plane.  So rank the frame's demand by LUMP -- summed
-               round-B bills, floors and ceilings alike -- and pre-pin the top
-               8 in rank order.  Round B's own grabs then HIT for ranked lumps
-               and fail cleanly to an honest counted solid for rank 9+.
-               sf frames only: pre-pinning on a master frame would block the
-               emit-time churn that already serves every lump there. */
-            if (sf_ok)
-            {
-                struct { int lump; int w; } lt[16];
-                int ln = 0;
-                for (int k = 0; k < psw_sub_n; ++k)
-                {
-                    int fl, cl, fdom, p2;
-                    psw_sub_lumps(k, &fl, &cl, &fdom);
-                    for (p2 = 0; p2 < 2; ++p2)
-                    {
-                        int lu, w;
-                        if (p2 == 0)
-                        {   /* the round-B floor condition, verbatim */
-                            if (fl < 0 || (psw_sub_flag[k] & 0x41) || (psw_sub_flag[k] & 0x10)) continue;
-                            lu = fl; w = 2 * (int)psw_sub_fe[k] + 1;
-                        }
-                        else
-                        {
-                            if (cl < 0 || (psw_sub_flag[k] & 0x84) || (psw_sub_flag[k] & 0x20)) continue;
-                            lu = cl; w = 2 * (int)psw_sub_ce[k] + 1;
-                        }
-                        {
-                            int t2;
-                            for (t2 = 0; t2 < ln; ++t2)
-                                if (lt[t2].lump == lu) { lt[t2].w += w; break; }
-                            if (t2 == ln && ln < 16) { lt[ln].lump = lu; lt[ln].w = w; ln++; }
-                        }
-                    }
-                }
-                for (int r2 = 0; r2 < 8 && r2 < ln; ++r2)
-                {   /* selection by weight; pin in rank order (wnt 0 = r54) */
-                    int b2 = r2;
-                    for (int t2 = r2 + 1; t2 < ln; ++t2)
-                        if (lt[t2].w > lt[b2].w) b2 = t2;
-                    { int tmp = lt[r2].lump; lt[r2].lump = lt[b2].lump; lt[b2].lump = tmp;
-                      tmp = lt[r2].w; lt[r2].w = lt[b2].w; lt[b2].w = tmp; }
-                    psw_slot_get(lt[r2].lump, 0);
-                }
-            }
+            /* ROUND 56 pre-pin DELETED at P58 (owner: "revert tes solutions",
+               fresh-eyes trace concurring): ranking + pinning the heaviest
+               lumps FIRST protected fossil chains from the miss-path eviction
+               the plain near->far grab performed early -- console measured it
+               WORSE (spawn s 14 -> 20).  Round B's own near->far grabs are the
+               allocator again; the s<esol>/<miss> split now arbitrates budget
+               vs slot-bank famine directly.  (~300 bytes of .text returned to
+               the pool, which sat 30 bytes under the boot floor.) */
             for (int k = 0; k < psw_sub_n; ++k)
             {   /* round B: upgrades + slots, near->far.  A pass already billed
                    its full e (e <= 4) is tiled as-is and only needs its slot;
@@ -12472,6 +12512,14 @@ static void vdp1_walls_flush(void)
         psw_tile_cull = 0;                    /* r41: slave-written, read uncached */
         psw_cover_last = (int)psw_ucr32((const volatile void *)&psw_cover_n);
         psw_cover_n = 0;                      /* r42: slave-written too */
+        psw_ceil_esol_last = (int)psw_ucr32((const volatile void *)&psw_ceil_esol);
+        psw_ceil_esol = 0;                    /* P58: emitter-side, slave-written */
+        psw_cover_skip_last = (int)psw_ucr32((const volatile void *)&psw_cover_skip);
+        psw_cover_skip = 0;                   /* P58 */
+        psw_fan_skip_last = (int)psw_ucr32((const volatile void *)&psw_fan_skip);
+        psw_fan_skip = 0;                     /* P58 */
+        psw_cap_stop_last = (int)psw_ucr32((const volatile void *)&psw_cap_stop_n);
+        psw_cap_stop_n = 0;                   /* P58 */
         psw_kill_last = (int)psw_ucr32((const volatile void *)&psw_kill_n);
         psw_punch_last = (int)psw_ucr32((const volatile void *)&psw_punch_cmds);
         psw_band_last = (int)psw_ucr32((const volatile void *)&psw_band_n);
@@ -15244,6 +15292,7 @@ extern "C" void DG_DrawFrame(void)
         sat_psw_t_last = sat_psw_tiers; sat_psw_r_last = sat_psw_ref;
         psw_wall_cull_last = sat_psw_wcull;             /* round 9: core band culls */
         psw_sub_ovf_last = psw_sub_ovf;                 /* round 21: recorder overflow */
+        psw_sub_n_last = psw_sub_n;                     /* P58: row 13 `o../<subn>` */
         psw_leaf_bad_last = psw_leaf_bad;               /* round 22: invalid leaf polys */
         sat_psw_tiers = 0; sat_psw_ref = 0; sat_psw_wcull = 0;
         psw_sub_ovf = 0; psw_leaf_bad = 0;

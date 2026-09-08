@@ -768,6 +768,12 @@ static int  psw_ceil_esol = 0, psw_ceil_esol_last = 0;   /* P58: the s field spl
    being refused there at all, and 960 B of code plus a 192 B table were the
    difference between a 4.91 KB pool and a 6 KB one.) */
 static int  sat_psw_diag = 0;   /* (psw_sub_why[] lives with the sub arrays) */
+extern "C" int sat_psw_noprune;      /* P68: core R_CheckBBox occlusion prunes OFF --
+                       cran 3 = cran 1 + this (frustum kept); class test for the
+                       un-noted bands (u/magenta), NOT a shipping mode */
+extern "C" int R_PswSubCeilH(int);   /* P68: TRUE ceiling height by sub number
+                       (magenta rings were projected at a borrowed height:
+                       "beaucoup trop hautes" + sheared) */
 /* ROUND 41 -- CRAN 4, "RAW CEILINGS": THE FORK, IN ONE PHOTOGRAPH.
    Nine rounds have each guessed which stage loses the plane and fixed a real but
    non-causal defect.  Enough.  This cran emits every ceiling as ONE solid fan of
@@ -3630,7 +3636,12 @@ static void fps_update(void)
                        `c` trio, `x`, `z` pair leave the row (latches alive:
                        cover/cskip/fskip stable since P58, x0 and z0/0 constant
                        on every console capture since they appeared). */
-                    snprintf(ovbuf, sizeof ovbuf, "P67.%d%s%s s%d/%d H%d+%s/u%d t%d o%d f%d n%d ",
+                    /* P68: cran 3 (L+Bas x3) = cran 1 + core BSP occlusion
+                       prunes OFF (sat_psw_noprune).  Verdict: bands fill (or
+                       turn solid/counted) + u -> 0  =>  the prune IS the door;
+                       bands stay void  =>  prune innocent.  u-rings now at the
+                       TRUE per-sub ceiling height (R_PswSubCeilH). */
+                    snprintf(ovbuf, sizeof ovbuf, "P68.%d%s%s s%d/%d H%d+%s/u%d t%d o%d f%d n%d ",
                              sat_psw_diag & 3,             /* r38: pad L+Down state */
                              psw_pp_base_near ? "N" : "",  /* r48: pad L+Up */
                              sfb,
@@ -9453,7 +9464,7 @@ static void psw_probe_tile(int tx, int ty, int ph, int psign)
     int qx[4], qy[4];
     int x0 = tx << 22, y0 = ty << 22;
     int x1 = x0 + (64 << 16), y1 = y0 + (64 << 16);
-    if (sat_psw_diag != 1 || !(sat_wall_paint & 1)) return;
+    if ((sat_psw_diag != 1 && sat_psw_diag != 3) || !(sat_wall_paint & 1)) return;   /* P68: 3 = 1+noprune */
     if (!psw_project(x0, y0, ph, psign, &qx[0], &qy[0])) return;
     if (!psw_project(x1, y0, ph, psign, &qx[1], &qy[1])) return;
     if (!psw_project(x1, y1, ph, psign, &qx[2], &qy[2])) return;
@@ -11566,8 +11577,9 @@ static void psw_probe_fill(const int *vx, const int *vy, int nv,
                      inside these rings with no red = the WALKER under-covers */
 static void psw_probe_pass(void)
 {
-    int rp = 0, mxch = 0, have_mxch = 0;
-    if (sat_psw_diag != 1 || !(sat_wall_paint & 1) || !psw_polys_ok) return;
+    int rp = 0;
+    if ((sat_psw_diag != 1 && sat_psw_diag != 3)
+        || !(sat_wall_paint & 1) || !psw_polys_ok) return;   /* P68: 3 = 1+noprune */
     psw_probe_frame = 0;
     psw_cur_k = -1;                     /* P67: probe quads never count as paint */
     psw_ray_drop = 0; psw_ray_un = 0;
@@ -11624,8 +11636,6 @@ static void psw_probe_pass(void)
 		    if (rp >= 8)
 		    { memmove(psw_ray_str, psw_ray_str + 1, 7); rp = 7; psw_ray_drop++; }
 		    psw_ray_str[rp++] = cch; psw_ray_str[rp] = 0;
-		    if (!have_mxch || psw_sub[k].ch > mxch)
-		    { mxch = psw_sub[k].ch; have_mxch = 1; }
 		}
 		if (psw_sub_flag[k] & (4 | 0x80))
 		{   /* the note's verdict killed it: paint the WHOLE claim red */
@@ -11650,33 +11660,39 @@ static void psw_probe_pass(void)
        whose leaf crosses the aim ray but which the recorder NEVER noted this
        frame (R_CheckBBox prune: the note hook at core r_bsp.c:937 is
        unconditional at R_Subsector entry, so "not in psw_sub" can only mean
-       "BSP never reached it").  Each such sub gets a MAGENTA ring at the
-       tallest crossed ceiling height, and row 13 counts them (`/u`).  Read:
-       only a ring AROUND THE DEFECT means anything -- a legitimately occluded
-       pruned sub rings too, floating on the wall that hides it. */
-    if (have_mxch && mxch > viewz)
-	for (int s2 = 0; s2 < numsubsectors; ++s2)
+       "BSP never reached it").  Each such sub gets a MAGENTA ring at its TRUE
+       ceiling height (P68: R_PswSubCeilH -- the P67 borrowed-height rings sat
+       "beaucoup trop hautes" AND sheared: each vertex rises by focal*ph/d, so
+       a wrong ph distorts the outline, it does not just translate it), and
+       row 13 counts them (`/u`).  Read: only a ring AROUND THE DEFECT means
+       anything -- a legitimately occluded pruned sub rings too, floating on
+       the wall that hides it. */
+    for (int s2 = 0; s2 < numsubsectors; ++s2)
+    {
+	int n0 = psw_pvn[s2], base = psw_pvi[s2], inrec = 0;
+	if (n0 < 3) continue;
 	{
-	    int n0 = psw_pvn[s2], base = psw_pvi[s2], inrec = 0;
-	    if (n0 < 3) continue;
+	    int bx0, by0, bx1, by1, i2;
+	    bx0 = bx1 = psw_pvx[base]; by0 = by1 = psw_pvy[base];
+	    for (i2 = 1; i2 < n0; ++i2)
 	    {
-		int bx0, by0, bx1, by1, i2;
-		bx0 = bx1 = psw_pvx[base]; by0 = by1 = psw_pvy[base];
-		for (i2 = 1; i2 < n0; ++i2)
-		{
-		    int wxx = psw_pvx[base + i2], wyy = psw_pvy[base + i2];
-		    if (wxx < bx0) bx0 = wxx; if (wxx > bx1) bx1 = wxx;
-		    if (wyy < by0) by0 = wyy; if (wyy > by1) by1 = wyy;
-		}
-		if (!psw_probe_ray(bx0, by0, bx1, by1)) continue;
+		int wxx = psw_pvx[base + i2], wyy = psw_pvy[base + i2];
+		if (wxx < bx0) bx0 = wxx; if (wxx > bx1) bx1 = wxx;
+		if (wyy < by0) by0 = wyy; if (wyy > by1) by1 = wyy;
 	    }
-	    for (int q = 0; q < psw_sub_n; ++q)
-		if (psw_sub[q].subnum == s2) { inrec = 1; break; }
-	    if (inrec) continue;
-	    psw_ray_un++;
-	    psw_probe_outline(psw_pvx + base, psw_pvy + base, n0,
-	                      mxch - viewz, -1, 250);
+	    if (!psw_probe_ray(bx0, by0, bx1, by1)) continue;
 	}
+	for (int q = 0; q < psw_sub_n; ++q)
+	    if (psw_sub[q].subnum == s2) { inrec = 1; break; }
+	if (inrec) continue;
+	psw_ray_un++;
+	{
+	    int ch2 = R_PswSubCeilH(s2);
+	    if (ch2 > viewz)
+		psw_probe_outline(psw_pvx + base, psw_pvy + base, n0,
+		                  ch2 - viewz, -1, 250);
+	}
+    }
 }
 
 static void psw_emit_subflats(int k)
@@ -11790,7 +11806,7 @@ static void psw_emit_subflats(int k)
 	    }
 	    else
 	    {
-		if (sat_psw_diag < 2)      /* r44 cran 2 (see the audit: the clip below
+		if (sat_psw_diag != 2)     /* r44 cran 2 (see the audit: the clip below
 		       re-derives flag 4's own predicate, so the cran never
 		       exonerated the clip -- kept only as the master-flats rung) */
 		{
@@ -11845,7 +11861,7 @@ static void psw_emit_subflats(int k)
 	    int solid = (psw_sub_flag[k] & fanbit)
 	           || (psw_flat_cmds + ebill > psw_flat_cap_dyn)
 	           || (psw_sf_mode && psw_cmd_left() < ebill)
-	           || (sat_psw_diag >= 2 && pass);   /* r41: raw ceilings */
+	           || (sat_psw_diag == 2 && pass);   /* r41: raw ceilings (P68: cran 3 excluded) */
 	    int fe_ = (int)((pass == 0) ? psw_sub_fe[k] : psw_sub_ce[k]);
 	    int slot = solid ? -1
 	             : psw_sf_mode ? psw_slot_peek(lump)   /* round 33: pure -- never
@@ -11950,7 +11966,7 @@ static void psw_emit_subflats(int k)
 		    psw_cur_mask = (pass == 0) ? psw_sub_fmask[k] : psw_sub_cmask[k];
 		    psw_cur_sub  = sn;          /* round 22: soft-line rescan key */
 		    psw_cur_pass = pass;        /* P58: emit64's ceiling famine skip */
-		    psw_probe_this = (pass && sat_psw_diag == 1
+		    psw_probe_this = (pass && (sat_psw_diag == 1 || sat_psw_diag == 3)
 		                      && (sat_wall_paint & 1)
 		                      && psw_probe_walkn < 8
 		                      && psw_probe_want(sn));   /* P65: class-0
@@ -11991,7 +12007,7 @@ static void psw_emit_subflats(int k)
 		       verts are the near-collinear clip artifacts; the corner
 		       shave is invisible at degrade distance.  Billed 4. */
 		    int idx[PSW_FAN_MAX], nn = (n < 9) ? n : 9, s;
-		    if (sat_psw_diag >= 2 && pass) nn = n;   /* r41: NO decimation --
+		    if (sat_psw_diag == 2 && pass) nn = n;   /* r41: NO decimation --
 		            dropping verts to 9 is the same INWARD simplification that
 		            round 40 removed from the leaf shave, and a probe must not
 		            carry the bug it is hunting */
@@ -16172,7 +16188,12 @@ static void poll_pad(void)
         psw_pp_base_near ^= 1;
     if (!(cur & PER_DGT_TL) && (cur & PER_DGT_TR)
         && (changed & PER_DGT_KD) && !(cur & PER_DGT_KD))
-        sat_psw_diag = (sat_psw_diag + 1) % 3;   /* r41: 0..2 */
+    {
+        sat_psw_diag = (sat_psw_diag + 1) % 4;   /* P68: 0..3 (3 = cran 1 + BSP
+                          occlusion prunes OFF -- verdict cran for the u-bands,
+                          fps irrelevant there) */
+        sat_psw_noprune = (sat_psw_diag == 3);
+    }
 #endif
     /* (Pad L+Down SKY/FLOOR BOUNDARY MODE REMOVED 2026-08-26 -- baked at 1, the shipped fix
        (window before the fence, map deferred to just after it).  0 was the A/B reference and 2

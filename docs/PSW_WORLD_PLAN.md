@@ -1116,6 +1116,28 @@ StoreWallRange, curline/frontsector/backsector/rw_angle1 vivants).
 > 1 ligne (gate) ; row : `t` (mort r49) → **`s<solid>`** = passes plafond sans
 > slot texture (l'aplat compté ; s haut stable = famine 8 slots = round 52).
 > Marqueur `P51`. Pool 5,47 Ko. Build normal bit-intact. 25e disque.
+> **Verdict console : RÉFUTÉ** (spawn aplat avec s0/F5-0/c0 ; trou avec
+> h1.4/F12-9/s12). L+X owner : spawn = MAGENTA (fans solides), trou = AUCUNE
+> peinture, symétrie sol/plafond (poinçons OR absents = subs sans job).
+
+> **ROUND 52 (2026-09-08)** — audit workflow 13 agents (5 finders + vérif
+> adversariale) : **3 mécanismes CONFIRMÉS, 5 réfutés sur preuve**.
+> (C0) les `-1` de psw_emit_baked contournaient psw_no_room → stop silencieux
+> du reste de la marche (zéro drop/tile_short/cover) — le dernier refus non
+> compté, slave-only. (C1) **cascade revendication/refus** : cvis publié à la
+> NOTE, un étage avant les verdicts d'émission → bandes fermées → feuilles
+> lointaines tuées (`h.band`) → sur slave les drops falsifient la
+> revendication a posteriori → LE TRIANGLE (master : mêmes kills = occlusion
+> exacte, pas de trou). (C2) la retenue cover r42 (−4) jamais financée : plan
+> tuilé facturé 2e+1, marche sur 2e−3, coût ~2e ⇒ manque ≥3 par construction
+> hors deal fin. Fixes : (A) les deux -1 du baked passent par psw_no_room ⇒
+> le cover r42 s'applique enfin ; (B) round B facture `e−4+PSW_COVER` (sf
+> seulement, sols+plafonds+cbill). Réfutés : staging/DMA, paire window/quad,
+> fan !done comme source du magenta spawn, seal midtexture (réel mais
+> mode-indépendant), timing des slots. ⚠ le magenta UNIFORME du spawn reste
+> sans mécanisme confirmé — à relire sur ce disque. Discriminateur : cran 1
+> au spot du triangle ⇒ h.band reste ~4 + trou disparu = cascade confirmée.
+> Marqueur `P52`. 26e disque.
 
 - **Polygones de sous-secteurs au level-load** (p_setup.c après :1234, PU_LEVEL zone
   LWRAM) : clip récursif du bbox map par les splitlines ancêtres (node_t x16/y16/dx16/

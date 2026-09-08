@@ -3528,7 +3528,7 @@ static void fps_update(void)
                        column: ceiling passes emitted without a texture slot =
                        the aplat, counted.  Expected ~0 at rest with the r51
                        memo gate; steady s>0 = the 8-slot famine (next round). */
-                    snprintf(ovbuf, sizeof ovbuf, "P51.%d%s h%d.%d/%d.%d F%s f%d k%d s%d c%d ",
+                    snprintf(ovbuf, sizeof ovbuf, "P52.%d%s h%d.%d/%d.%d F%s f%d k%d s%d c%d ",
                              sat_psw_diag & 3,             /* r38: pad L+Down state */
                              psw_pp_base_near ? "N" : "",  /* r48: pad L+Up */
                              psw_ceil_clip_last > 99 ? 99 : psw_ceil_clip_last,
@@ -9856,7 +9856,16 @@ static int psw_emit_baked(int slot, unsigned short colr, int ph, int psign,
     int x1 = x0 + (64 << 16), y1 = y0 + (64 << 16);
     int by1s = y1 - ((int)br->v0 << 16), by0s = y1 - ((int)br->vend << 16);
     int qx[4], qy[4], okq;
-    if (psw_flat_cmds >= psw_flat_cap_dyn) return -1;
+    /* ROUND 52 -- THE BAKED PATH'S -1 WAS THE LAST UN-COUNTED REFUSAL (audit,
+       adversarially verified).  r39 routed every emitter window guard through
+       psw_no_room (drop++ AND tile_short=1) and r42 turns tile_short into the
+       whole-leaf cover fan -- but this branch predates both: its bare -1 made
+       the caller stop=1 and abandon the REST of the plane walk with no drop,
+       no tile_short, hence no cover.  A walk can legally reach 0-1 room with
+       zero counted refusals (every gate checks BEFORE spending), so a starved
+       baked diagonal record died in silence -- slave-only (master's
+       psw_cmd_left is the whole bank), the F5/0-with-missing-geometry class. */
+    if (psw_flat_cmds >= psw_flat_cap_dyn) { psw_no_room(); return -1; }
     if (br->type == 0)
     {   /* full-width band: window-free, the exact live emission */
 	okq  = psw_project(x0, by1s, ph, psign, &qx[0], &qy[0]);
@@ -9935,7 +9944,8 @@ static int psw_emit_baked(int slot, unsigned short colr, int ph, int psign,
 		return 1;
 	    }
 	    if (psw_cmd_left() < 2
-	        || psw_flat_cmds + 1 >= psw_flat_cap_dyn) return -1;
+	        || psw_flat_cmds + 1 >= psw_flat_cap_dyn)
+	    { psw_no_room(); return -1; }              /* r52: counted (see above) */
 	    okq  = psw_project(x0, by1s, ph, psign, &qx[0], &qy[0]);
 	    okq &= psw_project(x1, by1s, ph, psign, &qx[1], &qy[1]);
 	    okq &= psw_project(x1, by0s, ph, psign, &qx[2], &qy[2]);
@@ -12049,34 +12059,52 @@ static void vdp1_walls_flush(void)
                    set at note) never upgrade and take no slot. */
                 int fl, cl, fdom;
                 psw_sub_lumps(k, &fl, &cl, &fdom);
+                /* ROUND 52 -- FUND THE COVER RESERVE IN THE BILL (audit,
+                   adversarially verified).  r42 withholds PSW_COVER=4 from the
+                   job window before every slave walk so the cover fan can
+                   always fire -- but the bill never paid for it: a tiled plane
+                   billed exactly 2e+1 walked on 2e-3 while the round-14 law
+                   prices the common walk at ~2e (border tile = window + quad).
+                   Guaranteed shortfall >= 3 BY CONSTRUCTION on every job past
+                   the r44 fine deal (~7 nearest); the dry tail then degraded
+                   or died at the (now counted) baked stop.  Slave frames only:
+                   the master has no window, so covf costs it nothing. */
                 if (fl >= 0 && !(psw_sub_flag[k] & 0x41) && !(psw_sub_flag[k] & 0x10))
                 {
                     int e = 2 * (int)psw_sub_fe[k] + 1;
+                    int covf = sf_ok ? PSW_COVER : 0;   /* r52 */
                     /* round 24: the CHAIN hint must ride the pre-pass grab too --
                        this near-first pass is what reserves the 8 slots, so an
                        emission-time-only hint found every neighbour taken and
                        strips silently degraded to singles */
                     int wnt = (psw_sub_fe[k] >= 18) ? 2 : (psw_sub_fe[k] >= 12) ? 1 : 0;
                     if (e <= 4)
-                    { if (psw_slot_get(fl, wnt) < 0) psw_sub_flag[k] |= 0x10; }   /* r49 */
-                    else if (ftile + (e - 4) <= limit
+                    { if (psw_slot_get(fl, wnt) < 0) psw_sub_flag[k] |= 0x10;
+                      else if (covf && ftile + covf <= limit)
+                      { ftile += covf; psw_sf_bill[k] += (unsigned short)covf; } }   /* r49+r52 */
+                    else if (ftile + (e - 4 + covf) <= limit
                              && psw_slot_get(fl, wnt) >= 0)
-                                                       { ftile += e - 4;
-                                                         if (sf_ok) psw_sf_bill[k] += (unsigned short)(e - 4); }
+                                                       { ftile += e - 4 + covf;
+                                                         if (sf_ok) psw_sf_bill[k] += (unsigned short)(e - 4 + covf); }
                     else                               psw_sub_flag[k] |= 0x10;
                 }
                 if (cl >= 0 && !(psw_sub_flag[k] & 0x84) && !(psw_sub_flag[k] & 0x20))
                 {
                     int e = 2 * (int)psw_sub_ce[k] + 1;
                     int wnt = (psw_sub_ce[k] >= 18) ? 2 : (psw_sub_ce[k] >= 12) ? 1 : 0;
+                    int covf = sf_ok ? PSW_COVER : 0;   /* r52: see the floor twin */
                     if (e <= 4)
-                    { if (psw_slot_get(cl, wnt) < 0) psw_sub_flag[k] |= 0x20; }   /* r49 */
-                    else if (ftile + (e - 4) <= limit
+                    { if (psw_slot_get(cl, wnt) < 0) psw_sub_flag[k] |= 0x20;
+                      else if (covf && ftile + covf <= limit)
+                      { ftile += covf;
+                        psw_sf_bill[k]  += (unsigned short)covf;
+                        psw_sf_cbill[k] += (unsigned short)covf; } }   /* r49+r52 */
+                    else if (ftile + (e - 4 + covf) <= limit
                              && psw_slot_get(cl, wnt) >= 0)
-                                                       { ftile += e - 4;
+                                                       { ftile += e - 4 + covf;
                                                          if (sf_ok)
-                                                         { psw_sf_bill[k]  += (unsigned short)(e - 4);
-                                                           psw_sf_cbill[k] += (unsigned short)(e - 4); } }  /* r39 */
+                                                         { psw_sf_bill[k]  += (unsigned short)(e - 4 + covf);
+                                                           psw_sf_cbill[k] += (unsigned short)(e - 4 + covf); } }  /* r39+r52 */
                     else                               psw_sub_flag[k] |= 0x20;
                 }
             }

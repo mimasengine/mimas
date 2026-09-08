@@ -3516,7 +3516,7 @@ static void fps_update(void)
                        evidence.  `o` and `m` are the two silent classes that
                        replace it: a sub the recorder never took, and a marker
                        asked for but never drawn. */
-                    snprintf(ovbuf, sizeof ovbuf, "P48.%d%s h%d.%d/%d.%d F%s f%d w%d/%d t%d c%d ",
+                    snprintf(ovbuf, sizeof ovbuf, "P49.%d%s h%d.%d/%d.%d F%s f%d w%d/%d t%d c%d ",
                              sat_psw_diag & 3,             /* r38: pad L+Down state */
                              psw_pp_base_near ? "N" : "",  /* r48: pad L+Up */
                              psw_ceil_clip_last > 99 ? 99 : psw_ceil_clip_last,
@@ -8762,7 +8762,7 @@ static void sat_psw_sub_note_body(int subnum, int fh, int ch, int fpic,
 			if (vis > 255) vis = 255;
 			if (pass == 0) psw_sub_fmask[k] = msk;
 			else           psw_sub_cmask[k] = msk;
-			if (vis < e) e = vis;
+			if (pass == 0 && vis < e) e = vis;   /* r49: floors only */
 			L->subnum = (short)subnum; L->pass = (unsigned char)pass;
 			L->vis = (unsigned char)vis; L->h = h;
 			L->vx = viewx; L->vy = viewy; L->vz = viewz;
@@ -10972,8 +10972,8 @@ static void psw_mask_fence(void)
 	    { psw_sub_fmask[k] = msk;
 	      if (vis < (int)psw_sub_fe[k]) psw_sub_fe[k] = (unsigned char)vis; }
 	    else
-	    { psw_sub_cmask[k] = msk;
-	      if (vis < (int)psw_sub_ce[k]) psw_sub_ce[k] = (unsigned char)vis; }
+	    { psw_sub_cmask[k] = msk; }   /* r49: the ceiling bill stays the touched
+	                                     estimate (its emit walk is un-culled) */
 	    {
 		struct psw_mlru *L = &psw_mlru_t[(((unsigned)jsub << 1)
 		                                  | (unsigned)pass) & (PSW_MLRU_N - 1)];
@@ -11221,17 +11221,34 @@ static void psw_emit_subflats(int k)
 	    }
 	    else
 	    {
-		if (sat_psw_diag < 2)      /* r44 cran 2: NOTHING refuses a ceiling.
-		       r41 called this "raw ceilings" and still honoured flag 4 --
-		       the note's own hidden verdict, set by the world clip (nn<3)
-		       AND by R_PswBandBoxHidden.  `h../<band>/..` reads 1 at the
-		       pylon, so that verdict is the last refusal standing there
-		       and the r41 fork was never actually bought. */
+		if (sat_psw_diag < 2)      /* r44 cran 2 (see the audit: the clip below
+		       re-derives flag 4's own predicate, so the cran never
+		       exonerated the clip -- kept only as the master-flats rung) */
 		{
 		    if (psw_sub_flag[k] & 4) continue;
 		    if (psw_sub_flag[k] & 0x80) continue;
-		    if (psw_sub_flag[k] & 8) cull_h = psw_sub[k].ch;
 		}
+		/* ROUND 49 -- A CEILING NEVER ARMS cull_h.  The owner's console
+		   trigger IS the mechanism: the orange region is visible exactly
+		   while its FAR vertex and its NEAR vertex are unoccluded, and
+		   vanishes when the pillar hides them -- and psw_plane_los_cull
+		   probes exactly those two vertices to arm the mixed walk.  The
+		   per-tile verdict is then psw_ceil_pt_hidden: ONE sample at the
+		   ray midpoint, which lands in the pillar's low-ceiling ground
+		   for tiles that are plainly visible (t9 -> t13 on the owner's
+		   pair of captures = the region's tiles dying).  Round 20 wrote
+		   the law and deleted the whole-plane cull for it -- "sampling
+		   points is NOT a proof that a REGION is hidden" -- and the same
+		   sin survived per tile.  A wrongly KEPT ceiling tile is bounded
+		   overdraw painted over by nearer geometry (far->near painter);
+		   a wrongly CULLED one is this hole.  Floors keep their walk:
+		   RBG0 covers a floor mistake either way.  The bill follows: the
+		   note no longer reduces ce by the probe count (round-17 law,
+		   bill >= emit).  Expected artefact to WATCH, not hidden: a
+		   ceiling tile behind a sky edge can now ghost over the sky (the
+		   probes' sky-hack occlusion is off this path); if the console
+		   shows it, the fix is a targeted sky guard, not the probes. */
+		/* (cull_h simply stays 0x7fffffff here) */
 	    }
 	    n = psw_plane_poly(sn, ph, psign, cx, cy);  /* world-clipped: no offscreen tail */
 	    if (n < 3) continue;
@@ -11998,8 +12015,11 @@ static void vdp1_walls_flush(void)
                        emission-time-only hint found every neighbour taken and
                        strips silently degraded to singles */
                     int wnt = (psw_sub_fe[k] >= 18) ? 2 : (psw_sub_fe[k] >= 12) ? 1 : 0;
-                    if (e <= 4)                        psw_slot_get(fl, wnt);
-                    else if (ftile + (e - 4) <= limit) { ftile += e - 4; psw_slot_get(fl, wnt);
+                    if (e <= 4)
+                    { if (psw_slot_get(fl, wnt) < 0) psw_sub_flag[k] |= 0x10; }   /* r49 */
+                    else if (ftile + (e - 4) <= limit
+                             && psw_slot_get(fl, wnt) >= 0)
+                                                       { ftile += e - 4;
                                                          if (sf_ok) psw_sf_bill[k] += (unsigned short)(e - 4); }
                     else                               psw_sub_flag[k] |= 0x10;
                 }
@@ -12007,8 +12027,11 @@ static void vdp1_walls_flush(void)
                 {
                     int e = 2 * (int)psw_sub_ce[k] + 1;
                     int wnt = (psw_sub_ce[k] >= 18) ? 2 : (psw_sub_ce[k] >= 12) ? 1 : 0;
-                    if (e <= 4)                        psw_slot_get(cl, wnt);
-                    else if (ftile + (e - 4) <= limit) { ftile += e - 4; psw_slot_get(cl, wnt);
+                    if (e <= 4)
+                    { if (psw_slot_get(cl, wnt) < 0) psw_sub_flag[k] |= 0x20; }   /* r49 */
+                    else if (ftile + (e - 4) <= limit
+                             && psw_slot_get(cl, wnt) >= 0)
+                                                       { ftile += e - 4;
                                                          if (sf_ok)
                                                          { psw_sf_bill[k]  += (unsigned short)(e - 4);
                                                            psw_sf_cbill[k] += (unsigned short)(e - 4); } }  /* r39 */

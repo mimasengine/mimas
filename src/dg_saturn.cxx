@@ -795,6 +795,12 @@ static int  psw_cap_stop_n = 0, psw_cap_stop_last = 0;     /* P58: global-cap
                        mid-walk stops (the uncounted class, hole candidate #2) --
                        row 13 `x`; fires BOTH modes, so x>0 while the triangle
                        shows names the cap, x0 acquits it */
+static int  psw_probe_this = 0;   /* P65: the walk's CURRENT ceiling plane is the
+                       probe target (cran 1 + L+X, crosshair ray, cap 2/frame):
+                       class-0 tiles paint GREY -- console P64 proved the tiles
+                       die at CLASSING (z0/0 with the hole alive), so show the
+                       classing's verdict tile by tile */
+static int  psw_probe_walkn = 0;  /* P65: probed planes this frame (walk side) */
 static int  psw_e64_skip = 0, psw_e64_skip_last = 0;       /* P63: emit64 border
                        pieces dropped by a SILENT exit (m<3 after the tile clips,
                        or unprojectable fan verts) -- row 13 `z<skip>/<sliver>`,
@@ -3607,7 +3613,7 @@ static void fps_update(void)
                        dieted twice, ovf guard stays) and `t<cull>` returns to
                        the row = mask/probe tile culls -- FLOOR-only now, the
                        ceiling consult is gone (the r49 second door). */
-                    snprintf(ovbuf, sizeof ovbuf, "P64.%d%s%s s%d/%d c%d/%d.%d x%d z%d/%d t%d o%d f%d n%d ",
+                    snprintf(ovbuf, sizeof ovbuf, "P65.%d%s%s s%d/%d c%d/%d.%d x%d z%d/%d t%d o%d f%d n%d ",
                              sat_psw_diag & 3,             /* r38: pad L+Down state */
                              psw_pp_base_near ? "N" : "",  /* r48: pad L+Up */
                              sfb,
@@ -8535,6 +8541,13 @@ static int psw_flat_cap_dyn = PSW_FLAT_CAP;  /* round 9: per-frame REAL flat roo
                                                 the things reserve (famine unification --
                                                 console 2026-09-02: flats overflowing the
                                                 shared bank dropped the NEAREST walls) */
+static unsigned char psw_sub_ecause[PSW_SUB_MAX]; /* P65: WHY the ladder refused this
+                       ceiling (owner's cyan spawn annotation = the s21 entry-solid
+                       planes, and esol conflated four causes): 1 = SLOT grab failed
+                       (>8 distinct lumps in scene), 2 = BUDGET limit, 3 = round-C
+                       standby rescue (budget-A family).  The entry fan paints the
+                       cause in L+X: magenta=slot, grey=budget, green=rescue,
+                       red=emission-time window/cap (no flag). */
 static unsigned char psw_sub_flag[PSW_SUB_MAX];   /* NOTE-time verdicts: b0 floor hidden,
                                                      b1 floor per-tile probe, b2/b3 = ceiling;
                                                      b4 floor SOLID (note-time distance LOD,
@@ -8703,6 +8716,7 @@ static void sat_psw_sub_note_body(int subnum, int fh, int ch, int fpic,
     psw_sub[k].w0    = (short)wall_acc_n;
     psw_sub[k].s0    = (short)vis0;
     psw_sub_flag[k] = 0; psw_sub_fe[k] = 8; psw_sub_ce[k] = 8;  /* 8 = unknown-est default */
+    psw_sub_ecause[k] = 0;   /* P65 */
     if (psw_polys_ok && subnum >= 0 && psw_pvn[subnum] < 3)
 	psw_leaf_bad++;              /* round 22: INVALID leaf polygon = the
 	                                deterministic same-spot hole class
@@ -10823,14 +10837,17 @@ static void psw_emit_plane_tiles(int slot, unsigned short colr,
 		};
 		auto emitfull = [&](int ty) -> void
 		{   /* non-mixed interior single: emit64's interior branch with
-		       the corner cache -- same projections, same command */
+		       the corner cache -- same projections, same command.
+		       P65: a cproj failure here dropped the tile with no counter
+		       and no paint (stripe's failures fall back to singles; these
+		       do not) -- counted into z<skip> and painted grey. */
 		    int r = ty - cy0r;
 		    int qx[4], qy[4];
 		    if (psw_flat_cmds >= psw_flat_cap_dyn) { psw_cap_stop(); stop = 1; return; }   /* P58 */
-		    if (!cproj(0, r + 1, &qx[0], &qy[0])) return;
-		    if (!cproj(1, r + 1, &qx[1], &qy[1])) return;
-		    if (!cproj(1, r,     &qx[2], &qy[2])) return;
-		    if (!cproj(0, r,     &qx[3], &qy[3])) return;
+		    if (!cproj(0, r + 1, &qx[0], &qy[0])) { psw_e64_skip++; psw_probe_tile(tx, ty, ph, psign); return; }   /* P65 */
+		    if (!cproj(1, r + 1, &qx[1], &qy[1])) { psw_e64_skip++; psw_probe_tile(tx, ty, ph, psign); return; }   /* P65 */
+		    if (!cproj(1, r,     &qx[2], &qy[2])) { psw_e64_skip++; psw_probe_tile(tx, ty, ph, psign); return; }   /* P65 */
+		    if (!cproj(0, r,     &qx[3], &qy[3])) { psw_e64_skip++; psw_probe_tile(tx, ty, ph, psign); return; }   /* P65 */
 		    psw_paint_idx = 176;                /* L+X: full squares RED */
 		    psw_emit_flatquad(slot, colr, qx, qy);
 		};
@@ -10861,7 +10878,9 @@ static void psw_emit_plane_tiles(int slot, unsigned short colr,
 		    for (int ty = cy0r; ty <= cy1r && !stop; )
 		    {
 			int cls = tclass(ty), bcls, adv = 1;
-			if (!cls) { ++ty; continue; }
+			if (!cls)
+			{ if (psw_probe_this) psw_probe_tile(tx, ty, ph, psign);   /* P65 */
+			  ++ty; continue; }
 			if (tx < bk->txa || tx >= bk->txa + (int)bk->tw
 			    || ty < bk->tya || ty >= bk->tya + (int)bk->th)
 			{ ++ty; continue; }          /* outside the leaf bbox */
@@ -10937,7 +10956,9 @@ static void psw_emit_plane_tiles(int slot, unsigned short colr,
 		    for (int ty = cy0r; ty <= cy1r && !stop; ++ty)
 		    {
 			int cls = tclass(ty);
-			if (!cls) continue;
+			if (!cls)
+			{ if (psw_probe_this) psw_probe_tile(tx, ty, ph, psign);   /* P65 */
+			  continue; }
 			if (psw_cur_pass == 0)
 			{   /* the note's cached verdicts, POSITIONAL index
 			       (round 22: keyed by cell position in the bbox's
@@ -10988,7 +11009,9 @@ static void psw_emit_plane_tiles(int slot, unsigned short colr,
 		    for (int ty = cy0r; ty <= cy1r && !stop; )
 		    {
 			int cls = tclass(ty);
-			if (cls == 0) { ++ty; continue; }
+			if (cls == 0)
+			{ if (psw_probe_this) psw_probe_tile(tx, ty, ph, psign);   /* P65 */
+			  ++ty; continue; }
 			if (cls == 3 && psw_cur_tall >= 2 && ty + 2 <= cy1r
 			    && tclass(ty + 1) == 3 && tclass(ty + 2) == 3
 			    && stripe(ty, 3)) { ty += 3; continue; }
@@ -11427,6 +11450,21 @@ static int psw_probe_ray(int bx0, int by0, int bx1, int by1)
     }
     return 1;
 }
+static int psw_probe_want(int sn)
+{   /* P65: is this leaf on the crosshair column?  (walk-side probe filter) */
+    int n0, base, bx0, by0, bx1, by1, i;
+    if (!psw_polys_ok || sn < 0) return 0;
+    n0 = psw_pvn[sn]; base = psw_pvi[sn];
+    if (n0 < 3) return 0;
+    bx0 = bx1 = psw_pvx[base]; by0 = by1 = psw_pvy[base];
+    for (i = 1; i < n0; ++i)
+    {
+	int wxx = psw_pvx[base + i], wyy = psw_pvy[base + i];
+	if (wxx < bx0) bx0 = wxx; if (wxx > bx1) bx1 = wxx;
+	if (wyy < by0) by0 = wyy; if (wyy > by1) by1 = wyy;
+    }
+    return psw_probe_ray(bx0, by0, bx1, by1);
+}
 static void psw_probe_outline(const int *vx, const int *vy, int nv,
                               int ph, int psign, int colidx)
 {
@@ -11496,7 +11534,7 @@ static void psw_probe_pass(void)
 {
     if (sat_psw_diag != 1 || !(sat_wall_paint & 1) || !psw_polys_ok) return;
     psw_probe_frame = 0;
-    for (int k = 0; k < psw_sub_n && psw_probe_frame < 3; ++k)
+    for (int k = 0; k < psw_sub_n && psw_probe_frame < 6; ++k)   /* P65: cap 3->6 */
     {
 	int sn = psw_sub[k].subnum;
 	if (sn < 0) continue;
@@ -11812,6 +11850,12 @@ static void psw_emit_subflats(int k)
 		    psw_cur_mask = (pass == 0) ? psw_sub_fmask[k] : psw_sub_cmask[k];
 		    psw_cur_sub  = sn;          /* round 22: soft-line rescan key */
 		    psw_cur_pass = pass;        /* P58: emit64's ceiling famine skip */
+		    psw_probe_this = (pass && sat_psw_diag == 1
+		                      && (sat_wall_paint & 1)
+		                      && psw_probe_walkn < 2
+		                      && psw_probe_want(sn));   /* P65: class-0
+		                            tiles of THIS plane paint grey */
+		    if (psw_probe_this) psw_probe_walkn++;
 		    psw_emit_plane_tiles(slot, pc, cx, cy, n, ph, psign, cull_h, scolr);
 		    psw_sf_end += cov;
 		    psw_ew_frt += (unsigned short)(frt_read() - ew0);
@@ -11849,7 +11893,20 @@ static void psw_emit_subflats(int k)
 		            dropping verts to 9 is the same INWARD simplification that
 		            round 40 removed from the leaf shave, and a probe must not
 		            carry the bug it is hunting */
-		    psw_paint_idx = 250; psw_fanq_n++;  /* L+X: solids MAGENTA */
+		    /* P65 -- the CEILING entry fan paints its CAUSE (owner's cyan spawn
+	       annotation = the s21 entry-solid planes; esol conflated them all):
+	       MAGENTA 250 = slot grab failed (>8 distinct lumps -> structural
+	       levers), GREY 88 = budget limit (slave carve/parity), GREEN 112 =
+	       round-C rescue, RED 176 = emission-time window/cap (no flag --
+	       red is free at spawn, full tiles are near-nonexistent there).
+	       Floors keep plain magenta. */
+	    psw_paint_idx = (pass == 0) ? 250
+	                  : !(psw_sub_flag[k] & (0x20 | 0x80)) ? 176
+	                  : (psw_sub_ecause[k] == 1) ? 250
+	                  : (psw_sub_ecause[k] == 2) ? 88
+	                  : (psw_sub_ecause[k] == 3) ? 112
+	                  : 250;
+	    psw_fanq_n++;
 		    for (s = 0; s < nn; ++s) idx[s] = (s * (n - 1)) / (nn - 1);
 		    for (i = 1; i + 1 < nn; i += 2)
 		    {
@@ -12270,6 +12327,7 @@ static void vdp1_walls_flush(void)
         psw_flat_cmds = 0; psw_flat_denied = 0; psw_punch_cmds = 0;
         psw_ceil_zero = 0;                   /* r34d (psw_ceil_hid resets at note) */
         psw_band_n = 0; psw_fanq_n = 0; psw_fine_cmds = 0;
+        psw_probe_walkn = 0; psw_probe_this = 0;   /* P65 */
         /* round 30: ew-interior probes reset at flush ENTRY (j+q cut in r33) */
         psw_eb_frt = 0; psw_eb_bord = 0;
         psw_ef_frt = 0;                  /* r33: ef now accumulates on the SLAVE */
@@ -12533,18 +12591,22 @@ static void vdp1_walls_flush(void)
                             deficit at cs0-1/fs0-4 per frame, +2/plane funds it;
                             the trade is counted (esol) if the bank tightens */
                     if (e <= 4)
-                    { if (psw_slot_get(cl, wnt) < 0) psw_sub_flag[k] |= 0x20;
+                    { if (psw_slot_get(cl, wnt) < 0)
+                      { psw_sub_flag[k] |= 0x20; psw_sub_ecause[k] = 1; }   /* P65: slot */
                       else if (covf && ftile + covf <= limit)
                       { ftile += covf;
                         psw_sf_bill[k]  += (unsigned short)covf;
                         psw_sf_cbill[k] += (unsigned short)covf; } }   /* r49+r52 */
-                    else if (ftile + (e - 4 + covf) <= limit
-                             && psw_slot_get(cl, wnt) >= 0)
-                                                       { ftile += e - 4 + covf;
+                    else if (ftile + (e - 4 + covf) > limit)   /* P65: split the two
+                            refusals (budget first, as the old && short-circuit
+                            did -- no upload attempted when the budget fails) */
+                    { psw_sub_flag[k] |= 0x20; psw_sub_ecause[k] = 2; }     /* budget */
+                    else if (psw_slot_get(cl, wnt) < 0)
+                    { psw_sub_flag[k] |= 0x20; psw_sub_ecause[k] = 1; }     /* slot */
+                    else                               { ftile += e - 4 + covf;
                                                          if (sf_ok)
                                                          { psw_sf_bill[k]  += (unsigned short)(e - 4 + covf);
                                                            psw_sf_cbill[k] += (unsigned short)(e - 4 + covf); } }  /* r39+r52 */
-                    else                               psw_sub_flag[k] |= 0x20;
                 }
             }
             /* ROUND 33 -- round C: the STANDBY rescue moved HERE, from the
@@ -12622,6 +12684,7 @@ static void vdp1_walls_flush(void)
                     && (!(psw_sub_flag[k] & 8) || !sky_near))
                 {
                     psw_sub_flag[k] = (unsigned char)((psw_sub_flag[k] & ~0x80) | 0x20);
+                    psw_sub_ecause[k] = 3;             /* P65: round-C rescue */
                     ftile += 4; psw_kill_n--;
                     if (sf_ok) psw_sf_cbill[k] += 4;   /* r39: a CEILING grant */
                     if (sf_ok) psw_sf_bill[k] += 4;

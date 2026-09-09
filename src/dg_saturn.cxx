@@ -753,6 +753,7 @@ static int  psw_fan_skip = 0, psw_fan_skip_last = 0;   /* P58 LAW: whyfan-3
                        honest bills admitted more tiled ceilings with thinner
                        margins.  A counter that cannot fire, third instance. */
 static int psw_bill_clamp_n = 0, psw_bill_clamp_last = 0;   /* P77: row `m` */
+static int psw_bill_valid_n = 0, psw_bill_valid_last = 0;   /* P78: row m/.. */
 static int  psw_floor_esol = 0, psw_floor_esol_last = 0;   /* P75: row `F` --
                        entry-solid FLOOR planes painted as fans.  The s split is
                        hard-gated to ceilings (`if (pass && slot < 0)`), so the
@@ -3507,7 +3508,7 @@ static void fps_update(void)
                     /* P70 -- THE CLEAN ROW (owner: "repartir d'une base saine";
                        the 41-disc probe sediments are gone, the branch memory
                        carries their history).  Format:
-                       P77.<diag><!/-><^> s<slot>:<bud>:<win> u<un> w<sh> k<cskip> F<fsol> f<cmds> m<clamp>
+                       P78.<diag><!/-><^> s<slot>:<bud>:<win> u<un> w<sh> k<cskip> F<fsol> f<cmds> m<clamp>/<valid>
                          diag   pad L+Down: 0 shipping / 1 MASTER flats /
                                 2 master flats + core noprune (r69 A/B ref)
                          !/-    flat body wedged -> flats on master / no arena
@@ -3529,7 +3530,7 @@ static void fps_update(void)
                        walls squeeze fbudget (paper); by win -> the walk model
                        is wrong.  u large with w small = grants strand on
                        entry-solids; w large = windows still too tight. */
-                    snprintf(ovbuf, sizeof ovbuf, "P77.%d%s%s s%d:%d:%d u%d w%d k%d F%d f%d m%d ",
+                    snprintf(ovbuf, sizeof ovbuf, "P78.%d%s%s s%d:%d:%d u%d w%d k%d F%d f%d m%d/%d ",
                              sat_psw_diag & 3,             /* pad L+Down state */
                              sfb,
                              psw_sub_ovf_last > 0 ? "^" : "",
@@ -3541,7 +3542,8 @@ static void fps_update(void)
                              psw_fan_skip_last > 99 ? 99 : psw_fan_skip_last,
                              psw_floor_esol_last > 99 ? 99 : psw_floor_esol_last,
                              psw_flat_last  > 999 ? 999 : psw_flat_last,
-                             psw_bill_clamp_last > 99 ? 99 : psw_bill_clamp_last);
+                             psw_bill_clamp_last > 99 ? 99 : psw_bill_clamp_last,
+                             psw_bill_valid_last > 99 ? 99 : psw_bill_valid_last);
                 }
 #endif
             if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 13, ovbuf);
@@ -9947,15 +9949,19 @@ static int psw_bill_of(int sn, int est, int pass)
     {
 	int m = (int)psw_ucr8(pass ? (const volatile void *)&psw_spendc[sn]
 	                           : (const volatile void *)&psw_spendf[sn]);
-	if (m > 0 && m + PSW_BILL_SLACK < e)
+	if (m > 0)
 	{
-	    e = m + PSW_BILL_SLACK;
-	    if (!psw_sf_mode) psw_bill_clamp_n++;   /* P77: row `m` -- pre-pass
-	                           clamps only (the slave's entry-check calls
-	                           would double-count).  m0 on console = the
-	                           memo chain is dead (validation/coherence);
-	                           m high with u unchanged = the strandings
-	                           are the MARGINS, not the bill. */
+	    if (!psw_sf_mode) psw_bill_valid_n++;   /* P78: memos SEEN (row m/..) */
+	    if (m + PSW_BILL_SLACK < e)
+	    {
+	        e = m + PSW_BILL_SLACK;
+	        if (!psw_sf_mode) psw_bill_clamp_n++;   /* P77: clamps FIRED -- pre-
+	                           pass only (the slave's entry-check calls would
+	                           double-count).  P78 read: valid~0 = validation
+	                           dead; valid high + clamp~0 = the open law is
+	                           already tight; both high + u flat = strandings
+	                           live outside the job-end subtraction. */
+	    }
 	}
     }
     return e;
@@ -11347,6 +11353,7 @@ static void psw_emit_subflats(int k)
        floor pass and hand it back, plus whatever the floor left, at pass 1. */
     int cres = 0;
     int spc0[2] = {0, 0}, sptl[2] = {0, 0}, spfs0 = 0;   /* P76: memo capture */
+    int spfsk[2] = {0, 0};             /* P78: counted skips, funded in the memo */
     if (psw_sf_mode && cl >= 0 && !(psw_sub_flag[k] & (4 | 0x80)))
     {
 	/* ROUND 39: withhold the ceiling's REAL grant, not a constant 4.  r34e
@@ -11488,6 +11495,11 @@ static void psw_emit_subflats(int k)
 	             : psw_sf_mode ? psw_slot_peek(lump)   /* round 33: pure -- never
 	                               uploads / touches the zone on the slave */
 	             : psw_slot_get(lump, (fe_ >= 18) ? 2 : (fe_ >= 12) ? 1 : 0);
+	    if (!pass && !solid && slot < 0)
+	        psw_floor_esol++;   /* P78: slot-miss FLOOR walk -- paints its whole
+	                               grid in centre-texel SOLID quads (tile-shaped
+	                               aplat, owner's blue band candidate); was
+	                               counted NOWHERE (audit).  Lands in F. */
 	    if (pass && slot < 0)
 	    { if (solid)
 	      { psw_ceil_esol++;               /* P58: the LADDER refused (flag/cap/window) */
@@ -11662,11 +11674,18 @@ static void psw_emit_subflats(int k)
 		            if (okc) { solid = 1; psw_cover_n++; }
 		        }
 		    }
-		    if (!psw_tile_short && slot >= 0 && psw_fan_skip == spfs0)
-		        sptl[pass] = 1;   /* P76: tiled AND clean -- memo-worthy.
-		                             A walk that shorted, converted, or lost
-		                             pieces through the silent doors must NOT
-		                             freeze its under-spend into the bill. */
+		    if (!psw_tile_short && slot >= 0)
+		    {   /* P78 -- the anti-freeze guard WAS the m2: k5 skips/frame land
+		           on exactly the big ceilings, every frame, so they never
+		           validated and the loop starved (console P77 m2).  A counted
+		           skip is a KNOWN deficit: the memo funds it at the coarse
+		           rate (2 cmds/piece) instead of refusing to learn -- next
+		           frame the piece can pay its way, k falls, the memo
+		           converges honest.  A SHORT stays invalid (deficit unknown:
+		           the walk stopped). */
+		        sptl[pass] = 1;
+		        spfsk[pass] = psw_fan_skip - spfs0;
+		    }
 		}
 		if (solid)
 		{   /* round 14: the solid fan is DECIMATED to <= 4 quads (a many-
@@ -11723,8 +11742,8 @@ static void psw_emit_subflats(int k)
     {   /* P76: write the memos -- floor spend ended where pass 1 began.  An
 	   unclean/solid/absent pass stores 0 (invalid -> full law next frame),
 	   so a plane can always climb back to tiled. */
-	int spf = spc0[1] - spc0[0];
-	int spc = psw_sf_cur - spc0[1];
+	int spf = spc0[1] - spc0[0] + 2 * spfsk[0];   /* P78: + counted skips */
+	int spc = psw_sf_cur - spc0[1] + 2 * spfsk[1];
 	psw_spendf[sn] = (unsigned char)((sptl[0] && spf > 0) ? (spf > 255 ? 255 : spf) : 0);
 	psw_spendc[sn] = (unsigned char)((sptl[1] && spc > 0) ? (spc > 255 ? 255 : spc) : 0);
     }
@@ -12701,6 +12720,8 @@ static void vdp1_walls_flush(void)
         psw_ceil_esol = 0;                    /* P58: emitter-side, slave-written */
         psw_bill_clamp_last = psw_bill_clamp_n;
         psw_bill_clamp_n = 0;                 /* P77: master-written (pre-pass) */
+        psw_bill_valid_last = psw_bill_valid_n;
+        psw_bill_valid_n = 0;                 /* P78 */
         psw_fan_skip_last = (int)psw_ucr32((const volatile void *)&psw_fan_skip);
         psw_fan_skip = 0;                     /* P58; P75: latched to row `k` */
         psw_floor_esol_last = (int)psw_ucr32((const volatile void *)&psw_floor_esol);

@@ -2449,6 +2449,15 @@ int vdp1_wall_nocol = 0;
                 (pool full, or the victim is still on screen -- the 3-state lock)
    Both are per-frame; V1 prints them as fl<sur>/<slot>. */
 static int vdp1_flat_sur = 0, vdp1_flat_slot = 0, vdp1_flat_pot = 0;
+#if SAT_PSW
+static int wall_spent_n = 0;         /* P79: ACTUAL wall commands this frame (measured
+                                        at the one plot dispatch, VDP1_PLOT_WALL) */
+static int psw_wall_spent_prev = 0;  /* P79: last frame's actual, latched at pre-pass */
+static int psw_wall_paper_prev = 0;  /* P79: last frame's PAPER (wall_cmds) */
+#define PSW_WALL_SPEND(n) (wall_spent_n += (int)(n))
+#else
+#define PSW_WALL_SPEND(n) ((void)0)   /* normal build: bit-intact, no measure */
+#endif
 static int vdp1_wall_drop = 0;   /* walls the core handed to VDP1 that the emit silently dropped --
                                     row 13 `N<orphan>/<drop>/<flip>`, summed over the window.  Watched
                                     at the command pointer, so it catches every early return in
@@ -3508,7 +3517,7 @@ static void fps_update(void)
                     /* P70 -- THE CLEAN ROW (owner: "repartir d'une base saine";
                        the 41-disc probe sediments are gone, the branch memory
                        carries their history).  Format:
-                       P78.<diag><!/-><^> s<slot>:<bud>:<win> u<un> w<sh> k<cskip> F<fsol> f<cmds> m<clamp>/<valid>
+                       P79.<diag><!/-><^> s<slot>:<bud>:<win> u<un> w<sh> k<cskip> F<fsol> f<cmds> m<clamp>/<valid>
                          diag   pad L+Down: 0 shipping / 1 MASTER flats /
                                 2 master flats + core noprune (r69 A/B ref)
                          !/-    flat body wedged -> flats on master / no arena
@@ -3530,7 +3539,7 @@ static void fps_update(void)
                        walls squeeze fbudget (paper); by win -> the walk model
                        is wrong.  u large with w small = grants strand on
                        entry-solids; w large = windows still too tight. */
-                    snprintf(ovbuf, sizeof ovbuf, "P78.%d%s%s s%d:%d:%d u%d w%d k%d F%d f%d m%d/%d ",
+                    snprintf(ovbuf, sizeof ovbuf, "P79.%d%s%s s%d:%d:%d u%d w%d k%d F%d f%d m%d/%d ",
                              sat_psw_diag & 3,             /* pad L+Down state */
                              sfb,
                              psw_sub_ovf_last > 0 ? "^" : "",
@@ -12128,6 +12137,7 @@ static void vdp1_walls_flush(void)
         else if (wall_acc[i].mode == 3)   wall_emit_banded(i);                       \
         else if (wall_acc[i].mode == 2)   wall_emit_flat(i);                         \
         else                              emitted = 0;   /* mode 0: not a drop */    \
+        PSW_WALL_SPEND(vdp1_wnext - wn0);              /* P79: walls' ACTUAL */     \
         if (emitted && vdp1_wnext == wn0 && vdp1_wall_drop < 9999) vdp1_wall_drop++; \
     } while (0)
 #if SAT_PSW
@@ -12210,7 +12220,25 @@ static void vdp1_walls_flush(void)
                an honest upper bound (a restore needs >= 1 thing). */
             treserve = 3 * thing_acc_n + 8;
 #endif
-            fbudget = (vdp1_wall_cap - (int)vdp1_wnext) - wall_cmds - treserve - 4;
+            /* P79 -- THE WALLS' PAPER, FINALLY AUDITED (owner: "ON PEUT
+               CORRIGER ET AVANCER ??").  Console P78 m2/14 proved the flat
+               bills were already tight; the flats hold 320 of the 487-cmd
+               bank while wall_cmds is an ESTIMATOR (tilecount/banded) never
+               confronted with the walls' real spend.  Credit the flats with
+               LAST frame's measured wall over-paper, capped: a wall spike
+               reclaims its paper the very next frame, and the r33c bank
+               belts still guard the residual (worst case = a 1-frame wall
+               drop on a hard turn, counted by vdp1_wall_drop).  This is the
+               aimd-wbudget lesson: paper vs measured, never paper alone. */
+            {
+                int wcred = psw_wall_paper_prev - psw_wall_spent_prev;
+                psw_wall_spent_prev = wall_spent_n;   /* one point per frame: */
+                wall_spent_n = 0;                     /* before ANY wall plots */
+                psw_wall_paper_prev = wall_cmds;
+                if (wcred < 0) wcred = 0;
+                if (wcred > 48) wcred = 48;
+                fbudget = (vdp1_wall_cap - (int)vdp1_wnext) - wall_cmds - treserve - 4 + wcred;
+            }
             if (fbudget < 0) fbudget = 0;
             if (fbudget > PSW_FLAT_CAP) fbudget = PSW_FLAT_CAP;
             psw_flat_cap_dyn = fbudget;

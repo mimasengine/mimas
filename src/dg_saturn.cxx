@@ -3495,7 +3495,7 @@ static void fps_update(void)
                     /* P70 -- THE CLEAN ROW (owner: "repartir d'une base saine";
                        the 41-disc probe sediments are gone, the branch memory
                        carries their history).  Format:
-                       P73.<diag><!/-><^> s<slot>:<bud>:<win> u<un> w<sh> g<grant> t<cull> f<cmds>
+                       P74.<diag><!/-><^> s<slot>:<bud>:<win> u<un> w<sh> g<grant> t<cull> f<cmds>
                          diag   pad L+Down: 0 shipping / 1 MASTER flats /
                                 2 master flats + core noprune (r69 A/B ref)
                          !/-    flat body wedged -> flats on master / no arena
@@ -3514,7 +3514,7 @@ static void fps_update(void)
                        walls squeeze fbudget (paper); by win -> the walk model
                        is wrong.  u large with w small = grants strand on
                        entry-solids; w large = windows still too tight. */
-                    snprintf(ovbuf, sizeof ovbuf, "P73.%d%s%s s%d:%d:%d u%d w%d g%d t%d f%d ",
+                    snprintf(ovbuf, sizeof ovbuf, "P74.%d%s%s s%d:%d:%d u%d w%d g%d t%d f%d ",
                              sat_psw_diag & 3,             /* pad L+Down state */
                              sfb,
                              psw_sub_ovf_last > 0 ? "^" : "",
@@ -11621,13 +11621,21 @@ static void psw_emit_subflats(int k)
 	       P73: FLOORS split too -- the console P72 magenta mass conflated
 	       every floor cause: 250 = flagged (slot/budget/rescue, 0x10|0x40),
 	       176 = emission-time window/cap, mirroring the ceiling red. */
+	    /* P74 -- MAGENTA IS SLOT-ONLY for ceilings now.  The P73 photo mixed
+	       two populations under one colour: 0x80 standbys (budget-refused in
+	       round A, ecause never written) fell through the ecause ladder to the
+	       250 fallback and read as slot famine while s counted them in `bud`.
+	       0x80 and every unknown paint GREY (budget) -- a magenta ceiling fan
+	       on a >= P74 capture is a REAL slot refusal, nothing else (the
+	       magenta UNDER tiles stays the under-fan deficit). */
 	    psw_paint_idx = (pass == 0)
 	                    ? ((psw_sub_flag[k] & (0x10 | 0x40)) ? 250 : 176)
 	                  : !(psw_sub_flag[k] & (0x20 | 0x80)) ? 176
+	                  : !(psw_sub_flag[k] & 0x20) ? 88
 	                  : (psw_sub_ecause[k] == 1) ? 250
 	                  : (psw_sub_ecause[k] == 2) ? 88
 	                  : (psw_sub_ecause[k] == 3) ? 112
-	                  : 250;
+	                  : 88;
 	    psw_fanq_n++;
 		    for (s = 0; s < nn; ++s) idx[s] = (s * (n - 1)) / (nn - 1);
 		    for (i = 1; i + 1 < nn; i += 2)
@@ -12144,7 +12152,15 @@ static void vdp1_walls_flush(void)
             int finepot = 0;
             if (sf_ok)
             {
-                finepot = limit >> 2;
+                /* P74 -- THE INSURANCE WAS EATING THE INSURED (console P73:
+                   s0:19:0 = 19 ceilings/frame refused for BUDGET while u161
+                   of g320 sat granted-unspent).  A QUARTER of the bank was
+                   carved for fine strips and dealt blind; an unfunded fine
+                   tile degrades to the 2-cmd coarse band (counted by `w` if
+                   it ever shorts), which is exactly the benign failure the
+                   budget law wants.  Halve the carve; the deal below is
+                   need-gated too. */
+                finepot = limit >> 3;
                 if (finepot > PSW_FINE_CAP) finepot = PSW_FINE_CAP;
                 limit -= finepot;
             }
@@ -12298,9 +12314,15 @@ static void vdp1_walls_flush(void)
                     int e = psw_bill_of((int)psw_sub[k].subnum, (int)psw_sub_ce[k]);   /* P72 */
                     int wnt = sf_ok ? 0   /* r54: no chains on slave frames */
                             : (psw_sub_ce[k] >= 18) ? 2 : (psw_sub_ce[k] >= 12) ? 1 : 0;
-                    int covf = sf_ok ? PSW_COVER + 2 : 0;   /* r52 twin; P59: the
-                            cover is dead for ceilings so covf is pure walk
-                            margin now -- console P58 measured the residual
+                    int covf = sf_ok ? PSW_COVER : 0;   /* r52 twin; P59's +2 walk
+                            margin RECLAIMED at P74: the under-fan makes a walk
+                            shortfall a tint instead of a hole and `w` counts it,
+                            so the deficit fund is superseded -- and console P73
+                            (s0:19:0, u161) showed the margins collectively
+                            starving 19 ceilings a frame.  covf=4 still funds the
+                            under-fan exactly (guard >= ebill+fq, fq <= 4).
+                            Original P59 note: the cover is dead for ceilings so
+                            covf is pure walk margin -- console P58 measured the residual
                             deficit at cs0-1/fs0-4 per frame, +2/plane funds it;
                             the trade is counted (esol) if the bank tightens */
                     if (e <= 4)
@@ -12451,7 +12473,25 @@ static void vdp1_walls_flush(void)
                     }
                     for (int j = psw_sf_njobs - 1; j >= 0 && fres >= 9; --j)
                         if (psw_sf_jobs[j].bill >= 5)      /* has a tiled pass */
-                        { psw_sf_jobs[j].bill += 9; ftile += 9; fres -= 9; }
+                        {   /* P74: the deal follows the NEED -- a job whose baked
+                               leaf holds no refinable diagonal got +9 of pure
+                               stranding (the u161 class).  A rec with fine==0xFE
+                               takes the LIVE V-band arm (worst spender, 16 cmds)
+                               so it KEEPS the deal; no bake = old law. */
+                            const struct psw_bleaf *bkd =
+                                psw_bake_get((int)psw_sub[psw_sf_jobs[j].k].subnum);
+                            if (bkd)
+                            {
+                                const struct psw_brec *br2 = (const struct psw_brec *)
+                                    ((const unsigned char *)(bkd + 1) + (int)bkd->tw * bkd->th);
+                                int r2, needs = 0;
+                                for (r2 = 0; r2 < (int)bkd->nrec; ++r2)
+                                    if (br2[r2].type == 2 && br2[r2].fine != 0xFFu)
+                                    { needs = 1; break; }
+                                if (!needs) continue;
+                            }
+                            psw_sf_jobs[j].bill += 9; ftile += 9; fres -= 9;
+                        }
                     {   /* arena space granted NEAR->far, then prefix sums over
                            the survivors.  P71: an over-room job is CLAMPED to
                            the remaining space, never dropped whole -- a dropped

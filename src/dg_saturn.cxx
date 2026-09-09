@@ -752,6 +752,7 @@ static int  psw_fan_skip = 0, psw_fan_skip_last = 0;   /* P58 LAW: whyfan-3
                        the gap magenta, and the population GREW r72->r74 as
                        honest bills admitted more tiled ceilings with thinner
                        margins.  A counter that cannot fire, third instance. */
+static int psw_bill_clamp_n = 0, psw_bill_clamp_last = 0;   /* P77: row `m` */
 static int  psw_floor_esol = 0, psw_floor_esol_last = 0;   /* P75: row `F` --
                        entry-solid FLOOR planes painted as fans.  The s split is
                        hard-gated to ceilings (`if (pass && slot < 0)`), so the
@@ -3506,7 +3507,7 @@ static void fps_update(void)
                     /* P70 -- THE CLEAN ROW (owner: "repartir d'une base saine";
                        the 41-disc probe sediments are gone, the branch memory
                        carries their history).  Format:
-                       P76.<diag><!/-><^> s<slot>:<bud>:<win> u<un> w<sh> k<cskip> F<fsol> g<grant> f<cmds>
+                       P77.<diag><!/-><^> s<slot>:<bud>:<win> u<un> w<sh> k<cskip> F<fsol> f<cmds> m<clamp>
                          diag   pad L+Down: 0 shipping / 1 MASTER flats /
                                 2 master flats + core noprune (r69 A/B ref)
                          !/-    flat body wedged -> flats on master / no arena
@@ -3515,8 +3516,11 @@ static void fps_update(void)
                                 budget/standby/rescue : window-or-cap
                          u      arena cmds granted but UNSPENT at job end
                          w      passes whose walk hit tile_short (walk famine)
-                         g      arena window GRANTED (cap = fbudget, the
-                                wall-bank leftover -- NOT the 420 arena)
+                         m      P77: pre-pass bill clamps by a valid memo --
+                                m0 = memo chain DEAD; m high with u flat =
+                                the strandings are the margins, not the bill
+                         (g retired at P77: redundant, g = u + f on every
+                          console capture; latch kept unprinted)
                          t      floor tile culls (mask)   f  flat quads emitted
                        (P73 retires n<fanq> and the /miss half -- miss read 0
                        for 8 straight captures; both stay latched, unprinted.) */
@@ -3525,7 +3529,7 @@ static void fps_update(void)
                        walls squeeze fbudget (paper); by win -> the walk model
                        is wrong.  u large with w small = grants strand on
                        entry-solids; w large = windows still too tight. */
-                    snprintf(ovbuf, sizeof ovbuf, "P76.%d%s%s s%d:%d:%d u%d w%d k%d F%d g%d f%d ",
+                    snprintf(ovbuf, sizeof ovbuf, "P77.%d%s%s s%d:%d:%d u%d w%d k%d F%d f%d m%d ",
                              sat_psw_diag & 3,             /* pad L+Down state */
                              sfb,
                              psw_sub_ovf_last > 0 ? "^" : "",
@@ -3536,8 +3540,8 @@ static void fps_update(void)
                              psw_short_n_last > 9 ? 9 : psw_short_n_last,
                              psw_fan_skip_last > 99 ? 99 : psw_fan_skip_last,
                              psw_floor_esol_last > 99 ? 99 : psw_floor_esol_last,
-                             psw_sf_grant_last > 999 ? 999 : psw_sf_grant_last,
-                             psw_flat_last  > 999 ? 999 : psw_flat_last);
+                             psw_flat_last  > 999 ? 999 : psw_flat_last,
+                             psw_bill_clamp_last > 99 ? 99 : psw_bill_clamp_last);
                 }
 #endif
             if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 13, ovbuf);
@@ -9943,7 +9947,16 @@ static int psw_bill_of(int sn, int est, int pass)
     {
 	int m = (int)psw_ucr8(pass ? (const volatile void *)&psw_spendc[sn]
 	                           : (const volatile void *)&psw_spendf[sn]);
-	if (m > 0 && m + PSW_BILL_SLACK < e) e = m + PSW_BILL_SLACK;
+	if (m > 0 && m + PSW_BILL_SLACK < e)
+	{
+	    e = m + PSW_BILL_SLACK;
+	    if (!psw_sf_mode) psw_bill_clamp_n++;   /* P77: row `m` -- pre-pass
+	                           clamps only (the slave's entry-check calls
+	                           would double-count).  m0 on console = the
+	                           memo chain is dead (validation/coherence);
+	                           m high with u unchanged = the strandings
+	                           are the MARGINS, not the bill. */
+	}
     }
     return e;
 }
@@ -12376,7 +12389,19 @@ static void vdp1_walls_flush(void)
                     int e = psw_bill_of((int)psw_sub[k].subnum, (int)psw_sub_ce[k], 1);   /* P72+P76 */
                     int wnt = sf_ok ? 0   /* r54: no chains on slave frames */
                             : (psw_sub_ce[k] >= 18) ? 2 : (psw_sub_ce[k] >= 12) ? 1 : 0;
-                    int covf = sf_ok ? PSW_COVER + 2 : 0;   /* r52 twin; P75: the
+                    /* P77: a ceiling with a VALID memo carries its own truth --
+                       the measured spend already contains the under-fan and
+                       every fine burst, so the walk-margin insurance shrinks
+                       to +2 (jitter).  Memo absent -> full insurance (P75 law
+                       below).  Floors are NOT touched: their covf funds the
+                       r42 cover holdback, not walk margin. */
+                    int cmval = sf_ok && psw_sub[k].subnum >= 0
+                                && psw_sub[k].subnum < PSW_SPEND_MAX
+                                && psw_ucr8((const volatile void *)
+                                            &psw_spendc[psw_sub[k].subnum]) > 0;
+                    int covf = !sf_ok ? 0
+                             : cmval  ? 2
+                             : PSW_COVER + 2;   /* r52 twin; P75: the
                             P74 reclaim (6->4) is REVERTED on the audit's verdict:
                             with covf=4 the fan guard passes at exact equality
                             (window e+4, fq up to 4) and the walk keeps ZERO
@@ -12544,8 +12569,19 @@ static void vdp1_walls_flush(void)
                                stranding (the u161 class).  A rec with fine==0xFE
                                takes the LIVE V-band arm (worst spender, 16 cmds)
                                so it KEEPS the deal; no bake = old law. */
-                            const struct psw_bleaf *bkd =
-                                psw_bake_get((int)psw_sub[psw_sf_jobs[j].k].subnum);
+                            int dsn = (int)psw_sub[psw_sf_jobs[j].k].subnum;
+                            /* P77: every PRESENT pass memo'd -> the fines are IN
+                               the measured spend, the +9 would only strand (the
+                               u-class); an absent pass cannot spend fines. */
+                            if (dsn >= 0 && dsn < PSW_SPEND_MAX)
+                            {
+                                int fl2, cl2, fd2;
+                                psw_sub_lumps(psw_sf_jobs[j].k, &fl2, &cl2, &fd2);
+                                if ((fl2 < 0 || psw_ucr8((const volatile void *)&psw_spendf[dsn]) > 0)
+                                    && (cl2 < 0 || psw_ucr8((const volatile void *)&psw_spendc[dsn]) > 0))
+                                    continue;
+                            }
+                            const struct psw_bleaf *bkd = psw_bake_get(dsn);
                             if (bkd)
                             {
                                 const unsigned char *grid = (const unsigned char *)(bkd + 1);
@@ -12663,6 +12699,8 @@ static void vdp1_walls_flush(void)
         psw_cover_n = 0;                      /* r42: slave-written too */
         psw_ceil_esol_last = (int)psw_ucr32((const volatile void *)&psw_ceil_esol);
         psw_ceil_esol = 0;                    /* P58: emitter-side, slave-written */
+        psw_bill_clamp_last = psw_bill_clamp_n;
+        psw_bill_clamp_n = 0;                 /* P77: master-written (pre-pass) */
         psw_fan_skip_last = (int)psw_ucr32((const volatile void *)&psw_fan_skip);
         psw_fan_skip = 0;                     /* P58; P75: latched to row `k` */
         psw_floor_esol_last = (int)psw_ucr32((const volatile void *)&psw_floor_esol);

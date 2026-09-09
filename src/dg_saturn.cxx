@@ -676,6 +676,10 @@ static void sat_psw_sub_note(int subnum, int fh, int ch, int fpic,
                              int flump, int clump, int light, int vis0);
 static int  psw_flat_last = 0;             /* flat quads emitted last frame (row 13 `f`)
                                               ALSO read by the sf credit at the pre-pass */
+static int  psw_sf_grant_last = 0;         /* P71: total arena window GRANTED this frame
+                                              (row 13 `g`) -- the ledger law: g >> f =
+                                              paper famine, the 2e+1 worst-case bill is
+                                              starving planes the bank could afford */
 static int  psw_fan_last = 0;              /* fan flat pieces/planes (row 13 `n`) */
 static int  psw_sub_ovf_last = 0;          /* subsector-recorder overflow (row 13 `o`) */
 /* (P70 cleanup: the dead display latches are GONE -- flat_denied/kill/punch/
@@ -3475,19 +3479,22 @@ static void fps_update(void)
                     /* P70 -- THE CLEAN ROW (owner: "repartir d'une base saine";
                        the 41-disc probe sediments are gone, the branch memory
                        carries their history).  Format:
-                       P70.<diag><!/-> s<esol>/<miss> t<cull> o<ovf> f<cmds> n<fanq>
+                       P71.<diag><!/-> s<esol>/<miss> g<grant> t<cull> o<ovf> f<cmds> n<fanq>
                          diag   pad L+Down: 0 shipping / 1 MASTER flats /
                                 2 master flats + core noprune (r69 A/B ref)
                          !/-    flat body wedged -> flats on master / no arena
                          s      ceilings solid at ENTRY (ladder refused) vs
                                 live slot MISSES -- the open slave-spawn front
+                         g      arena window GRANTED (P71, the ledger read:
+                                g >> f = the 2e+1 bill starves on paper)
                          t      floor tile culls (mask)     o  recorder overflow
                          f      flat quads emitted           n  solid fans */
-                    snprintf(ovbuf, sizeof ovbuf, "P70.%d%s s%d/%d t%d o%d f%d n%d ",
+                    snprintf(ovbuf, sizeof ovbuf, "P71.%d%s s%d/%d g%d t%d o%d f%d n%d ",
                              sat_psw_diag & 3,             /* pad L+Down state */
                              sfb,
                              psw_ceil_esol_last > 99 ? 99 : psw_ceil_esol_last,
                              psw_ceil_solid_last > 99 ? 99 : psw_ceil_solid_last,
+                             psw_sf_grant_last > 999 ? 999 : psw_sf_grant_last,
                              psw_tile_cull_last > 99 ? 99 : psw_tile_cull_last,
                              psw_sub_ovf_last > 99 ? 99 : psw_sub_ovf_last,
                              psw_flat_last  > 999 ? 999 : psw_flat_last,
@@ -11465,6 +11472,40 @@ static void psw_emit_subflats(int k)
 		    psw_cur_mask = (pass == 0) ? psw_sub_fmask[k] : psw_sub_cmask[k];
 		    psw_cur_sub  = sn;          /* round 22: soft-line rescan key */
 		    psw_cur_pass = pass;        /* P58: emit64's ceiling famine skip */
+		    if (psw_sf_mode && pass == 1)
+		    {   /* P71 -- UNDER-COVER (owner front #1: spawn tiles missing at
+		           cran 0 with NO L+X paint = they reach no emitter).  The solid
+		           fan is staged BEFORE the tile walk: VDP1 list order puts every
+		           textured tile ON TOP of it, so a window famine now shows the
+		           plane's tint instead of void -- and the P58 law holds by
+		           construction (nothing ever paints OVER a slave tile; the fan
+		           is UNDER).  Guarded: enough window for fan + a few tiles,
+		           else the old partial-tiles behaviour. */
+			int nn2 = (n < 9) ? n : 9, fq = (nn2 - 1) / 2;
+			if (psw_cmd_left() > fq + 4)
+			{
+			    int okc = 1;
+			    for (i = 0; i < n; ++i)
+				if (!psw_project(cx[i], cy[i], ph, psign, &sxv[i], &syv[i]))
+				{ okc = 0; break; }
+			    if (okc)
+			    {
+				int fidx[9], s2;
+				for (s2 = 0; s2 < nn2; ++s2) fidx[s2] = (s2 * (n - 1)) / (nn2 - 1);
+				psw_paint_idx = 250;   /* L+X: a deficit reads MAGENTA under the tiles */
+				for (i = 1; i + 1 < nn2; i += 2)
+				{
+				    int qx2[4], qy2[4];
+				    int i2 = (i + 2 < nn2) ? i + 2 : i + 1;
+				    qx2[0] = sxv[fidx[0]];     qy2[0] = syv[fidx[0]];
+				    qx2[1] = sxv[fidx[i]];     qy2[1] = syv[fidx[i]];
+				    qx2[2] = sxv[fidx[i + 1]]; qy2[2] = syv[fidx[i + 1]];
+				    qx2[3] = sxv[fidx[i2]];    qy2[3] = syv[fidx[i2]];
+				    psw_emit_flatquad(-1, scolr, qx2, qy2);
+				}
+			    }
+			}
+		    }
 		    psw_emit_plane_tiles(slot, pc, cx, cy, n, ph, psign, cull_h, scolr);
 		    psw_sf_end += cov;
 		    if (psw_tile_short)
@@ -12330,16 +12371,22 @@ static void vdp1_walls_flush(void)
                         if (psw_sf_jobs[j].bill >= 5)      /* has a tiled pass */
                         { psw_sf_jobs[j].bill += 9; ftile += 9; fres -= 9; }
                     {   /* arena space granted NEAR->far, then prefix sums over
-                           the survivors (a refused job is dropped from the list,
-                           never left with bill 0 -- the slave would still walk
-                           its whole plane just to have every command refused) */
+                           the survivors.  P71: an over-room job is CLAMPED to
+                           the remaining space, never dropped whole -- a dropped
+                           job was emitted by NOBODY (the r39 class, its counter
+                           lied once already); a clamped window emits what fits
+                           and the under-cover fan tints the rest.  room reaches
+                           0 at the FAR end only (grant is near-first). */
                         int room = PSW_FLAT_CAP, ao = 0, nj = 0;
                         for (int j = psw_sf_njobs - 1; j >= 0; --j)
                         {
                             if ((int)psw_sf_jobs[j].bill <= room)
                                 room -= (int)psw_sf_jobs[j].bill;
                             else
-                                psw_sf_jobs[j].bill = 0;
+                            {
+                                psw_sf_jobs[j].bill = (unsigned short)room;
+                                room = 0;
+                            }
                         }
                         for (int j = 0; j < psw_sf_njobs; ++j)
                             if (psw_sf_jobs[j].bill > 0)
@@ -12350,6 +12397,7 @@ static void vdp1_walls_flush(void)
                                 nj++;
                             }
                         psw_sf_njobs = nj;
+                        psw_sf_grant_last = ao;   /* P71: row 13 `g` (vs `f` emitted) */
                     }
                 }
                 if (psw_sf_njobs > 0)

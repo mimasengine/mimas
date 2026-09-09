@@ -3519,7 +3519,7 @@ static void fps_update(void)
                     /* P70 -- THE CLEAN ROW (owner: "repartir d'une base saine";
                        the 41-disc probe sediments are gone, the branch memory
                        carries their history).  Format:
-                       P80.<diag><!/-><^> s<slot>:<bud>:<win> u<un> w<sh> k<cskip> F<fsol> f<cmds> m<clamp>/<valid>
+                       P81.<diag><!/-><^> s<slot>:<bud>:<win> u<un> w<sh> k<cskip> F<fsol> f<cmds> m<clamp>/<valid>
                          diag   pad L+Down: 0 shipping / 1 MASTER flats /
                                 2 master flats + core noprune (r69 A/B ref)
                          !/-    flat body wedged -> flats on master / no arena
@@ -3541,7 +3541,7 @@ static void fps_update(void)
                        walls squeeze fbudget (paper); by win -> the walk model
                        is wrong.  u large with w small = grants strand on
                        entry-solids; w large = windows still too tight. */
-                    snprintf(ovbuf, sizeof ovbuf, "P80.%d%s%s s%d:%d:%d u%d w%d k%d F%d f%d m%d/%d ",
+                    snprintf(ovbuf, sizeof ovbuf, "P81.%d%s%s s%d:%d:%d u%d w%d k%d F%d f%d m%d/%d ",
                              sat_psw_diag & 3,             /* pad L+Down state */
                              sfb,
                              psw_sub_ovf_last > 0 ? "^" : "",
@@ -6067,8 +6067,18 @@ static const unsigned int VDP1_BANK[2] = { 0x25C00100u, 0x25C02700u };
    finished early) -- the VDP1 was idle, only the bank was full. */
 #define VDP1_BANK_SPLIT     303           /* last physical slot of the 0x2600 region = the JUMP */
 static const unsigned int VDP1_BANK_EXT[2] = { 0x25C5E000u, 0x25C5F800u };
-#define VDP1_BANK_EXT_CMDS  192           /* 0x1800 VRAM / 32B each */
-#define VDP1_BANK_CMDS  (VDP1_BANK_SPLIT + VDP1_BANK_EXT_CMDS)   /* 495 logical cmds per bank */
+#define VDP1_BANK_EXT_CMDS  191           /* P81: was 192 -- the last physical EXT1
+                                             slot now holds the static jump to EXT2 */
+/* P81 -- THE OWNER'S QUESTION ("on est sur d'etre au max de vdp1 ?") ANSWERED: NO.
+   The 495-cmd bank was OUR VRAM constant while the chip draws 4-15 ms of 33 and the
+   re-cut plan ("cede WTEX slots -> bigger command banks") sat instrumented-but-never-
+   executed since 08-05.  One ceded WTEX narrow slot (16 KB; tx read 5/24 at the spawn,
+   and the r80 far-wall demotion cuts wtex demand exactly where scenes are texture-
+   heavy) becomes EXT2: +256 logical commands per bank, 495 -> 750.  Watch row 18
+   `bk` (wtex thrash) -- it is the gate on this cede, as the round-20 note says. */
+static const unsigned int VDP1_BANK_EXT2[2] = { 0x25C55E00u, 0x25C57E00u };
+#define VDP1_BANK_EXT2_CMDS 256           /* 0x2000 VRAM / 32B each */
+#define VDP1_BANK_CMDS  (VDP1_BANK_SPLIT + VDP1_BANK_EXT_CMDS + VDP1_BANK_EXT2_CMDS)   /* 750 */
 #else
 static const unsigned int VDP1_BANK[2] = { 0x25C00100u, 0x25C02100u };
 #define VDP1_BANK_CMDS  256               /* commands per bank (0x2000 VRAM / 32B each) */
@@ -6332,8 +6342,17 @@ static void vdp1_cmd_at(unsigned int base, int idx, const unsigned short *c)
 #if SAT_PSW
     if (idx >= VDP1_BANK_SPLIT && (base == VDP1_BANK[0] || base == VDP1_BANK[1]))
     {
-        base = VDP1_BANK_EXT[base == VDP1_BANK[1] ? 1 : 0];
-        idx -= VDP1_BANK_SPLIT;
+        int b2 = (base == VDP1_BANK[1]) ? 1 : 0;
+        if (idx >= VDP1_BANK_SPLIT + VDP1_BANK_EXT_CMDS)
+        {   /* P81: past EXT1's 191 slots -> EXT2 (the ceded wtex narrow slot) */
+            base = VDP1_BANK_EXT2[b2];
+            idx -= VDP1_BANK_SPLIT + VDP1_BANK_EXT_CMDS;
+        }
+        else
+        {
+            base = VDP1_BANK_EXT[b2];
+            idx -= VDP1_BANK_SPLIT;
+        }
     }
     if (vdp1_stg_on)
     {   /* (round 30: the `y` frt bracket left with its row column -- twice
@@ -6417,15 +6436,23 @@ static inline unsigned short pal_rgb555(int idx)
                               LRU -- an open scene shows 6-10 distinct flats, and every
                               lump past the 4th emitted its whole plane as solids.  The
                               wall pool ran tx11/26 = half empty on those captures.)
-                              PSW relayout: pool ends 0x25C59E00, flats 4..7 fill
+                              PSW relayout: pool ends 0x25C55E00 since P81 (EXT2
+                              fills 0x25C55E00..0x25C59E00), flats 4..7 fill
                               0x25C59E00..0x25C5DE00, below the bank ext (0x25C5E000). */
 #else
 #define WTEX_SMALL_N   16
 #endif
 #define WTEX_SMALL_SZ  0x2100u                                      /* 8448 B -> 64x(128+4) @ 8bpp */
+#if SAT_PSW
+#define WTEX_NARROW_N  5    /* P81: 6 -> 5 -- the last narrow slot (16 KB) is ceded to
+                               the VDP1_BANK_EXT2 command regions (+256 cmds/bank).
+                               The wtex pool now ends 0x25C55E00; EXT2 fills
+                               0x25C55E00..0x25C59E00, flush against psw flats 4..7. */
+#else
 #define WTEX_NARROW_N  6    /* 15 -> 6: the 16 KB pool now only serves what does NOT fit 8448 B
                                (~24% of textures).  Watch `bk` (row 18) if a texture-varied level
                                re-bakes: the small pool falls back here, not the reverse. */
+#endif
 #define WTEX_NARROW_SZ 0x4000u                                      /* 16KB -> 128x128 @ 8bpp */
 #if SAT_WPN_VDP1
 #define WTEX_WIDE_N    4   /* SAT_WPN_VDP1: cede the last 2 wide slots (64KB) to the 4-slot 16KB VDP1
@@ -11856,8 +11883,15 @@ static void psw_sf_dma_range(int idx, int n, const unsigned int *src)
 	    dst = VDP1_BANK[vdp1_wbank] + (unsigned int)idx * 32u;
 	    if (idx + take > VDP1_BANK_SPLIT) take = VDP1_BANK_SPLIT - idx;
 	}
-	else
+	else if (idx < VDP1_BANK_SPLIT + VDP1_BANK_EXT_CMDS)
+	{
 	    dst = VDP1_BANK_EXT[vdp1_wbank] + (unsigned int)(idx - VDP1_BANK_SPLIT) * 32u;
+	    if (idx + take > VDP1_BANK_SPLIT + VDP1_BANK_EXT_CMDS)
+	        take = VDP1_BANK_SPLIT + VDP1_BANK_EXT_CMDS - idx;   /* P81: EXT seam */
+	}
+	else
+	    dst = VDP1_BANK_EXT2[vdp1_wbank]
+	        + (unsigned int)(idx - VDP1_BANK_SPLIT - VDP1_BANK_EXT_CMDS) * 32u;
 	{
 	    volatile unsigned int *d = (volatile unsigned int *)dst;
 	    for (int w2 = 0; w2 < take * 8; ++w2) d[w2] = s[w2];
@@ -13052,6 +13086,10 @@ static void vdp1_wpn_init(void)
         cmd[1]  = (unsigned short)((VDP1_BANK_EXT[b] - VDP1_VRAM_BASE) >> 3);
         cmd[10] = 319; cmd[11] = 223;
         for (int k = 0; k < 16; ++k) p[k] = cmd[k];
+        /* P81: second static bridge -- EXT1's last physical slot jumps to EXT2 */
+        p = (volatile unsigned short *)VDP1_BANK_EXT[b] + VDP1_BANK_EXT_CMDS * 16;
+        cmd[1] = (unsigned short)((VDP1_BANK_EXT2[b] - VDP1_VRAM_BASE) >> 3);
+        for (int k = 0; k < 16; ++k) p[k] = cmd[k];
     }
 #endif
 
@@ -13831,8 +13869,13 @@ static void vdp1_wpn_kick(void)
         unsigned int base_ca  = bank_off >> 3;
         unsigned int end_ca   = (bank_off + (unsigned int)vdp1_last_cmds * 32u) >> 3;
 #if SAT_PSW
-        /* round 19: a list longer than the contiguous region ends in the EXTENSION */
-        if (vdp1_last_cmds > VDP1_BANK_SPLIT)
+        /* round 19: a list longer than the contiguous region ends in the EXTENSION
+           (P81: or in EXT2 past EXT1's 191 slots) */
+        if (vdp1_last_cmds > VDP1_BANK_SPLIT + VDP1_BANK_EXT_CMDS)
+            end_ca = (VDP1_BANK_EXT2[vdp1_bank & 1] - VDP1_VRAM_BASE
+                      + ((unsigned int)vdp1_last_cmds - VDP1_BANK_SPLIT
+                         - VDP1_BANK_EXT_CMDS) * 32u) >> 3;
+        else if (vdp1_last_cmds > VDP1_BANK_SPLIT)
             end_ca = (VDP1_BANK_EXT[vdp1_bank & 1] - VDP1_VRAM_BASE
                       + ((unsigned int)vdp1_last_cmds - VDP1_BANK_SPLIT) * 32u) >> 3;
 #endif
@@ -13850,7 +13893,12 @@ static void vdp1_wpn_kick(void)
             {   /* round 19: LOPR inside the extension maps back to logical slots
                    (LOPR past the contiguous region used to clamp to "finished") */
                 int ext_ca = (int)((VDP1_BANK_EXT[vdp1_bank & 1] - VDP1_VRAM_BASE) >> 3);
-                if ((int)vdp1_lopr >= ext_ca
+                int ex2_ca = (int)((VDP1_BANK_EXT2[vdp1_bank & 1] - VDP1_VRAM_BASE) >> 3);
+                if ((int)vdp1_lopr >= ex2_ca
+                    && (int)vdp1_lopr < ex2_ca + VDP1_BANK_EXT2_CMDS * 4)   /* P81 */
+                    got = (VDP1_BANK_SPLIT + VDP1_BANK_EXT_CMDS) * 4
+                        + ((int)vdp1_lopr - ex2_ca);
+                else if ((int)vdp1_lopr >= ext_ca
                     && (int)vdp1_lopr < ext_ca + VDP1_BANK_EXT_CMDS * 4)
                     got = VDP1_BANK_SPLIT * 4 + ((int)vdp1_lopr - ext_ca);
                 else if (got >= VDP1_BANK_SPLIT * 4 && got < span

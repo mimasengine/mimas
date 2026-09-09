@@ -3489,7 +3489,11 @@ static void fps_update(void)
                                 g >> f = the 2e+1 bill starves on paper)
                          t      floor tile culls (mask)     o  recorder overflow
                          f      flat quads emitted           n  solid fans */
-                    snprintf(ovbuf, sizeof ovbuf, "P71.%d%s s%d/%d g%d t%d o%d f%d n%d ",
+                    /* P72: bills are HONEST now (psw_bill_of: baked class grid,
+                       min with the old 2e+1).  Read g vs f again: g should fall
+                       off the 320 cap toward f+margins, and the far field's
+                       windows become real -- the anti-aplat lever. */
+                    snprintf(ovbuf, sizeof ovbuf, "P72.%d%s s%d/%d g%d t%d o%d f%d n%d ",
                              sat_psw_diag & 3,             /* pad L+Down state */
                              sfb,
                              psw_ceil_esol_last > 99 ? 99 : psw_ceil_esol_last,
@@ -9518,6 +9522,14 @@ struct psw_bleaf {
     short txa, tya;
     unsigned char tw, th;
     unsigned char nrec, nfine;
+    unsigned short cbill;   /* P72: HONEST command bill from the class grid --
+                               FULL 1, border (REC/LIVE) 2, SLIV/OUT 0, +1 --
+                               console P71 read g320(=cap)/f154: the 2e+1
+                               worst-case law booked DOUBLE the real spend and
+                               the far field lived on clamped crumbs (the
+                               owner's "on retombe trop facilement sur de
+                               l'aplat").  Still an upper bound: strips only
+                               merge FULLs, fine strips ride the global cap. */
 };
 static unsigned char  *psw_bk_pool = 0;
 static int             psw_bk_size = 0, psw_bk_used = 0;
@@ -9818,6 +9830,16 @@ static int psw_bake_build(int sn)        /* >= 0 pool offset | -1 no room | -2 n
 	L->txa = (short)txa; L->tya = (short)tya;
 	L->tw = (unsigned char)tw; L->th = (unsigned char)th;
 	L->nrec = (unsigned char)nrec; L->nfine = (unsigned char)nfin;
+	{   /* P72: the honest bill, once, from the finished class grid */
+	    int cb = 1, ti;
+	    for (ti = 0; ti < tw * th; ++ti)
+	    {
+		unsigned char c2 = cls[ti];
+		if (c2 == PSW_BKC_FULL) cb += 1;
+		else if (c2 == PSW_BKC_LIVE || c2 >= PSW_BKC_REC0) cb += 2;
+	    }
+	    L->cbill = (unsigned short)cb;
+	}
 	p = (unsigned char *)(L + 1);
 	memcpy(p, cls, (unsigned)(tw * th)); p += tw * th;
 	memcpy(p, rec, (unsigned)nrec * sizeof(struct psw_brec)); p += nrec * sizeof(struct psw_brec);
@@ -9849,6 +9871,19 @@ static const struct psw_bleaf *psw_bake_get(int sn)
 	if (r == -2) psw_bk_off[sn] = 0xFFFEu;
 	return 0;
     }
+}
+
+/* P72 -- the honest command bill for one plane of sub sn: the baked class
+   grid's exact count when available, the 2e+1 worst-case law otherwise, and
+   never MORE than the old law (masks can shrink est below the grid).  Every
+   grant AND the emission-time entry check must use this same number -- a
+   window granted honestly but tested against 2e+1 would refuse itself. */
+static int psw_bill_of(int sn, int est)
+{
+    int e = 2 * est + 1;
+    const struct psw_bleaf *bk = psw_bake_get(sn);
+    if (bk && (int)bk->cbill < e) e = (int)bk->cbill;
+    return e;
 }
 
 /* emit one BAKED border tile: 1 = done, 0 = fall back to the live path,
@@ -11358,7 +11393,7 @@ static void psw_emit_subflats(int k)
 	       several-fold and the belt forced NEAR granted planes to solid late in
 	       the frame (part of the console "zone rose" excess).  The stored
 	       fe/ce IS this pass's honest upper bound. */
-	    int ebill = 2 * (int)((pass == 0) ? psw_sub_fe[k] : psw_sub_ce[k]) + 1;
+	    int ebill = psw_bill_of(sn, (int)((pass == 0) ? psw_sub_fe[k] : psw_sub_ce[k]));   /* P72 */
 	    /* ROUND 39 -- THE WINDOW MUST DEGRADE, NOT TRUNCATE.  The solid law
 	       read only the GLOBAL psw_flat_cap_dyn, so a plane whose per-job
 	       WINDOW could not pay for its tiles walked the whole grid anyway and
@@ -12105,7 +12140,7 @@ static void vdp1_walls_flush(void)
                 if (cl < 0 || (psw_sub_flag[k] & 4)) continue;
                 {
                     int e = (psw_sub_flag[k] & 0x20) ? 4
-                          : 2 * (int)psw_sub_ce[k] + 1;
+                          : psw_bill_of((int)psw_sub[k].subnum, (int)psw_sub_ce[k]);   /* P72 */
                     int m = (e < 4) ? e : 4;
                     /* ROUND 50 -- THE CEILING GUARANTEE YIELDS ONLY TO THE BANK,
                        never to the half-budget sweep cap.  The owner's four
@@ -12147,7 +12182,7 @@ static void vdp1_walls_flush(void)
                 if (fl >= 0 && !(psw_sub_flag[k] & 1))
                 {
                     int e = (psw_sub_flag[k] & 0x10) ? 4
-                          : 2 * (int)psw_sub_fe[k] + 1;
+                          : psw_bill_of((int)psw_sub[k].subnum, (int)psw_sub_fe[k]);   /* P72 */
                     int m = (e < 4) ? e : 4;
                     if (ftile + m <= limit) { ftile += m; if (sf_ok) psw_sf_bill[k] += (unsigned short)m; }
                     else psw_sub_flag[k] |= 0x40;  /* STANDBY */
@@ -12181,7 +12216,7 @@ static void vdp1_walls_flush(void)
                    the master has no window, so covf costs it nothing. */
                 if (fl >= 0 && !(psw_sub_flag[k] & 0x41) && !(psw_sub_flag[k] & 0x10))
                 {
-                    int e = 2 * (int)psw_sub_fe[k] + 1;
+                    int e = psw_bill_of((int)psw_sub[k].subnum, (int)psw_sub_fe[k]);   /* P72 */
                     int covf = sf_ok ? PSW_COVER : 0;   /* r52 */
                     /* round 24: the CHAIN hint must ride the pre-pass grab too --
                        this near-first pass is what reserves the 8 slots, so an
@@ -12213,7 +12248,7 @@ static void vdp1_walls_flush(void)
                 }
                 if (cl >= 0 && !(psw_sub_flag[k] & 0x84) && !(psw_sub_flag[k] & 0x20))
                 {
-                    int e = 2 * (int)psw_sub_ce[k] + 1;
+                    int e = psw_bill_of((int)psw_sub[k].subnum, (int)psw_sub_ce[k]);   /* P72 */
                     int wnt = sf_ok ? 0   /* r54: no chains on slave frames */
                             : (psw_sub_ce[k] >= 18) ? 2 : (psw_sub_ce[k] >= 12) ? 1 : 0;
                     int covf = sf_ok ? PSW_COVER + 2 : 0;   /* r52 twin; P59: the

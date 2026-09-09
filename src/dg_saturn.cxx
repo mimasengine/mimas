@@ -2454,6 +2454,8 @@ static int wall_spent_n = 0;         /* P79: ACTUAL wall commands this frame (me
                                         at the one plot dispatch, VDP1_PLOT_WALL) */
 static int psw_wall_spent_prev = 0;  /* P79: last frame's actual, latched at pre-pass */
 static int psw_wall_paper_prev = 0;  /* P79: last frame's PAPER (wall_cmds) */
+static int psw_wtax = 0;             /* P80: far-wall demotion tax (hysteresis:
+                                        rises instantly, decays 4/frame) */
 #define PSW_WALL_SPEND(n) (wall_spent_n += (int)(n))
 #else
 #define PSW_WALL_SPEND(n) ((void)0)   /* normal build: bit-intact, no measure */
@@ -3517,7 +3519,7 @@ static void fps_update(void)
                     /* P70 -- THE CLEAN ROW (owner: "repartir d'une base saine";
                        the 41-disc probe sediments are gone, the branch memory
                        carries their history).  Format:
-                       P79.<diag><!/-><^> s<slot>:<bud>:<win> u<un> w<sh> k<cskip> F<fsol> f<cmds> m<clamp>/<valid>
+                       P80.<diag><!/-><^> s<slot>:<bud>:<win> u<un> w<sh> k<cskip> F<fsol> f<cmds> m<clamp>/<valid>
                          diag   pad L+Down: 0 shipping / 1 MASTER flats /
                                 2 master flats + core noprune (r69 A/B ref)
                          !/-    flat body wedged -> flats on master / no arena
@@ -3539,7 +3541,7 @@ static void fps_update(void)
                        walls squeeze fbudget (paper); by win -> the walk model
                        is wrong.  u large with w small = grants strand on
                        entry-solids; w large = windows still too tight. */
-                    snprintf(ovbuf, sizeof ovbuf, "P79.%d%s%s s%d:%d:%d u%d w%d k%d F%d f%d m%d/%d ",
+                    snprintf(ovbuf, sizeof ovbuf, "P80.%d%s%s s%d:%d:%d u%d w%d k%d F%d f%d m%d/%d ",
                              sat_psw_diag & 3,             /* pad L+Down state */
                              sfb,
                              psw_sub_ovf_last > 0 ? "^" : "",
@@ -12203,8 +12205,32 @@ static void vdp1_walls_flush(void)
                     && psw_sub[k].fh < sat_vdp2_floor_h)
                 { psw_punch_frame = 1; break; }
             }
+            /* P80 -- THE OWNER'S LADDER, STEP 1 (cap 2026-09-09) : "d'abord
+               les plans les plus loins, puis les MURS les plus loins, puis
+               les plans un peu moins loin".  The bank is measured FULL (P79:
+               u+f = 371 + walls-actual ~ 487) and refused planes persist at
+               the SPAWN -- the near field can only be textured by taking
+               from the far field, and no ledger ever took from WALLS.  Far
+               walls (wall_acc is BSP near-first; the tail IS the far field)
+               DEMOTE to flat (mode 2, paper 1) until the released paper
+               covers last frame's refused planes.  Hysteresis kills the
+               equilibrium flicker; the near HALF is never touched.  Scene
+               with zero refusals -> tax decays to 0 -> full wall texture. */
+            {
+                int wantw = 4 * (psw_esol_bud_last + psw_floor_esol_last);
+                if (wantw > 96) wantw = 96;
+                psw_wtax = (wantw > psw_wtax) ? wantw
+                         : (psw_wtax > 4) ? psw_wtax - 4 : 0;
+                wantw = psw_wtax;
+                for (int i = wall_acc_n - 1; i >= wall_acc_n / 2 && wantw > 0; --i)
+                    if (wall_acc[i].mode == 1 || wall_acc[i].mode == 3)
+                    {
+                        int pap = psw_wall_paper(i);
+                        if (pap > 1) { wall_acc[i].mode = 2; wantw -= pap - 1; }
+                    }
+            }
             for (int i = 0; i < wall_acc_n; ++i)
-                wall_cmds += psw_wall_paper(i);
+                wall_cmds += psw_wall_paper(i);   /* (P80 demotions already applied) */
 #if SAT_WORLD_THINGS_VDP1
             /* ROUND 33c -- the restore is billed PER THING, not per frame: the
                drain appends ONE view-window restore per emit_subthings CALL

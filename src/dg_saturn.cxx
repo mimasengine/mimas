@@ -699,7 +699,23 @@ static int  psw_ceil_esol = 0, psw_ceil_esol_last = 0;   /* P58: the s field spl
                        into s<esol>/<miss> -- esol = ceiling planes solid AT ENTRY
                        (flag 0x20/0x80, global cap, window < ebill: the LADDER
                        refused), miss = a live slot peek/get MISS on an otherwise
-                       tiled plane (slot-bank shortfall).  Different owners. */
+                       tiled plane (slot-bank shortfall).  Different owners.
+                       (P73: the row prints the CAUSE split below instead; esol/
+                       miss stay latched as the P58 arbitration's raw pair.) */
+/* P73 -- the console P72 verdict ("plus d'aplats") needs the WHICH, not another
+   fix: s23-25 entry-solids per frame with THREE possible owners.  Split them:
+     slot  = flag 0x20 with ecause 1 (the 8-distinct-lump slave bank ran out)
+     bud   = flag 0x80 (round-A budget standby) or ecause 2/3 (round-B budget
+             refusal / round-C rescue): PAPER famine -- walls squeezing fbudget
+     win   = no flag: emission-time window/cap (the walk model is wrong)
+   and close the arena ledger: u = window commands GRANTED but left UNSPENT at
+   job end (entry-solids strand e+covf each; healthy jobs strand margins), w =
+   passes whose walk hit psw_tile_short (mid-walk famine -- the smeared class). */
+static int  psw_esol_slot = 0, psw_esol_slot_last = 0;
+static int  psw_esol_bud  = 0, psw_esol_bud_last  = 0;
+static int  psw_esol_win  = 0, psw_esol_win_last  = 0;
+static int  psw_sf_unspent = 0, psw_sf_unspent_last = 0;
+static int  psw_short_n = 0, psw_short_n_last = 0;
 /* (ROUND 36b's R+X A/B on the two ceiling refusals is REMOVED -- it did its job
    on console: the spawn ceilings moved, the triangle did not, which is how the
    two defects were finally told apart.  Round 38's marker paint answers the same
@@ -3479,30 +3495,37 @@ static void fps_update(void)
                     /* P70 -- THE CLEAN ROW (owner: "repartir d'une base saine";
                        the 41-disc probe sediments are gone, the branch memory
                        carries their history).  Format:
-                       P71.<diag><!/-> s<esol>/<miss> g<grant> t<cull> o<ovf> f<cmds> n<fanq>
+                       P73.<diag><!/-><^> s<slot>:<bud>:<win> u<un> w<sh> g<grant> t<cull> f<cmds>
                          diag   pad L+Down: 0 shipping / 1 MASTER flats /
                                 2 master flats + core noprune (r69 A/B ref)
                          !/-    flat body wedged -> flats on master / no arena
-                         s      ceilings solid at ENTRY (ladder refused) vs
-                                live slot MISSES -- the open slave-spawn front
-                         g      arena window GRANTED (P71, the ledger read:
-                                g >> f = the 2e+1 bill starves on paper)
-                         t      floor tile culls (mask)     o  recorder overflow
-                         f      flat quads emitted           n  solid fans */
-                    /* P72: bills are HONEST now (psw_bill_of: baked class grid,
-                       min with the old 2e+1).  Read g vs f again: g should fall
-                       off the 320 cap toward f+margins, and the far field's
-                       windows become real -- the anti-aplat lever. */
-                    snprintf(ovbuf, sizeof ovbuf, "P72.%d%s s%d/%d g%d t%d o%d f%d n%d ",
+                         ^      recorder overflow (was field o, ~always 0)
+                         s      ceiling ENTRY-solids by CAUSE -- slot bank :
+                                budget/standby/rescue : window-or-cap
+                         u      arena cmds granted but UNSPENT at job end
+                         w      passes whose walk hit tile_short (walk famine)
+                         g      arena window GRANTED (cap = fbudget, the
+                                wall-bank leftover -- NOT the 420 arena)
+                         t      floor tile culls (mask)   f  flat quads emitted
+                       (P73 retires n<fanq> and the /miss half -- miss read 0
+                       for 8 straight captures; both stay latched, unprinted.) */
+                    /* P73 read -- WHICH famine is it?  s dominated by slot ->
+                       the 8-distinct-lump slave bank is the wall; by bud ->
+                       walls squeeze fbudget (paper); by win -> the walk model
+                       is wrong.  u large with w small = grants strand on
+                       entry-solids; w large = windows still too tight. */
+                    snprintf(ovbuf, sizeof ovbuf, "P73.%d%s%s s%d:%d:%d u%d w%d g%d t%d f%d ",
                              sat_psw_diag & 3,             /* pad L+Down state */
                              sfb,
-                             psw_ceil_esol_last > 99 ? 99 : psw_ceil_esol_last,
-                             psw_ceil_solid_last > 99 ? 99 : psw_ceil_solid_last,
+                             psw_sub_ovf_last > 0 ? "^" : "",
+                             psw_esol_slot_last > 99 ? 99 : psw_esol_slot_last,
+                             psw_esol_bud_last  > 99 ? 99 : psw_esol_bud_last,
+                             psw_esol_win_last  > 99 ? 99 : psw_esol_win_last,
+                             psw_sf_unspent_last > 999 ? 999 : psw_sf_unspent_last,
+                             psw_short_n_last > 99 ? 99 : psw_short_n_last,
                              psw_sf_grant_last > 999 ? 999 : psw_sf_grant_last,
                              psw_tile_cull_last > 99 ? 99 : psw_tile_cull_last,
-                             psw_sub_ovf_last > 99 ? 99 : psw_sub_ovf_last,
-                             psw_flat_last  > 999 ? 999 : psw_flat_last,
-                             psw_fan_last > 999 ? 999 : psw_fan_last);
+                             psw_flat_last  > 999 ? 999 : psw_flat_last);
                 }
 #endif
             if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 13, ovbuf);
@@ -11410,7 +11433,14 @@ static void psw_emit_subflats(int k)
 	                               uploads / touches the zone on the slave */
 	             : psw_slot_get(lump, (fe_ >= 18) ? 2 : (fe_ >= 12) ? 1 : 0);
 	    if (pass && slot < 0)
-	    { if (solid) psw_ceil_esol++;      /* P58: the LADDER refused (flag/cap/window) */
+	    { if (solid)
+	      { psw_ceil_esol++;               /* P58: the LADDER refused (flag/cap/window) */
+	        /* P73: the cause split -- same ladder as the P65 cause paint below.
+	           0x80 (round-A standby, rescue exhausted) is BUDGET regardless of
+	           ecause: ecause is only written on the 0x20 paths and would be stale. */
+	        if (!(psw_sub_flag[k] & (0x20 | 0x80)))                      psw_esol_win++;
+	        else if ((psw_sub_flag[k] & 0x20) && psw_sub_ecause[k] == 1) psw_esol_slot++;
+	        else                                                         psw_esol_bud++; }
 	      else       psw_ceil_solid++; }   /* P58: live slot miss -- bank shortfall */
 	    psw_cur_tall = (slot >= 0) ? (int)psw_slot[slot].tall : 0;  /* round 24:
 	                       chain length - 1 -> 64x128 / 64x192 strips */
@@ -11517,7 +11547,16 @@ static void psw_emit_subflats(int k)
 		           is UNDER).  Guarded: enough window for fan + a few tiles,
 		           else the old partial-tiles behaviour. */
 			int nn2 = (n < 9) ? n : 9, fq = (nn2 - 1) / 2;
-			if (psw_cmd_left() > fq + 4)
+			/* P73 -- THE FAN MUST NOT EAT THE WALK (console P72: "plus
+			   d'aplats").  The r71 guard (`> fq + 4`) let the fan spend fq
+			   commands out of the SAME window the honest r72 bill had cut
+			   to the tiles' exact need: every upgraded ceiling walked ~fq
+			   short, smearing 1-2 missing tiles (fan tint showing through)
+			   across the whole scene.  Fire only when the margin holds the
+			   fan ABOVE this pass's own bill -- the covf grant (+6/plane)
+			   covers fq <= 4 whenever the floor pass left it alone, so the
+			   fan stays free insurance and can never starve a tile. */
+			if (psw_cmd_left() >= ebill + fq)
 			{
 			    int okc = 1;
 			    for (i = 0; i < n; ++i)
@@ -11544,7 +11583,8 @@ static void psw_emit_subflats(int k)
 		    psw_emit_plane_tiles(slot, pc, cx, cy, n, ph, psign, cull_h, scolr);
 		    psw_sf_end += cov;
 		    if (psw_tile_short)
-		    {   /* P58 -- THE COVER WAS THE APLAT (owner's hypothesis, proven by
+		    {   psw_short_n++;   /* P73: row `w` -- this pass's walk went short */
+		        /* P58 -- THE COVER WAS THE APLAT (owner's hypothesis, proven by
 		           the fresh trace): this fan is staged AFTER the walk's textured
 		           tiles, so VDP1 list order paints it ON TOP -- one lost command
 		           repainted the whole ceiling solid, and only where windows are
@@ -11578,8 +11618,11 @@ static void psw_emit_subflats(int k)
 	       levers), GREY 88 = budget limit (slave carve/parity), GREEN 112 =
 	       round-C rescue, RED 176 = emission-time window/cap (no flag --
 	       red is free at spawn, full tiles are near-nonexistent there).
-	       Floors keep plain magenta. */
-	    psw_paint_idx = (pass == 0) ? 250
+	       P73: FLOORS split too -- the console P72 magenta mass conflated
+	       every floor cause: 250 = flagged (slot/budget/rescue, 0x10|0x40),
+	       176 = emission-time window/cap, mirroring the ceiling red. */
+	    psw_paint_idx = (pass == 0)
+	                    ? ((psw_sub_flag[k] & (0x10 | 0x40)) ? 250 : 176)
 	                  : !(psw_sub_flag[k] & (0x20 | 0x80)) ? 176
 	                  : (psw_sub_ecause[k] == 1) ? 250
 	                  : (psw_sub_ecause[k] == 2) ? 88
@@ -11636,6 +11679,10 @@ static void psw_sf_body_run(void)
 	struct psw_sfjob *J = &psw_sf_jobs[j];
 	psw_sf_cur = J->aoff; psw_sf_end = (int)J->aoff + (int)J->bill;
 	psw_emit_subflats(J->k);
+	psw_sf_unspent += psw_sf_end - psw_sf_cur;   /* P73: row `u` -- the arena
+	                       ledger's other half: granted, then NOT spent (entry-
+	                       solids strand their whole grant; healthy jobs their
+	                       margins).  Read before the JP-skip pad consumes it. */
 	while (psw_sf_cur < psw_sf_end)
 	{   /* JP-skip pad: CMDCTRL 0x4000; link/verts don't care, stay 0 */
 	    unsigned int *d = psw_sf_stg + (unsigned int)psw_sf_cur * 8u;
@@ -12504,6 +12551,16 @@ static void vdp1_walls_flush(void)
         psw_ceil_esol = 0;                    /* P58: emitter-side, slave-written */
         psw_fan_skip = 0;                     /* P58 */
         psw_fan_last = (int)psw_ucr32((const volatile void *)&psw_fanq_n);
+        psw_esol_slot_last = (int)psw_ucr32((const volatile void *)&psw_esol_slot);
+        psw_esol_slot = 0;                    /* P73: cause split, slave-written */
+        psw_esol_bud_last  = (int)psw_ucr32((const volatile void *)&psw_esol_bud);
+        psw_esol_bud = 0;
+        psw_esol_win_last  = (int)psw_ucr32((const volatile void *)&psw_esol_win);
+        psw_esol_win = 0;
+        psw_sf_unspent_last = (int)psw_ucr32((const volatile void *)&psw_sf_unspent);
+        psw_sf_unspent = 0;                   /* P73: arena ledger, slave-written */
+        psw_short_n_last = (int)psw_ucr32((const volatile void *)&psw_short_n);
+        psw_short_n = 0;                      /* P73: walk famine, slave-written */
         psw_frame_no++;                       /* the mask-reuse clock (PSW_MASK_AGE) */
 #if SAT_WORLD_THINGS_VDP1
         if (psw_thing_drop > 0)

@@ -3519,7 +3519,7 @@ static void fps_update(void)
                     /* P70 -- THE CLEAN ROW (owner: "repartir d'une base saine";
                        the 41-disc probe sediments are gone, the branch memory
                        carries their history).  Format:
-                       P81.<diag><!/-><^> s<slot>:<bud>:<win> u<un> w<sh> k<cskip> F<fsol> f<cmds> m<clamp>/<valid>
+                       P82.<diag><!/-><^> s<slot>:<bud>:<win> u<un> w<sh> k<cskip> F<fsol> f<cmds> m<clamp>/<valid>
                          diag   pad L+Down: 0 shipping / 1 MASTER flats /
                                 2 master flats + core noprune (r69 A/B ref)
                          !/-    flat body wedged -> flats on master / no arena
@@ -3541,7 +3541,7 @@ static void fps_update(void)
                        walls squeeze fbudget (paper); by win -> the walk model
                        is wrong.  u large with w small = grants strand on
                        entry-solids; w large = windows still too tight. */
-                    snprintf(ovbuf, sizeof ovbuf, "P81.%d%s%s s%d:%d:%d u%d w%d k%d F%d f%d m%d/%d ",
+                    snprintf(ovbuf, sizeof ovbuf, "P82.%d%s%s s%d:%d:%d u%d w%d k%d F%d f%d m%d/%d ",
                              sat_psw_diag & 3,             /* pad L+Down state */
                              sfb,
                              psw_sub_ovf_last > 0 ? "^" : "",
@@ -8628,7 +8628,7 @@ static inline unsigned int psw_ucr8(const volatile void *p)   /* P76: memo bytes
 { return *(const volatile unsigned char *)((unsigned int)(unsigned long)p | 0x20000000u); }
 #define PSW_SPEND_MAX  512          /* subs past this keep the open-loop law */
 #define PSW_BILL_SLACK 2
-static unsigned char psw_spendf[PSW_SPEND_MAX];   /* 0 = no valid memo */
+static unsigned char psw_spendf[PSW_SPEND_MAX];   /* P82: spend+1 -- 0 = no memo, 1 = a valid ZERO */
 static unsigned char psw_spendc[PSW_SPEND_MAX];
 static inline void psw_ucw32(volatile void *p, unsigned int v)
 { *(volatile unsigned int *)((unsigned int)(unsigned long)p | 0x20000000u) = v; }
@@ -9989,6 +9989,7 @@ static int psw_bill_of(int sn, int est, int pass)
 	                           : (const volatile void *)&psw_spendf[sn]);
 	if (m > 0)
 	{
+	    m -= 1;                  /* P82: stored = spend+1 -- 1 is a VALID ZERO */
 	    if (!psw_sf_mode) psw_bill_valid_n++;   /* P78: memos SEEN (row m/..) */
 	    if (m + PSW_BILL_SLACK < e)
 	    {
@@ -11778,12 +11779,23 @@ static void psw_emit_subflats(int k)
     }
     if (psw_sf_mode && sn >= 0 && sn < PSW_SPEND_MAX)
     {   /* P76: write the memos -- floor spend ended where pass 1 began.  An
-	   unclean/solid/absent pass stores 0 (invalid -> full law next frame),
-	   so a plane can always climb back to tiled. */
+	   UNCLEAN pass stores 0 (invalid -> full law next frame), so a plane
+	   can always climb back to tiled.
+	   P82 -- THE VALID ZERO.  `spf > 0` conflated "spent ZERO" with
+	   "unknown": a CLEAN pass that emitted nothing (every tile occluded)
+	   stored 0 = no-memo and was re-granted its FULL paper law every
+	   frame, stranding it as JP-skip pad -- console P81 read u161-216
+	   with m0-4/24: HALF the arena asleep while `bud` refused 15-26
+	   live planes.  Encoding is now spend+1 (0 = no memo, 1 = a valid
+	   zero); the one VALUE reader (psw_bill_of) shifts back, the `> 0`
+	   validity readers keep their meaning verbatim.  A valid-zero bill
+	   is the SLACK (2): if the plane comes back it blows its 2-window,
+	   the short invalidates the memo, next frame full law -- the same
+	   one-frame recovery every under-read memo already has. */
 	int spf = spc0[1] - spc0[0] + 2 * spfsk[0];   /* P78: + counted skips */
 	int spc = psw_sf_cur - spc0[1] + 2 * spfsk[1];
-	psw_spendf[sn] = (unsigned char)((sptl[0] && spf > 0) ? (spf > 255 ? 255 : spf) : 0);
-	psw_spendc[sn] = (unsigned char)((sptl[1] && spc > 0) ? (spc > 255 ? 255 : spc) : 0);
+	psw_spendf[sn] = (unsigned char)(sptl[0] ? (spf > 254 ? 255 : spf + 1) : 0);
+	psw_spendc[sn] = (unsigned char)(sptl[1] ? (spc > 254 ? 255 : spc + 1) : 0);
     }
     /* ROUND 38 -- PAINT THE REFUSAL.  One marker per refused plane, at this
        sub's own painter rank (so it lands exactly where the plane would have,

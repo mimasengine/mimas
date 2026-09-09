@@ -742,10 +742,21 @@ static int  psw_cover_n = 0;   /* r42: planes whose slave
                        window ran dry mid-walk and were covered by the fan --
                        P58 LAW: FLOORS only; a dry ceiling is a counted hole,
                        the cover fan NEVER paints over slave ceiling tiles */
-static int  psw_fan_skip = 0;       /* P58 LAW: whyfan-3
+static int  psw_fan_skip = 0, psw_fan_skip_last = 0;   /* P58 LAW: whyfan-3
                        (window-famine) ceiling pieces left unpainted on slave
                        frames -- each is a small hole, never painted over.
-                       Counter feeds nothing; the SKIP is the law. */
+                       P75: PRINTED at last (row `k`) -- the 15-agent audit
+                       proved this is THE invisible famine: emit64's fine/coarse
+                       gates refuse by NOT being taken (no psw_no_room, no
+                       tile_short, w blind by construction), the under-fan tints
+                       the gap magenta, and the population GREW r72->r74 as
+                       honest bills admitted more tiled ceilings with thinner
+                       margins.  A counter that cannot fire, third instance. */
+static int  psw_floor_esol = 0, psw_floor_esol_last = 0;   /* P75: row `F` --
+                       entry-solid FLOOR planes painted as fans.  The s split is
+                       hard-gated to ceilings (`if (pass && slot < 0)`), so the
+                       entire magenta floor mass was counted NOWHERE while three
+                       budget rounds reformed a ceiling-only ledger. */
 static int  psw_tile_cull = 0, psw_tile_cull_last = 0;   /* tiles the mask or
                        cull_h skipped.  P58: the psign<0 gate is GONE -- r49 made
                        ceiling culls unreachable, so the r41 gate had turned this
@@ -3495,7 +3506,7 @@ static void fps_update(void)
                     /* P70 -- THE CLEAN ROW (owner: "repartir d'une base saine";
                        the 41-disc probe sediments are gone, the branch memory
                        carries their history).  Format:
-                       P74.<diag><!/-><^> s<slot>:<bud>:<win> u<un> w<sh> g<grant> t<cull> f<cmds>
+                       P75.<diag><!/-><^> s<slot>:<bud>:<win> u<un> w<sh> k<cskip> F<fsol> g<grant> f<cmds>
                          diag   pad L+Down: 0 shipping / 1 MASTER flats /
                                 2 master flats + core noprune (r69 A/B ref)
                          !/-    flat body wedged -> flats on master / no arena
@@ -3514,7 +3525,7 @@ static void fps_update(void)
                        walls squeeze fbudget (paper); by win -> the walk model
                        is wrong.  u large with w small = grants strand on
                        entry-solids; w large = windows still too tight. */
-                    snprintf(ovbuf, sizeof ovbuf, "P74.%d%s%s s%d:%d:%d u%d w%d g%d t%d f%d ",
+                    snprintf(ovbuf, sizeof ovbuf, "P75.%d%s%s s%d:%d:%d u%d w%d k%d F%d g%d f%d ",
                              sat_psw_diag & 3,             /* pad L+Down state */
                              sfb,
                              psw_sub_ovf_last > 0 ? "^" : "",
@@ -3522,9 +3533,10 @@ static void fps_update(void)
                              psw_esol_bud_last  > 99 ? 99 : psw_esol_bud_last,
                              psw_esol_win_last  > 99 ? 99 : psw_esol_win_last,
                              psw_sf_unspent_last > 999 ? 999 : psw_sf_unspent_last,
-                             psw_short_n_last > 99 ? 99 : psw_short_n_last,
+                             psw_short_n_last > 9 ? 9 : psw_short_n_last,
+                             psw_fan_skip_last > 99 ? 99 : psw_fan_skip_last,
+                             psw_floor_esol_last > 99 ? 99 : psw_floor_esol_last,
                              psw_sf_grant_last > 999 ? 999 : psw_sf_grant_last,
-                             psw_tile_cull_last > 99 ? 99 : psw_tile_cull_last,
                              psw_flat_last  > 999 ? 999 : psw_flat_last);
                 }
 #endif
@@ -10594,8 +10606,9 @@ static void psw_emit_plane_tiles(int slot, unsigned short colr,
 		    { psw_fan_skip++; return; }   /* P58: a window-famine ceiling piece on a
 		           slave frame is a HOLE, not an aplat -- the solid piece painted
 		           where the master paints texture was half the console's aplat.
-		           Counted (row 13 c../.<n>) so the next round can refund the
-		           window with the real deficit, not a guess. */
+		           Counted: row 13 `k` since P75 (the c../.<n> fields died
+		           at P70 -- this counter went UNPRINTED for five rounds while
+		           the console asked where the magenta came from). */
 		    if (!sxv_ensure()) return;
 		    psw_paint_idx = (whyfan == 1) ? 4        /* r53: WHITE  = okq   */
 		                  : (whyfan == 2) ? 88       /*      GREY   = rows  */
@@ -11436,8 +11449,10 @@ static void psw_emit_subflats(int k)
 	    { if (solid)
 	      { psw_ceil_esol++;               /* P58: the LADDER refused (flag/cap/window) */
 	        /* P73: the cause split -- same ladder as the P65 cause paint below.
-	           0x80 (round-A standby, rescue exhausted) is BUDGET regardless of
-	           ecause: ecause is only written on the 0x20 paths and would be stale. */
+	           P75 audit correction: an un-rescued 0x80 standby NEVER reaches
+	           this ladder (skipped whole upstream) -- it is an uncounted HOLE,
+	           not a fan; the 0x80 terms here and in the paint are guard rails.
+	           `bud` = ecause 2 (round-B budget) + 3 (rescue) + 0 (r57 nearfb). */
 	        if (!(psw_sub_flag[k] & (0x20 | 0x80)))                      psw_esol_win++;
 	        else if ((psw_sub_flag[k] & 0x20) && psw_sub_ecause[k] == 1) psw_esol_slot++;
 	        else                                                         psw_esol_bud++; }
@@ -11621,13 +11636,14 @@ static void psw_emit_subflats(int k)
 	       P73: FLOORS split too -- the console P72 magenta mass conflated
 	       every floor cause: 250 = flagged (slot/budget/rescue, 0x10|0x40),
 	       176 = emission-time window/cap, mirroring the ceiling red. */
-	    /* P74 -- MAGENTA IS SLOT-ONLY for ceilings now.  The P73 photo mixed
-	       two populations under one colour: 0x80 standbys (budget-refused in
-	       round A, ecause never written) fell through the ecause ladder to the
-	       250 fallback and read as slot famine while s counted them in `bud`.
-	       0x80 and every unknown paint GREY (budget) -- a magenta ceiling fan
-	       on a >= P74 capture is a REAL slot refusal, nothing else (the
-	       magenta UNDER tiles stays the under-fan deficit). */
+	    /* P74 -- MAGENTA IS SLOT-ONLY for ceiling ENTRY fans.  P75 audit
+	       correction: 0x80 standbys never reach emission (skipped whole
+	       upstream -- uncounted holes), so the pre-P74 250 fallback caught
+	       only the rare ecause-0 nearfb planes; the recolor stands (unknown
+	       = GREY) but the P73 magenta masses were NEVER this population --
+	       they are the UNCOUNTED floor fans (magenta below) and the
+	       under-fan deficit showing through emit64's ungated skips (row `k`).
+	       A magenta ceiling ENTRY fan on >= P74 = real slot refusal. */
 	    psw_paint_idx = (pass == 0)
 	                    ? ((psw_sub_flag[k] & (0x10 | 0x40)) ? 250 : 176)
 	                  : !(psw_sub_flag[k] & (0x20 | 0x80)) ? 176
@@ -11637,6 +11653,8 @@ static void psw_emit_subflats(int k)
 	                  : (psw_sub_ecause[k] == 3) ? 112
 	                  : 88;
 	    psw_fanq_n++;
+	    if (pass == 0) psw_floor_esol++;   /* P75: row `F` -- the floor mass,
+	                       counted at the site that PAINTS it (any cause) */
 		    for (s = 0; s < nn; ++s) idx[s] = (s * (n - 1)) / (nn - 1);
 		    for (i = 1; i + 1 < nn; i += 2)
 		    {
@@ -12314,13 +12332,17 @@ static void vdp1_walls_flush(void)
                     int e = psw_bill_of((int)psw_sub[k].subnum, (int)psw_sub_ce[k]);   /* P72 */
                     int wnt = sf_ok ? 0   /* r54: no chains on slave frames */
                             : (psw_sub_ce[k] >= 18) ? 2 : (psw_sub_ce[k] >= 12) ? 1 : 0;
-                    int covf = sf_ok ? PSW_COVER : 0;   /* r52 twin; P59's +2 walk
-                            margin RECLAIMED at P74: the under-fan makes a walk
-                            shortfall a tint instead of a hole and `w` counts it,
-                            so the deficit fund is superseded -- and console P73
-                            (s0:19:0, u161) showed the margins collectively
-                            starving 19 ceilings a frame.  covf=4 still funds the
-                            under-fan exactly (guard >= ebill+fq, fq <= 4).
+                    int covf = sf_ok ? PSW_COVER + 2 : 0;   /* r52 twin; P75: the
+                            P74 reclaim (6->4) is REVERTED on the audit's verdict:
+                            with covf=4 the fan guard passes at exact equality
+                            (window e+4, fq up to 4) and the walk keeps ZERO
+                            slack -- while cbill UNDER-prices diagonals (a funded
+                            U-strip rec spends 9-10 billed 2, the live V-band arm
+                            up to 16), so every overrun exits through emit64's
+                            UNGATED coarse-band door: no psw_no_room, no
+                            tile_short, just psw_fan_skip (row `k` since P75) and
+                            the magenta under-fan showing through -- the owner's
+                            "encore plus de flats", invisible to w BY CONSTRUCTION.
                             Original P59 note: the cover is dead for ceilings so
                             covf is pure walk margin -- console P58 measured the residual
                             deficit at cs0-1/fs0-4 per frame, +2/plane funds it;
@@ -12482,12 +12504,20 @@ static void vdp1_walls_flush(void)
                                 psw_bake_get((int)psw_sub[psw_sf_jobs[j].k].subnum);
                             if (bkd)
                             {
+                                const unsigned char *grid = (const unsigned char *)(bkd + 1);
                                 const struct psw_brec *br2 = (const struct psw_brec *)
-                                    ((const unsigned char *)(bkd + 1) + (int)bkd->tw * bkd->th);
+                                    (grid + (int)bkd->tw * bkd->th);
                                 int r2, needs = 0;
                                 for (r2 = 0; r2 < (int)bkd->nrec; ++r2)
                                     if (br2[r2].type == 2 && br2[r2].fine != 0xFFu)
                                     { needs = 1; break; }
+                                /* P75 -- the r74 gate missed the WORST spender: a
+                                   leaf whose diagonals ride LIVE cells has no
+                                   type-2 rec at all yet fires emit64's live fine
+                                   arm (10-16 cmds billed 2).  A LIVE cell keeps
+                                   the deal too (audit, adversarially verified). */
+                                for (r2 = 0; !needs && r2 < (int)bkd->tw * bkd->th; ++r2)
+                                    if (grid[r2] == PSW_BKC_LIVE) needs = 1;
                                 if (!needs) continue;
                             }
                             psw_sf_jobs[j].bill += 9; ftile += 9; fres -= 9;
@@ -12589,7 +12619,10 @@ static void vdp1_walls_flush(void)
         psw_cover_n = 0;                      /* r42: slave-written too */
         psw_ceil_esol_last = (int)psw_ucr32((const volatile void *)&psw_ceil_esol);
         psw_ceil_esol = 0;                    /* P58: emitter-side, slave-written */
-        psw_fan_skip = 0;                     /* P58 */
+        psw_fan_skip_last = (int)psw_ucr32((const volatile void *)&psw_fan_skip);
+        psw_fan_skip = 0;                     /* P58; P75: latched to row `k` */
+        psw_floor_esol_last = (int)psw_ucr32((const volatile void *)&psw_floor_esol);
+        psw_floor_esol = 0;                   /* P75: row `F`, slave-written */
         psw_fan_last = (int)psw_ucr32((const volatile void *)&psw_fanq_n);
         psw_esol_slot_last = (int)psw_ucr32((const volatile void *)&psw_esol_slot);
         psw_esol_slot = 0;                    /* P73: cause split, slave-written */

@@ -3519,7 +3519,7 @@ static void fps_update(void)
                     /* P70 -- THE CLEAN ROW (owner: "repartir d'une base saine";
                        the 41-disc probe sediments are gone, the branch memory
                        carries their history).  Format:
-                       P87.<diag><!/-><^> s<slot>:<bud>:<win> E<miss> u<un> w<sh> k<cskip> F<fsol> f<cmds>
+                       P88.<diag><!/-><^> s<slot>:<bud>:<win> E<miss> u<un> w<sh> k<cskip> F<fsol> f<cmds>
                          diag   pad L+Down: 0 shipping / 1 MASTER flats /
                                 2 master flats + core noprune (r69 A/B ref)
                          !/-    flat body wedged -> flats on master / no arena
@@ -3541,7 +3541,7 @@ static void fps_update(void)
                        walls squeeze fbudget (paper); by win -> the walk model
                        is wrong.  u large with w small = grants strand on
                        entry-solids; w large = windows still too tight. */
-                    snprintf(ovbuf, sizeof ovbuf, "P87.%d%s%s s%d:%d:%d E%d u%d w%d k%d F%d f%d ",
+                    snprintf(ovbuf, sizeof ovbuf, "P88.%d%s%s s%d:%d:%d E%d u%d w%d k%d F%d f%d ",
                              sat_psw_diag & 3,             /* pad L+Down state */
                              sfb,
                              psw_sub_ovf_last > 0 ? "^" : "",
@@ -8490,6 +8490,15 @@ static int psw_cur_tall = 0;     /* round 23/24: the emitting plane's slot CHAIN
                                     minus one (0 = single, 1 = pair, 2 = triple) --
                                     interior tile columns emit 64x128 / 64x192 strips */
 
+/* P88 -- THE GOVERNOR IS OFF WHILE THE MODE IS BUILT (owner directive,
+   2026-09-10: "desactiver le gouverneur tant qu'on construit ce mode.  Il
+   devra reprendre le controle plus tard, quand on aura les bonnes limites et
+   les bonnes degradations (LOD, distance, fog)").  0 = build mode: fbudget
+   pinned at the arena cap, per-job windows at the FULL open law (no cbill
+   cap, no memo clamp), no r83 distance latch, no r80 far-wall tax.  Only the
+   PHYSICAL belts remain (arena size, bank caps, per-put guards).  Set to 1
+   to re-arm the whole rationing stack unchanged. */
+static int psw_governor = 0;
 static int psw_flat_cap_dyn = PSW_FLAT_CAP;  /* round 9: per-frame REAL flat room = bank
                                                 minus the walls' decided command cost minus
                                                 the things reserve (famine unification --
@@ -10021,6 +10030,9 @@ static int psw_bill_of(int sn, int est, int pass)
 {
     int e = 2 * est + 1;
     const struct psw_bleaf *bk = psw_bake_get(sn);
+    if (!psw_governor) return e;   /* P88: build mode -- the LAW, uncapped
+                                      (no cbill, no memo clamp).  The arena
+                                      belt still bounds the frame total. */
     if (bk && (int)bk->cbill < e) e = (int)bk->cbill;
     if (sn >= 0 && sn < PSW_SPEND_MAX)
     {
@@ -12330,7 +12342,9 @@ static void vdp1_walls_flush(void)
                equilibrium flicker; the near HALF is never touched.  Scene
                with zero refusals -> tax decays to 0 -> full wall texture. */
             {
-                int wantw = 4 * (psw_esol_bud_last + psw_floor_esol_last);
+                int wantw = psw_governor
+                          ? 4 * (psw_esol_bud_last + psw_floor_esol_last)
+                          : 0;   /* P88: no degradations while the mode is built */
                 if (wantw > 96) wantw = 96;
                 psw_wtax = (wantw > psw_wtax) ? wantw
                          : (psw_wtax > 4) ? psw_wtax - 4 : 0;
@@ -12378,6 +12392,9 @@ static void vdp1_walls_flush(void)
                 if (wcred > 48) wcred = 48;
                 fbudget = (vdp1_wall_cap - (int)vdp1_wnext) - wall_cmds - treserve - 4 + wcred;
             }
+            if (!psw_governor) fbudget = PSW_FLAT_CAP;   /* P88: build mode --
+                       the wall-paper subtraction and the wcred loop are the
+                       GOVERNOR; only the physical arena bounds the flats */
             if (fbudget < 0) fbudget = 0;
             if (fbudget > PSW_FLAT_CAP) fbudget = PSW_FLAT_CAP;
             psw_flat_cap_dyn = fbudget;
@@ -12587,7 +12604,8 @@ static void vdp1_walls_flush(void)
                       { ftile += covf; psw_sf_bill[k] += (unsigned short)covf; } }   /* r49+r52 */
                     else if (ftile + (e - 4 + covf) > limit)
                     {                                  psw_sub_flag[k] |= 0x10;
-                                                       lodstop = 1; }   /* P83: pot closed */
+                                                       if (psw_governor)
+                                                           lodstop = 1; }   /* P83/P88 */
                     else if (psw_slot_get(fl, wnt) < 0) psw_sub_flag[k] |= 0x10;
                     else                               { ftile += e - 4 + covf;
                                                          if (sf_ok) psw_sf_bill[k] += (unsigned short)(e - 4 + covf); }
@@ -12637,7 +12655,7 @@ static void vdp1_walls_flush(void)
                             refusals (budget first, as the old && short-circuit
                             did -- no upload attempted when the budget fails) */
                     { psw_sub_flag[k] |= 0x20; psw_sub_ecause[k] = 2;
-                      lodstop = 1; }   /* P83: pot closed for everything farther */
+                      if (psw_governor) lodstop = 1; }   /* P83/P88 */
                     else if (psw_slot_get(cl, wnt) < 0)
                     { psw_sub_flag[k] |= 0x20; psw_sub_ecause[k] = 1; }     /* slot */
                     else                               { ftile += e - 4 + covf;

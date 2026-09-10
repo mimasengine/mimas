@@ -689,6 +689,10 @@ static int  psw_sub_ovf_last = 0;          /* subsector-recorder overflow (row 1
    their _lasts -- is GONE.  It delivered its verdicts (h.clip = legitimate
    near kill, band dead r55, zero 0 everywhere, sky = real skies) and the
    triangle died elsewhere (R_CheckBBox prune, fixed r69). */
+static int  psw_ceil_solid_pk = 0, psw_short_pk = 0;   /* P89: slow-decay PEAKS
+                       (~1 s) -- a 30 Hz parity flick is invisible to a photo of
+                       a per-frame latch (each capture catches ONE random frame);
+                       the peak shows the BAD parity whatever frame is caught. */
 static int  psw_ceil_solid = 0, psw_ceil_solid_last = 0;   /* r51: ceiling passes
                        emitted WITHOUT a texture slot -- the whole-plane solid
                        degrade AND the per-tile famine fallback both land here
@@ -3519,7 +3523,7 @@ static void fps_update(void)
                     /* P70 -- THE CLEAN ROW (owner: "repartir d'une base saine";
                        the 41-disc probe sediments are gone, the branch memory
                        carries their history).  Format:
-                       P88.<diag><!/-><^> s<slot>:<bud>:<win> E<miss> u<un> w<sh> k<cskip> F<fsol> f<cmds>
+                       P89.<diag><!/-><^> s<slot>:<bud>:<win> E<miss.pk> u<un> w<sh.pk> k<cskip> F<fsol> f<cmds>
                          diag   pad L+Down: 0 shipping / 1 MASTER flats /
                                 2 master flats + core noprune (r69 A/B ref)
                          !/-    flat body wedged -> flats on master / no arena
@@ -3541,16 +3545,16 @@ static void fps_update(void)
                        walls squeeze fbudget (paper); by win -> the walk model
                        is wrong.  u large with w small = grants strand on
                        entry-solids; w large = windows still too tight. */
-                    snprintf(ovbuf, sizeof ovbuf, "P88.%d%s%s s%d:%d:%d E%d u%d w%d k%d F%d f%d ",
+                    snprintf(ovbuf, sizeof ovbuf, "P89.%d%s%s s%d:%d:%d E%d u%d w%d k%d F%d f%d ",
                              sat_psw_diag & 3,             /* pad L+Down state */
                              sfb,
                              psw_sub_ovf_last > 0 ? "^" : "",
                              psw_esol_slot_last > 99 ? 99 : psw_esol_slot_last,
                              psw_esol_bud_last  > 99 ? 99 : psw_esol_bud_last,
                              psw_esol_win_last  > 99 ? 99 : psw_esol_win_last,
-                             psw_ceil_solid_last > 99 ? 99 : psw_ceil_solid_last,   /* P84: E */
+                             psw_ceil_solid_pk > 99 ? 99 : psw_ceil_solid_pk,   /* P84+P89: E = PEAK */
                              psw_sf_unspent_last > 999 ? 999 : psw_sf_unspent_last,
-                             psw_short_n_last > 9 ? 9 : psw_short_n_last,
+                             psw_short_pk > 9 ? 9 : psw_short_pk,   /* P89: w = PEAK */
                              psw_fan_skip_last > 99 ? 99 : psw_fan_skip_last,
                              psw_floor_esol_last > 99 ? 99 : psw_floor_esol_last,
                              psw_flat_last  > 999 ? 999 : psw_flat_last);
@@ -12947,6 +12951,10 @@ static void vdp1_walls_flush(void)
         psw_sf_unspent = 0;                   /* P73: arena ledger, slave-written */
         psw_short_n_last = (int)psw_ucr32((const volatile void *)&psw_short_n);
         psw_short_n = 0;                      /* P73: walk famine, slave-written */
+        if (psw_ceil_solid_last > psw_ceil_solid_pk) psw_ceil_solid_pk = psw_ceil_solid_last;
+        else if (psw_ceil_solid_pk && !(psw_frame_no & 31)) psw_ceil_solid_pk--;   /* P89 */
+        if (psw_short_n_last > psw_short_pk) psw_short_pk = psw_short_n_last;
+        else if (psw_short_pk && !(psw_frame_no & 31)) psw_short_pk--;
         psw_frame_no++;                       /* the mask-reuse clock (PSW_MASK_AGE) */
 #if SAT_WORLD_THINGS_VDP1
         if (psw_thing_drop > 0)

@@ -3519,7 +3519,7 @@ static void fps_update(void)
                     /* P70 -- THE CLEAN ROW (owner: "repartir d'une base saine";
                        the 41-disc probe sediments are gone, the branch memory
                        carries their history).  Format:
-                       P85.<diag><!/-><^> s<slot>:<bud>:<win> E<miss> u<un> w<sh> k<cskip> F<fsol> f<cmds>
+                       P86.<diag><!/-><^> s<slot>:<bud>:<win> E<miss> u<un> w<sh> k<cskip> F<fsol> f<cmds>
                          diag   pad L+Down: 0 shipping / 1 MASTER flats /
                                 2 master flats + core noprune (r69 A/B ref)
                          !/-    flat body wedged -> flats on master / no arena
@@ -3541,7 +3541,7 @@ static void fps_update(void)
                        walls squeeze fbudget (paper); by win -> the walk model
                        is wrong.  u large with w small = grants strand on
                        entry-solids; w large = windows still too tight. */
-                    snprintf(ovbuf, sizeof ovbuf, "P85.%d%s%s s%d:%d:%d E%d u%d w%d k%d F%d f%d ",
+                    snprintf(ovbuf, sizeof ovbuf, "P86.%d%s%s s%d:%d:%d E%d u%d w%d k%d F%d f%d ",
                              sat_psw_diag & 3,             /* pad L+Down state */
                              sfb,
                              psw_sub_ovf_last > 0 ? "^" : "",
@@ -10006,7 +10006,13 @@ static int psw_bill_of(int sn, int est, int pass)
        law 2e+1.  If the law feeds it, the memo turns honest next frame and
        rules from then on; if yellow survives even the law, the live arm
        out-costs 2e+1 and the next round prices the RECs themselves. */
-    if (m == 255) { m = 0; bk = 0; }
+    if (m == 255)
+    {   /* P86: the HUNGRY ration is WORKABLE, never the raw law -- P85's
+           open-law ration starved the frame (console: "pluS de jaune").
+           48 covers the super-walk (est/s^2 + margin) at s <= 4. */
+	m = 0; bk = 0;
+	if (e > 48) e = 48;
+    }
     if (bk && (int)bk->cbill < e) e = (int)bk->cbill;
     if (m > 0)
     {
@@ -10134,6 +10140,76 @@ static int psw_emit_baked(int slot, unsigned short colr, int ph, int psign,
 	    psw_emit_rectquad(slot, colr, qx, qy, br->v0, br->vend - br->v0, 0, 64, 1);
 	    return 1;
 	}
+    }
+}
+
+/* P86 -- the SUPER-WALK: stride-s (128/192/256u) world-grid supertiles, the
+   64x64 char stretched x s on each.  INTERIOR ONLY: a supertile fully inside
+   the clipped poly emits ONE quad; the border ring is left to the staged
+   under-fan (UNDER by the P58 law, so the rim reads as the plane's tint --
+   zero border commands).  The 4-corner edge test is the bake builder's,
+   verbatim, at s scale.  WORLD-anchored: the round-13 "swimmer" was a char
+   pinned to MOVING view-clip verts; a world grid cannot swim. */
+static void psw_emit_plane_super(int slot, unsigned short colr,
+                                 const int *cx, const int *cy, int n,
+                                 int ph, int psign, int stride)
+{
+    int bx0, bx1, by0, by1, i, j, wpos2;
+    long long aw = 0;
+    if (n < 3 || slot < 0) return;
+    bx0 = bx1 = cx[0]; by0 = by1 = cy[0];
+    for (i = 1; i < n; ++i)
+    {
+	if (cx[i] < bx0) bx0 = cx[i]; if (cx[i] > bx1) bx1 = cx[i];
+	if (cy[i] < by0) by0 = cy[i]; if (cy[i] > by1) by1 = cy[i];
+    }
+    for (i = 0; i < n; ++i)
+    {
+	j = (i + 1 == n) ? 0 : i + 1;
+	aw += (long long)(cx[i] - cx[0]) * (cy[j] - cy[0])
+	    - (long long)(cx[j] - cx[0]) * (cy[i] - cy[0]);
+    }
+    wpos2 = (aw >= 0);
+    {
+	int txa = bx0 >> 22, txb = (bx1 - 1) >> 22;
+	int tya = by0 >> 22, tyb = (by1 - 1) >> 22;
+	int tx, ty;
+	/* snap DOWN to the world-stable stride grid (negative-safe) */
+	txa -= ((txa % stride) + stride) % stride;
+	tya -= ((tya % stride) + stride) % stride;
+	for (ty = tya; ty <= tyb; ty += stride)
+	    for (tx = txa; tx <= txb; tx += stride)
+	    {
+		int x0 = tx << 22, y0 = ty << 22;
+		int x1 = x0 + ((stride * 64) << 16), y1 = y0 + ((stride * 64) << 16);
+		int e, inside = 1;
+		if (psw_cmd_left() <= 0 && psw_no_room()) return;   /* r39: latched */
+		if (psw_flat_cmds >= psw_flat_cap_dyn) { psw_cap_stop(); return; }   /* P58 */
+		for (e = 0; e < n && inside; ++e)
+		{
+		    int e1 = (e + 1 == n) ? 0 : e + 1;
+		    long long ex = cx[e1] - cx[e], ey = cy[e1] - cy[e];
+		    int ins = 0, k2;
+		    static const int cxo[4] = { 0, 1, 1, 0 }, cyo[4] = { 0, 0, 1, 1 };
+		    for (k2 = 0; k2 < 4; ++k2)
+		    {
+			long long c = ex * (long long)((cyo[k2] ? y1 : y0) - cy[e])
+			            - ey * (long long)((cxo[k2] ? x1 : x0) - cx[e]);
+			if (wpos2 ? (c >= 0) : (c <= 0)) ins++;
+		    }
+		    if (ins != 4) inside = 0;
+		}
+		if (!inside) continue;
+		{
+		    int qx[4], qy[4];
+		    if (!psw_project(x0, y1, ph, psign, &qx[0], &qy[0])) continue;
+		    if (!psw_project(x1, y1, ph, psign, &qx[1], &qy[1])) continue;
+		    if (!psw_project(x1, y0, ph, psign, &qx[2], &qy[2])) continue;
+		    if (!psw_project(x0, y0, ph, psign, &qx[3], &qy[3])) continue;
+		    psw_paint_idx = 176;      /* L+X: textured content = RED */
+		    psw_emit_flatquad(slot, colr, qx, qy);
+		}
+	    }
     }
 }
 
@@ -11721,7 +11797,23 @@ static void psw_emit_subflats(int k)
 			    }
 			}
 		    }
-		    psw_emit_plane_tiles(slot, pc, cx, cy, n, ph, psign, cull_h, scolr);
+		    {   /* P86 -- THE SUPER-WALK TRIGGER (P84 "jaune", P85 "pluS de
+		           jaune"): a plane whose priced walk cannot fit its window
+		           never fits it -- the spawn ceiling is ~150-200 tiles
+		           against a shared 420 arena, so the fix is COST, not
+		           ration (the r85 open-law ration starved the frame).
+		           est/s^2 stretched supertiles fit ANY workable window. */
+			int fe2 = (int)((pass == 0) ? psw_sub_fe[k] : psw_sub_ce[k]);
+			if (psw_sf_mode && slot >= 0 && 2 * fe2 > psw_cmd_left())
+			{
+			    int st2 = 2;
+			    while (st2 < 4 && fe2 / (st2 * st2) + 4 > psw_cmd_left())
+				st2++;
+			    psw_emit_plane_super(slot, pc, cx, cy, n, ph, psign, st2);
+			}
+			else
+			    psw_emit_plane_tiles(slot, pc, cx, cy, n, ph, psign, cull_h, scolr);
+		    }
 		    psw_sf_end += cov;
 		    if (psw_tile_short)
 		    {   psw_short_n++;   /* P73: row `w` -- this pass's walk went short */

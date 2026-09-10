@@ -3519,7 +3519,7 @@ static void fps_update(void)
                     /* P70 -- THE CLEAN ROW (owner: "repartir d'une base saine";
                        the 41-disc probe sediments are gone, the branch memory
                        carries their history).  Format:
-                       P86.<diag><!/-><^> s<slot>:<bud>:<win> E<miss> u<un> w<sh> k<cskip> F<fsol> f<cmds>
+                       P87.<diag><!/-><^> s<slot>:<bud>:<win> E<miss> u<un> w<sh> k<cskip> F<fsol> f<cmds>
                          diag   pad L+Down: 0 shipping / 1 MASTER flats /
                                 2 master flats + core noprune (r69 A/B ref)
                          !/-    flat body wedged -> flats on master / no arena
@@ -3541,7 +3541,7 @@ static void fps_update(void)
                        walls squeeze fbudget (paper); by win -> the walk model
                        is wrong.  u large with w small = grants strand on
                        entry-solids; w large = windows still too tight. */
-                    snprintf(ovbuf, sizeof ovbuf, "P86.%d%s%s s%d:%d:%d E%d u%d w%d k%d F%d f%d ",
+                    snprintf(ovbuf, sizeof ovbuf, "P87.%d%s%s s%d:%d:%d E%d u%d w%d k%d F%d f%d ",
                              sat_psw_diag & 3,             /* pad L+Down state */
                              sfb,
                              psw_sub_ovf_last > 0 ? "^" : "",
@@ -9325,10 +9325,27 @@ static void psw_emit_flatquad(int slot, unsigned short colr, const int *qx, cons
 	cmd[0] = 0x0004;
 	cmd[3] = (unsigned short)(0x0100u | (unsigned)psw_paint_idx);
     }
-    for (i = 0; i < 4; ++i)
     {
-	cmd[6 + 2*i] = (short)((qx[i] << detailshift) + vx);
-	cmd[7 + 2*i] = (short)(qy[i] + vy);
+	int gqx[4], gqy[4];
+	for (i = 0; i < 4; ++i) { gqx[i] = qx[i]; gqy[i] = qy[i]; }
+	if (sat_wall_paint & 1)
+	{   /* P87 -- THE OWNER'S READABLE GRID: inset every emitted quad 1px
+	       toward its centroid in L+X, so the REAL tiling is COUNTABLE on a
+	       capture (owner measured the spawn ceiling at ~22 tiles by hand;
+	       this makes the measurement free).  Normal render untouched. */
+	    int cgx = (gqx[0] + gqx[1] + gqx[2] + gqx[3]) >> 2;
+	    int cgy = (gqy[0] + gqy[1] + gqy[2] + gqy[3]) >> 2;
+	    for (i = 0; i < 4; ++i)
+	    {
+		if (gqx[i] < cgx) gqx[i]++; else if (gqx[i] > cgx) gqx[i]--;
+		if (gqy[i] < cgy) gqy[i]++; else if (gqy[i] > cgy) gqy[i]--;
+	    }
+	}
+	for (i = 0; i < 4; ++i)
+	{
+	    cmd[6 + 2*i] = (short)((gqx[i] << detailshift) + vx);
+	    cmd[7 + 2*i] = (short)(gqy[i] + vy);
+	}
     }
     psw_cmd_put(cmd);
     psw_flat_cmds++;
@@ -9394,10 +9411,27 @@ static void psw_emit_rectquad(int slot, unsigned short colr,
 	cmd[0] = 0x0004;
 	cmd[3] = (unsigned short)(0x0100u | (unsigned)psw_paint_idx);
     }
-    for (i = 0; i < 4; ++i)
     {
-	cmd[6 + 2*i] = (short)((qx[i] << detailshift) + vx);
-	cmd[7 + 2*i] = (short)(qy[i] + vy);
+	int gqx[4], gqy[4];
+	for (i = 0; i < 4; ++i) { gqx[i] = qx[i]; gqy[i] = qy[i]; }
+	if (sat_wall_paint & 1)
+	{   /* P87 -- THE OWNER'S READABLE GRID: inset every emitted quad 1px
+	       toward its centroid in L+X, so the REAL tiling is COUNTABLE on a
+	       capture (owner measured the spawn ceiling at ~22 tiles by hand;
+	       this makes the measurement free).  Normal render untouched. */
+	    int cgx = (gqx[0] + gqx[1] + gqx[2] + gqx[3]) >> 2;
+	    int cgy = (gqy[0] + gqy[1] + gqy[2] + gqy[3]) >> 2;
+	    for (i = 0; i < 4; ++i)
+	    {
+		if (gqx[i] < cgx) gqx[i]++; else if (gqx[i] > cgx) gqx[i]--;
+		if (gqy[i] < cgy) gqy[i]++; else if (gqy[i] > cgy) gqy[i]--;
+	    }
+	}
+	for (i = 0; i < 4; ++i)
+	{
+	    cmd[6 + 2*i] = (short)((gqx[i] << detailshift) + vx);
+	    cmd[7 + 2*i] = (short)(gqy[i] + vy);
+	}
     }
     psw_cmd_put(cmd);
     psw_flat_cmds++;
@@ -9986,47 +10020,26 @@ static const struct psw_bleaf *psw_bake_get(int sn)
 static int psw_bill_of(int sn, int est, int pass)
 {
     int e = 2 * est + 1;
-    int m = 0;
     const struct psw_bleaf *bk = psw_bake_get(sn);
-    if (sn >= 0 && sn < PSW_SPEND_MAX)
-	m = (int)psw_ucr8(pass ? (const volatile void *)&psw_spendc[sn]
-	                       : (const volatile void *)&psw_spendf[sn]);
-    /* P85 -- THE HUNGRY BILL (console P84, owner: "jaune").  The spawn block
-       is the P71 under-fan with ZERO tiles on top and E0 k5 w2, f221 << cap:
-       the shorts are WINDOW shorts, and `w` counts PASSES -- 1-2 shorted
-       passes = 1-2 GIANT subs = the block.  The window can never fit the
-       walk because the cbill cap is a DOCUMENTED under-read (r52: "cbill
-       UNDER-prices diagonals -- a funded U-strip rec spends 9-10 billed 2,
-       the live V-band arm up to 16"): bill < emit violates the round-17
-       law, and the memo cannot help -- a SHORT invalidates it and the next
-       frame re-reads the same cbill.  Yellow in perpetuity, immune to every
-       budget round (r79-r83 all no-ops at the spot, QED).  A pass that
-       SHORTED now writes the sentinel 255 (real spend caps at 254); a
-       hungry sub's bill LIFTS the cbill cap and returns to the full open
-       law 2e+1.  If the law feeds it, the memo turns honest next frame and
-       rules from then on; if yellow survives even the law, the live arm
-       out-costs 2e+1 and the next round prices the RECs themselves. */
-    if (m == 255)
-    {   /* P86: the HUNGRY ration is WORKABLE, never the raw law -- P85's
-           open-law ration starved the frame (console: "pluS de jaune").
-           48 covers the super-walk (est/s^2 + margin) at s <= 4. */
-	m = 0; bk = 0;
-	if (e > 48) e = 48;
-    }
     if (bk && (int)bk->cbill < e) e = (int)bk->cbill;
-    if (m > 0)
+    if (sn >= 0 && sn < PSW_SPEND_MAX)
     {
-	m -= 1;                  /* P82: stored = spend+1 -- 1 is a VALID ZERO */
-	if (!psw_sf_mode) psw_bill_valid_n++;   /* P78: memos SEEN (row m/..) */
-	if (m + PSW_BILL_SLACK < e)
+	int m = (int)psw_ucr8(pass ? (const volatile void *)&psw_spendc[sn]
+	                           : (const volatile void *)&psw_spendf[sn]);
+	if (m > 0)
 	{
-	    e = m + PSW_BILL_SLACK;
-	    if (!psw_sf_mode) psw_bill_clamp_n++;   /* P77: clamps FIRED -- pre-
-	                       pass only (the slave's entry-check calls would
-	                       double-count).  P78 read: valid~0 = validation
-	                       dead; valid high + clamp~0 = the open law is
-	                       already tight; both high + u flat = strandings
-	                       live outside the job-end subtraction. */
+	    m -= 1;                  /* P82: stored = spend+1 -- 1 is a VALID ZERO */
+	    if (!psw_sf_mode) psw_bill_valid_n++;   /* P78: memos SEEN (row m/..) */
+	    if (m + PSW_BILL_SLACK < e)
+	    {
+	        e = m + PSW_BILL_SLACK;
+	        if (!psw_sf_mode) psw_bill_clamp_n++;   /* P77: clamps FIRED -- pre-
+	                           pass only (the slave's entry-check calls would
+	                           double-count).  P78 read: valid~0 = validation
+	                           dead; valid high + clamp~0 = the open law is
+	                           already tight; both high + u flat = strandings
+	                           live outside the job-end subtraction. */
+	    }
 	}
     }
     return e;
@@ -10140,76 +10153,6 @@ static int psw_emit_baked(int slot, unsigned short colr, int ph, int psign,
 	    psw_emit_rectquad(slot, colr, qx, qy, br->v0, br->vend - br->v0, 0, 64, 1);
 	    return 1;
 	}
-    }
-}
-
-/* P86 -- the SUPER-WALK: stride-s (128/192/256u) world-grid supertiles, the
-   64x64 char stretched x s on each.  INTERIOR ONLY: a supertile fully inside
-   the clipped poly emits ONE quad; the border ring is left to the staged
-   under-fan (UNDER by the P58 law, so the rim reads as the plane's tint --
-   zero border commands).  The 4-corner edge test is the bake builder's,
-   verbatim, at s scale.  WORLD-anchored: the round-13 "swimmer" was a char
-   pinned to MOVING view-clip verts; a world grid cannot swim. */
-static void psw_emit_plane_super(int slot, unsigned short colr,
-                                 const int *cx, const int *cy, int n,
-                                 int ph, int psign, int stride)
-{
-    int bx0, bx1, by0, by1, i, j, wpos2;
-    long long aw = 0;
-    if (n < 3 || slot < 0) return;
-    bx0 = bx1 = cx[0]; by0 = by1 = cy[0];
-    for (i = 1; i < n; ++i)
-    {
-	if (cx[i] < bx0) bx0 = cx[i]; if (cx[i] > bx1) bx1 = cx[i];
-	if (cy[i] < by0) by0 = cy[i]; if (cy[i] > by1) by1 = cy[i];
-    }
-    for (i = 0; i < n; ++i)
-    {
-	j = (i + 1 == n) ? 0 : i + 1;
-	aw += (long long)(cx[i] - cx[0]) * (cy[j] - cy[0])
-	    - (long long)(cx[j] - cx[0]) * (cy[i] - cy[0]);
-    }
-    wpos2 = (aw >= 0);
-    {
-	int txa = bx0 >> 22, txb = (bx1 - 1) >> 22;
-	int tya = by0 >> 22, tyb = (by1 - 1) >> 22;
-	int tx, ty;
-	/* snap DOWN to the world-stable stride grid (negative-safe) */
-	txa -= ((txa % stride) + stride) % stride;
-	tya -= ((tya % stride) + stride) % stride;
-	for (ty = tya; ty <= tyb; ty += stride)
-	    for (tx = txa; tx <= txb; tx += stride)
-	    {
-		int x0 = tx << 22, y0 = ty << 22;
-		int x1 = x0 + ((stride * 64) << 16), y1 = y0 + ((stride * 64) << 16);
-		int e, inside = 1;
-		if (psw_cmd_left() <= 0 && psw_no_room()) return;   /* r39: latched */
-		if (psw_flat_cmds >= psw_flat_cap_dyn) { psw_cap_stop(); return; }   /* P58 */
-		for (e = 0; e < n && inside; ++e)
-		{
-		    int e1 = (e + 1 == n) ? 0 : e + 1;
-		    long long ex = cx[e1] - cx[e], ey = cy[e1] - cy[e];
-		    int ins = 0, k2;
-		    static const int cxo[4] = { 0, 1, 1, 0 }, cyo[4] = { 0, 0, 1, 1 };
-		    for (k2 = 0; k2 < 4; ++k2)
-		    {
-			long long c = ex * (long long)((cyo[k2] ? y1 : y0) - cy[e])
-			            - ey * (long long)((cxo[k2] ? x1 : x0) - cx[e]);
-			if (wpos2 ? (c >= 0) : (c <= 0)) ins++;
-		    }
-		    if (ins != 4) inside = 0;
-		}
-		if (!inside) continue;
-		{
-		    int qx[4], qy[4];
-		    if (!psw_project(x0, y1, ph, psign, &qx[0], &qy[0])) continue;
-		    if (!psw_project(x1, y1, ph, psign, &qx[1], &qy[1])) continue;
-		    if (!psw_project(x1, y0, ph, psign, &qx[2], &qy[2])) continue;
-		    if (!psw_project(x0, y0, ph, psign, &qx[3], &qy[3])) continue;
-		    psw_paint_idx = 176;      /* L+X: textured content = RED */
-		    psw_emit_flatquad(slot, colr, qx, qy);
-		}
-	    }
     }
 }
 
@@ -11408,10 +11351,27 @@ static void psw_emit_punchquad(const int *qx, const int *qy)
     cmd[3] = 0x0000;                   /* sprite 0 = transparent -> RBG0 shows through */
     if (sat_wall_paint & 1)
 	cmd[3] = (unsigned short)(0x0100u | 163u);   /* L+X: punches solid YELLOW */
-    for (i = 0; i < 4; ++i)
     {
-	cmd[6 + 2*i] = (short)((qx[i] << detailshift) + vx);
-	cmd[7 + 2*i] = (short)(qy[i] + vy);
+	int gqx[4], gqy[4];
+	for (i = 0; i < 4; ++i) { gqx[i] = qx[i]; gqy[i] = qy[i]; }
+	if (sat_wall_paint & 1)
+	{   /* P87 -- THE OWNER'S READABLE GRID: inset every emitted quad 1px
+	       toward its centroid in L+X, so the REAL tiling is COUNTABLE on a
+	       capture (owner measured the spawn ceiling at ~22 tiles by hand;
+	       this makes the measurement free).  Normal render untouched. */
+	    int cgx = (gqx[0] + gqx[1] + gqx[2] + gqx[3]) >> 2;
+	    int cgy = (gqy[0] + gqy[1] + gqy[2] + gqy[3]) >> 2;
+	    for (i = 0; i < 4; ++i)
+	    {
+		if (gqx[i] < cgx) gqx[i]++; else if (gqx[i] > cgx) gqx[i]--;
+		if (gqy[i] < cgy) gqy[i]++; else if (gqy[i] > cgy) gqy[i]--;
+	    }
+	}
+	for (i = 0; i < 4; ++i)
+	{
+	    cmd[6 + 2*i] = (short)((gqx[i] << detailshift) + vx);
+	    cmd[7 + 2*i] = (short)(gqy[i] + vy);
+	}
     }
     psw_cmd_put(cmd);
     psw_flat_cmds++;
@@ -11492,7 +11452,6 @@ static void psw_emit_subflats(int k)
        floor pass and hand it back, plus whatever the floor left, at pass 1. */
     int cres = 0;
     int spc0[2] = {0, 0}, sptl[2] = {0, 0}, spfs0 = 0;   /* P76: memo capture */
-    int shrt[2] = {0, 0};              /* P85: pass ended in a window SHORT */
     int spfsk[2] = {0, 0};             /* P78: counted skips, funded in the memo */
     if (psw_sf_mode && cl >= 0 && !(psw_sub_flag[k] & (4 | 0x80)))
     {
@@ -11797,23 +11756,7 @@ static void psw_emit_subflats(int k)
 			    }
 			}
 		    }
-		    {   /* P86 -- THE SUPER-WALK TRIGGER (P84 "jaune", P85 "pluS de
-		           jaune"): a plane whose priced walk cannot fit its window
-		           never fits it -- the spawn ceiling is ~150-200 tiles
-		           against a shared 420 arena, so the fix is COST, not
-		           ration (the r85 open-law ration starved the frame).
-		           est/s^2 stretched supertiles fit ANY workable window. */
-			int fe2 = (int)((pass == 0) ? psw_sub_fe[k] : psw_sub_ce[k]);
-			if (psw_sf_mode && slot >= 0 && 2 * fe2 > psw_cmd_left())
-			{
-			    int st2 = 2;
-			    while (st2 < 4 && fe2 / (st2 * st2) + 4 > psw_cmd_left())
-				st2++;
-			    psw_emit_plane_super(slot, pc, cx, cy, n, ph, psign, st2);
-			}
-			else
-			    psw_emit_plane_tiles(slot, pc, cx, cy, n, ph, psign, cull_h, scolr);
-		    }
+		    psw_emit_plane_tiles(slot, pc, cx, cy, n, ph, psign, cull_h, scolr);
 		    psw_sf_end += cov;
 		    if (psw_tile_short)
 		    {   psw_short_n++;   /* P73: row `w` -- this pass's walk went short */
@@ -11849,7 +11792,6 @@ static void psw_emit_subflats(int k)
 		        sptl[pass] = 1;
 		        spfsk[pass] = psw_fan_skip - spfs0;
 		    }
-		    if (psw_tile_short) shrt[pass] = 1;   /* P85: HUNGRY candidate */
 		}
 		if (solid)
 		{   /* round 14: the solid fan is DECIMATED to <= 4 quads (a many-
@@ -11919,10 +11861,8 @@ static void psw_emit_subflats(int k)
 	   one-frame recovery every under-read memo already has. */
 	int spf = spc0[1] - spc0[0] + 2 * spfsk[0];   /* P78: + counted skips */
 	int spc = psw_sf_cur - spc0[1] + 2 * spfsk[1];
-	psw_spendf[sn] = (unsigned char)(sptl[0] ? (spf > 253 ? 254 : spf + 1)
-	                               : shrt[0] ? 255 : 0);   /* P85: 255 = HUNGRY */
-	psw_spendc[sn] = (unsigned char)(sptl[1] ? (spc > 253 ? 254 : spc + 1)
-	                               : shrt[1] ? 255 : 0);
+	psw_spendf[sn] = (unsigned char)(sptl[0] ? (spf > 254 ? 255 : spf + 1) : 0);
+	psw_spendc[sn] = (unsigned char)(sptl[1] ? (spc > 254 ? 255 : spc + 1) : 0);
     }
     /* ROUND 38 -- PAINT THE REFUSAL.  One marker per refused plane, at this
        sub's own painter rank (so it lands exactly where the plane would have,

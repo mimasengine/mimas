@@ -3519,7 +3519,7 @@ static void fps_update(void)
                     /* P70 -- THE CLEAN ROW (owner: "repartir d'une base saine";
                        the 41-disc probe sediments are gone, the branch memory
                        carries their history).  Format:
-                       P83.<diag><!/-><^> s<slot>:<bud>:<win> u<un> w<sh> k<cskip> F<fsol> f<cmds> m<clamp>/<valid>
+                       P84.<diag><!/-><^> s<slot>:<bud>:<win> E<miss> u<un> w<sh> k<cskip> F<fsol> f<cmds>
                          diag   pad L+Down: 0 shipping / 1 MASTER flats /
                                 2 master flats + core noprune (r69 A/B ref)
                          !/-    flat body wedged -> flats on master / no arena
@@ -3541,20 +3541,25 @@ static void fps_update(void)
                        walls squeeze fbudget (paper); by win -> the walk model
                        is wrong.  u large with w small = grants strand on
                        entry-solids; w large = windows still too tight. */
-                    snprintf(ovbuf, sizeof ovbuf, "P83.%d%s%s s%d:%d:%d u%d w%d k%d F%d f%d m%d/%d ",
+                    snprintf(ovbuf, sizeof ovbuf, "P84.%d%s%s s%d:%d:%d E%d u%d w%d k%d F%d f%d ",
                              sat_psw_diag & 3,             /* pad L+Down state */
                              sfb,
                              psw_sub_ovf_last > 0 ? "^" : "",
                              psw_esol_slot_last > 99 ? 99 : psw_esol_slot_last,
                              psw_esol_bud_last  > 99 ? 99 : psw_esol_bud_last,
                              psw_esol_win_last  > 99 ? 99 : psw_esol_win_last,
+                             psw_ceil_solid_last > 99 ? 99 : psw_ceil_solid_last,   /* P84: E */
                              psw_sf_unspent_last > 999 ? 999 : psw_sf_unspent_last,
                              psw_short_n_last > 9 ? 9 : psw_short_n_last,
                              psw_fan_skip_last > 99 ? 99 : psw_fan_skip_last,
                              psw_floor_esol_last > 99 ? 99 : psw_floor_esol_last,
-                             psw_flat_last  > 999 ? 999 : psw_flat_last,
-                             psw_bill_clamp_last > 99 ? 99 : psw_bill_clamp_last,
-                             psw_bill_valid_last > 99 ? 99 : psw_bill_valid_last);
+                             psw_flat_last  > 999 ? 999 : psw_flat_last);
+                    /* P84: `m` (bill clamp/valid) retired from the row -- the
+                       accounting front CLOSED at P78/P82; both stay latched.
+                       `E` = psw_ceil_solid, the walk-time ceiling slot miss --
+                       retired at P73 on "miss read 0 for 8 captures", which
+                       predates the current artifact era: an unprinted latch
+                       cannot be falsified by any capture since. */
                 }
 #endif
             if (sat_dbg_overlay_mode == 0) SRL::Debug::Print(0, 13, ovbuf);
@@ -10796,16 +10801,20 @@ static void psw_emit_plane_tiles(int slot, unsigned short colr,
 		auto emitfull = [&](int ty) -> void
 		{   /* non-mixed interior single: emit64's interior branch with
 		       the corner cache -- same projections, same command.
-		       P65: a cproj failure here dropped the tile with no counter
-		       and no paint (stripe's failures fall back to singles; these
-		       do not) -- counted into z<skip> and painted grey. */
+		       P84: the P65 comment here PROMISED "counted into z<skip> and
+		       painted grey" -- the code had four bare returns (the count
+		       died in a cleanup, the z field is long retired).  An interior
+		       tile whose corner fails projection is a SILENT whole-tile
+		       hole -- the comment-vs-code lie class.  It now folds into
+		       psw_fan_skip (row k): if the spawn block is THESE, k explodes. */
 		    int r = ty - cy0r;
 		    int qx[4], qy[4];
 		    if (psw_flat_cmds >= psw_flat_cap_dyn) { psw_cap_stop(); stop = 1; return; }   /* P58 */
-		    if (!cproj(0, r + 1, &qx[0], &qy[0])) return;
-		    if (!cproj(1, r + 1, &qx[1], &qy[1])) return;
-		    if (!cproj(1, r,     &qx[2], &qy[2])) return;
-		    if (!cproj(0, r,     &qx[3], &qy[3])) return;
+		    if (!cproj(0, r + 1, &qx[0], &qy[0])
+		     || !cproj(1, r + 1, &qx[1], &qy[1])
+		     || !cproj(1, r,     &qx[2], &qy[2])
+		     || !cproj(0, r,     &qx[3], &qy[3]))
+		    { psw_fan_skip++; return; }   /* P84: row k */
 		    psw_paint_idx = 176;                /* L+X: full squares RED */
 		    psw_emit_flatquad(slot, colr, qx, qy);
 		};
@@ -11675,7 +11684,14 @@ static void psw_emit_subflats(int k)
 			    {
 				int fidx[9], s2;
 				for (s2 = 0; s2 < nn2; ++s2) fidx[s2] = (s2 * (n - 1)) / (nn2 - 1);
-				psw_paint_idx = 250;   /* L+X: a deficit reads MAGENTA under the tiles */
+				psw_paint_idx = 163;   /* P84: the under-fan deficit reads
+				       YELLOW under the tiles now.  250 was SHARED with the
+				       slot-famine pieces and the plane fans (r53 palette), so
+				       the owner's "gros bloc magenta" could not name its door.
+				       On a CEILING, yellow (the RBG0 punch colour, floor-only)
+				       collides with nothing.  Next capture: block YELLOW =
+				       the walk under-emits (deficit doors); block still
+				       MAGENTA = slot-famine pieces or a plane fan (row E). */
 				for (i = 1; i + 1 < nn2; i += 2)
 				{
 				    int qx2[4], qy2[4];

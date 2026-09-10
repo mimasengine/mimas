@@ -3523,7 +3523,7 @@ static void fps_update(void)
                     /* P70 -- THE CLEAN ROW (owner: "repartir d'une base saine";
                        the 41-disc probe sediments are gone, the branch memory
                        carries their history).  Format:
-                       P89.<diag><!/-><^> s<slot>:<bud>:<win> E<miss.pk> u<un> w<sh.pk> k<cskip> F<fsol> f<cmds>
+                       P90.<diag><!/-><^> s<slot>:<bud>:<win> E<miss.pk> u<un> w<sh.pk> k<cskip> F<fsol> f<cmds>
                          diag   pad L+Down: 0 shipping / 1 MASTER flats /
                                 2 master flats + core noprune (r69 A/B ref)
                          !/-    flat body wedged -> flats on master / no arena
@@ -3545,7 +3545,7 @@ static void fps_update(void)
                        walls squeeze fbudget (paper); by win -> the walk model
                        is wrong.  u large with w small = grants strand on
                        entry-solids; w large = windows still too tight. */
-                    snprintf(ovbuf, sizeof ovbuf, "P89.%d%s%s s%d:%d:%d E%d u%d w%d k%d F%d f%d ",
+                    snprintf(ovbuf, sizeof ovbuf, "P90.%d%s%s s%d:%d:%d E%d u%d w%d k%d F%d f%d ",
                              sat_psw_diag & 3,             /* pad L+Down state */
                              sfb,
                              psw_sub_ovf_last > 0 ? "^" : "",
@@ -12625,7 +12625,9 @@ static void vdp1_walls_flush(void)
                        to +2 (jitter).  Memo absent -> full insurance (P75 law
                        below).  Floors are NOT touched: their covf funds the
                        r42 cover holdback, not walk margin. */
-                    int cmval = sf_ok && psw_sub[k].subnum >= 0
+                    /* P90 -- GOVERNOR-CLASS (reads LAST frame's memo): off in build
+                       mode, or the covf 2/6 swing feeds the r90 2-cycle (below). */
+                    int cmval = psw_governor && sf_ok && psw_sub[k].subnum >= 0
                                 && psw_sub[k].subnum < PSW_SPEND_MAX
                                 && psw_ucr8((const volatile void *)
                                             &psw_spendc[psw_sub[k].subnum]) > 0;
@@ -12806,7 +12808,17 @@ static void vdp1_walls_flush(void)
                             /* P77: every PRESENT pass memo'd -> the fines are IN
                                the measured spend, the +9 would only strand (the
                                u-class); an absent pass cannot spend fines. */
-                            if (dsn >= 0 && dsn < PSW_SPEND_MAX)
+                            /* P90 -- THE FLICK WAS THIS LOOP (console P88/P89: the spawn
+                               ceiling textured/yellow STRICTLY 1 frame in 2, under pause too,
+                               E0 peak, w2 peak).  r88 disarmed the memo VALUE (bill_of returns
+                               the law first) but left its VALIDITY bit armed at two readers:
+                               this skip (+9) and round B's cmval covf (+2 valid / +6 not).  A
+                               short writes the memo 0 -> next frame +13 -> the walk completes
+                               -> memo valid -> next frame +0 -> short: negative feedback with
+                               a one-frame lag = period 2 from a frozen view.  Pre-r88 the
+                               cbill cap kept BOTH parities short (stable yellow).  Both readers
+                               are governor-class; psw_governor = 1 restores P77 verbatim. */
+                            if (psw_governor && dsn >= 0 && dsn < PSW_SPEND_MAX)
                             {
                                 int fl2, cl2, fd2;
                                 psw_sub_lumps(psw_sf_jobs[j].k, &fl2, &cl2, &fd2);

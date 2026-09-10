@@ -3519,7 +3519,7 @@ static void fps_update(void)
                     /* P70 -- THE CLEAN ROW (owner: "repartir d'une base saine";
                        the 41-disc probe sediments are gone, the branch memory
                        carries their history).  Format:
-                       P82.<diag><!/-><^> s<slot>:<bud>:<win> u<un> w<sh> k<cskip> F<fsol> f<cmds> m<clamp>/<valid>
+                       P83.<diag><!/-><^> s<slot>:<bud>:<win> u<un> w<sh> k<cskip> F<fsol> f<cmds> m<clamp>/<valid>
                          diag   pad L+Down: 0 shipping / 1 MASTER flats /
                                 2 master flats + core noprune (r69 A/B ref)
                          !/-    flat body wedged -> flats on master / no arena
@@ -3541,7 +3541,7 @@ static void fps_update(void)
                        walls squeeze fbudget (paper); by win -> the walk model
                        is wrong.  u large with w small = grants strand on
                        entry-solids; w large = windows still too tight. */
-                    snprintf(ovbuf, sizeof ovbuf, "P82.%d%s%s s%d:%d:%d u%d w%d k%d F%d f%d m%d/%d ",
+                    snprintf(ovbuf, sizeof ovbuf, "P83.%d%s%s s%d:%d:%d u%d w%d k%d F%d f%d m%d/%d ",
                              sat_psw_diag & 3,             /* pad L+Down state */
                              sfb,
                              psw_sub_ovf_last > 0 ? "^" : "",
@@ -12453,6 +12453,24 @@ static void vdp1_walls_flush(void)
                allocator again; the s<esol>/<miss> split now arbitrates budget
                vs slot-bank famine directly.  (~300 bytes of .text returned to
                the pool, which sat 30 bytes under the boot floor.) */
+            /* P83 -- THE OWNER'S LADDER, PLANES RUNG: FIRST BUDGET REFUSAL
+               CLOSES THE POT.  The console arithmetic that four accounting
+               rounds (r79-r82) could not move: at the spawn, presence (~200)
+               + the fine carve (~50) leave ~170 of the 420 for upgrades,
+               against ~15 subs of ONE giant near ceiling at ~30-45 each --
+               demand is ~3x the pot BY GEOMETRY, so the aplat is not a leak,
+               it is rationing.  And round B rationed it BACKWARDS: first-fit
+               kept walking after an expensive near plane failed, funding
+               cheap FAR scraps around it -- the exact inverse of the owner's
+               LOD ("d'abord les plans les plus loins" en flat).  The latch:
+               once ANY upgrade fails on budget, every farther plane keeps
+               its presence BY LAW (ecause 2, grey in L+X, counted in s:bud
+               -- expect `bud` to RISE while the near field textures: that is
+               the law refusing, not famine).  Side win: the far field no
+               longer takes texture slots either, so the 8-slot bank serves
+               the near field (watch `F` fall).  k is BSP near-first, the
+               same premise r80's wall tax shipped on. */
+            int lodstop = 0;
             for (int k = 0; k < psw_sub_n; ++k)
             {   /* round B: upgrades + slots, near->far.  A pass already billed
                    its full e (e <= 4) is tiled as-is and only needs its slot;
@@ -12493,15 +12511,19 @@ static void vdp1_walls_flush(void)
                        their chains. */
                     int wnt = sf_ok ? 0
                             : (psw_sub_fe[k] >= 18) ? 2 : (psw_sub_fe[k] >= 12) ? 1 : 0;
-                    if (e <= 4)
+                    if (lodstop)                       psw_sub_flag[k] |= 0x10;   /* P83:
+                                                          past the pot-close, presence by law
+                                                          (no slot_get: no upload, no LRU churn) */
+                    else if (e <= 4)
                     { if (psw_slot_get(fl, wnt) < 0) psw_sub_flag[k] |= 0x10;
                       else if (covf && ftile + covf <= limit)
                       { ftile += covf; psw_sf_bill[k] += (unsigned short)covf; } }   /* r49+r52 */
-                    else if (ftile + (e - 4 + covf) <= limit
-                             && psw_slot_get(fl, wnt) >= 0)
-                                                       { ftile += e - 4 + covf;
+                    else if (ftile + (e - 4 + covf) > limit)
+                    {                                  psw_sub_flag[k] |= 0x10;
+                                                       lodstop = 1; }   /* P83: pot closed */
+                    else if (psw_slot_get(fl, wnt) < 0) psw_sub_flag[k] |= 0x10;
+                    else                               { ftile += e - 4 + covf;
                                                          if (sf_ok) psw_sf_bill[k] += (unsigned short)(e - 4 + covf); }
-                    else                               psw_sub_flag[k] |= 0x10;
                 }
                 if (cl >= 0 && !(psw_sub_flag[k] & 0x84) && !(psw_sub_flag[k] & 0x20))
                 {
@@ -12535,7 +12557,9 @@ static void vdp1_walls_flush(void)
                             covf is pure walk margin -- console P58 measured the residual
                             deficit at cs0-1/fs0-4 per frame, +2/plane funds it;
                             the trade is counted (esol) if the bank tightens */
-                    if (e <= 4)
+                    if (lodstop)
+                    { psw_sub_flag[k] |= 0x20; psw_sub_ecause[k] = 2; }     /* P83: law */
+                    else if (e <= 4)
                     { if (psw_slot_get(cl, wnt) < 0)
                       { psw_sub_flag[k] |= 0x20; psw_sub_ecause[k] = 1; }   /* P65: slot */
                       else if (covf && ftile + covf <= limit)
@@ -12545,7 +12569,8 @@ static void vdp1_walls_flush(void)
                     else if (ftile + (e - 4 + covf) > limit)   /* P65: split the two
                             refusals (budget first, as the old && short-circuit
                             did -- no upload attempted when the budget fails) */
-                    { psw_sub_flag[k] |= 0x20; psw_sub_ecause[k] = 2; }     /* budget */
+                    { psw_sub_flag[k] |= 0x20; psw_sub_ecause[k] = 2;
+                      lodstop = 1; }   /* P83: pot closed for everything farther */
                     else if (psw_slot_get(cl, wnt) < 0)
                     { psw_sub_flag[k] |= 0x20; psw_sub_ecause[k] = 1; }     /* slot */
                     else                               { ftile += e - 4 + covf;

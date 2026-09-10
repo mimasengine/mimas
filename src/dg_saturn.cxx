@@ -3519,7 +3519,7 @@ static void fps_update(void)
                     /* P70 -- THE CLEAN ROW (owner: "repartir d'une base saine";
                        the 41-disc probe sediments are gone, the branch memory
                        carries their history).  Format:
-                       P84.<diag><!/-><^> s<slot>:<bud>:<win> E<miss> u<un> w<sh> k<cskip> F<fsol> f<cmds>
+                       P85.<diag><!/-><^> s<slot>:<bud>:<win> E<miss> u<un> w<sh> k<cskip> F<fsol> f<cmds>
                          diag   pad L+Down: 0 shipping / 1 MASTER flats /
                                 2 master flats + core noprune (r69 A/B ref)
                          !/-    flat body wedged -> flats on master / no arena
@@ -3541,7 +3541,7 @@ static void fps_update(void)
                        walls squeeze fbudget (paper); by win -> the walk model
                        is wrong.  u large with w small = grants strand on
                        entry-solids; w large = windows still too tight. */
-                    snprintf(ovbuf, sizeof ovbuf, "P84.%d%s%s s%d:%d:%d E%d u%d w%d k%d F%d f%d ",
+                    snprintf(ovbuf, sizeof ovbuf, "P85.%d%s%s s%d:%d:%d E%d u%d w%d k%d F%d f%d ",
                              sat_psw_diag & 3,             /* pad L+Down state */
                              sfb,
                              psw_sub_ovf_last > 0 ? "^" : "",
@@ -9986,26 +9986,41 @@ static const struct psw_bleaf *psw_bake_get(int sn)
 static int psw_bill_of(int sn, int est, int pass)
 {
     int e = 2 * est + 1;
+    int m = 0;
     const struct psw_bleaf *bk = psw_bake_get(sn);
-    if (bk && (int)bk->cbill < e) e = (int)bk->cbill;
     if (sn >= 0 && sn < PSW_SPEND_MAX)
+	m = (int)psw_ucr8(pass ? (const volatile void *)&psw_spendc[sn]
+	                       : (const volatile void *)&psw_spendf[sn]);
+    /* P85 -- THE HUNGRY BILL (console P84, owner: "jaune").  The spawn block
+       is the P71 under-fan with ZERO tiles on top and E0 k5 w2, f221 << cap:
+       the shorts are WINDOW shorts, and `w` counts PASSES -- 1-2 shorted
+       passes = 1-2 GIANT subs = the block.  The window can never fit the
+       walk because the cbill cap is a DOCUMENTED under-read (r52: "cbill
+       UNDER-prices diagonals -- a funded U-strip rec spends 9-10 billed 2,
+       the live V-band arm up to 16"): bill < emit violates the round-17
+       law, and the memo cannot help -- a SHORT invalidates it and the next
+       frame re-reads the same cbill.  Yellow in perpetuity, immune to every
+       budget round (r79-r83 all no-ops at the spot, QED).  A pass that
+       SHORTED now writes the sentinel 255 (real spend caps at 254); a
+       hungry sub's bill LIFTS the cbill cap and returns to the full open
+       law 2e+1.  If the law feeds it, the memo turns honest next frame and
+       rules from then on; if yellow survives even the law, the live arm
+       out-costs 2e+1 and the next round prices the RECs themselves. */
+    if (m == 255) { m = 0; bk = 0; }
+    if (bk && (int)bk->cbill < e) e = (int)bk->cbill;
+    if (m > 0)
     {
-	int m = (int)psw_ucr8(pass ? (const volatile void *)&psw_spendc[sn]
-	                           : (const volatile void *)&psw_spendf[sn]);
-	if (m > 0)
+	m -= 1;                  /* P82: stored = spend+1 -- 1 is a VALID ZERO */
+	if (!psw_sf_mode) psw_bill_valid_n++;   /* P78: memos SEEN (row m/..) */
+	if (m + PSW_BILL_SLACK < e)
 	{
-	    m -= 1;                  /* P82: stored = spend+1 -- 1 is a VALID ZERO */
-	    if (!psw_sf_mode) psw_bill_valid_n++;   /* P78: memos SEEN (row m/..) */
-	    if (m + PSW_BILL_SLACK < e)
-	    {
-	        e = m + PSW_BILL_SLACK;
-	        if (!psw_sf_mode) psw_bill_clamp_n++;   /* P77: clamps FIRED -- pre-
-	                           pass only (the slave's entry-check calls would
-	                           double-count).  P78 read: valid~0 = validation
-	                           dead; valid high + clamp~0 = the open law is
-	                           already tight; both high + u flat = strandings
-	                           live outside the job-end subtraction. */
-	    }
+	    e = m + PSW_BILL_SLACK;
+	    if (!psw_sf_mode) psw_bill_clamp_n++;   /* P77: clamps FIRED -- pre-
+	                       pass only (the slave's entry-check calls would
+	                       double-count).  P78 read: valid~0 = validation
+	                       dead; valid high + clamp~0 = the open law is
+	                       already tight; both high + u flat = strandings
+	                       live outside the job-end subtraction. */
 	}
     }
     return e;
@@ -11401,6 +11416,7 @@ static void psw_emit_subflats(int k)
        floor pass and hand it back, plus whatever the floor left, at pass 1. */
     int cres = 0;
     int spc0[2] = {0, 0}, sptl[2] = {0, 0}, spfs0 = 0;   /* P76: memo capture */
+    int shrt[2] = {0, 0};              /* P85: pass ended in a window SHORT */
     int spfsk[2] = {0, 0};             /* P78: counted skips, funded in the memo */
     if (psw_sf_mode && cl >= 0 && !(psw_sub_flag[k] & (4 | 0x80)))
     {
@@ -11741,6 +11757,7 @@ static void psw_emit_subflats(int k)
 		        sptl[pass] = 1;
 		        spfsk[pass] = psw_fan_skip - spfs0;
 		    }
+		    if (psw_tile_short) shrt[pass] = 1;   /* P85: HUNGRY candidate */
 		}
 		if (solid)
 		{   /* round 14: the solid fan is DECIMATED to <= 4 quads (a many-
@@ -11810,8 +11827,10 @@ static void psw_emit_subflats(int k)
 	   one-frame recovery every under-read memo already has. */
 	int spf = spc0[1] - spc0[0] + 2 * spfsk[0];   /* P78: + counted skips */
 	int spc = psw_sf_cur - spc0[1] + 2 * spfsk[1];
-	psw_spendf[sn] = (unsigned char)(sptl[0] ? (spf > 254 ? 255 : spf + 1) : 0);
-	psw_spendc[sn] = (unsigned char)(sptl[1] ? (spc > 254 ? 255 : spc + 1) : 0);
+	psw_spendf[sn] = (unsigned char)(sptl[0] ? (spf > 253 ? 254 : spf + 1)
+	                               : shrt[0] ? 255 : 0);   /* P85: 255 = HUNGRY */
+	psw_spendc[sn] = (unsigned char)(sptl[1] ? (spc > 253 ? 254 : spc + 1)
+	                               : shrt[1] ? 255 : 0);
     }
     /* ROUND 38 -- PAINT THE REFUSAL.  One marker per refused plane, at this
        sub's own painter rank (so it lands exactly where the plane would have,
